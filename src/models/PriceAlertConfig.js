@@ -1,4 +1,5 @@
 import pool from '../config/database.js';
+import logger from '../utils/logger.js';
 
 /**
  * Price Alert Config Model
@@ -21,11 +22,26 @@ export class PriceAlertConfig {
     query += ' ORDER BY created_at DESC';
 
     const [rows] = await pool.execute(query, params);
-    return rows.map(row => ({
-      ...row,
-      symbols: JSON.parse(row.symbols || '[]'),
-      intervals: JSON.parse(row.intervals || '[]')
-    }));
+    // Safely parse JSON string fields into arrays
+    return rows.map(config => {
+      try {
+        if (typeof config.symbols === 'string') {
+          config.symbols = JSON.parse(config.symbols);
+        }
+      } catch (e) {
+        logger.warn(`Invalid JSON in price_alert_config.symbols for ID ${config.id}: ${config.symbols}`);
+        config.symbols = [];
+      }
+      try {
+        if (typeof config.intervals === 'string') {
+          config.intervals = JSON.parse(config.intervals);
+        }
+      } catch (e) {
+        logger.warn(`Invalid JSON in price_alert_config.intervals for ID ${config.id}: ${config.intervals}`);
+        config.intervals = [];
+      }
+      return config;
+    });
   }
 
   /**
@@ -140,4 +156,3 @@ export class PriceAlertConfig {
     );
   }
 }
-

@@ -48,7 +48,7 @@ export class PositionMonitor {
       await exchangeService.initialize();
       this.exchangeServices.set(bot.id, exchangeService);
 
-      const positionService = new PositionService(exchangeService);
+      const positionService = new PositionService(exchangeService, this.telegramService);
       this.positionServices.set(bot.id, positionService);
 
       const orderService = new OrderService(exchangeService, this.telegramService);
@@ -132,6 +132,12 @@ export class PositionMonitor {
         // If position was opened before this candle, it's an old unfilled order
         if (positionTime < candleTime) {
           const orderService = this.orderServices.get(strategy.bot_id);
+          const exSvc = this.exchangeServices.get(strategy.bot_id);
+          // For Binance (direct client), skip generic cancel because entry orders are executed immediately
+          if (exSvc?.bot?.exchange === 'binance') {
+            logger.debug(`Skip cancelling unfilled order on Binance for position ${position.id}`);
+            return;
+          }
           if (orderService) {
             await orderService.cancelOrder(position, 'candle_end');
             logger.info(`Cancelled unfilled order for position ${position.id}`);

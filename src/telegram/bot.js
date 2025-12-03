@@ -253,8 +253,8 @@ Win Rate: ${winRate}% (${winCount}W / ${lossCount}L)
   async stop() {
     if (this.bot) {
       try {
-        this.bot.stop();
-        logger.info('Telegram bot stopped');
+      this.bot.stop();
+      logger.info('Telegram bot stopped');
       } catch (error) {
         // Bot may already be stopped, ignore error
         if (!error.message?.includes('not running')) {

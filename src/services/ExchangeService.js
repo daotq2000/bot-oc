@@ -15,6 +15,7 @@ export class ExchangeService {
     this.binanceDirectClient = null; // Direct API client for Binance (no CCXT)
     this.proxyAgent = null;
     this.apiKeyValid = true; // Track if API key is valid
+    this._binanceConfiguredSymbols = new Set(); // symbols configured with leverage/margin
   }
 
   /**
@@ -206,42 +207,64 @@ export class ExchangeService {
    */
   async createOrder(params) {
     try {
-      const { symbol, side, amount, type = 'limit', price } = params;
+      const { symbol, side, amount, type = 'limit', price, positionSide } = params;
 
       // For Binance: use direct client
       if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
         const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
-        
-        // Calculate quantity from amount in USDT
-        const currentPrice = price || await this.getTickerPrice(symbol);
-        let quantity = amount / currentPrice;
-        
-        // BinanceDirectClient will handle precision rounding
-        // We just need to ensure we have enough USDT for minimum quantity
-        // Get stepSize to calculate minimum quantity needed
-        const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
-        const minQuantity = parseFloat(stepSize);
-        const minUSDT = minQuantity * currentPrice;
-        
-        if (amount < minUSDT) {
-          throw new Error(`Amount ${amount} USDT is too small. Minimum needed: ${minUSDT.toFixed(2)} USDT for ${symbol} at price ${currentPrice} (minQuantity: ${minQuantity})`);
+
+        // Validate symbol is tradable on Binance Futures (testnet/prod accordingly)
+        const symbolInfo = await this.binanceDirectClient.getTradingExchangeSymbol(normalizedSymbol);
+        if (!symbolInfo || symbolInfo.status !== 'TRADING') {
+          throw new Error(`Symbol ${normalizedSymbol} is not available for trading on Binance Futures.`);
         }
         
-        logger.debug(`Calculated quantity: ${quantity} for ${symbol} (amount: ${amount} USDT, price: ${currentPrice}, stepSize: ${stepSize})`);
-        
+        // Calculate quantity and notional (USDT)
+        const currentPrice = price || await this.getTickerPrice(symbol);
+        const quantity = amount / currentPrice;
+        const notional = amount; // USDT-margined futures: price * qty = amount
+
+        // Configure margin type and optimal leverage per symbol per notional
+        try {
+          const marginType = (process.env.BINANCE_DEFAULT_MARGIN_TYPE || 'CROSSED').toUpperCase();
+          await this.binanceDirectClient.setMarginType(normalizedSymbol, marginType);
+          const optimalLev = await this.binanceDirectClient.getOptimalLeverage(normalizedSymbol, notional);
+          const desiredLev = optimalLev || parseInt(process.env.BINANCE_DEFAULT_LEVERAGE || '5');
+          // Cache last applied leverage to avoid redundant calls
+          this._binanceLeverageMap = this._binanceLeverageMap || new Map();
+          if (this._binanceLeverageMap.get(normalizedSymbol) !== desiredLev) {
+            await this.binanceDirectClient.setLeverage(normalizedSymbol, desiredLev);
+            this._binanceLeverageMap.set(normalizedSymbol, desiredLev);
+            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (optimal) for bot ${this.bot.id}`);
+          }
+        } catch (cfgErr) {
+          logger.warn(`Binance leverage/margin setup warning for ${normalizedSymbol}: ${cfgErr?.message || cfgErr}`);
+        }
+
+        // Respect strategy amount: do NOT auto-increase to meet min notional.
+        // Validate against MIN_NOTIONAL; if not enough, throw to skip trade.
+        const minNotional = await this.binanceDirectClient.getMinNotional(normalizedSymbol);
+        if (minNotional && amount < minNotional) {
+          throw new Error(`Amount ${amount} USDT is below minimum notional ${minNotional} USDT for ${normalizedSymbol}.`);
+        }
+
+        logger.debug(`Calculated quantity: ${quantity} for ${symbol} (amount: ${amount} USDT, price: ${currentPrice})`);
+
         let order;
         if (type === 'market') {
           order = await this.binanceDirectClient.placeMarketOrder(
             normalizedSymbol,
             side,
-            quantity
+            quantity,
+            positionSide
           );
         } else {
           order = await this.binanceDirectClient.placeLimitOrder(
             normalizedSymbol,
             side,
             quantity,
-            price
+            price,
+            positionSide
           );
         }
         
@@ -281,7 +304,19 @@ export class ExchangeService {
 
       return order;
     } catch (error) {
-      logger.error(`Failed to create order for bot ${this.bot.id}:`, error);
+      const msg = error?.message || '';
+      const soft = (
+        msg.includes('not available for trading on Binance Futures') ||
+        msg.includes('below minimum notional') ||
+        msg.includes('Invalid price after rounding') ||
+        msg.includes('Precision is over the maximum') ||
+        msg.includes('-1121') || msg.includes('-1111') || msg.includes('-4061')
+      );
+      if (soft) {
+        logger.warn(`Create order validation for bot ${this.bot.id}: ${msg}`);
+      } else {
+        logger.error(`Failed to create order for bot ${this.bot.id}:`, error);
+      }
       throw error;
     }
   }
@@ -295,10 +330,58 @@ export class ExchangeService {
    */
   async closePosition(symbol, side, amount) {
     try {
-      // For closing, reverse the side
+      // For Binance: use direct client and reduce-only with exact position size
+      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+        const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+        // Get open positions to determine exact reducible amount
+        const positions = await this.binanceDirectClient.getOpenPositions(normalizedSymbol);
+        const desiredSide = side === 'long' ? 'BUY' : 'SELL'; // order side to close is opposite, but we decide below
+        const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+
+        // Find matching position
+        let pos = null;
+        if (Array.isArray(positions)) {
+          // PositionRisk returns both LONG/SHORT entries in dual-side, or one entry in one-way
+          pos = positions.find(p => p.symbol === normalizedSymbol && (p.positionSide ? p.positionSide === positionSide : true));
+          // If not found by side (one-way), take any non-zero
+          if (!pos) pos = positions.find(p => p.symbol === normalizedSymbol && parseFloat(p.positionAmt) !== 0);
+        }
+
+        const posAmt = pos ? Math.abs(parseFloat(pos.positionAmt || 0)) : 0;
+        if (!pos || posAmt === 0) {
+          logger.warn(`No open position to close for ${normalizedSymbol}, skip close.`);
+          return { skipped: true };
+        }
+
+        // Use stepSize to floor quantity <= posAmt
+        const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
+        const qtyStr = this.binanceDirectClient.formatQuantity(posAmt, stepSize);
+        const qty = parseFloat(qtyStr);
+        if (qty <= 0) {
+          logger.warn(`Computed close quantity <= 0 for ${normalizedSymbol}, skip.`);
+          return { skipped: true };
+        }
+
+        const closeSide = side === 'long' ? 'SELL' : 'BUY';
+        const order = await this.binanceDirectClient.placeMarketOrder(
+          normalizedSymbol,
+          closeSide,
+          qty,
+          positionSide,
+          true // reduceOnly
+        );
+        logger.info(`Position closed for bot ${this.bot.id}:`, {
+          orderId: order.orderId,
+          symbol,
+          side,
+          amount
+        });
+        return order;
+      }
+
+      // For closing on other exchanges, reverse the side and use CCXT
       const orderSide = side === 'long' ? 'sell' : 'buy';
       const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
-      
       const order = await this.exchange.createMarketOrder(
         marketSymbol,
         orderSide,
@@ -314,6 +397,12 @@ export class ExchangeService {
 
       return order;
     } catch (error) {
+      const msg = error?.message || '';
+      if (msg.includes('-2022') || msg.toLowerCase().includes('reduceonly')) {
+        // Race condition: position already reduced/closed by TP/SL or other order
+        logger.warn(`ReduceOnly close skipped for bot ${this.bot.id} (${symbol}): ${msg}`);
+        return { skipped: true };
+      }
       logger.error(`Failed to close position for bot ${this.bot.id}:`, error);
       throw error;
     }
@@ -375,6 +464,65 @@ export class ExchangeService {
       logger.error(`Failed to transfer future to spot for bot ${this.bot.id}:`, error);
       throw error;
     }
+  }
+
+  /**
+   * Create Take Profit Limit order (reduce-only)
+   * Only implemented for Binance (direct client) for now
+   * @param {string} symbol
+   * @param {'long'|'short'} side - original position side
+   * @param {number} tpPrice
+   * @param {number} quantity
+   */
+  async createTakeProfitLimit(symbol, side, tpPrice, quantity) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+      const data = await this.binanceDirectClient.createTpLimitOrder(normalizedSymbol, side, tpPrice, quantity);
+      return data;
+    }
+    throw new Error('createTakeProfitLimit not supported on this exchange');
+  }
+
+  async createStopLossLimit(symbol, side, slPrice, quantity) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+      const data = await this.binanceDirectClient.createSlLimitOrder(normalizedSymbol, side, slPrice, quantity);
+      return data;
+    }
+    throw new Error('createStopLossLimit not supported on this exchange');
+  }
+
+  async getTickSize(symbol) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      return await this.binanceDirectClient.getTickSize(symbol);
+    }
+    return '0.01';
+  }
+
+  async createEntryTriggerOrder(symbol, side, entryPrice, quantity) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+      return await this.binanceDirectClient.createEntryTriggerOrder(normalizedSymbol, side, entryPrice, quantity);
+    }
+    throw new Error('createEntryTriggerOrder not supported on this exchange');
+  }
+
+  async getClosableQuantity(symbol, side) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+      const positions = await this.binanceDirectClient.getOpenPositions(normalizedSymbol);
+      const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+      let pos = null;
+      if (Array.isArray(positions)) {
+        pos = positions.find(p => p.symbol === normalizedSymbol && (p.positionSide ? p.positionSide === positionSide : true));
+        if (!pos) pos = positions.find(p => p.symbol === normalizedSymbol && parseFloat(p.positionAmt) !== 0);
+      }
+      const posAmt = pos ? Math.abs(parseFloat(pos.positionAmt || 0)) : 0;
+      if (posAmt <= 0) return 0;
+      const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
+      return parseFloat(this.binanceDirectClient.formatQuantity(posAmt, stepSize));
+    }
+    return 0;
   }
 
   /**
@@ -550,8 +698,18 @@ export class ExchangeService {
    */
   async cancelOrder(orderId, symbol) {
     try {
-      const result = await this.exchange.cancelOrder(orderId, symbol);
-      logger.info(`Order cancelled for bot ${this.bot.id}:`, { orderId, symbol });
+      // Binance: use direct client
+      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+        const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+        const result = await this.binanceDirectClient.cancelOrder(normalizedSymbol, orderId);
+        logger.info(`Order cancelled for bot ${this.bot.id}:`, { orderId, symbol: normalizedSymbol });
+        return result;
+      }
+
+      // Other exchanges: use CCXT
+      const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
+      const result = await this.exchange.cancelOrder(orderId, marketSymbol);
+      logger.info(`Order cancelled for bot ${this.bot.id}:`, { orderId, symbol: marketSymbol });
       return result;
     } catch (error) {
       logger.error(`Failed to cancel order for bot ${this.bot.id}:`, error);

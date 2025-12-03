@@ -8,6 +8,7 @@ export class TelegramService {
   constructor() {
     this.bot = null;
     this.initialized = false;
+    this.alertChannelId = process.env.TELEGRAM_ALERT_CHANNEL_ID || '-1003163801780';
   }
 
   /**
@@ -39,17 +40,30 @@ export class TelegramService {
    */
   async sendMessage(chatId, message, options = {}) {
     if (!this.initialized || !this.bot) {
-      logger.warn('Telegram bot not initialized, skipping message');
+      logger.warn(`[Telegram] Bot not initialized, skipping message to ${chatId}`);
+      return;
+    }
+
+    if (!chatId) {
+      logger.warn(`[Telegram] Chat ID is empty, skipping message`);
       return;
     }
 
     try {
+      logger.debug(`[Telegram] Sending message to ${chatId}, length=${message.length}`);
       await this.bot.telegram.sendMessage(chatId, message, {
         parse_mode: 'HTML',
         ...options
       });
+      logger.debug(`[Telegram] ✅ Successfully sent message to ${chatId}`);
     } catch (error) {
-      logger.error(`Failed to send Telegram message to ${chatId}:`, error);
+      logger.error(`[Telegram] Failed to send message to ${chatId}:`, error);
+      logger.error(`[Telegram] Error details:`, {
+        message: error?.message,
+        code: error?.code,
+        response: error?.response
+      });
+      throw error; // Re-throw to let caller handle
     }
   }
 
@@ -72,16 +86,116 @@ export class TelegramService {
 ${sideEmoji} <b>NEW ${sideText} POSITION</b>
 
 Symbol: <b>${position.symbol}</b>
-Entry: <b>$${parseFloat(position.entry_price).toFixed(2)}</b>
-TP: <b>$${parseFloat(position.take_profit_price).toFixed(2)}</b> (+${this.calculatePercent(position.entry_price, position.take_profit_price, position.side).toFixed(2)}%)
-SL: <b>$${parseFloat(position.stop_loss_price).toFixed(2)}</b> (-${this.calculatePercent(position.entry_price, position.stop_loss_price, position.side).toFixed(2)}%)
-Amount: <b>$${parseFloat(position.amount).toFixed(2)}</b>
+Entry: <b>${parseFloat(position.entry_price).toFixed(2)}</b>
+TP: <b>${parseFloat(position.take_profit_price).toFixed(2)}</b> (+${this.calculatePercent(position.entry_price, position.take_profit_price, position.side).toFixed(2)}%)
+SL: <b>${parseFloat(position.stop_loss_price).toFixed(2)}</b> (-${this.calculatePercent(position.entry_price, position.stop_loss_price, position.side).toFixed(2)}%)
+Amount: <b>${parseFloat(position.amount).toFixed(2)}</b>
 
 Bot: ${bot.bot_name || 'N/A'}
 Strategy: ${strategy.interval} | OC: ${strategy.oc}%
     `.trim();
 
     await this.sendMessage(chatId, message);
+  }
+
+  /**
+   * Helpers for formatted channel messages
+   */
+  formatSymbolUnderscore(symbol) {
+    if (!symbol) return symbol;
+    const s = symbol.toUpperCase();
+    if (s.endsWith('USDT')) return s.replace(/USDT$/, '_USDT');
+    if (s.includes('/')) return s.replace('/', '_');
+    return s;
+  }
+
+  formatIntervalLabel(interval) {
+    if (!interval) return '';
+    const m = interval.match(/^(\d+)m$/i);
+    if (m) return `Min${m[1]}`;
+    const h = interval.match(/^(\d+)h$/i);
+    if (h) return `Hour${h[1]}`;
+    return interval;
+  }
+
+  async sendEntryTradeAlert(position, strategy, oc) {
+    try {
+      if (!this.initialized || !this.bot) {
+        logger.warn(`[Entry Alert] Telegram bot not initialized, skipping alert for position ${position?.id}`);
+        return;
+      }
+
+      const channelId = this.alertChannelId;
+      if (!channelId) {
+        logger.warn(`[Entry Alert] Alert channel ID not configured, skipping alert for position ${position?.id}`);
+        return;
+      }
+
+      const botName = (strategy?.bot?.bot_name) || 'N/A';
+      const symbol = this.formatSymbolUnderscore(position.symbol);
+      const side = position.side === 'long' ? 'Long' : 'Short';
+      const intervalLabel = this.formatIntervalLabel(strategy.interval);
+      const ocStr = (Number(oc || strategy.oc || 0)).toFixed(1);
+      const extendStr = (Number(strategy.extend || 0)).toFixed(0);
+      const tpStr = (Number(strategy.take_profit || 0)).toFixed(0);
+      const openPrice = Number(position.entry_price).toFixed(4);
+      const amountStr = Number(position.amount).toFixed(2);
+
+      const msg = `
+🚀 ${symbol} | ${side}
+Bot: ${botName}
+${intervalLabel} | OC: ${ocStr}% | Extend: ${extendStr}% | TP: ${tpStr}%
+Status: Completed
+Open price: ${openPrice}
+Amount: ${amountStr} (100%)`.trim();
+
+      logger.info(`[Entry Alert] Sending entry trade alert for position ${position.id} (${symbol}) to channel ${channelId}`);
+      await this.sendMessage(channelId, msg);
+      logger.info(`[Entry Alert] ✅ Successfully sent entry trade alert for position ${position.id} (${symbol})`);
+    } catch (e) {
+      logger.error(`[Entry Alert] Failed to send entry trade alert for position ${position?.id}:`, e);
+      logger.error(`[Entry Alert] Error stack:`, e?.stack);
+    }
+  }
+
+  async sendCloseSummaryAlert(position, stats) {
+    try {
+      const channelId = this.alertChannelId;
+      const symbol = this.formatSymbolUnderscore(position.symbol);
+      const isWin = (position.close_reason === 'tp_hit');
+      const sideTitle = position.side === 'long' ? 'Long' : 'Short';
+      const title = isWin ? `🏆 ${symbol} | ${sideTitle} WIN` : `😡 ${symbol} | ${sideTitle} LOSE`;
+
+      const wins = Number(stats?.wins || 0);
+      const loses = Number(stats?.loses || 0);
+      const totalPnl = Number(stats?.total_pnl || 0);
+
+      const botName = position.bot_name || 'N/A';
+      const intervalLabel = this.formatIntervalLabel(position.interval);
+      const ocStr = Number(position.oc || 0).toFixed(2);
+      const extendStr = Number(position.extend || 0).toFixed(0);
+      const tpStr = Number(position.take_profit || 0).toFixed(0);
+
+      const closePrice = Number(position.close_price).toFixed(4);
+      const amountStr = Number(position.amount).toFixed(2);
+
+      const pnlVal = Number(position.pnl || 0);
+      const pnlPct = this.calculatePercent(position.entry_price, position.close_price, position.side);
+      const pnlLine = `${pnlVal >= 0 ? '' : ''}${pnlVal.toFixed(2)}$ ~ ${pnlPct >= 0 ? '' : ''}${pnlPct.toFixed(2)}%`;
+
+      const msg = `
+${title}
+${wins} WIN, ${loses} LOSE | Total PNL: ${totalPnl.toFixed(2)}$
+Bot: ${botName}
+Strategy: ${intervalLabel} | OC: ${ocStr}% | Extend: ${extendStr}% | TP: ${tpStr}%
+Close price: ${closePrice}$
+Amount: ${amountStr}
+💰 PNL: ${pnlLine}`.trim();
+
+      await this.sendMessage(channelId, msg);
+    } catch (e) {
+      logger.error('Failed to send close summary alert:', e);
+    }
   }
 
   /**
@@ -210,44 +324,43 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
   }
 
   /**
-   * Send price volatility alert with the new compact format
+   * Send price volatility alert with compact format
+   * Format: ┌🚀🚀🚀 SVSA ⚡️ 10.50% 🟢
+   *         └ 0.003788 → 0.004186
    * @param {string} chatId - Chat ID
    * @param {Object} alertData - Alert data
    */
-  async sendVolatilityAlert(chatId, alertData) {
-    if (!chatId) return;
+//   async sendVolatilityAlert(chatId, alertData) {
+//     if (!chatId) return;
 
-    const {
-      symbol,
-      interval,
-      oc,
-      open,
-      currentPrice,
-      direction
-    } = alertData;
+//     const {
+//       symbol,
+//       oc,
+//       open,
+//       currentPrice,
+//       direction
+//     } = alertData;
 
-    const intervalEmoji = this.getIntervalEmoji(interval);
-    const directionEmoji = direction === 'bullish' ? '🟢' : '🔴';
-    const rockets = Math.abs(oc) >= 10 ? '🚀'.repeat(Math.min(Math.floor(Math.abs(oc) / 10), 5)) : '';
+//     const directionEmoji = direction === 'bullish' ? '🟢' : '🔴';
+//     const rockets = Math.abs(oc) >= 10 ? '🚀'.repeat(Math.min(Math.floor(Math.abs(oc) / 10), 5)) : '';
+//     const ocSign = oc >= 0 ? '+' : '';
 
-    // Format time as HH:MM:SS AM/PM
-    const timeStr = new Date().toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true
-    });
+//     // Format prices to remove trailing zeros
+//     const formatPrice = (price) => {
+//       const num = parseFloat(price);
+//       return num.toString();
+//     };
 
-    // Format prices to remove trailing zeros
-    const formatPrice = (price) => parseFloat(price.toFixed(8)).toString();
+//     // Remove USDT suffix for cleaner display
+//     const symbolDisplay = symbol.replace('USDT', '');
 
-    const message = `
-📈 ${symbol.replace('USDT', '_USDT')} ${intervalEmoji} ${oc.toFixed(2)}% ${directionEmoji} ${rockets}
-┌ ${formatPrice(open)} → ${formatPrice(currentPrice)} ${timeStr}
-    `.trim();
+//     const message = `
+// ┌${rockets} ${symbolDisplay} ⚡️ ${ocSign}${oc.toFixed(2)}% ${directionEmoji}
+// └ ${formatPrice(open)} → ${formatPrice(currentPrice)}
+//     `.trim();
 
-    await this.sendMessage(chatId, message);
-  }
+//     await this.sendMessage(chatId, message);
+//   }
 
   /**
    * Get interval emoji representation
@@ -271,35 +384,46 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
 
 
   /**
-   * Send price volatility alert
-   * @param {string} chatId - Chat ID
-   * @param {Object} alertData - Alert data
+   * Send price volatility alert (compact format)
+   * Format:
+   * ┌🚀🚀🚀 SVSA ⚡️ 10.50% 🟢
+   * └ 0.003788 → 0.004186
    */
   async sendVolatilityAlert(chatId, alertData) {
     if (!chatId) return;
 
-    const {
-      symbol,
-      interval,
-      oc,
-      open,
-      currentPrice,
-      direction
-    } = alertData;
+    const { oc, open, currentPrice, direction, interval,symbol } = alertData;
 
-    const intervalEmoji = this.getIntervalEmoji(interval);
     const directionEmoji = direction === 'bullish' ? '🟢' : '🔴';
-    const rockets = Math.abs(oc) >= 10 ? '🚀'.repeat(Math.min(Math.floor(Math.abs(oc) / 10), 5)) : '';
+
+    // 1 rocket per 10% absolute OC
+    const rocketCount = Math.floor(Math.abs(oc) / 10);
+    const rockets = rocketCount > 0 ? '🚀'.repeat(rocketCount) : '';
+
+    // Absolute OC with two decimals
+    const ocAbs = Math.abs(oc).toFixed(2);
+
+    // Interval label (emoji if available)
+    const intervalLabel = typeof this.getIntervalEmoji === 'function'
+      ? this.getIntervalEmoji(interval)
+      : (interval || '');
+
+    // Price formatting: up to 8 decimals, trim trailing zeros
+    const formatPrice = (p) => {
+      const n = Number(p);
+      if (!Number.isFinite(n)) return String(p);
+      let s = n.toFixed(8);
+      s = s.replace(/\.0+$/, '');
+      s = s.replace(/(\.\d*?[1-9])0+$/, '$1');
+      return s;
+    };
+
+    // Format symbol for display (remove USDT suffix)
+    const symbolDisplay = symbol ? symbol.replace(/USDT$/, '') : 'N/A';
 
     const message = `
-📈 <b>Price Alert</b> ${rockets}
-
-Symbol: <b>${symbol}</b>
-Interval: <b>${intervalEmoji}</b>
-OC: <b>${oc.toFixed(2)}%</b> ${directionEmoji}
-
-Open: ${open}
-Price: ${currentPrice}
+┌${rockets} ${symbolDisplay} ${intervalLabel} ⚡️ ${ocAbs}% ${directionEmoji}
+└ ${formatPrice(open)} → ${formatPrice(currentPrice)}
     `.trim();
 
     await this.sendMessage(chatId, message);

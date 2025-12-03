@@ -80,7 +80,10 @@ echo ""
 echo "📌 Step 4: Starting bot with PM2..."
 cd "$PROJECT_DIR"
 
-# Start bot
+# Export runtime environment overrides
+export TP_UPDATE_THRESHOLD_TICKS=1
+
+# Start bot with updated env
 pm2 start src/app.js --name "$BOT_NAME"
 
 # Save PM2 configuration

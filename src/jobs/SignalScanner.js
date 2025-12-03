@@ -193,19 +193,35 @@ export class SignalScanner {
         this.getAlertConfigs()
       ]);
 
+      // Helper to normalize symbol format (BTC/USDT -> BTCUSDT, BTCUSDT -> BTCUSDT)
+      const normalizeSymbol = (symbol) => {
+        if (!symbol) return symbol;
+        return symbol.toUpperCase().replace(/\//g, '').replace(/:/g, '');
+      };
+
       // Create a lookup map for alert configs for efficient access
       const alertConfigMap = new Map();
       const allSymbols = new Set();
 
       for (const strategy of strategies) {
-        allSymbols.add(strategy.symbol.toUpperCase());
+        allSymbols.add(normalizeSymbol(strategy.symbol));
       }
 
       for (const config of alertConfigs) {
-        for (const symbol of config.symbols) {
-          allSymbols.add(symbol.toUpperCase());
-          for (const interval of config.intervals) {
-            const key = `${symbol.toUpperCase()}:${interval}`;
+        // Handle JSON string or array for symbols/intervals
+        const symbols = typeof config.symbols === 'string' ? JSON.parse(config.symbols) : config.symbols;
+        const intervals = typeof config.intervals === 'string' ? JSON.parse(config.intervals) : config.intervals;
+
+        if (!Array.isArray(symbols) || !Array.isArray(intervals)) {
+          logger.warn(`[Alert] Skipping invalid alert config ID ${config.id}: symbols or intervals not an array.`);
+          continue;
+        }
+
+        for (const symbol of symbols) {
+          const normalizedSymbol = normalizeSymbol(symbol);
+          allSymbols.add(normalizedSymbol);
+          for (const interval of intervals) {
+            const key = `${normalizedSymbol}:${interval}`;
             alertConfigMap.set(key, config);
           }
         }
@@ -223,8 +239,14 @@ export class SignalScanner {
         await Promise.allSettled(
           batch.map(strategy => {
             // Find a matching alert config for this strategy
-            const alertKey = `${strategy.symbol.toUpperCase()}:${strategy.interval}`;
+            const normalizedSymbol = normalizeSymbol(strategy.symbol);
+            const alertKey = `${normalizedSymbol}:${strategy.interval}`;
             const alertConfig = alertConfigMap.get(alertKey);
+            if (alertConfig) {
+              logger.debug(`[Alert] Matched config for ${strategy.symbol} (${strategy.interval}) with threshold ${alertConfig.threshold}%`);
+            } else {
+              logger.debug(`[Alert] No alert config found for key: ${alertKey}`);
+            }
             return this.scanStrategy(strategy, alertConfig);
           })
         );

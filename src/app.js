@@ -9,6 +9,7 @@ import { CandleUpdater } from './jobs/CandleUpdater.js';
 import { SignalScanner } from './jobs/SignalScanner.js';
 import { PositionMonitor } from './jobs/PositionMonitor.js';
 import { BalanceManager } from './jobs/BalanceManager.js';
+import { exchangeInfoService } from './services/ExchangeInfoService.js';
 
 import routes from './routes/index.js';
 import logger from './utils/logger.js';
@@ -66,6 +67,14 @@ async function start() {
       process.exit(1);
     }
     logger.info('Database connected successfully');
+
+    // Initialize exchange info service (load symbol filters)
+    logger.info('Initializing exchange info service...');
+    await exchangeInfoService.loadFiltersFromDB();
+    
+    // Update symbol filters from Binance API (async, don't wait)
+    exchangeInfoService.updateFiltersFromExchange()
+      .catch(error => logger.error('Failed to update symbol filters from Binance:', error));
 
     // Initialize Telegram service
     logger.info('Initializing Telegram service...');

@@ -58,8 +58,8 @@ export function calculateShortEntryPrice(open, oc, extend) {
  * @returns {number} Take profit price
  */
 export function calculateTakeProfit(entryPrice, oc, takeProfit, side) {
-  // actual_tp_percent = (oc * take_profit / 1000)
-  const actualTPPercent = (oc * takeProfit) / 1000;
+  // New rule: TP% = take_profit / 10  (e.g., 35.5 -> 3.55%)
+  const actualTPPercent = (takeProfit) / 10;
   
   if (side === 'long') {
     return entryPrice * (1 + actualTPPercent / 100);
@@ -88,7 +88,7 @@ export function calculateInitialStopLoss(tpPrice, oc, reduce, side) {
 }
 
 /**
- * Calculate dynamic stop loss based on elapsed time
+ * Calculate dynamic stop loss based on elapsed time (converging from TP)
  * @param {number} tpPrice - Take profit price
  * @param {number} oc - OC percentage
  * @param {number} reduce - Initial reduce value
@@ -98,7 +98,8 @@ export function calculateInitialStopLoss(tpPrice, oc, reduce, side) {
  * @returns {number} Updated stop loss price
  */
 export function calculateDynamicStopLoss(tpPrice, oc, reduce, upReduce, minutesElapsed, side) {
-  // current_sl = tp_price + ((reduce + minutes * up_reduce) * oc / 100)
+  // Reverted to original logic: SL converges from TP towards entry/current price over time.
+  // current_sl = tp_price - ((reduce + minutes * up_reduce) * oc / 100) for long
   const currentReduce = reduce + (minutesElapsed * upReduce);
   const slOffset = (currentReduce * oc) / 100;
   

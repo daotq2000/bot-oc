@@ -7,11 +7,14 @@ import crypto from 'crypto';
 import logger from '../utils/logger.js';
 import { webSocketManager } from './WebSocketManager.js';
 
+
 export class BinanceDirectClient {
   constructor(apiKey, secretKey, isTestnet = true) {
     this.apiKey = apiKey;
     this.secretKey = secretKey;
     this.isTestnet = isTestnet;
+    this.restPriceFallbackCache = new Map(); // symbol -> { price, timestamp }
+    this.restPriceFallbackCooldownMs = Number(process.env.BINANCE_REST_PRICE_COOLDOWN_MS || 5000);
     
     // Production data URL (always use production for market data)
     this.productionDataURL = 'https://fapi.binance.com';
@@ -23,6 +26,33 @@ export class BinanceDirectClient {
     
     this.minRequestInterval = 100; // 100ms between requests
     this.lastRequestTime = 0;
+
+    // Cache for account position mode (hedge vs one-way)
+    this._dualSidePosition = null; // boolean
+    this._positionModeCheckedAt = 0;
+    this._positionModeTTL = 60_000; // 1 minute
+  }
+
+  /**
+   * Determine decimal precision from a tick/step size string.
+   * Handles values like "0.01000000", "1", and scientific notation "1e-8".
+   */
+  getPrecisionFromIncrement(increment) {
+    if (!increment) return 0;
+    const str = increment.toString();
+
+    // Handle scientific notation (e.g., 1e-8)
+    const sciMatch = str.match(/e-(\d+)$/i);
+    if (sciMatch) {
+      return parseInt(sciMatch[1], 10);
+    }
+
+    if (!str.includes('.')) {
+      return 0;
+    }
+
+    const decimals = str.split('.')[1].replace(/0+$/, '');
+    return decimals.length;
   }
 
   /**
@@ -75,10 +105,37 @@ export class BinanceDirectClient {
     } catch (error) {
       // Don't log again if already logged above
       if (!error.message?.includes('HTTP')) {
-        logger.error(`❌ Market data request failed: ${endpoint}`, error.message);
+      logger.error(`❌ Market data request failed: ${endpoint}`, error.message);
       }
       throw error;
     }
+  }
+
+  /**
+   * Make PUBLIC request against TRADING baseURL (used for testnet exchangeInfo without auth)
+   */
+  async makeTradingPublicRequest(endpoint, method = 'GET', params = {}) {
+    // Rate limiting
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestTime;
+    if (timeSinceLastRequest < this.minRequestInterval) {
+      await new Promise(resolve => setTimeout(resolve, this.minRequestInterval - timeSinceLastRequest));
+    }
+    this.lastRequestTime = Date.now();
+
+    const url = new URL(endpoint, this.baseURL);
+    if (params && Object.keys(params).length > 0) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) url.searchParams.append(key, value);
+      });
+    }
+
+    const response = await fetch(url.toString(), { method, headers: { 'Content-Type': 'application/json' } });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    }
+    return await response.json();
   }
 
   /**
@@ -152,6 +209,13 @@ export class BinanceDirectClient {
         
         if (!response.ok) {
           if (data.code && data.msg) {
+            if (data.code === -1111) {
+              logger.error('Binance precision rejection', {
+                endpoint,
+                params: this.sanitizeParams(params),
+                response: data
+              });
+            }
             throw new Error(`Binance API Error ${data.code}: ${data.msg}`);
           }
           throw new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
@@ -162,6 +226,81 @@ export class BinanceDirectClient {
         if (i === retries - 1) throw error;
         await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
       }
+    }
+  }
+
+  /**
+   * Set margin type for a symbol (ISOLATED or CROSSED)
+   */
+  async setMarginType(symbol, marginType = 'ISOLATED') {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    const params = { symbol: normalizedSymbol, marginType: marginType.toUpperCase() };
+    try {
+      return await this.makeRequest('/fapi/v1/marginType', 'POST', params, true);
+    } catch (e) {
+      // Non-fatal if already set or not changeable
+      logger.warn(`setMarginType warning for ${normalizedSymbol}: ${e.message || e}`);
+      return null;
+    }
+  }
+
+  /**
+   * Set leverage for a symbol (1-125 depending on symbol)
+   */
+  async setLeverage(symbol, leverage = 5) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    const lev = Math.max(1, Math.min(parseInt(leverage) || 5, 125));
+    const params = { symbol: normalizedSymbol, leverage: lev };
+    try {
+      return await this.makeRequest('/fapi/v1/leverage', 'POST', params, true);
+    } catch (e) {
+      logger.warn(`setLeverage warning for ${normalizedSymbol}: ${e.message || e}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get leverage brackets for a symbol (signed endpoint)
+   */
+  async getLeverageBrackets(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    const params = { symbol: normalizedSymbol };
+    const data = await this.makeRequest('/fapi/v1/leverageBracket', 'GET', params, true);
+    // API returns array (or object with array) depending on context; normalize
+    const arr = Array.isArray(data) ? data : (data?.brackets || []);
+    if (arr.length === 0) return [];
+    // On some responses, each element is { symbol, brackets: [...] }
+    if (arr[0]?.brackets) {
+      const entry = arr.find(e => e.symbol === normalizedSymbol) || arr[0];
+      return entry?.brackets || [];
+    }
+    // Or already brackets list
+    return arr;
+  }
+
+  /**
+   * Determine optimal (max allowed) leverage for given notional
+   */
+  async getOptimalLeverage(symbol, notionalUSDT) {
+    try {
+      const brackets = await this.getLeverageBrackets(symbol);
+      if (!brackets || brackets.length === 0) return null;
+      const n = Number(notionalUSDT) || 0;
+      // Binance brackets typically have: notionalFloor, notionalCap, initialLeverage
+      // Pick the bracket where floor < n <= cap; if notional==0, choose highest initialLeverage
+      let chosen = null;
+      if (n > 0) {
+        chosen = brackets.find(b => (n > Number(b.notionalFloor || 0)) && (n <= Number(b.notionalCap || Number.MAX_SAFE_INTEGER)));
+      }
+      if (!chosen) {
+        // If none matched, choose the bracket with max initialLeverage
+        chosen = brackets.reduce((a, b) => (Number(b.initialLeverage || 0) > Number(a.initialLeverage || 0) ? b : a), brackets[0]);
+      }
+      const lev = parseInt(chosen?.initialLeverage || 0) || null;
+      return lev;
+    } catch (e) {
+      logger.warn(`getOptimalLeverage failed for ${symbol}: ${e.message || e}`);
+      return null;
     }
   }
 
@@ -177,8 +316,26 @@ export class BinanceDirectClient {
       return cachedPrice;
     }
 
-    // If price is not in cache, return null and let the caller handle it
-    logger.warn(`Price for ${normalizedSymbol} not found in WebSocket cache.`);
+    // Respect cooldown when reusing REST fallback price
+    const fallbackEntry = this.restPriceFallbackCache.get(normalizedSymbol);
+    const now = Date.now();
+    if (fallbackEntry && now - fallbackEntry.timestamp < this.restPriceFallbackCooldownMs) {
+      return fallbackEntry.price;
+    }
+
+    try {
+      const ticker = await this.makeMarketDataRequest('/fapi/v1/ticker/price', 'GET', { symbol: normalizedSymbol });
+      const restPrice = parseFloat(ticker?.price);
+      if (Number.isFinite(restPrice) && restPrice > 0) {
+        this.restPriceFallbackCache.set(normalizedSymbol, { price: restPrice, timestamp: now });
+        logger.warn(`Price for ${normalizedSymbol} not in WebSocket cache. Using REST fallback price ${restPrice}.`);
+        return restPrice;
+      }
+    } catch (error) {
+      logger.error(`Failed REST fallback price fetch for ${normalizedSymbol}:`, error.message || error);
+    }
+
+    logger.warn(`Price for ${normalizedSymbol} not found via WebSocket or REST fallback.`);
     return null;
   }
 
@@ -225,11 +382,14 @@ export class BinanceDirectClient {
    * @returns {Promise<Object>} Exchange info for the symbol
    */
   async getExchangeInfo(symbol) {
+    if (!symbol) {
+      return await this.makeMarketDataRequest('/fapi/v1/exchangeInfo', 'GET');
+    }
     const normalizedSymbol = this.normalizeSymbol(symbol);
     const data = await this.makeMarketDataRequest('/fapi/v1/exchangeInfo', 'GET', { symbol: normalizedSymbol });
-    
     if (data.symbols && data.symbols.length > 0) {
-      return data.symbols[0];
+      const found = data.symbols.find(s => s.symbol === normalizedSymbol);
+      return found || null; // do not fallback to first symbol
     }
     return null;
   }
@@ -239,10 +399,27 @@ export class BinanceDirectClient {
    * @param {string} symbol - Trading symbol
    * @returns {Promise<string>} tickSize (e.g., "0.10", "0.01")
    */
+  async getTradingExchangeSymbol(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    try {
+      const data = await this.makeTradingPublicRequest('/fapi/v1/exchangeInfo', 'GET', { symbol: normalizedSymbol });
+      if (data?.symbols?.length) {
+        return data.symbols.find(s => s.symbol === normalizedSymbol) || null;
+      }
+      return null;
+    } catch (e) {
+      // Fallback: try production data endpoint
+      try {
+        const data = await this.makeMarketDataRequest('/fapi/v1/exchangeInfo', 'GET', { symbol: normalizedSymbol });
+        if (data?.symbols?.length) return data.symbols.find(s => s.symbol === normalizedSymbol) || null;
+      } catch (_) {}
+      return null;
+    }
+  }
+
   async getTickSize(symbol) {
-    const exchangeInfo = await this.getExchangeInfo(symbol);
+    const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
     if (!exchangeInfo || !exchangeInfo.filters) return '0.01';
-    
     const priceFilter = exchangeInfo.filters.find(f => f.filterType === 'PRICE_FILTER');
     return priceFilter?.tickSize || '0.01';
   }
@@ -253,11 +430,47 @@ export class BinanceDirectClient {
    * @returns {Promise<string>} stepSize (e.g., "0.001", "0.01")
    */
   async getStepSize(symbol) {
-    const exchangeInfo = await this.getExchangeInfo(symbol);
+    const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
     if (!exchangeInfo || !exchangeInfo.filters) return '0.001';
-    
     const lotSizeFilter = exchangeInfo.filters.find(f => f.filterType === 'LOT_SIZE');
     return lotSizeFilter?.stepSize || '0.001';
+  }
+
+  /**
+   * Get minimum notional for a symbol
+   * @param {string} symbol
+   * @returns {Promise<number|null>}
+   */
+  async getMinNotional(symbol) {
+    const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
+    if (!exchangeInfo || !exchangeInfo.filters) return null;
+    const minNotionalFilter = exchangeInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL');
+    const val = minNotionalFilter?.notional || minNotionalFilter?.minNotional;
+    const num = parseFloat(val);
+    return Number.isFinite(num) ? num : null;
+  }
+
+  /**
+   * Check whether account uses dual-side position mode (hedge)
+   * @returns {Promise<boolean>}
+   */
+  async getDualSidePosition() {
+    const now = Date.now();
+    if (this._dualSidePosition !== null && now - this._positionModeCheckedAt < this._positionModeTTL) {
+      return this._dualSidePosition;
+    }
+    try {
+      const data = await this.makeRequest('/fapi/v1/positionSide/dual', 'GET', {}, true);
+      const dual = !!data?.dualSidePosition;
+      this._dualSidePosition = dual;
+      this._positionModeCheckedAt = now;
+      return dual;
+    } catch (error) {
+      logger.warn(`Failed to query positionSide mode, defaulting to one-way: ${error.message || error}`);
+      this._dualSidePosition = false;
+      this._positionModeCheckedAt = now;
+      return false;
+    }
   }
 
   /**
@@ -269,16 +482,9 @@ export class BinanceDirectClient {
   roundPrice(price, tickSize) {
     const tick = parseFloat(tickSize);
     if (tick === 0) return price;
-    
-    // Find precision: count decimal places
-    const precision = tickSize.indexOf('1') - 1;
-    if (precision < 0) {
-      // If no '1' found, count decimal places differently
-      const parts = tickSize.split('.');
-      const precision = parts.length > 1 ? parts[1].length : 0;
-      return Number(price.toFixed(precision));
-    }
-    
+
+    const precision = this.getPrecisionFromIncrement(tickSize);
+  
     // Round to nearest tick
     const rounded = Math.round(price / tick) * tick;
     return Number(rounded.toFixed(precision));
@@ -290,22 +496,16 @@ export class BinanceDirectClient {
    * @param {string} stepSize - Step size (e.g., "0.001", "0.01")
    * @returns {number} Rounded quantity
    */
-  roundQuantity(quantity, stepSize) {
-    const step = parseFloat(stepSize);
-    if (step === 0) return quantity;
-    
-    // Find precision: count decimal places
-    const precision = stepSize.indexOf('1') - 1;
-    if (precision < 0) {
-      // If no '1' found, count decimal places differently
-      const parts = stepSize.split('.');
-      const precision = parts.length > 1 ? parts[1].length : 0;
-      return Number(quantity.toFixed(precision));
+  formatQuantity(quantity, stepSize) {
+    const precision = this.getPrecisionFromIncrement(stepSize);
+
+    if (precision === 0) {
+      return Math.floor(parseFloat(quantity)).toString();
     }
-    
-    // Round down to nearest step (floor)
-    const rounded = Math.floor(quantity / step) * step;
-    return Number(rounded.toFixed(precision));
+
+    const factor = Math.pow(10, precision);
+    const flooredQuantity = Math.floor(parseFloat(quantity) * factor) / factor;
+    return flooredQuantity.toFixed(precision);
   }
 
   /**
@@ -442,60 +642,44 @@ export class BinanceDirectClient {
   /**
    * Place market order
    */
-  async placeMarketOrder(symbol, side, quantity, positionSide = 'BOTH') {
+  async placeMarketOrder(symbol, side, quantity, positionSide = 'BOTH', reduceOnly = false) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
-    
-    // Get stepSize and current price for this symbol
-    const [stepSize, currentPrice] = await Promise.all([
+
+    const [stepSize, currentPrice, dualSide] = await Promise.all([
       this.getStepSize(normalizedSymbol),
-      this.getPrice(normalizedSymbol)
+      this.getPrice(normalizedSymbol),
+      this.getDualSidePosition()
     ]);
-    
-    // Round quantity correctly
-    let roundedQuantity = this.roundQuantity(quantity, stepSize);
-    
-    // Check minimum notional (quantity * price >= 100 USDT for Binance Futures)
-    const minNotional = 100;
-    let notional = roundedQuantity * currentPrice;
-    
-    // If notional is too small, increase quantity to meet minimum
-    if (notional < minNotional) {
-      const requiredQuantity = minNotional / currentPrice;
-      roundedQuantity = this.roundQuantity(requiredQuantity, stepSize);
-      notional = roundedQuantity * currentPrice;
-      
-      // Double check after rounding up
-      if (notional < minNotional) {
-        // Round up one more step
-        const step = parseFloat(stepSize);
-        roundedQuantity = this.roundQuantity(requiredQuantity + step, stepSize);
-        notional = roundedQuantity * currentPrice;
-      }
+
+    if (currentPrice === null) {
+      throw new Error(`Could not retrieve price for ${normalizedSymbol} to place market order.`);
     }
-    
-    if (roundedQuantity <= 0) {
-      throw new Error(`Invalid quantity after rounding: ${roundedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
+
+    const formattedQuantity = this.formatQuantity(quantity, stepSize);
+    if (parseFloat(formattedQuantity) <= 0) {
+      throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
     }
-    
-    if (notional < minNotional) {
-      throw new Error(`Notional value ${notional.toFixed(2)} USDT is too small. Minimum is ${minNotional} USDT for ${symbol}`);
-    }
-    
-    logger.debug(`Market order: quantity=${roundedQuantity}, price=${currentPrice}, notional=${notional.toFixed(2)} USDT`);
-    
+
+    logger.debug(`Market order: quantity=${formattedQuantity}, price=${currentPrice}`);
+
     const params = {
       symbol: normalizedSymbol,
       side: side.toUpperCase(),
       type: 'MARKET',
-      quantity: roundedQuantity.toString()
+      quantity: formattedQuantity
     };
-    
-    if (positionSide !== 'BOTH') {
+
+    if (reduceOnly) {
+      params.reduceOnly = 'true';
+    }
+
+    // Only include positionSide when account is in dual-side (hedge) mode
+    if (dualSide && positionSide && positionSide !== 'BOTH') {
       params.positionSide = positionSide;
     }
-    
+
     const data = await this.makeRequest('/fapi/v1/order', 'POST', params, true);
-    logger.info(`✅ Market order placed: ${side} ${quantity} ${symbol} - Order ID: ${data.orderId}`);
+    logger.info(`✅ Market order placed: ${side} ${formattedQuantity} ${symbol} - Order ID: ${data.orderId}`);
     return data;
   }
 
@@ -504,39 +688,41 @@ export class BinanceDirectClient {
    */
   async placeLimitOrder(symbol, side, quantity, price, positionSide = 'BOTH', timeInForce = 'GTC') {
     const normalizedSymbol = this.normalizeSymbol(symbol);
-    
-    // Get tickSize and stepSize for this symbol and round correctly
-    const [tickSize, stepSize] = await Promise.all([
+
+    // Get precision and account mode
+    const [tickSize, stepSize, dualSide] = await Promise.all([
       this.getTickSize(normalizedSymbol),
-      this.getStepSize(normalizedSymbol)
+      this.getStepSize(normalizedSymbol),
+      this.getDualSidePosition()
     ]);
-    
+
     const roundedPrice = this.roundPrice(price, tickSize);
-    const roundedQuantity = this.roundQuantity(quantity, stepSize);
-    
-    if (roundedQuantity <= 0) {
-      throw new Error(`Invalid quantity after rounding: ${roundedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
+    const formattedQuantity = this.formatQuantity(quantity, stepSize);
+
+    if (parseFloat(formattedQuantity) <= 0) {
+      throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
     }
-    
+
     if (roundedPrice <= 0) {
       throw new Error(`Invalid price after rounding: ${roundedPrice} (original: ${price}, tickSize: ${tickSize})`);
     }
-    
+
     const params = {
       symbol: normalizedSymbol,
       side: side.toUpperCase(),
       type: 'LIMIT',
-      quantity: roundedQuantity.toString(),
+      quantity: formattedQuantity,
       price: roundedPrice.toString(),
       timeInForce
     };
-    
-    if (positionSide !== 'BOTH') {
+
+    // Only include positionSide when account is in dual-side (hedge) mode
+    if (dualSide && positionSide && positionSide !== 'BOTH') {
       params.positionSide = positionSide;
     }
-    
+
     const data = await this.makeRequest('/fapi/v1/order', 'POST', params, true);
-    logger.info(`✅ Limit order placed: ${side} ${quantity} ${symbol} @ ${price} - Order ID: ${data.orderId}`);
+    logger.info(`✅ Limit order placed: ${side} ${formattedQuantity} ${symbol} @ ${roundedPrice} - Order ID: ${data.orderId}`);
     return data;
   }
 
@@ -558,42 +744,11 @@ export class BinanceDirectClient {
   formatPrice(price, tickSize) {
     const tick = parseFloat(tickSize);
     if (tick === 0) return price;
-    
-    // Find precision: count decimal places
-    const precision = tickSize.indexOf('1') - 1;
-    if (precision < 0) {
-      // If no '1' found, count decimal places differently
-      const parts = tickSize.split('.');
-      const precision = parts.length > 1 ? parts[1].length : 0;
-      return Number(price.toFixed(precision));
-    }
-    
+
+    const precision = this.getPrecisionFromIncrement(tickSize);
+
     // Round to nearest tick
     const rounded = Math.round(price / tick) * tick;
-    return Number(rounded.toFixed(precision));
-  }
-
-  /**
-   * Format quantity according to stepSize
-   * @param {number} quantity - Quantity to format
-   * @param {string} stepSize - Step size (e.g., "0.001", "0.01")
-   * @returns {number} Formatted quantity
-   */
-  formatQuantity(quantity, stepSize) {
-    const step = parseFloat(stepSize);
-    if (step === 0) return quantity;
-    
-    // Find precision: count decimal places
-    const precision = stepSize.indexOf('1') - 1;
-    if (precision < 0) {
-      // If no '1' found, count decimal places differently
-      const parts = stepSize.split('.');
-      const precision = parts.length > 1 ? parts[1].length : 0;
-      return Number(quantity.toFixed(precision));
-    }
-    
-    // Round down to nearest step (floor)
-    const rounded = Math.floor(quantity / step) * step;
     return Number(rounded.toFixed(precision));
   }
 
@@ -642,7 +797,7 @@ export class BinanceDirectClient {
       }
     }
     
-    if (formattedQuantity <= 0) {
+    if (parseFloat(formattedQuantity) <= 0) {
       throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
     }
     
@@ -689,44 +844,48 @@ export class BinanceDirectClient {
    */
   async createTpLimitOrder(symbol, side, tpPrice, quantity = null) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
-    
-    // Get precision info
-    const [tickSize, stepSize] = await Promise.all([
+
+    // Get precision info & account mode
+    const [tickSize, stepSize, dualSide] = await Promise.all([
       this.getTickSize(normalizedSymbol),
-      this.getStepSize(normalizedSymbol)
+      this.getStepSize(normalizedSymbol),
+      this.getDualSidePosition()
     ]);
-    
+
     // Format price
     const formattedPrice = this.formatPrice(tpPrice, tickSize);
-    
+
     // Determine position side
     const positionSide = side === 'long' ? 'LONG' : 'SHORT';
     // For TP: long position closes with SELL, short position closes with BUY
     const orderSide = side === 'long' ? 'SELL' : 'BUY';
-    
+
     const params = {
       symbol: normalizedSymbol,
       side: orderSide,
       type: 'TAKE_PROFIT',
-      positionSide: positionSide,
-      stopPrice: formattedPrice.toString(), // Trigger price (when price reaches this, order activates)
-      price: formattedPrice.toString(), // Limit price (order executes at this price)
+      stopPrice: formattedPrice.toString(), // Trigger price
+      price: formattedPrice.toString(), // Limit price
       closePosition: quantity ? 'false' : 'true',
-      reduceOnly: 'true',
       timeInForce: 'GTC'
     };
-    
+
+    // Only include positionSide in dual-side (hedge) mode
+    if (dualSide) {
+      params.positionSide = positionSide;
+    }
+
     // Add quantity if provided
     if (quantity) {
       const formattedQuantity = this.formatQuantity(quantity, stepSize);
-      if (formattedQuantity <= 0) {
+      if (parseFloat(formattedQuantity) <= 0) {
         throw new Error(`Invalid quantity after formatting: ${formattedQuantity}`);
       }
-      params.quantity = formattedQuantity.toString();
+      params.quantity = formattedQuantity; // Pass as string
     }
-    
-    logger.info(`Creating TP limit order: ${orderSide} ${normalizedSymbol} @ ${formattedPrice} (${positionSide})`);
-    
+
+    logger.info(`Creating TP limit order: ${orderSide} ${normalizedSymbol} @ ${formattedPrice}${dualSide ? ` (${positionSide})` : ''}`);
+
     try {
       const data = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
       logger.info(`✅ TP limit order placed: Order ID: ${data.orderId}`);
@@ -748,10 +907,11 @@ export class BinanceDirectClient {
   async createSlLimitOrder(symbol, side, slPrice, quantity = null) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
     
-    // Get precision info
-    const [tickSize, stepSize] = await Promise.all([
+    // Get precision info & account mode
+    const [tickSize, stepSize, dualSide] = await Promise.all([
       this.getTickSize(normalizedSymbol),
-      this.getStepSize(normalizedSymbol)
+      this.getStepSize(normalizedSymbol),
+      this.getDualSidePosition()
     ]);
     
     // Format price
@@ -766,24 +926,27 @@ export class BinanceDirectClient {
       symbol: normalizedSymbol,
       side: orderSide,
       type: 'STOP',
-      positionSide: positionSide,
       stopPrice: formattedPrice.toString(), // Trigger price (when price reaches this, order activates)
       price: formattedPrice.toString(), // Limit price (order executes at this price)
       closePosition: quantity ? 'false' : 'true',
-      reduceOnly: 'true',
       timeInForce: 'GTC'
     };
+
+    // Only include positionSide in dual-side (hedge) mode
+    if (dualSide) {
+      params.positionSide = positionSide;
+    }
     
     // Add quantity if provided
     if (quantity) {
       const formattedQuantity = this.formatQuantity(quantity, stepSize);
-      if (formattedQuantity <= 0) {
+      if (parseFloat(formattedQuantity) <= 0) {
         throw new Error(`Invalid quantity after formatting: ${formattedQuantity}`);
       }
-      params.quantity = formattedQuantity.toString();
+      params.quantity = formattedQuantity; // Pass as string
     }
     
-    logger.info(`Creating SL limit order: ${orderSide} ${normalizedSymbol} @ ${formattedPrice} (${positionSide})`);
+    logger.info(`Creating SL limit order: ${orderSide} ${normalizedSymbol} @ ${formattedPrice}${dualSide ? ` (${positionSide})` : ''}`);
     
     try {
       const data = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
@@ -828,6 +991,24 @@ export class BinanceDirectClient {
       
       throw error;
     }
+  }
+
+  /**
+   * Cancel order by orderId
+   */
+  async cancelOrder(symbol, orderId) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    const params = { symbol: normalizedSymbol, orderId: orderId };
+    const data = await this.makeRequest('/fapi/v1/order', 'DELETE', params, true);
+    return data;
+  }
+
+  sanitizeParams(params) {
+    if (!params) return params;
+    const clone = { ...params };
+    if (clone.signature) delete clone.signature;
+    if (clone.timestamp) delete clone.timestamp;
+    return clone;
   }
 }
 

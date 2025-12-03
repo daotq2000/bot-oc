@@ -11,7 +11,7 @@ export class Position {
    */
   static async findAll(filters = {}) {
     let query = `SELECT p.*, s.symbol, s.\`interval\`, s.oc, s.take_profit, 
-                        s.reduce, s.up_reduce, s.bot_id, b.bot_name, b.exchange
+                        s.reduce, s.up_reduce, s.extend, s.bot_id, b.bot_name, b.exchange
                  FROM positions p
                  JOIN strategies s ON p.strategy_id = s.id
                  JOIN bots b ON s.bot_id = b.id`;
@@ -52,7 +52,7 @@ export class Position {
   static async findById(id) {
     const [rows] = await pool.execute(
       `SELECT p.*, s.symbol, s.interval, s.oc, s.take_profit,
-              s.reduce, s.up_reduce, s.bot_id, b.bot_name, b.exchange
+              s.reduce, s.up_reduce, s.extend, s.bot_id, b.bot_name, b.exchange
        FROM positions p
        JOIN strategies s ON p.strategy_id = s.id
        JOIN bots b ON s.bot_id = b.id
@@ -118,17 +118,19 @@ export class Position {
       amount,
       take_profit_price,
       stop_loss_price,
-      current_reduce
+      current_reduce,
+      tp_order_id = null,
+      sl_order_id = null
     } = data;
 
     const [result] = await pool.execute(
       `INSERT INTO positions (
         strategy_id, order_id, symbol, side, entry_price, amount,
-        take_profit_price, stop_loss_price, current_reduce
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         strategy_id, order_id, symbol, side, entry_price, amount,
-        take_profit_price, stop_loss_price, current_reduce
+        take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id
       ]
     );
 
@@ -145,12 +147,12 @@ export class Position {
     const fields = [];
     const values = [];
 
-    Object.keys(data).forEach(key => {
-      if (data[key] !== undefined) {
-        fields.push(`${key} = ?`);
+    for (const key in data) {
+      if (Object.hasOwn(data, key) && data[key] !== undefined) {
+        fields.push(`\`${key}\` = ?`);
         values.push(data[key]);
       }
-    });
+    }
 
     if (fields.length === 0) {
       return this.findById(id);
@@ -196,5 +198,28 @@ export class Position {
       closed_at: new Date()
     });
   }
-}
 
+  /**
+   * Get bot-level stats: wins (tp_hit), loses (sl_hit), total pnl
+   * @param {number} botId
+   * @returns {Promise<{wins:number,loses:number,total_pnl:number}>}
+   */
+  static async getBotStats(botId) {
+    const [rows] = await pool.execute(
+      `SELECT 
+         SUM(CASE WHEN p.close_reason='tp_hit' THEN 1 ELSE 0 END) AS wins,
+         SUM(CASE WHEN p.close_reason='sl_hit' THEN 1 ELSE 0 END) AS loses,
+         SUM(COALESCE(p.pnl,0)) AS total_pnl
+       FROM positions p
+       JOIN strategies s ON p.strategy_id = s.id
+       WHERE s.bot_id = ? AND p.status='closed'`,
+      [botId]
+    );
+    const r = rows[0] || {};
+    return {
+      wins: Number(r.wins || 0),
+      loses: Number(r.loses || 0),
+      total_pnl: Number(r.total_pnl || 0)
+    };
+  }
+}

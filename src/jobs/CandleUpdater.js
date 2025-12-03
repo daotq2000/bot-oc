@@ -3,7 +3,7 @@ import { Bot } from '../models/Bot.js';
 import { Strategy } from '../models/Strategy.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { CandleService } from '../services/CandleService.js';
-import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
+import { DEFAULT_CRON_PATTERNS, SCAN_INTERVALS } from '../config/constants.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -14,6 +14,7 @@ export class CandleUpdater {
     this.exchangeServices = new Map(); // botId -> ExchangeService
     this.candleServices = new Map(); // botId -> CandleService
     this.isRunning = false;
+    this.updateInterval = null; // For setInterval
   }
 
   /**
@@ -108,16 +109,42 @@ export class CandleUpdater {
   }
 
   /**
-   * Start the cron job
+   * Start the cron job (using setInterval for higher frequency)
    */
   start() {
-    const pattern = DEFAULT_CRON_PATTERNS.CANDLE_UPDATE;
+    const intervalMs = SCAN_INTERVALS.CANDLE_UPDATE;
     
-    cron.schedule(pattern, async () => {
-      await this.updateAllCandles();
-    });
+    // Use setInterval for frequencies higher than 1 minute
+    // Cron only supports minimum 1 minute intervals
+    if (intervalMs < 60000) {
+      // Use setInterval for sub-minute intervals
+      this.updateInterval = setInterval(async () => {
+        await this.updateAllCandles();
+      }, intervalMs);
 
-    logger.info(`CandleUpdater started with pattern: ${pattern}`);
+      // Run immediately on start
+      this.updateAllCandles();
+
+      logger.info(`CandleUpdater started with interval: ${intervalMs}ms (${intervalMs / 1000}s)`);
+    } else {
+      // Use cron for intervals >= 1 minute
+      const pattern = DEFAULT_CRON_PATTERNS.CANDLE_UPDATE;
+      cron.schedule(pattern, async () => {
+        await this.updateAllCandles();
+      });
+      logger.info(`CandleUpdater started with pattern: ${pattern}`);
+    }
+  }
+
+  /**
+   * Stop the update job
+   */
+  stop() {
+    if (this.updateInterval) {
+      clearInterval(this.updateInterval);
+      this.updateInterval = null;
+    }
+    logger.info('CandleUpdater stopped');
   }
 
   /**

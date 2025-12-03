@@ -150,10 +150,11 @@ export class TransferService {
    */
   async autoManageBalances(bot) {
     try {
-      // Temporarily disable auto balance management for Gate.io to avoid
-      // SERVER_ERROR from transfer API on testnet
-      if (bot.exchange === 'gate') {
-        logger.debug(`Auto balance management disabled for Gate bot ${bot.id}`);
+      // Temporarily disable auto balance management for Gate.io and Binance
+      // Gate: avoid SERVER_ERROR from transfer API on testnet
+      // Binance: direct client path doesn't implement spot/future transfer APIs here
+      if (bot.exchange === 'gate' || bot.exchange === 'binance') {
+        logger.debug(`Auto balance management disabled for ${bot.exchange} bot ${bot.id}`);
         return;
       }
 

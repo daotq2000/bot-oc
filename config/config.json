@@ -1,0 +1,9 @@
+{
+  "development": {
+    "username": "root",
+    "password": "rootpassword",
+    "database": "bot_oc",
+    "host": "127.0.0.1",
+    "dialect": "mysql"
+  }
+}

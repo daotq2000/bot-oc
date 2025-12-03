@@ -30,14 +30,29 @@ export class OrderService {
         : 'limit';
 
       // Create order
-      // Note: amount here is in USDT, ExchangeService will calculate quantity
-      const order = await this.exchangeService.createOrder({
-        symbol: strategy.symbol,
-        side: side === 'long' ? 'buy' : 'sell',
-        amount: amount, // Pass USDT amount, not quantity
-        type: orderType,
-        price: orderType === 'limit' ? entryPrice : undefined
-      });
+      // For SHORT with limit (price not close), use entry trigger STOP_MARKET instead of passive limit
+      let order;
+      if (side === 'short' && orderType === 'limit') {
+        const mktPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
+        if (!mktPrice || mktPrice <= 0) throw new Error('Cannot fetch current price for short trigger');
+        const qty = amount / mktPrice;
+        order = await this.exchangeService.createEntryTriggerOrder(
+          strategy.symbol,
+          side,
+          entryPrice,
+          qty
+        );
+      } else {
+        // Note: amount here is in USDT, ExchangeService will calculate quantity
+        order = await this.exchangeService.createOrder({
+          symbol: strategy.symbol,
+          side: side === 'long' ? 'buy' : 'sell',
+          positionSide: side === 'long' ? 'LONG' : 'SHORT',
+          amount: amount, // USDT amount from strategy config
+          type: orderType,
+          price: orderType === 'limit' ? entryPrice : undefined
+        });
+      }
 
       // Store position in database
       const position = await Position.create({
@@ -61,20 +76,94 @@ export class OrderService {
         slPrice
       });
 
-      // Send Telegram notification
+      // Send Telegram notification to bot chat
       await this.telegramService.sendOrderNotification(position, strategy);
+
+      // Send entry trade alert to central channel
+      try {
+        logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
+        // Ensure bot info present
+        if (!strategy.bot && strategy.bot_id) {
+          const { Bot } = await import('../models/Bot.js');
+          strategy.bot = await Bot.findById(strategy.bot_id);
+          logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
+        }
+        logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
+        await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
+        logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
+      } catch (e) {
+        logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
+        logger.error(`[OrderService] Error stack:`, e?.stack);
+      }
+
+      // Create TP limit order (reduce-only) if supported
+      try {
+        const quantity = Number(order.amount);
+        if (Number.isFinite(quantity) && quantity > 0) {
+          const tpRes = await this.exchangeService.createTakeProfitLimit(
+            strategy.symbol,
+            side,
+            tpPrice,
+            quantity
+          );
+          const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
+          if (tpOrderId) {
+            await Position.update(position.id, { tp_order_id: tpOrderId });
+          }
+          logger.info(`TP limit order created for position ${position.id}`);
+        } else {
+          logger.warn(`Skip creating TP: invalid quantity ${order.amount}`);
+        }
+      } catch (e) {
+        logger.warn(`Failed to create TP limit order for position ${position.id}: ${e?.message || e}`);
+      }
+
+      // Create SL limit order (initial) if supported
+      try {
+        const quantity = Number(order.amount);
+        if (Number.isFinite(quantity) && quantity > 0 && Number(slPrice) > 0) {
+          const slRes = await this.exchangeService.createStopLossLimit(
+            strategy.symbol,
+            side,
+            slPrice,
+            quantity
+          );
+          const slOrderId = slRes?.orderId ? String(slRes.orderId) : null;
+          if (slOrderId) {
+            await Position.update(position.id, { sl_order_id: slOrderId });
+          }
+          logger.info(`SL limit order created for position ${position.id}`);
+        } else {
+          logger.warn(`Skip creating SL: invalid quantity ${order.amount} or slPrice ${slPrice}`);
+        }
+      } catch (e) {
+        logger.warn(`Failed to create SL limit order for position ${position.id}: ${e?.message || e}`);
+      }
 
       return position;
     } catch (error) {
+      const msg = error?.message || '';
+      const softErrors = [
+        'not available for trading on Binance Futures',
+        'below minimum notional',
+        'Invalid price after rounding',
+        'Precision is over the maximum',
+      ];
+      if (
+        softErrors.some(s => msg.includes(s)) ||
+        msg.includes('-1121') || msg.includes('-1111') || msg.includes('-4061') || msg.includes('-2027')
+      ) {
+        logger.warn(`Skip executing signal due to validation: ${msg}`);
+        return null; // do not escalate
+      }
+
       logger.error(`Failed to execute signal:`, error);
-      // Log detailed error information
       if (error.code) {
         logger.error(`Error code: ${error.code}`);
       }
       if (error.message) {
         logger.error(`Error message: ${error.message}`);
       }
-      // Re-throw to let caller handle
       throw error;
     }
   }

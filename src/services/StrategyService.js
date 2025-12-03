@@ -19,11 +19,6 @@ export class StrategyService {
   }
 
   /**
-   * Check for trading signal
-   * @param {Object} strategy - Strategy object
-   * @returns {Promise<Object|null>} Signal object or null
-   */
-  /**
    * Check for trading signal and/or price alert
    * @param {Object} strategy - Strategy object
    * @param {Object} alertConfig - Optional price alert configuration
@@ -220,7 +215,8 @@ export class StrategyService {
     if (side === 'long') {
       return calculateLongEntryPrice(candle.open, oc, strategy.extend);
     } else {
-      return calculateShortEntryPrice(candle.open, oc, strategy.extend);
+      const overrideExtend = Number(process.env.SHORT_EXTEND_OVERRIDE || strategy.extend);
+      return calculateShortEntryPrice(candle.open, oc, overrideExtend);
     }
   }
 
@@ -245,14 +241,6 @@ export class StrategyService {
   }
 
   /**
-   * Check if signal should be ignored based on previous candle
-   * @param {Object} currentCandle - Current candle
-   * @param {Object} strategy - Strategy object
-   * @param {string} side - 'long' or 'short'
-   * @param {number} currentPrice - Current market price
-   * @returns {Promise<boolean>} True if should ignore
-   */
-  /**
    * Check and send price volatility alert if threshold is met
    * @param {Object} alertConfig - Price alert configuration
    * @param {Object} candleData - Candle and price data
@@ -262,10 +250,31 @@ export class StrategyService {
 
     if (!alertConfig || !this.telegramService) return;
 
-    // Check if OC meets the alert threshold
-    if (Math.abs(oc) >= alertConfig.threshold) {
-      logger.info(`[Alert] ${symbol} ${interval} OC of ${oc.toFixed(2)}% has crossed the threshold of ${alertConfig.threshold}%`);
+    // Check if OC meets the threshold - CRITICAL FIX
+    const absoluteOC = Math.abs(oc);
+    if (absoluteOC < alertConfig.threshold) {
+      logger.debug(`[Alert] OC ${absoluteOC.toFixed(2)}% below threshold ${alertConfig.threshold}% for ${symbol} ${interval}, skipping alert`);
+      return;
+    }
 
+    // Guard: skip alerts for symbols not tradable on Binance Futures (when running on Binance)
+    try {
+      const exSvc = this.exchangeService;
+      if (exSvc?.bot?.exchange === 'binance' && exSvc?.binanceDirectClient) {
+        const info = await exSvc.binanceDirectClient.getTradingExchangeSymbol(symbol);
+        if (!info || info.status !== 'TRADING') {
+          logger.debug(`[Alert] Skip non-tradable futures symbol ${symbol} for interval ${interval}`);
+          return;
+        }
+      }
+    } catch (e) {
+      logger.debug(`[Alert] Tradability check failed for ${symbol}, skipping alert: ${e?.message || e}`);
+      return;
+    }
+
+    // Send price alert only if threshold is met
+    try {
+      logger.info(`[Alert] Triggering volatility alert for ${symbol} ${interval} (OC=${oc.toFixed(2)}% >= threshold ${alertConfig.threshold}%)`);
       // Send Telegram alert
       await this.telegramService.sendVolatilityAlert(alertConfig.telegram_chat_id, {
         symbol,
@@ -275,12 +284,20 @@ export class StrategyService {
         currentPrice,
         direction
       });
-
-      // Here you might want to add a cooldown mechanism to avoid spamming alerts
-      // For now, we'll rely on the job's interval
+      logger.info(`[Alert] ✅ Successfully sent volatility alert for ${symbol} ${interval} to chat ${alertConfig.telegram_chat_id}`);
+    } catch (error) {
+      logger.error(`[Alert] ❌ Failed to send volatility alert for ${symbol} ${interval}: ${error?.message || error}`);
     }
   }
 
+  /**
+   * Check if signal should be ignored based on previous candle
+   * @param {Object} currentCandle - Current candle
+   * @param {Object} strategy - Strategy object
+   * @param {string} side - 'long' or 'short'
+   * @param {number} currentPrice - Current market price
+   * @returns {Promise<boolean>} True if should ignore
+   */
   async shouldIgnoreSignal(currentCandle, strategy, side, currentPrice) {
     try {
       // Get previous candle
