@@ -26,23 +26,25 @@ export class SymbolFilter {
     const placeholders = [];
 
     for (const filter of filters) {
-      placeholders.push('(?, ?, ?, ?, ?)');
+      placeholders.push('(?, ?, ?, ?, ?, ?)');
       values.push(
         filter.exchange,
         filter.symbol,
         filter.tick_size,
         filter.step_size,
-        filter.min_notional
+        filter.min_notional,
+        filter.max_leverage || 125
       );
     }
 
     const sql = `
-      INSERT INTO symbol_filters (exchange, symbol, tick_size, step_size, min_notional)
+      INSERT INTO symbol_filters (exchange, symbol, tick_size, step_size, min_notional, max_leverage)
       VALUES ${placeholders.join(', ')}
       ON DUPLICATE KEY UPDATE
         tick_size = VALUES(tick_size),
         step_size = VALUES(step_size),
         min_notional = VALUES(min_notional),
+        max_leverage = VALUES(max_leverage),
         updated_at = NOW()
     `;
 

@@ -1,4 +1,5 @@
 import { Telegraf } from 'telegraf';
+import { configService } from '../services/ConfigService.js';
 import { Bot } from '../models/Bot.js';
 import { Strategy } from '../models/Strategy.js';
 import { Position } from '../models/Position.js';
@@ -19,7 +20,7 @@ export class TelegramBot {
    */
   async initialize() {
     try {
-      const token = process.env.TELEGRAM_BOT_TOKEN;
+      const token = configService.getString('TELEGRAM_BOT_TOKEN');
       if (!token) {
         logger.warn('Telegram bot token not configured');
         return false;

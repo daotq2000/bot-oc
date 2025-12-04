@@ -88,10 +88,16 @@ export class StrategyController {
         return res.status(400).json({ success: false, error: 'Invalid take profit value' });
       }
 
-      // Check if strategy already exists for this bot and symbol
-      const existing = await Strategy.findByBotAndSymbol(data.bot_id, data.symbol);
+      // Check if strategy already exists for this bot with the same unique key
+      const existing = await Strategy.findByUniqueKey(
+        data.bot_id,
+        data.symbol,
+        data.interval,
+        (data.trade_type || 'both'),
+        data.oc
+      );
       if (existing) {
-        return res.status(400).json({ success: false, error: 'Strategy already exists for this bot and symbol' });
+        return res.status(400).json({ success: false, error: 'Strategy already exists for this bot/symbol/interval/trade_type/oc' });
       }
 
       const strategy = await Strategy.create(data);

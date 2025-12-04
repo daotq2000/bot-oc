@@ -3,7 +3,8 @@ import { Bot } from '../models/Bot.js';
 import { Strategy } from '../models/Strategy.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { CandleService } from '../services/CandleService.js';
-import { DEFAULT_CRON_PATTERNS, SCAN_INTERVALS } from '../config/constants.js';
+import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
+import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -112,7 +113,7 @@ export class CandleUpdater {
    * Start the cron job (using setInterval for higher frequency)
    */
   start() {
-    const intervalMs = SCAN_INTERVALS.CANDLE_UPDATE;
+    const intervalMs = configService.getNumber('CANDLE_UPDATE_INTERVAL_MS', 30000);
     
     // Use setInterval for frequencies higher than 1 minute
     // Cron only supports minimum 1 minute intervals

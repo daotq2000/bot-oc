@@ -2,6 +2,7 @@ import ccxt from 'ccxt';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { BinanceDirectClient } from './BinanceDirectClient.js';
+import { exchangeInfoService } from './ExchangeInfoService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -80,11 +81,16 @@ export class ExchangeService {
       // For Binance: Use direct API client (no CCXT)
       if (this.bot.exchange === 'binance') {
         // Use direct HTTP client instead of CCXT for Binance
-        const isTestnet = true; // Always use testnet for trading
+        const { configService } = await import('./ConfigService.js');
+        const botFlag = this.bot?.binance_testnet;
+        const isTestnet = (botFlag === null || botFlag === undefined)
+          ? configService.getBoolean('BINANCE_TESTNET', true)
+          : !!Number(botFlag); // per-bot override if provided
         this.binanceDirectClient = new BinanceDirectClient(
           this.bot.access_key,
           this.bot.secret_key,
-          isTestnet
+          isTestnet,
+          exchangeInfoService // Inject cache service
         );
         logger.info(`Binance direct API client initialized for bot ${this.bot.id} - Trading from ${this.binanceDirectClient.baseURL}, Market data from ${this.binanceDirectClient.productionDataURL}`);
         this.apiKeyValid = true; // Direct client doesn't need loadMarkets()
@@ -112,10 +118,11 @@ export class ExchangeService {
         // Proxy support is disabled temporarily
 
         // Only enable sandbox mode for non-Binance exchanges or if explicitly requested
+        const { configService } = await import('./ConfigService.js');
         const sandboxEnabled =
-          process.env.CCXT_SANDBOX === 'true' ||
-          (this.bot.exchange === 'gate' && process.env.GATE_SANDBOX === 'true') ||
-          (this.bot.exchange === 'mexc' && process.env.MEXC_SANDBOX === 'true');
+          configService.getBoolean('CCXT_SANDBOX', false) ||
+          (this.bot.exchange === 'gate' && configService.getBoolean('GATE_SANDBOX', false)) ||
+          (this.bot.exchange === 'mexc' && configService.getBoolean('MEXC_SANDBOX', false));
 
         if (sandboxEnabled && typeof this.exchange.setSandboxMode === 'function') {
           this.exchange.setSandboxMode(true);
@@ -221,15 +228,25 @@ export class ExchangeService {
         
         // Calculate quantity and notional (USDT)
         const currentPrice = price || await this.getTickerPrice(symbol);
-        const quantity = amount / currentPrice;
-        const notional = amount; // USDT-margined futures: price * qty = amount
+        if (!Number.isFinite(Number(currentPrice)) || Number(currentPrice) <= 0) {
+          throw new Error(`Invalid current/entry price for ${normalizedSymbol}: ${currentPrice}`);
+        }
+        if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
+          throw new Error(`Invalid amount (USDT) for ${normalizedSymbol}: ${amount}`);
+        }
+        const quantity = Number(amount) / Number(currentPrice);
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+          throw new Error(`Computed quantity invalid for ${normalizedSymbol}: amount=${amount}, price=${currentPrice}`);
+        }
+        const notional = Number(amount); // USDT-margined futures: price * qty = amount
 
         // Configure margin type and optimal leverage per symbol per notional
         try {
-          const marginType = (process.env.BINANCE_DEFAULT_MARGIN_TYPE || 'CROSSED').toUpperCase();
+          const { configService } = await import('./ConfigService.js');
+          const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
           await this.binanceDirectClient.setMarginType(normalizedSymbol, marginType);
           const optimalLev = await this.binanceDirectClient.getOptimalLeverage(normalizedSymbol, notional);
-          const desiredLev = optimalLev || parseInt(process.env.BINANCE_DEFAULT_LEVERAGE || '5');
+          const desiredLev = optimalLev || parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
           // Cache last applied leverage to avoid redundant calls
           this._binanceLeverageMap = this._binanceLeverageMap || new Map();
           if (this._binanceLeverageMap.get(normalizedSymbol) !== desiredLev) {
@@ -242,10 +259,24 @@ export class ExchangeService {
         }
 
         // Respect strategy amount: do NOT auto-increase to meet min notional.
-        // Validate against MIN_NOTIONAL; if not enough, throw to skip trade.
+        // Validate against MIN_NOTIONAL using EFFECTIVE notional after quantity formatting.
         const minNotional = await this.binanceDirectClient.getMinNotional(normalizedSymbol);
-        if (minNotional && amount < minNotional) {
-          throw new Error(`Amount ${amount} USDT is below minimum notional ${minNotional} USDT for ${normalizedSymbol}.`);
+        if (minNotional) {
+          try {
+            const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
+            const formattedQtyStr = this.binanceDirectClient.formatQuantity(quantity, stepSize);
+            const formattedQty = parseFloat(formattedQtyStr);
+            const effectiveNotional = (formattedQty || 0) * currentPrice;
+            logger.debug(`[MinNotionalCheck] ${normalizedSymbol}: amount=${amount}, price=${currentPrice}, rawQty=${quantity}, stepSize=${stepSize}, fmtQty=${formattedQty}, effectiveNotional=${effectiveNotional}, minNotional=${minNotional}`);
+            if (!Number.isFinite(effectiveNotional) || effectiveNotional + 1e-8 < Number(minNotional)) {
+              throw new Error(`Effective notional ${effectiveNotional.toFixed(8)} USDT is below minimum notional ${minNotional} USDT for ${normalizedSymbol} (amount=${amount}).`);
+            }
+          } catch (e) {
+            // If any issue computing step size, fall back to simple check on amount (still safer than skipping validation)
+            if (amount < Number(minNotional)) {
+              throw new Error(`Amount ${amount} USDT is below minimum notional ${minNotional} USDT for ${normalizedSymbol}.`);
+            }
+          }
         }
 
         logger.debug(`Calculated quantity: ${quantity} for ${symbol} (amount: ${amount} USDT, price: ${currentPrice})`);
@@ -269,6 +300,7 @@ export class ExchangeService {
         }
         
         // Convert to CCXT-like format
+        const isLimit = type === 'limit';
         return {
           id: order.orderId.toString(),
           symbol: normalizedSymbol,
@@ -276,9 +308,9 @@ export class ExchangeService {
           side: side,
           amount: quantity,
           price: price || currentPrice,
-          status: 'closed',
-          filled: quantity,
-          remaining: 0,
+          status: isLimit ? 'open' : 'closed',
+          filled: isLimit ? 0 : quantity,
+          remaining: isLimit ? quantity : 0,
           timestamp: Date.now(),
           datetime: new Date().toISOString()
         };
@@ -494,6 +526,14 @@ export class ExchangeService {
 
   async getTickSize(symbol) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      // Try cache first
+      const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+      const cached = exchangeInfoService.getTickSize(normalizedSymbol);
+      if (cached) {
+        logger.debug(`[Cache Hit] ExchangeService.getTickSize for ${normalizedSymbol}: ${cached}`);
+        return cached;
+      }
+      // Fallback to REST API
       return await this.binanceDirectClient.getTickSize(symbol);
     }
     return '0.01';
@@ -712,8 +752,45 @@ export class ExchangeService {
       logger.info(`Order cancelled for bot ${this.bot.id}:`, { orderId, symbol: marketSymbol });
       return result;
     } catch (error) {
+      // Handle "Unknown order sent" error gracefully - order may have already been filled/cancelled
+      if (error.message && error.message.includes('-2011')) {
+        logger.warn(`Order ${orderId} not found on exchange (may have been filled or already cancelled): ${error.message}`);
+        return null; // Return null to indicate order doesn't exist
+      }
       logger.error(`Failed to cancel order for bot ${this.bot.id}:`, error);
       throw error;
+    }
+  }
+
+  /**
+   * Get order status (normalized)
+   * @returns {Promise<{status:string, filled:number, raw:any}>}
+   */
+  async getOrderStatus(symbol, orderId) {
+    try {
+      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+        const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+        const data = await this.binanceDirectClient.getOrder(normalizedSymbol, orderId);
+        const statusMap = {
+          NEW: 'open',
+          PARTIALLY_FILLED: 'open',
+          FILLED: 'closed',
+          CANCELED: 'canceled',
+          CANCELLED: 'canceled',
+          EXPIRED: 'canceled'
+        };
+        const status = statusMap[data.status] || 'open';
+        const filled = parseFloat(data.executedQty || '0') || 0;
+        return { status, filled, raw: data };
+      }
+
+      // CCXT path
+      const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
+      const order = await this.exchange.fetchOrder(orderId, marketSymbol);
+      return { status: order.status, filled: order.filled || 0, raw: order };
+    } catch (e) {
+      logger.warn(`getOrderStatus failed for bot ${this.bot.id} (${symbol}/${orderId}): ${e?.message || e}`);
+      return { status: 'unknown', filled: 0, raw: null };
     }
   }
 }

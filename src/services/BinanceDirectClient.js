@@ -6,22 +6,24 @@
 import crypto from 'crypto';
 import logger from '../utils/logger.js';
 import { webSocketManager } from './WebSocketManager.js';
+import { configService } from './ConfigService.js';
 
 
 export class BinanceDirectClient {
-  constructor(apiKey, secretKey, isTestnet = true) {
+  constructor(apiKey, secretKey, isTestnet = true, exchangeInfoService = null) {
     this.apiKey = apiKey;
     this.secretKey = secretKey;
     this.isTestnet = isTestnet;
+    this.exchangeInfoService = exchangeInfoService; // Injected service for caching
     this.restPriceFallbackCache = new Map(); // symbol -> { price, timestamp }
-    this.restPriceFallbackCooldownMs = Number(process.env.BINANCE_REST_PRICE_COOLDOWN_MS || 5000);
+    this.restPriceFallbackCooldownMs = Number(configService.getNumber('BINANCE_REST_PRICE_COOLDOWN_MS', 5000));
     
     // Production data URL (always use production for market data)
     this.productionDataURL = 'https://fapi.binance.com';
     
     // Trading URL (testnet or production)
     this.baseURL = isTestnet 
-      ? (process.env.BINANCE_FUTURES_ENDPOINT || 'https://testnet.binancefuture.com')
+      ? (configService.getString('BINANCE_FUTURES_ENDPOINT', 'https://testnet.binancefuture.com'))
       : 'https://fapi.binance.com';
     
     this.minRequestInterval = 100; // 100ms between requests
@@ -418,6 +420,19 @@ export class BinanceDirectClient {
   }
 
   async getTickSize(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    
+    // Try to get from cache first
+    if (this.exchangeInfoService) {
+      const cached = this.exchangeInfoService.getTickSize(normalizedSymbol);
+      if (cached) {
+        logger.debug(`[Cache Hit] getTickSize for ${normalizedSymbol}: ${cached}`);
+        return cached;
+      }
+    }
+    
+    // Fallback to REST API if cache miss
+    logger.debug(`[Cache Miss] getTickSize for ${normalizedSymbol}, falling back to REST API`);
     const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
     if (!exchangeInfo || !exchangeInfo.filters) return '0.01';
     const priceFilter = exchangeInfo.filters.find(f => f.filterType === 'PRICE_FILTER');
@@ -430,6 +445,19 @@ export class BinanceDirectClient {
    * @returns {Promise<string>} stepSize (e.g., "0.001", "0.01")
    */
   async getStepSize(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    
+    // Try to get from cache first
+    if (this.exchangeInfoService) {
+      const cached = this.exchangeInfoService.getStepSize(normalizedSymbol);
+      if (cached) {
+        logger.debug(`[Cache Hit] getStepSize for ${normalizedSymbol}: ${cached}`);
+        return cached;
+      }
+    }
+    
+    // Fallback to REST API if cache miss
+    logger.debug(`[Cache Miss] getStepSize for ${normalizedSymbol}, falling back to REST API`);
     const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
     if (!exchangeInfo || !exchangeInfo.filters) return '0.001';
     const lotSizeFilter = exchangeInfo.filters.find(f => f.filterType === 'LOT_SIZE');
@@ -442,12 +470,58 @@ export class BinanceDirectClient {
    * @returns {Promise<number|null>}
    */
   async getMinNotional(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    
+    // Try to get from cache first
+    if (this.exchangeInfoService) {
+      const cached = this.exchangeInfoService.getMinNotional(normalizedSymbol);
+      if (cached) {
+        logger.debug(`[Cache Hit] getMinNotional for ${normalizedSymbol}: ${cached}`);
+        return cached;
+      }
+    }
+    
+    // Fallback to REST API if cache miss
+    logger.debug(`[Cache Miss] getMinNotional for ${normalizedSymbol}, falling back to REST API`);
     const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
     if (!exchangeInfo || !exchangeInfo.filters) return null;
     const minNotionalFilter = exchangeInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL');
     const val = minNotionalFilter?.notional || minNotionalFilter?.minNotional;
     const num = parseFloat(val);
     return Number.isFinite(num) ? num : null;
+  }
+
+  /**
+   * Get maximum leverage for a symbol
+   * @param {string} symbol - Trading symbol
+   * @returns {Promise<number|null>} Maximum leverage or null if not found
+   */
+  async getMaxLeverage(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    
+    // Try to get from cache first
+    if (this.exchangeInfoService) {
+      const cached = this.exchangeInfoService.getMaxLeverage(normalizedSymbol);
+      if (cached) {
+        logger.debug(`[Cache Hit] getMaxLeverage for ${normalizedSymbol}: ${cached}`);
+        return cached;
+      }
+    }
+    
+    // Fallback to REST API if cache miss
+    logger.debug(`[Cache Miss] getMaxLeverage for ${normalizedSymbol}, falling back to REST API`);
+    try {
+      const brackets = await this.getLeverageBrackets(normalizedSymbol);
+      if (!brackets || brackets.length === 0) return 125;
+      const maxBracket = brackets.reduce((max, bracket) => {
+        const leverage = parseInt(bracket.initialLeverage || 0);
+        return leverage > parseInt(max.initialLeverage || 0) ? bracket : max;
+      });
+      return parseInt(maxBracket.initialLeverage || 125);
+    } catch (e) {
+      logger.warn(`getMaxLeverage failed for ${normalizedSymbol}: ${e.message || e}`);
+      return 125; // Default to 125
+    }
   }
 
   /**
@@ -497,14 +571,17 @@ export class BinanceDirectClient {
    * @returns {number} Rounded quantity
    */
   formatQuantity(quantity, stepSize) {
+    const q = Number(quantity);
+    if (!Number.isFinite(q) || q <= 0) return '0';
+
     const precision = this.getPrecisionFromIncrement(stepSize);
 
     if (precision === 0) {
-      return Math.floor(parseFloat(quantity)).toString();
+      return Math.floor(q).toString();
     }
 
     const factor = Math.pow(10, precision);
-    const flooredQuantity = Math.floor(parseFloat(quantity) * factor) / factor;
+    const flooredQuantity = Math.floor(q * factor) / factor;
     return flooredQuantity.toFixed(precision);
   }
 
@@ -1001,6 +1078,16 @@ export class BinanceDirectClient {
     const params = { symbol: normalizedSymbol, orderId: orderId };
     const data = await this.makeRequest('/fapi/v1/order', 'DELETE', params, true);
     return data;
+  }
+
+  /**
+   * Get order status
+   */
+  async getOrder(symbol, orderId) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    const params = { symbol: normalizedSymbol, orderId: orderId };
+    const data = await this.makeRequest('/fapi/v1/order', 'GET', params, true);
+    return data; // contains status: NEW|PARTIALLY_FILLED|FILLED|CANCELED|EXPIRED
   }
 
   sanitizeParams(params) {

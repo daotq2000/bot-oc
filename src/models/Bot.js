@@ -54,6 +54,10 @@ export class Bot {
       withdraw_address,
       withdraw_network = 'BEP20',
       spot_balance_threshold = 10.00,
+      max_concurrent_trades = 5,
+      telegram_alert_channel_id = null,
+      binance_testnet = null,
+      concurrency_lock_timeout = null,
       is_active = true
     } = data;
 
@@ -62,13 +66,15 @@ export class Bot {
         bot_name, exchange, uid, access_key, secret_key, proxy,
         telegram_chat_id, future_balance_target, spot_transfer_threshold,
         transfer_frequency, withdraw_enabled, withdraw_address,
-        withdraw_network, spot_balance_threshold, is_active
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        withdraw_network, spot_balance_threshold, max_concurrent_trades,
+        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         bot_name, exchange, uid, access_key, secret_key, proxy,
         telegram_chat_id, future_balance_target, spot_transfer_threshold,
         transfer_frequency, withdraw_enabled, withdraw_address,
-        withdraw_network, spot_balance_threshold, is_active
+        withdraw_network, spot_balance_threshold, max_concurrent_trades,
+        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active
       ]
     );
 

@@ -11,10 +11,10 @@ export class Position {
    */
   static async findAll(filters = {}) {
     let query = `SELECT p.*, s.symbol, s.\`interval\`, s.oc, s.take_profit, 
-                        s.reduce, s.up_reduce, s.extend, s.bot_id, b.bot_name, b.exchange
+                        s.reduce, s.up_reduce, s.extend, p.bot_id, b.bot_name, b.exchange
                  FROM positions p
                  JOIN strategies s ON p.strategy_id = s.id
-                 JOIN bots b ON s.bot_id = b.id`;
+                 JOIN bots b ON p.bot_id = b.id`;
 
     const conditions = [];
     const params = [];
@@ -52,10 +52,11 @@ export class Position {
   static async findById(id) {
     const [rows] = await pool.execute(
       `SELECT p.*, s.symbol, s.interval, s.oc, s.take_profit,
-              s.reduce, s.up_reduce, s.extend, s.bot_id, b.bot_name, b.exchange
+              s.reduce, s.up_reduce, s.extend, s.bot_id,
+              b.bot_name, b.exchange, b.telegram_chat_id, b.telegram_alert_channel_id
        FROM positions p
        JOIN strategies s ON p.strategy_id = s.id
-       JOIN bots b ON s.bot_id = b.id
+       JOIN bots b ON p.bot_id = b.id
        WHERE p.id = ?`,
       [id]
     );
@@ -72,7 +73,7 @@ export class Position {
                         s.reduce, s.up_reduce, s.bot_id, b.bot_name, b.exchange
                  FROM positions p
                  JOIN strategies s ON p.strategy_id = s.id
-                 JOIN bots b ON s.bot_id = b.id
+                 JOIN bots b ON p.bot_id = b.id
                  WHERE p.status = 'open'`;
 
     const params = [];
@@ -111,6 +112,7 @@ export class Position {
   static async create(data) {
     const {
       strategy_id,
+      bot_id,
       order_id,
       symbol,
       side,
@@ -125,11 +127,11 @@ export class Position {
 
     const [result] = await pool.execute(
       `INSERT INTO positions (
-        strategy_id, order_id, symbol, side, entry_price, amount,
+        strategy_id, bot_id, order_id, symbol, side, entry_price, amount,
         take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        strategy_id, order_id, symbol, side, entry_price, amount,
+        strategy_id, bot_id, order_id, symbol, side, entry_price, amount,
         take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id
       ]
     );
@@ -221,5 +223,20 @@ export class Position {
       loses: Number(r.loses || 0),
       total_pnl: Number(r.total_pnl || 0)
     };
+  }
+
+  /**
+   * Get count of open positions for a bot
+   * @param {number} botId - Bot ID
+   * @returns {Promise<number>} Count of open positions
+   */
+  static async countOpenByBot(botId) {
+    const [rows] = await pool.execute(
+      `SELECT COUNT(*) as count
+       FROM positions p
+       WHERE p.bot_id = ? AND p.status = 'open'`,
+      [botId]
+    );
+    return rows[0]?.count || 0;
   }
 }

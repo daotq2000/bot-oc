@@ -1,5 +1,6 @@
 import { Position } from '../models/Position.js';
 import { TelegramService } from './TelegramService.js';
+import { concurrencyManager } from './ConcurrencyManager.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -20,19 +21,57 @@ export class OrderService {
     try {
       const { strategy, side, entryPrice, amount, tpPrice, slPrice } = signal;
 
+      // Acquire concurrency reservation (DB-backed advisory lock)
+      let reservationToken;
+      try {
+        reservationToken = await concurrencyManager.reserveSlot(strategy.bot_id);
+      } catch (e) {
+        if (e?.code === 'CONCURRENCY_LOCK_TIMEOUT') {
+          // Lock contention: skip silently without alert; not a real limit breach
+          logger.warn(`[OrderService] Concurrency lock timeout for bot ${strategy.bot_id}, skip placing order (no alert).`);
+          return null;
+        }
+        throw e;
+      }
+
+      if (!reservationToken) {
+        // Real limit reached under lock
+        const status = await concurrencyManager.getStatus(strategy.bot_id);
+        const msg = `Max concurrent trades limit reached: ${status.currentCount}/${status.maxConcurrent}`;
+        logger.warn(`[OrderService] ${msg} for strategy ${strategy.id} (${strategy.symbol})`);
+        // Send Telegram alert about rejection
+        try {
+          if (!strategy.bot && strategy.bot_id) {
+            const { Bot } = await import('../models/Bot.js');
+            strategy.bot = await Bot.findById(strategy.bot_id);
+          }
+          await this.telegramService?.sendConcurrencyLimitAlert?.(strategy, status);
+        } catch (e) {
+          logger.warn(`[OrderService] Failed to send concurrency alert: ${e?.message || e}`);
+        }
+        return null; // treat as soft skip
+      }
+
+      let orderCreated = false;
+
       // Check if entry price is still valid
       const currentPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
       
       // For limit orders, we need to check if price is close enough
       // If price already passed entry, use market order
-      const orderType = this.shouldUseMarketOrder(side, currentPrice, entryPrice)
+      let orderType = this.shouldUseMarketOrder(side, currentPrice, entryPrice)
         ? 'market'
         : 'limit';
 
+      // Force passive limit if strategy indicates so (fallback when extend not met)
+      if (signal.forcePassiveLimit) {
+        orderType = 'limit';
+      }
+
       // Create order
-      // For SHORT with limit (price not close), use entry trigger STOP_MARKET instead of passive limit
+      // For SHORT with limit and NOT forced passive limit, use entry trigger STOP_MARKET instead of passive limit
       let order;
-      if (side === 'short' && orderType === 'limit') {
+      if (side === 'short' && orderType === 'limit' && !signal.forcePassiveLimit) {
         const mktPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
         if (!mktPrice || mktPrice <= 0) throw new Error('Cannot fetch current price for short trigger');
         const qty = amount / mktPrice;
@@ -57,6 +96,7 @@ export class OrderService {
       // Store position in database
       const position = await Position.create({
         strategy_id: strategy.id,
+        bot_id: strategy.bot_id,
         order_id: order.id,
         symbol: strategy.symbol,
         side: side,
@@ -140,6 +180,11 @@ export class OrderService {
         logger.warn(`Failed to create SL limit order for position ${position.id}: ${e?.message || e}`);
       }
 
+      // Mark reservation as 'released' (position opened)
+      try {
+        await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
+      } catch (_) {}
+
       return position;
     } catch (error) {
       const msg = error?.message || '';
@@ -165,6 +210,13 @@ export class OrderService {
         logger.error(`Error message: ${error.message}`);
       }
       throw error;
+    } finally {
+      // If order was not created, cancel reservation (if any)
+      try {
+        if (typeof reservationToken !== 'undefined' && reservationToken && !orderCreated) {
+          await concurrencyManager.finalizeReservation(signal.strategy.bot_id, reservationToken, 'cancelled');
+        }
+      } catch (_) {}
     }
   }
 

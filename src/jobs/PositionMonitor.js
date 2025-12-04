@@ -6,6 +6,7 @@ import { PositionService } from '../services/PositionService.js';
 import { OrderService } from '../services/OrderService.js';
 import { TelegramService } from '../services/TelegramService.js';
 import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
+import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -104,43 +105,49 @@ export class PositionMonitor {
    */
   async checkUnfilledOrders(position) {
     try {
-      // Get strategy to check candle status
+      // Resolve services
       const strategy = await Strategy.findById(position.strategy_id);
       if (!strategy) return;
-
-      // Get latest candle
-      const { CandleService } = await import('../services/CandleService.js');
       const exchangeService = this.exchangeServices.get(strategy.bot_id);
-      if (!exchangeService) return;
+      const orderService = this.orderServices.get(strategy.bot_id);
+      if (!exchangeService || !orderService) return;
 
-      const candleService = new CandleService(exchangeService);
-      const latestCandle = await candleService.getLatestCandle(strategy.symbol, strategy.interval);
+      // TTL-based cancellation: if order not filled after N minutes, cancel
+      
+      const ttlMinutes = Number(configService.getNumber('ENTRY_ORDER_TTL_MINUTES', 10));
+      const ttlMs = Math.max(1, ttlMinutes) * 60 * 1000;
+      const openedAtMs = new Date(position.opened_at).getTime();
+      const now = Date.now();
 
-      if (!latestCandle) return;
+      if (position.status === 'open' && now - openedAtMs >= ttlMs) {
+        // Check actual order status on exchange to avoid cancelling filled orders
+        const st = await exchangeService.getOrderStatus(position.symbol, position.order_id);
+        if (st.status === 'open' && (st.filled || 0) === 0) {
+          await orderService.cancelOrder(position, 'ttl_expired');
+          logger.info(`Cancelled unfilled entry (TTL ${ttlMinutes}m) for position ${position.id}`);
+          return; // done for this position
+        }
+      }
 
-      // If candle is closed and position is still open, check if order was filled
-      // For simplicity, we'll assume if position is still open after candle close,
-      // the order wasn't filled and should be cancelled
-      // In production, you should check order status on exchange
+      // Optional: candle-based safety cancel for non-filled entries from previous candle
+      
+      const candleCancelEnabled = configService.getBoolean('ENABLE_CANDLE_END_CANCEL_FOR_ENTRY', false);
+      if (candleCancelEnabled) {
+        const { CandleService } = await import('../services/CandleService.js');
+        const candleService = new CandleService(exchangeService);
+        const latestCandle = await candleService.getLatestCandle(strategy.symbol, strategy.interval);
+        if (!latestCandle) return;
+        const isCandleClosed = candleService.isCandleClosed(latestCandle);
 
-      const isCandleClosed = candleService.isCandleClosed(latestCandle);
-      if (isCandleClosed && position.status === 'open') {
-        // Check if this is a new candle (not the one we entered on)
-        const positionTime = new Date(position.opened_at).getTime();
-        const candleTime = latestCandle.open_time;
-
-        // If position was opened before this candle, it's an old unfilled order
-        if (positionTime < candleTime) {
-          const orderService = this.orderServices.get(strategy.bot_id);
-          const exSvc = this.exchangeServices.get(strategy.bot_id);
-          // For Binance (direct client), skip generic cancel because entry orders are executed immediately
-          if (exSvc?.bot?.exchange === 'binance') {
-            logger.debug(`Skip cancelling unfilled order on Binance for position ${position.id}`);
-            return;
-          }
-          if (orderService) {
-            await orderService.cancelOrder(position, 'candle_end');
-            logger.info(`Cancelled unfilled order for position ${position.id}`);
+        if (isCandleClosed && position.status === 'open') {
+          const positionTime = new Date(position.opened_at).getTime();
+          const candleTime = latestCandle.open_time;
+          if (positionTime < candleTime) {
+            const st = await exchangeService.getOrderStatus(position.symbol, position.order_id);
+            if (st.status === 'open' && (st.filled || 0) === 0) {
+              await orderService.cancelOrder(position, 'candle_end');
+              logger.info(`Cancelled unfilled order at candle end for position ${position.id}`);
+            }
           }
         }
       }

@@ -7,6 +7,7 @@ import {
   calculateIgnoreThreshold
 } from '../utils/calculator.js';
 import logger from '../utils/logger.js';
+import { configService } from './ConfigService.js';
 
 /**
  * Strategy Service - Signal generation logic
@@ -155,15 +156,19 @@ export class StrategyService {
   async checkSideSignal(strategy, side, candle, currentPrice, oc) {
     try {
       // Calculate entry price
-      const entryPrice = this.calculateEntryPrice(candle, strategy, side);
+      const entryPrice = await this.calculateEntryPrice(candle, strategy, side);
       logger.info(`[Signal] Strategy ${strategy.id} (${strategy.symbol}) ${side}: Entry=${entryPrice}, Current=${currentPrice}, Open=${candle.open}, Extend=${strategy.extend}%`);
 
       // Check if extend condition is met
       const extendMet = this.checkExtendCondition(side, currentPrice, entryPrice, candle.open);
       
       if (!extendMet) {
-        logger.info(`[Signal] Strategy ${strategy.id} (${strategy.symbol}) ${side}: Extend condition not met. Current=${currentPrice}, Entry=${entryPrice}, Open=${candle.open}`);
-        return null;
+        const allowLimitFallback = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
+        if (!allowLimitFallback) {
+          logger.info(`[Signal] Strategy ${strategy.id} (${strategy.symbol}) ${side}: Extend condition not met. Current=${currentPrice}, Entry=${entryPrice}, Open=${candle.open} -> skip (config ENABLE_LIMIT_ON_EXTEND_MISS=false)`);
+          return null;
+        }
+        logger.info(`[Signal] Strategy ${strategy.id} (${strategy.symbol}) ${side}: Extend not met -> proceed with LIMIT fallback (will place limit order with TTL)`);
       }
 
       // Check ignore logic
@@ -192,7 +197,10 @@ export class StrategyService {
         tpPrice,
         slPrice,
         amount: strategy.amount,
-        oc: Math.abs(oc)
+        oc: Math.abs(oc),
+        // If extend not met but fallback allowed, force passive LIMIT instead of trigger
+        forcePassiveLimit: !extendMet,
+        ttlMinutes: Number(configService.getNumber('ENTRY_ORDER_TTL_MINUTES', 10))
       };
     } catch (error) {
       logger.error(`Error checking side signal for ${strategy.symbol} ${side}:`, error);
@@ -207,7 +215,7 @@ export class StrategyService {
    * @param {string} side - 'long' or 'short'
    * @returns {number} Entry price
    */
-  calculateEntryPrice(candle, strategy, side) {
+  async calculateEntryPrice(candle, strategy, side) {
     const oc = Math.abs(
       this.candleService.calculateCandleMetrics(candle).oc
     );
@@ -215,7 +223,8 @@ export class StrategyService {
     if (side === 'long') {
       return calculateLongEntryPrice(candle.open, oc, strategy.extend);
     } else {
-      const overrideExtend = Number(process.env.SHORT_EXTEND_OVERRIDE || strategy.extend);
+      const { configService } = await import('./ConfigService.js');
+      const overrideExtend = Number(configService.getNumber('SHORT_EXTEND_OVERRIDE', strategy.extend));
       return calculateShortEntryPrice(candle.open, oc, overrideExtend);
     }
   }

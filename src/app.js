@@ -10,6 +10,8 @@ import { SignalScanner } from './jobs/SignalScanner.js';
 import { PositionMonitor } from './jobs/PositionMonitor.js';
 import { BalanceManager } from './jobs/BalanceManager.js';
 import { exchangeInfoService } from './services/ExchangeInfoService.js';
+import { configService } from './services/ConfigService.js';
+import { AppConfig } from './models/AppConfig.js';
 
 import routes from './routes/index.js';
 import logger from './utils/logger.js';
@@ -67,6 +69,28 @@ async function start() {
       process.exit(1);
     }
     logger.info('Database connected successfully');
+
+    // Seed required configs into DB (idempotent)
+    try {
+      logger.info('Seeding default application configs...');
+      await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
+      await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '10', 'Minutes before auto-cancel unfilled entry LIMIT orders');
+    } catch (e) {
+      logger.warn(`Failed seeding default configs: ${e?.message || e}`);
+    }
+
+    // Load application configs from DB
+    logger.info('Loading application configs...');
+    await configService.loadAll();
+
+    // Override logger level from DB config if present
+    try {
+      const newLevel = configService.getString('LOG_LEVEL', null);
+      if (newLevel) {
+        logger.level = newLevel;
+        logger.info(`[Config] Logger level set to ${newLevel} from app_configs`);
+      }
+    } catch (_) {}
 
     // Initialize exchange info service (load symbol filters)
     logger.info('Initializing exchange info service...');

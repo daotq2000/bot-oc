@@ -84,6 +84,23 @@ export class Strategy {
   }
 
   /**
+   * Get strategy by unique key for a bot: symbol + interval + trade_type + oc
+   * @param {number} botId
+   * @param {string} symbol
+   * @param {string} interval
+   * @param {string} tradeType
+   * @param {number} oc
+   * @returns {Promise<Object|null>}
+   */
+  static async findByUniqueKey(botId, symbol, interval, tradeType, oc) {
+    const [rows] = await pool.execute(
+      'SELECT * FROM strategies WHERE bot_id = ? AND symbol = ? AND `interval` = ? AND trade_type = ? AND oc = ?',
+      [botId, symbol, interval, tradeType, oc]
+    );
+    return rows[0] || null;
+  }
+
+  /**
    * Create new strategy
    * @param {Object} data - Strategy data
    * @returns {Promise<Object>}

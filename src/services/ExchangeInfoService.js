@@ -7,7 +7,7 @@ import logger from '../utils/logger.js';
  */
 class ExchangeInfoService {
   constructor() {
-    this.filtersCache = new Map(); // symbol -> { tickSize, stepSize, minNotional }
+    this.filtersCache = new Map(); // symbol -> { tickSize, stepSize, minNotional, maxLeverage }
     this.isInitialized = false;
   }
 
@@ -35,12 +35,24 @@ class ExchangeInfoService {
         const minNotionalFilter = symbolInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL');
 
         if (priceFilter && lotSizeFilter && minNotionalFilter) {
+          // Extract max leverage from symbol info
+          let maxLeverage = 125; // Default max leverage for Binance Futures
+          if (symbolInfo.leverageBrackets && symbolInfo.leverageBrackets.length > 0) {
+            // Get the highest initial leverage from brackets
+            const maxBracket = symbolInfo.leverageBrackets.reduce((max, bracket) => {
+              const leverage = parseInt(bracket.initialLeverage || 0);
+              return leverage > parseInt(max.initialLeverage || 0) ? bracket : max;
+            });
+            maxLeverage = parseInt(maxBracket.initialLeverage || 125);
+          }
+
           filtersToSave.push({
             exchange: 'binance',
             symbol: symbolInfo.symbol,
             tick_size: priceFilter.tickSize,
             step_size: lotSizeFilter.stepSize,
-            min_notional: minNotionalFilter.notional
+            min_notional: minNotionalFilter.notional,
+            max_leverage: maxLeverage
           });
         }
       }
@@ -69,7 +81,8 @@ class ExchangeInfoService {
         this.filtersCache.set(filter.symbol, {
           tickSize: filter.tick_size,
           stepSize: filter.step_size,
-          minNotional: filter.min_notional
+          minNotional: filter.min_notional,
+          maxLeverage: filter.max_leverage || 125
         });
       }
       this.isInitialized = true;
@@ -89,6 +102,46 @@ class ExchangeInfoService {
       logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
     }
     return this.filtersCache.get(symbol.toUpperCase());
+  }
+
+  /**
+   * Get tick size for a specific symbol from cache
+   * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @returns {string|null} The tick size or null if not found
+   */
+  getTickSize(symbol) {
+    const filters = this.getFilters(symbol);
+    return filters ? filters.tickSize : null;
+  }
+
+  /**
+   * Get step size for a specific symbol from cache
+   * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @returns {string|null} The step size or null if not found
+   */
+  getStepSize(symbol) {
+    const filters = this.getFilters(symbol);
+    return filters ? filters.stepSize : null;
+  }
+
+  /**
+   * Get minimum notional for a specific symbol from cache
+   * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @returns {number|null} The minimum notional or null if not found
+   */
+  getMinNotional(symbol) {
+    const filters = this.getFilters(symbol);
+    return filters ? filters.minNotional : null;
+  }
+
+  /**
+   * Get maximum leverage for a specific symbol from cache
+   * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @returns {number|null} The maximum leverage or null if not found
+   */
+  getMaxLeverage(symbol) {
+    const filters = this.getFilters(symbol);
+    return filters ? filters.maxLeverage : null;
   }
 }
 

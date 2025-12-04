@@ -9,7 +9,9 @@ import { CandleService } from '../services/CandleService.js';
 import { StrategyService } from '../services/StrategyService.js';
 import { OrderService } from '../services/OrderService.js';
 import { TelegramService } from '../services/TelegramService.js';
+import { concurrencyManager } from '../services/ConcurrencyManager.js';
 import { DEFAULT_CRON_PATTERNS, SCAN_INTERVALS } from '../config/constants.js';
+import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -66,7 +68,11 @@ export class SignalScanner {
       const orderService = new OrderService(exchangeService, this.telegramService);
       this.orderServices.set(bot.id, orderService);
 
-      logger.info(`SignalScanner initialized for bot ${bot.id}`);
+      // Initialize concurrency manager for this bot
+      const maxConcurrentTrades = bot.max_concurrent_trades || 5;
+      concurrencyManager.initializeBot(bot.id, maxConcurrentTrades);
+
+      logger.info(`SignalScanner initialized for bot ${bot.id} (max_concurrent_trades=${maxConcurrentTrades})`);
     } catch (error) {
       logger.error(`Failed to initialize SignalScanner for bot ${bot.id}:`, error);
     }
@@ -96,6 +102,7 @@ export class SignalScanner {
         logger.debug(`Strategy ${strategy.id} already has open position, skipping`);
         return;
       }
+
 
       // Get services for this bot
       const strategyService = this.strategyServices.get(strategy.bot_id);
@@ -131,7 +138,7 @@ export class SignalScanner {
    */
   async getStrategies() {
     const now = Date.now();
-    const cacheTTL = SCAN_INTERVALS.STRATEGY_CACHE_TTL;
+    const cacheTTL = configService.getNumber('STRATEGY_CACHE_TTL_MS', 10000);
 
     // Return cached strategies if still valid
     if (this.strategiesCache && (now - this.strategiesCacheTime) < cacheTTL) {
@@ -269,7 +276,7 @@ export class SignalScanner {
    * Start the scan job (using setInterval for higher frequency)
    */
   start() {
-    const intervalMs = SCAN_INTERVALS.SIGNAL_SCAN;
+    const intervalMs = configService.getNumber('SIGNAL_SCAN_INTERVAL_MS', 30000);
     
     // Use setInterval for frequencies higher than 1 minute
     // Cron only supports minimum 1 minute intervals

@@ -1,5 +1,7 @@
 import { Position } from '../models/Position.js';
 import { calculatePnL, calculateDynamicStopLoss, calculateTakeProfit, calculateInitialStopLoss } from '../utils/calculator.js';
+import { exchangeInfoService } from './ExchangeInfoService.js';
+import { configService } from './ConfigService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -62,8 +64,13 @@ export class PositionService {
 
         // Cancel/replace SL pending order on exchange if moved enough ticks
         try {
-          const thresholdTicks = Number(process.env.SL_UPDATE_THRESHOLD_TICKS || 2);
-          const tickSizeStr = await this.exchangeService.getTickSize(position.symbol);
+          const thresholdTicks = Number(configService.getNumber('SL_UPDATE_THRESHOLD_TICKS', 2));
+          // Try to get tick size from cache first
+          let tickSizeStr = exchangeInfoService.getTickSize(position.symbol);
+          if (!tickSizeStr) {
+            // Fallback to REST API if cache miss
+            tickSizeStr = await this.exchangeService.getTickSize(position.symbol);
+          }
           const tick = parseFloat(tickSizeStr || '0') || 0;
           const prevSL = Number(position.stop_loss_price || 0);
           const newSL = Number(updatedSL || 0);
@@ -105,8 +112,13 @@ export class PositionService {
             Number(position.take_profit || 0),
             position.side
           );
-          const thresholdTicksTP = Number(process.env.TP_UPDATE_THRESHOLD_TICKS || process.env.SL_UPDATE_THRESHOLD_TICKS || 2);
-          const tickSizeStrTP = await this.exchangeService.getTickSize(position.symbol);
+          const thresholdTicksTP = Number(configService.getNumber('TP_UPDATE_THRESHOLD_TICKS', configService.getNumber('SL_UPDATE_THRESHOLD_TICKS', 2)));
+          // Try to get tick size from cache first
+          let tickSizeStrTP = exchangeInfoService.getTickSize(position.symbol);
+          if (!tickSizeStrTP) {
+            // Fallback to REST API if cache miss
+            tickSizeStrTP = await this.exchangeService.getTickSize(position.symbol);
+          }
           const tickTP = parseFloat(tickSizeStrTP || '0') || 0;
           const prevTP = Number(position.take_profit_price || 0);
           const newTP = Number(desiredTP || 0);

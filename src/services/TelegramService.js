@@ -1,5 +1,6 @@
 import { Telegraf } from 'telegraf';
 import logger from '../utils/logger.js';
+import { configService } from './ConfigService.js';
 
 /**
  * Telegram Service - Send notifications via Telegram
@@ -8,7 +9,7 @@ export class TelegramService {
   constructor() {
     this.bot = null;
     this.initialized = false;
-    this.alertChannelId = process.env.TELEGRAM_ALERT_CHANNEL_ID || '-1003163801780';
+    this.alertChannelId = null;
   }
 
   /**
@@ -16,13 +17,14 @@ export class TelegramService {
    */
   async initialize() {
     try {
-      const token = process.env.TELEGRAM_BOT_TOKEN;
+      const token = configService.getString('TELEGRAM_BOT_TOKEN');
       if (!token) {
         logger.warn('Telegram bot token not configured');
         return false;
       }
 
       this.bot = new Telegraf(token);
+      this.alertChannelId = configService.getString('TELEGRAM_ALERT_CHANNEL_ID', this.alertChannelId || '-1003163801780');
       this.initialized = true;
       logger.info('Telegram bot initialized');
       return true;
@@ -125,7 +127,7 @@ Strategy: ${strategy.interval} | OC: ${strategy.oc}%
         return;
       }
 
-      const channelId = this.alertChannelId;
+      const channelId = (strategy?.bot?.telegram_alert_channel_id) || this.alertChannelId;
       if (!channelId) {
         logger.warn(`[Entry Alert] Alert channel ID not configured, skipping alert for position ${position?.id}`);
         return;
@@ -160,7 +162,7 @@ Amount: ${amountStr} (100%)`.trim();
 
   async sendCloseSummaryAlert(position, stats) {
     try {
-      const channelId = this.alertChannelId;
+      const channelId = position?.telegram_alert_channel_id || this.alertChannelId;
       const symbol = this.formatSymbolUnderscore(position.symbol);
       const isWin = (position.close_reason === 'tp_hit');
       const sideTitle = position.side === 'long' ? 'Long' : 'Short';
@@ -444,6 +446,72 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
       '1h': '1️⃣h'
     };
     return map[interval] || interval;
+  }
+
+  /**
+   * Send concurrency limit alert (trade rejected due to max concurrent trades limit)
+   * @param {Object} strategy - Strategy object
+   * @param {Object} status - Concurrency status from ConcurrencyManager
+   */
+  async sendConcurrencyLimitAlert(strategy, status) {
+    try {
+      if (!this.initialized || !this.bot) {
+        logger.warn(`[ConcurrencyAlert] Telegram bot not initialized`);
+        return;
+      }
+
+      let bot = strategy.bot || {};
+      let chatId = bot.telegram_alert_channel_id || bot.telegram_chat_id || this.alertChannelId;
+
+      if (!chatId) {
+        // Attempt to fetch bot info if missing
+        try {
+          const { Bot } = await import('../models/Bot.js');
+          const full = await Bot.findById(strategy.bot_id);
+          bot = full || bot;
+          chatId = bot?.telegram_alert_channel_id || bot?.telegram_chat_id || this.alertChannelId;
+        } catch (_) {}
+      }
+
+      if (!chatId) {
+        logger.debug(`[ConcurrencyAlert] No alert/chat ID for bot ${bot?.id || strategy.bot_id}, skipping alert`);
+        return;
+      }
+
+      const utilizationPercent = status.utilizationPercent || 0;
+      const utilizationBar = this.createProgressBar(utilizationPercent);
+
+      const message = `
+⚠️ <b>TRADE REJECTED - MAX CONCURRENT LIMIT</b>
+
+Symbol: <b>${strategy.symbol}</b>
+Strategy: <b>${strategy.interval}</b> (OC: ${strategy.oc}%)
+Bot: <b>${bot.bot_name || 'N/A'}</b>
+
+Current Positions: <b>${status.currentCount}/${status.maxConcurrent}</b>
+Utilization: ${utilizationBar} <b>${utilizationPercent}%</b>
+
+<i>Signal detected but trade rejected to maintain concurrency limit.</i>
+      `.trim();
+
+      logger.info(`[ConcurrencyAlert] Sending concurrency limit alert for strategy ${strategy.id} (${strategy.symbol})`);
+      await this.sendMessage(chatId, message);
+      logger.info(`[ConcurrencyAlert] ✅ Successfully sent concurrency limit alert`);
+    } catch (e) {
+      logger.error(`[ConcurrencyAlert] Failed to send concurrency limit alert:`, e);
+    }
+  }
+
+  /**
+   * Create a simple progress bar for visualization
+   * @param {number} percent - Percentage (0-100)
+   * @returns {string} Progress bar string
+   */
+  createProgressBar(percent) {
+    const filled = Math.round(percent / 10);
+    const empty = 10 - filled;
+    const bar = '█'.repeat(filled) + '░'.repeat(empty);
+    return bar;
   }
 }
 
