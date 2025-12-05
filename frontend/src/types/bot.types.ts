@@ -12,6 +12,8 @@ export interface Bot {
   withdrawAddress?: string;
   spotBalanceThreshold: number;
   isActive: boolean;
+  // Optional credentials for display-only purposes from API
+  accessKey?: string;
   stats?: BotStats;
 }
 
@@ -37,5 +39,6 @@ export interface BotFormData {
   withdrawAddress?: string;
   spotBalanceThreshold: number;
   telegramChatId?: string;
+  isActive?: boolean; // allow update API to toggle status
 }
 

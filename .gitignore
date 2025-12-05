@@ -7,3 +7,12 @@ node_modules/
 dist/
 build/
 
+# Database exports and backups
+*.sql
+*.sql.gz
+data.sql
+data_*.sql
+backup*.sql
+backup*.sql.gz
+database_backup/
+

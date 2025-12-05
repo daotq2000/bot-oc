@@ -235,20 +235,35 @@ export class PositionService {
   async closePosition(position, currentPrice, pnl, reason) {
     try {
       // Close on exchange
-      await this.exchangeService.closePosition(
+      // ExchangeService handles exchange-specific logic (Binance, MEXC, Gate.io)
+      // MEXC: Uses CCXT to close position via market order
+      // Binance: Uses direct API with reduce-only flag
+      const closeRes = await this.exchangeService.closePosition(
         position.symbol,
         position.side,
         position.amount
       );
 
+      // Prefer actual fill price if available and recompute PnL
+      const fillPrice = Number(closeRes?.avgFillPrice || closeRes?.average || closeRes?.price || currentPrice);
+      const safeClosePrice = Number.isFinite(fillPrice) && fillPrice > 0 ? fillPrice : Number(currentPrice);
+
+      const recomputedPnL = calculatePnL(
+        position.entry_price,
+        safeClosePrice,
+        position.amount,
+        position.side
+      );
+
       // Update in database
-      const closed = await Position.close(position.id, currentPrice, pnl, reason);
+      const closed = await Position.close(position.id, safeClosePrice, recomputedPnL, reason);
 
       logger.info(`Position closed:`, {
         positionId: position.id,
         symbol: position.symbol,
         reason,
-        pnl
+        pnl: recomputedPnL,
+        closePrice: safeClosePrice
       });
 
       // Send Telegram close summary to central channel with stats

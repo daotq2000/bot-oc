@@ -112,6 +112,7 @@ export class ExchangeService {
         // Add UID for MEXC if provided
         if (this.bot.exchange === 'mexc' && this.bot.uid) {
           this.exchange.uid = this.bot.uid;
+          logger.debug(`MEXC UID configured for bot ${this.bot.id}`);
         }
 
         // Setup proxy if provided
@@ -129,6 +130,13 @@ export class ExchangeService {
           logger.info(
             `Sandbox mode enabled for bot ${this.bot.id} on ${this.bot.exchange}`
           );
+        }
+
+        // MEXC-specific configuration
+        if (this.bot.exchange === 'mexc') {
+          // MEXC uses defaultType: 'swap' for futures trading
+          this.exchange.options.defaultType = 'swap';
+          logger.debug(`MEXC configured for swap trading (futures) for bot ${this.bot.id}`);
         }
 
         // Test connection for non-Binance
@@ -182,18 +190,32 @@ export class ExchangeService {
       if (type === 'future') {
         // For futures, use swap balance
         const balance = await this.exchange.fetchBalance({ type: 'swap' });
+        
+        // MEXC returns balance in different structure, normalize it
+        let usdtBalance = balance.USDT;
+        if (!usdtBalance && balance.USDT_SWAP) {
+          usdtBalance = balance.USDT_SWAP;
+        }
+        
         return {
-          free: balance.USDT?.free || 0,
-          used: balance.USDT?.used || 0,
-          total: balance.USDT?.total || 0
+          free: usdtBalance?.free || 0,
+          used: usdtBalance?.used || 0,
+          total: usdtBalance?.total || 0
         };
       } else {
         // For spot
         const balance = await this.exchange.fetchBalance();
+        
+        // MEXC returns balance in different structure, normalize it
+        let usdtBalance = balance.USDT;
+        if (!usdtBalance && balance.USDT_SPOT) {
+          usdtBalance = balance.USDT_SPOT;
+        }
+        
         return {
-          free: balance.USDT?.free || 0,
-          used: balance.USDT?.used || 0,
-          total: balance.USDT?.total || 0
+          free: usdtBalance?.free || 0,
+          used: usdtBalance?.used || 0,
+          total: usdtBalance?.total || 0
         };
       }
     } catch (error) {
@@ -282,6 +304,7 @@ export class ExchangeService {
         logger.debug(`Calculated quantity: ${quantity} for ${symbol} (amount: ${amount} USDT, price: ${currentPrice})`);
 
         let order;
+        let avgFillPrice = null;
         if (type === 'market') {
           order = await this.binanceDirectClient.placeMarketOrder(
             normalizedSymbol,
@@ -289,6 +312,9 @@ export class ExchangeService {
             quantity,
             positionSide
           );
+          try {
+            avgFillPrice = await this.binanceDirectClient.getOrderAverageFillPrice(normalizedSymbol, order.orderId);
+          } catch (_) {}
         } else {
           order = await this.binanceDirectClient.placeLimitOrder(
             normalizedSymbol,
@@ -307,7 +333,8 @@ export class ExchangeService {
           type: type,
           side: side,
           amount: quantity,
-          price: price || currentPrice,
+          price: avgFillPrice || price || currentPrice,
+          avgFillPrice: avgFillPrice || undefined,
           status: isLimit ? 'open' : 'closed',
           filled: isLimit ? 0 : quantity,
           remaining: isLimit ? quantity : 0,
@@ -316,14 +343,57 @@ export class ExchangeService {
         };
       }
 
-      // For other exchanges: use CCXT
+      // For other exchanges: use CCXT (MEXC/Gate)
       const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
+
+      // For MEXC and other swaps, convert USDT amount -> contracts quantity
+      let usePrice = price || await this.getTickerPrice(symbol);
+      if (!Number.isFinite(Number(usePrice)) || Number(usePrice) <= 0) {
+        throw new Error(`Invalid current/entry price for ${marketSymbol}: ${usePrice}`);
+      }
+
+      // Load market metadata for precision and limits
+      const market = this.exchange.market(marketSymbol);
+
+      // Calculate raw quantity in contracts from USDT notional
+      let rawQty = Number(amount) / Number(usePrice);
+      if (!Number.isFinite(rawQty) || rawQty <= 0) {
+        throw new Error(`Computed quantity invalid for ${marketSymbol}: amount=${amount}, price=${usePrice}`);
+      }
+
+      // Apply amount precision (contracts) and price precision (for limit)
+      const qtyStr = this.exchange.amountToPrecision(marketSymbol, rawQty);
+      const qty = parseFloat(qtyStr);
+      let priceOut = undefined;
+      if (type === 'limit') {
+        const priceStr = this.exchange.priceToPrecision(marketSymbol, usePrice);
+        priceOut = parseFloat(priceStr);
+      }
+
+      // Validate against exchange limits
+      const minQty = market?.limits?.amount?.min;
+      const maxQty = market?.limits?.amount?.max;
+      const minCost = market?.limits?.cost?.min;
+      const notional = qty * Number(usePrice);
+
+      if (Number.isFinite(minQty) && qty + 1e-12 < Number(minQty)) {
+        throw new Error(`Order quantity ${qty} < minQty ${minQty} for ${marketSymbol}`);
+      }
+      if (Number.isFinite(maxQty) && qty - 1e-12 > Number(maxQty)) {
+        throw new Error(`Order quantity ${qty} > maxQty ${maxQty} for ${marketSymbol}`);
+      }
+      if (Number.isFinite(minCost) && notional + 1e-12 < Number(minCost)) {
+        throw new Error(`Order notional ${notional.toFixed(8)} < minCost ${minCost} for ${marketSymbol}`);
+      }
+
+      const extraParams = {};
       const order = await this.exchange.createOrder(
         marketSymbol,
         type,
         side,
-        amount,
-        price
+        qty,
+        priceOut,
+        extraParams
       );
 
       logger.info(`Order created for bot ${this.bot.id}:`, {
@@ -331,18 +401,32 @@ export class ExchangeService {
         symbol,
         side,
         amount,
-        price
+        qty,
+        price: priceOut || usePrice
       });
 
       return order;
     } catch (error) {
       const msg = error?.message || '';
+      
+      // MEXC-specific error codes and messages
+      const mexcErrors = [
+        'Invalid symbol', // MEXC: Invalid trading pair
+        'Insufficient balance', // MEXC: Not enough balance
+        'Order quantity is too small', // MEXC: Below minimum notional
+        'Price precision error', // MEXC: Price precision issue
+        'Quantity precision error', // MEXC: Quantity precision issue
+        'Order price is too high', // MEXC: Price out of range
+        'Order price is too low', // MEXC: Price out of range
+      ];
+      
       const soft = (
         msg.includes('not available for trading on Binance Futures') ||
         msg.includes('below minimum notional') ||
         msg.includes('Invalid price after rounding') ||
         msg.includes('Precision is over the maximum') ||
-        msg.includes('-1121') || msg.includes('-1111') || msg.includes('-4061')
+        msg.includes('-1121') || msg.includes('-1111') || msg.includes('-4061') ||
+        mexcErrors.some(err => msg.includes(err))
       );
       if (soft) {
         logger.warn(`Create order validation for bot ${this.bot.id}: ${msg}`);
@@ -402,35 +486,64 @@ export class ExchangeService {
           positionSide,
           true // reduceOnly
         );
+        // Try to compute average fill price for the close
+        let avgFillPrice = null;
+        try {
+          avgFillPrice = await this.binanceDirectClient.getOrderAverageFillPrice(normalizedSymbol, order.orderId);
+        } catch (_) {}
         logger.info(`Position closed for bot ${this.bot.id}:`, {
           orderId: order.orderId,
           symbol,
           side,
-          amount
+          amount: qty,
+          avgFillPrice
         });
-        return order;
+        return { ...order, avgFillPrice };
       }
 
-      // For closing on other exchanges, reverse the side and use CCXT
-      const orderSide = side === 'long' ? 'sell' : 'buy';
+      // For closing on other exchanges, compute actual position size and use reduceOnly
       const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
-      const order = await this.exchange.createMarketOrder(
-        marketSymbol,
-        orderSide,
-        amount
-      );
+      const positions = await this.exchange.fetchPositions();
+      const pos = Array.isArray(positions)
+        ? positions.find(p => (p.symbol === marketSymbol || p.symbol === symbol || p.info?.symbol === marketSymbol || p.info?.symbol === symbol) && ((p.contracts ?? Math.abs(parseFloat(p.positionAmt || 0))) > 0))
+        : null;
+
+      const contracts = pos ? (pos.contracts ?? Math.abs(parseFloat(pos.positionAmt || 0))) : 0;
+      if (!contracts || contracts <= 0) {
+        logger.warn(`No open position to close for ${marketSymbol}, skip close.`);
+        return { skipped: true };
+      }
+
+      // Respect precision
+      const qtyStr = this.exchange.amountToPrecision(marketSymbol, contracts);
+      const qty = parseFloat(qtyStr);
+      if (!qty || qty <= 0) {
+        logger.warn(`Computed close quantity <= 0 for ${marketSymbol}, skip.`);
+        return { skipped: true };
+      }
+
+      const orderSide = side === 'long' ? 'sell' : 'buy';
+      const params = { reduceOnly: true };
+      const order = await this.exchange.createOrder(marketSymbol, 'market', orderSide, qty, undefined, params);
 
       logger.info(`Position closed for bot ${this.bot.id}:`, {
         orderId: order.id,
         symbol,
         side,
-        amount
+        qty
       });
 
       return order;
     } catch (error) {
       const msg = error?.message || '';
-      if (msg.includes('-2022') || msg.toLowerCase().includes('reduceonly')) {
+      
+      // Handle MEXC and other exchange errors
+      const isReduceOnlyError = msg.includes('-2022') || 
+                                msg.toLowerCase().includes('reduceonly') ||
+                                msg.includes('Position does not exist') ||
+                                msg.includes('Insufficient position');
+      
+      if (isReduceOnlyError) {
         // Race condition: position already reduced/closed by TP/SL or other order
         logger.warn(`ReduceOnly close skipped for bot ${this.bot.id} (${symbol}): ${msg}`);
         return { skipped: true };
@@ -448,19 +561,19 @@ export class ExchangeService {
   async transferSpotToFuture(amount) {
     try {
       if (this.bot.exchange === 'mexc') {
-        // MEXC transfer
+        // MEXC transfer: spot -> swap (futures)
         const result = await this.exchange.transfer('USDT', amount, 'spot', 'swap');
-        logger.info(`Spot to future transfer for bot ${this.bot.id}: ${amount} USDT`);
+        logger.info(`Spot to future transfer for bot ${this.bot.id}: ${amount} USDT (MEXC)`);
         return result;
       } else if (this.bot.exchange === 'binance') {
-        // Binance transfer
+        // Binance transfer: spot -> future
         const result = await this.exchange.transfer('USDT', amount, 'spot', 'future');
-        logger.info(`Spot to future transfer for bot ${this.bot.id}: ${amount} USDT`);
+        logger.info(`Spot to future transfer for bot ${this.bot.id}: ${amount} USDT (Binance)`);
         return result;
       } else {
-        // Gate.io transfer
+        // Gate.io transfer: spot -> future
         const result = await this.exchange.transfer('USDT', amount, 'spot', 'future');
-        logger.info(`Spot to future transfer for bot ${this.bot.id}: ${amount} USDT`);
+        logger.info(`Spot to future transfer for bot ${this.bot.id}: ${amount} USDT (Gate.io)`);
         return result;
       }
     } catch (error) {
@@ -477,19 +590,19 @@ export class ExchangeService {
   async transferFutureToSpot(amount) {
     try {
       if (this.bot.exchange === 'mexc') {
-        // MEXC transfer
+        // MEXC transfer: swap (futures) -> spot
         const result = await this.exchange.transfer('USDT', amount, 'swap', 'spot');
-        logger.info(`Future to spot transfer for bot ${this.bot.id}: ${amount} USDT`);
+        logger.info(`Future to spot transfer for bot ${this.bot.id}: ${amount} USDT (MEXC)`);
         return result;
       } else if (this.bot.exchange === 'binance') {
-        // Binance transfer
+        // Binance transfer: future -> spot
         const result = await this.exchange.transfer('USDT', amount, 'future', 'spot');
-        logger.info(`Future to spot transfer for bot ${this.bot.id}: ${amount} USDT`);
+        logger.info(`Future to spot transfer for bot ${this.bot.id}: ${amount} USDT (Binance)`);
         return result;
       } else {
-        // Gate.io transfer
+        // Gate.io transfer: future -> spot
         const result = await this.exchange.transfer('USDT', amount, 'future', 'spot');
-        logger.info(`Future to spot transfer for bot ${this.bot.id}: ${amount} USDT`);
+        logger.info(`Future to spot transfer for bot ${this.bot.id}: ${amount} USDT (Gate.io)`);
         return result;
       }
     } catch (error) {
@@ -609,6 +722,23 @@ export class ExchangeService {
 
       // For other exchanges: use CCXT
       const positions = await this.exchange.fetchPositions(symbol);
+      
+      // MEXC returns positions with different field names, normalize them
+      if (this.bot.exchange === 'mexc') {
+        return positions.filter(p => {
+          // MEXC: contracts or positionAmt field
+          const contracts = p.contracts || Math.abs(parseFloat(p.positionAmt || 0));
+          return contracts > 0;
+        }).map(p => {
+          // Normalize MEXC position format to match Binance format
+          return {
+            ...p,
+            contracts: p.contracts || Math.abs(parseFloat(p.positionAmt || 0)),
+            positionAmt: p.positionAmt || p.contracts
+          };
+        });
+      }
+      
       return positions.filter(p => p.contracts > 0);
     } catch (error) {
       logger.error(`Failed to get open positions for bot ${this.bot.id}:`, error);

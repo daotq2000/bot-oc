@@ -3,6 +3,7 @@
  */
 
 export const EXCHANGES = {
+  BINANCE: 'binance',
   MEXC: 'mexc',
   GATE: 'gate'
 };

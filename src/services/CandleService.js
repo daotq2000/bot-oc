@@ -46,6 +46,7 @@ export class CandleService {
       }
 
       // Convert CCXT format [timestamp, open, high, low, close, volume] to our format
+      // MEXC may return candles in different format, normalize them
       const candlesForDB = candles.map(candle => {
         if (Array.isArray(candle)) {
           // CCXT format: [timestamp, open, high, low, close, volume]
@@ -64,18 +65,22 @@ export class CandleService {
             close_time: openTime + timeframeMs - 1
           };
         } else {
-          // Already object format
+          // Already object format (MEXC may return this way)
+          // MEXC fields: openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, numberOfTrades, takerBuyBaseAssetVolume, takerBuyQuoteAssetVolume
+          const openTime = candle.open_time || candle.openTime || candle.t;
+          const closeTime = candle.close_time || candle.closeTime || (openTime + this.getTimeframeMs(interval) - 1);
+          
           return {
             exchange: this.exchange,
             symbol: symbol,
             interval: interval,
-            open_time: candle.open_time || candle.openTime,
-            open: parseFloat(candle.open),
-            high: parseFloat(candle.high),
-            low: parseFloat(candle.low),
-            close: parseFloat(candle.close),
-            volume: parseFloat(candle.volume || 0),
-            close_time: candle.close_time || candle.closeTime || ((candle.open_time || candle.openTime) + this.getTimeframeMs(interval) - 1)
+            open_time: openTime,
+            open: parseFloat(candle.open || candle.o),
+            high: parseFloat(candle.high || candle.h),
+            low: parseFloat(candle.low || candle.l),
+            close: parseFloat(candle.close || candle.c),
+            volume: parseFloat(candle.volume || candle.v || 0),
+            close_time: closeTime
           };
         }
       });

@@ -35,6 +35,21 @@ export class TelegramService {
   }
 
   /**
+   * Adaptive price formatting for small-priced assets
+   */
+  formatPriceAdaptive(value) {
+    const v = Number(value);
+    if (!Number.isFinite(v)) return String(value);
+    const abs = Math.abs(v);
+    if (abs >= 100) return v.toFixed(2);
+    if (abs >= 1) return v.toFixed(4);
+    if (abs >= 0.1) return v.toFixed(5);
+    if (abs >= 0.01) return v.toFixed(6);
+    if (abs >= 0.001) return v.toFixed(7);
+    return v.toFixed(8);
+  }
+
+  /**
    * Send message to chat
    * @param {string} chatId - Chat ID
    * @param {string} message - Message text
@@ -88,9 +103,9 @@ export class TelegramService {
 ${sideEmoji} <b>NEW ${sideText} POSITION</b>
 
 Symbol: <b>${position.symbol}</b>
-Entry: <b>${parseFloat(position.entry_price).toFixed(2)}</b>
-TP: <b>${parseFloat(position.take_profit_price).toFixed(2)}</b> (+${this.calculatePercent(position.entry_price, position.take_profit_price, position.side).toFixed(2)}%)
-SL: <b>${parseFloat(position.stop_loss_price).toFixed(2)}</b> (-${this.calculatePercent(position.entry_price, position.stop_loss_price, position.side).toFixed(2)}%)
+Entry: <b>${this.formatPriceAdaptive(position.entry_price)}</b>
+TP: <b>${this.formatPriceAdaptive(position.take_profit_price)}</b> (+${this.calculatePercent(position.entry_price, position.take_profit_price, position.side).toFixed(2)}%)
+SL: <b>${this.formatPriceAdaptive(position.stop_loss_price)}</b> (-${this.calculatePercent(position.entry_price, position.stop_loss_price, position.side).toFixed(2)}%)
 Amount: <b>${parseFloat(position.amount).toFixed(2)}</b>
 
 Bot: ${bot.bot_name || 'N/A'}
@@ -140,7 +155,7 @@ Strategy: ${strategy.interval} | OC: ${strategy.oc}%
       const ocStr = (Number(oc || strategy.oc || 0)).toFixed(1);
       const extendStr = (Number(strategy.extend || 0)).toFixed(0);
       const tpStr = (Number(strategy.take_profit || 0)).toFixed(0);
-      const openPrice = Number(position.entry_price).toFixed(4);
+      const openPrice = this.formatPriceAdaptive(position.entry_price);
       const amountStr = Number(position.amount).toFixed(2);
 
       const msg = `
@@ -178,7 +193,7 @@ Amount: ${amountStr} (100%)`.trim();
       const extendStr = Number(position.extend || 0).toFixed(0);
       const tpStr = Number(position.take_profit || 0).toFixed(0);
 
-      const closePrice = Number(position.close_price).toFixed(4);
+      const closePrice = this.formatPriceAdaptive(position.close_price);
       const amountStr = Number(position.amount).toFixed(2);
 
       const pnlVal = Number(position.pnl || 0);
@@ -226,8 +241,8 @@ ${pnlEmoji} <b>POSITION CLOSED</b>
 
 Symbol: <b>${position.symbol}</b>
 Side: <b>${position.side.toUpperCase()}</b>
-Entry: <b>$${parseFloat(position.entry_price).toFixed(2)}</b>
-Close: <b>$${parseFloat(position.close_price).toFixed(2)}</b>
+Entry: <b>${this.formatPriceAdaptive(position.entry_price)}</b>
+Close: <b>${this.formatPriceAdaptive(position.close_price)}</b>
 PnL: <b>${pnlSign}$${pnl.toFixed(2)}</b> (${pnlSign}${pnlPercent.toFixed(2)}%)
 Reason: <b>${this.formatCloseReason(position.close_reason)}</b>
     `.trim();

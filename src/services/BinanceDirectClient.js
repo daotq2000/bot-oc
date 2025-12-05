@@ -732,6 +732,31 @@ export class BinanceDirectClient {
   }
 
   /**
+   * Fetch user trades for an order and compute average fill price
+   */
+  async getOrderAverageFillPrice(symbol, orderId) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    try {
+      const trades = await this.makeRequest('/fapi/v1/userTrades', 'GET', { symbol: normalizedSymbol, orderId }, true);
+      if (!Array.isArray(trades) || trades.length === 0) return null;
+      let sum = 0, qty = 0;
+      for (const t of trades) {
+        const p = parseFloat(t.price || 0);
+        const q = parseFloat(t.qty || 0);
+        if (p > 0 && q > 0) {
+          sum += p * q;
+          qty += q;
+        }
+      }
+      if (qty <= 0) return null;
+      return sum / qty;
+    } catch (e) {
+      logger.warn(`getOrderAverageFillPrice failed for ${normalizedSymbol}/${orderId}: ${e?.message || e}`);
+      return null;
+    }
+  }
+
+  /**
    * Place market order
    */
   async placeMarketOrder(symbol, side, quantity, positionSide = 'BOTH', reduceOnly = false) {

@@ -73,7 +73,7 @@ export class OrderService {
       let order;
       let attemptedMarketFallback = false;
       try {
-        if (side === 'short' && orderType === 'limit' && !signal.forcePassiveLimit) {
+        if (side === 'short' && orderType === 'limit' && !signal.forcePassiveLimit && this.exchangeService?.bot?.exchange === 'binance') {
           const mktPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
           if (!mktPrice || mktPrice <= 0) throw new Error('Cannot fetch current price for short trigger');
           const qty = amount / mktPrice;
@@ -96,9 +96,17 @@ export class OrderService {
         }
       } catch (e) {
         const em = e?.message || '';
-        // Binance -2021: Order would immediately trigger -> fallback to market
-        if (em.includes('-2021') || em.toLowerCase().includes('would immediately trigger')) {
-          logger.warn(`[OrderService] Fallback to MARKET due to -2021 for ${strategy.symbol} (side=${side}).`);
+        
+        // MEXC and Binance error handling for immediate trigger
+        const shouldFallbackToMarket = 
+          em.includes('-2021') || 
+          em.toLowerCase().includes('would immediately trigger') ||
+          em.includes('Order price is too high') ||
+          em.includes('Order price is too low') ||
+          em.includes('Invalid order price');
+        
+        if (shouldFallbackToMarket) {
+          logger.warn(`[OrderService] Fallback to MARKET due to price trigger for ${strategy.symbol} (side=${side}). Error: ${em}`);
           attemptedMarketFallback = true;
           order = await this.exchangeService.createOrder({
             symbol: strategy.symbol,
@@ -162,7 +170,7 @@ export class OrderService {
         order_id: order.id,
         symbol: strategy.symbol,
         side: side,
-        entry_price: orderType === 'market' ? currentPrice : entryPrice,
+        entry_price: orderType === 'market' ? (Number(order?.avgFillPrice || order?.price || currentPrice)) : entryPrice,
         amount: amount,
         take_profit_price: tpPrice,
         stop_loss_price: slPrice,
