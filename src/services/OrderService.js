@@ -71,26 +71,88 @@ export class OrderService {
       // Create order
       // For SHORT with limit and NOT forced passive limit, use entry trigger STOP_MARKET instead of passive limit
       let order;
-      if (side === 'short' && orderType === 'limit' && !signal.forcePassiveLimit) {
-        const mktPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
-        if (!mktPrice || mktPrice <= 0) throw new Error('Cannot fetch current price for short trigger');
-        const qty = amount / mktPrice;
-        order = await this.exchangeService.createEntryTriggerOrder(
-          strategy.symbol,
-          side,
-          entryPrice,
-          qty
-        );
-      } else {
-        // Note: amount here is in USDT, ExchangeService will calculate quantity
-        order = await this.exchangeService.createOrder({
-          symbol: strategy.symbol,
-          side: side === 'long' ? 'buy' : 'sell',
-          positionSide: side === 'long' ? 'LONG' : 'SHORT',
-          amount: amount, // USDT amount from strategy config
-          type: orderType,
-          price: orderType === 'limit' ? entryPrice : undefined
-        });
+      let attemptedMarketFallback = false;
+      try {
+        if (side === 'short' && orderType === 'limit' && !signal.forcePassiveLimit) {
+          const mktPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
+          if (!mktPrice || mktPrice <= 0) throw new Error('Cannot fetch current price for short trigger');
+          const qty = amount / mktPrice;
+          order = await this.exchangeService.createEntryTriggerOrder(
+            strategy.symbol,
+            side,
+            entryPrice,
+            qty
+          );
+        } else {
+          // Note: amount here is in USDT, ExchangeService will calculate quantity
+          order = await this.exchangeService.createOrder({
+            symbol: strategy.symbol,
+            side: side === 'long' ? 'buy' : 'sell',
+            positionSide: side === 'long' ? 'LONG' : 'SHORT',
+            amount: amount, // USDT amount from strategy config
+            type: orderType,
+            price: orderType === 'limit' ? entryPrice : undefined
+          });
+        }
+      } catch (e) {
+        const em = e?.message || '';
+        // Binance -2021: Order would immediately trigger -> fallback to market
+        if (em.includes('-2021') || em.toLowerCase().includes('would immediately trigger')) {
+          logger.warn(`[OrderService] Fallback to MARKET due to -2021 for ${strategy.symbol} (side=${side}).`);
+          attemptedMarketFallback = true;
+          order = await this.exchangeService.createOrder({
+            symbol: strategy.symbol,
+            side: side === 'long' ? 'buy' : 'sell',
+            positionSide: side === 'long' ? 'LONG' : 'SHORT',
+            amount: amount,
+            type: 'market'
+          });
+          orderType = 'market';
+        } else {
+          throw e;
+        }
+      }
+
+      // Ensure we have a valid order object before proceeding
+      if (!order || !order.id) {
+        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
+        // Do not throw here, just return null to prevent crashing the scanner
+        return null;
+      }
+
+      // Ensure we have a valid order object before proceeding
+      if (!order || !order.id) {
+        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
+        // Do not throw here, just return null to prevent crashing the scanner
+        return null;
+      }
+
+      // Ensure we have a valid order object before proceeding
+      if (!order || !order.id) {
+        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
+        // Do not throw here, just return null to prevent crashing the scanner
+        return null;
+      }
+
+      // Ensure we have a valid order object before proceeding
+      if (!order || !order.id) {
+        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
+        // Do not throw here, just return null to prevent crashing the scanner
+        return null;
+      }
+
+      // Ensure we have a valid order object before proceeding
+      if (!order || !order.id) {
+        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
+        // Do not throw here, just return null to prevent crashing the scanner
+        return null;
+      }
+
+      // Ensure we have a valid order object before proceeding
+      if (!order || !order.id) {
+        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
+        // Do not throw here, just return null to prevent crashing the scanner
+        return null;
       }
 
       // Store position in database
@@ -182,6 +244,7 @@ export class OrderService {
 
       // Mark reservation as 'released' (position opened)
       try {
+        orderCreated = true;
         await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
       } catch (_) {}
 

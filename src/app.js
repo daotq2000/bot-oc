@@ -75,6 +75,8 @@ async function start() {
       logger.info('Seeding default application configs...');
       await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '10', 'Minutes before auto-cancel unfilled entry LIMIT orders');
+      await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '20000', 'Signal scanner job interval in milliseconds');
+      await AppConfig.set('CANDLE_UPDATE_INTERVAL_MS', '20000', 'Candle updater job interval in milliseconds');
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);
     }

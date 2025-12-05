@@ -81,13 +81,19 @@ export class BinanceDirectClient {
       });
     }
     
+    const timeout = configService.getNumber('BINANCE_REQUEST_TIMEOUT_MS', 10000);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
     try {
       const response = await fetch(url.toString(), {
         method,
         headers: {
           'Content-Type': 'application/json'
-        }
+        },
+        signal: controller.signal
       });
+      clearTimeout(timeoutId);
       
       if (!response.ok) {
         const errorText = await response.text();
@@ -105,9 +111,10 @@ export class BinanceDirectClient {
       
       return await response.json();
     } catch (error) {
+      clearTimeout(timeoutId);
       // Don't log again if already logged above
       if (!error.message?.includes('HTTP')) {
-      logger.error(`❌ Market data request failed: ${endpoint}`, error.message);
+        logger.error(`❌ Market data request failed: ${endpoint}`, error.message);
       }
       throw error;
     }
@@ -190,6 +197,10 @@ export class BinanceDirectClient {
       }
     }
     
+    const timeout = configService.getNumber('BINANCE_REQUEST_TIMEOUT_MS', 10000);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
     const headers = {
       'Content-Type': 'application/x-www-form-urlencoded'
     };
@@ -204,8 +215,11 @@ export class BinanceDirectClient {
         const response = await fetch(url + queryString, {
           method,
           headers,
-          body: requestBody
+          body: requestBody,
+          signal: controller.signal
         });
+
+        clearTimeout(timeoutId);
         
         const data = await response.json();
         
@@ -225,6 +239,7 @@ export class BinanceDirectClient {
         
         return data;
       } catch (error) {
+        clearTimeout(timeoutId);
         if (i === retries - 1) throw error;
         await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
       }
@@ -931,6 +946,19 @@ export class BinanceDirectClient {
 
     // Format price
     const formattedPrice = this.formatPrice(tpPrice, tickSize);
+
+    // Safety check to prevent -2021 "Order would immediately trigger"
+    const currentPrice = await this.getPrice(normalizedSymbol);
+    if (currentPrice) {
+      if (side === 'long' && formattedPrice <= currentPrice) {
+        logger.warn(`[TP-SKIP] TP price ${formattedPrice} for LONG is at or below current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
+        return null;
+      }
+      if (side === 'short' && formattedPrice >= currentPrice) {
+        logger.warn(`[TP-SKIP] TP price ${formattedPrice} for SHORT is at or above current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
+        return null;
+      }
+    }
 
     // Determine position side
     const positionSide = side === 'long' ? 'LONG' : 'SHORT';

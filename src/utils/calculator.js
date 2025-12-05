@@ -32,8 +32,12 @@ export function getCandleDirection(open, close) {
  * @returns {number} Entry price
  */
 export function calculateLongEntryPrice(open, oc, extend) {
-  const entryOffset = (open * oc * extend) / 10000;
-  return open - entryOffset;
+  const o = Number(open);
+  const ocN = Number(oc);
+  const ext = Number(extend);
+  if (!Number.isFinite(o) || !Number.isFinite(ocN) || !Number.isFinite(ext)) return NaN;
+  const entryOffset = (o * ocN * ext) / 10000;
+  return o - entryOffset;
 }
 
 /**
@@ -45,8 +49,12 @@ export function calculateLongEntryPrice(open, oc, extend) {
  * @returns {number} Entry price
  */
 export function calculateShortEntryPrice(open, oc, extend) {
-  const entryOffset = (open * oc * extend) / 10000;
-  return open + entryOffset;
+  const o = Number(open);
+  const ocN = Number(oc);
+  const ext = Number(extend);
+  if (!Number.isFinite(o) || !Number.isFinite(ocN) || !Number.isFinite(ext)) return NaN;
+  const entryOffset = (o * ocN * ext) / 10000;
+  return o + entryOffset;
 }
 
 /**
@@ -58,13 +66,14 @@ export function calculateShortEntryPrice(open, oc, extend) {
  * @returns {number} Take profit price
  */
 export function calculateTakeProfit(entryPrice, oc, takeProfit, side) {
-  // New rule: TP% = take_profit / 10  (e.g., 35.5 -> 3.55%)
-  const actualTPPercent = (takeProfit) / 10;
-  
+  const e = Number(entryPrice);
+  const tp = Number(takeProfit);
+  if (!Number.isFinite(e) || !Number.isFinite(tp)) return NaN;
+  const actualTPPercent = tp / 10; // e.g., 35.5 -> 3.55%
   if (side === 'long') {
-    return entryPrice * (1 + actualTPPercent / 100);
+    return e * (1 + actualTPPercent / 100);
   } else {
-    return entryPrice * (1 - actualTPPercent / 100);
+    return e * (1 - actualTPPercent / 100);
   }
 }
 
@@ -77,13 +86,15 @@ export function calculateTakeProfit(entryPrice, oc, takeProfit, side) {
  * @returns {number} Stop loss price
  */
 export function calculateInitialStopLoss(tpPrice, oc, reduce, side) {
-  // initial_sl = tp_price + (reduce * oc / 100)
-  const slOffset = (reduce * oc) / 100;
-  
+  const tp = Number(tpPrice);
+  const r = Number(reduce);
+  const ocn = Number(oc);
+  if (!Number.isFinite(tp) || !Number.isFinite(r) || !Number.isFinite(ocn)) return NaN;
+  const slOffset = (r * ocn) / 100;
   if (side === 'long') {
-    return tpPrice - slOffset;
+    return tp - slOffset;
   } else {
-    return tpPrice + slOffset;
+    return tp + slOffset;
   }
 }
 
@@ -98,15 +109,13 @@ export function calculateInitialStopLoss(tpPrice, oc, reduce, side) {
  * @returns {number} Updated stop loss price
  */
 export function calculateDynamicStopLoss(tpPrice, oc, reduce, upReduce, minutesElapsed, side) {
-  // Reverted to original logic: SL converges from TP towards entry/current price over time.
-  // current_sl = tp_price - ((reduce + minutes * up_reduce) * oc / 100) for long
-  const currentReduce = reduce + (minutesElapsed * upReduce);
-  const slOffset = (currentReduce * oc) / 100;
-  
+  const tp = Number(tpPrice);
+  const currentReduce = Number(reduce) + (Number(minutesElapsed) * Number(upReduce));
+  const slOffset = (currentReduce * Number(oc)) / 100;
   if (side === 'long') {
-    return tpPrice - slOffset;
+    return tp - slOffset;
   } else {
-    return tpPrice + slOffset;
+    return tp + slOffset;
   }
 }
 
@@ -118,10 +127,12 @@ export function calculateDynamicStopLoss(tpPrice, oc, reduce, upReduce, minutesE
  * @returns {number} PnL percentage
  */
 export function calculatePnLPercent(entryPrice, currentPrice, side) {
+  const e = Number(entryPrice);
+  const c = Number(currentPrice);
   if (side === 'long') {
-    return ((currentPrice - entryPrice) / entryPrice) * 100;
+    return ((c - e) / e) * 100;
   } else {
-    return ((entryPrice - currentPrice) / entryPrice) * 100;
+    return ((e - c) / e) * 100;
   }
 }
 
@@ -135,7 +146,7 @@ export function calculatePnLPercent(entryPrice, currentPrice, side) {
  */
 export function calculatePnL(entryPrice, currentPrice, amount, side) {
   const pnlPercent = calculatePnLPercent(entryPrice, currentPrice, side);
-  return (amount * pnlPercent) / 100;
+  return (Number(amount) * pnlPercent) / 100;
 }
 
 /**
@@ -146,7 +157,7 @@ export function calculatePnL(entryPrice, currentPrice, amount, side) {
  * @returns {number} Ignore threshold amount
  */
 export function calculateIgnoreThreshold(previousHigh, previousLow, ignore) {
-  const previousRange = Math.abs(previousHigh - previousLow);
-  return (previousRange * ignore) / 100;
+  const previousRange = Math.abs(Number(previousHigh) - Number(previousLow));
+  return (previousRange * Number(ignore)) / 100;
 }
 

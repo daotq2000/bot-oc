@@ -223,7 +223,6 @@ export class StrategyService {
     if (side === 'long') {
       return calculateLongEntryPrice(candle.open, oc, strategy.extend);
     } else {
-      const { configService } = await import('./ConfigService.js');
       const overrideExtend = Number(configService.getNumber('SHORT_EXTEND_OVERRIDE', strategy.extend));
       return calculateShortEntryPrice(candle.open, oc, overrideExtend);
     }

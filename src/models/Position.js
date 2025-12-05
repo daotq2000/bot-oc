@@ -110,7 +110,7 @@ export class Position {
    * @returns {Promise<Object>}
    */
   static async create(data) {
-    const {
+    let {
       strategy_id,
       bot_id,
       order_id,
@@ -125,14 +125,24 @@ export class Position {
       sl_order_id = null
     } = data;
 
+    const safe = (v) => (v === undefined ? null : v);
+
+    // Resolve bot_id from strategies if not provided
+    if ((bot_id === undefined || bot_id === null) && strategy_id) {
+      try {
+        const [rows] = await pool.execute('SELECT bot_id FROM strategies WHERE id = ? LIMIT 1', [strategy_id]);
+        bot_id = rows?.[0]?.bot_id ?? null;
+      } catch (_) {}
+    }
+
     const [result] = await pool.execute(
       `INSERT INTO positions (
         strategy_id, bot_id, order_id, symbol, side, entry_price, amount,
         take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        strategy_id, bot_id, order_id, symbol, side, entry_price, amount,
-        take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id
+        safe(strategy_id), safe(bot_id), safe(order_id), safe(symbol), safe(side), safe(entry_price), safe(amount),
+        safe(take_profit_price), safe(stop_loss_price), safe(current_reduce), safe(tp_order_id), safe(sl_order_id)
       ]
     );
 
