@@ -1,114 +1,152 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Script to force restart bot service
-# Clears logs, kills existing processes, and restarts with new PID
+# Portable restart script for bot-oc
+# - Auto-detects project directory (no hardcoded paths)
+# - Works with PM2 if available, otherwise falls back to nohup
+# - Clears logs and restarts the app
+#
+# Usage:
+#   ./restart_bot.sh
+#
+# Optional env vars:
+#   BOT_NAME=bot-oc PORT=3000 TP_UPDATE_THRESHOLD_TICKS=1
 
-set -e  # Exit on error
+set -euo pipefail
 
-BOT_NAME="bot-oc"
-PROJECT_DIR="/home/daotran2/Documents/Github/bot-oc"
+BOT_NAME="${BOT_NAME:-bot-oc}"
+PORT="${PORT:-3000}"
+
+# Resolve project directory to the directory of this script
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+PROJECT_DIR="${SCRIPT_DIR}"
 LOG_DIR="${PROJECT_DIR}/logs"
+APP_ENTRY="${PROJECT_DIR}/src/app.js"
+PID_FILE="${PROJECT_DIR}/run.pid"
 
-echo "🔄 Force Restart Bot Service"
-echo "=============================="
-echo ""
+# Load .env if present (export all variables)
+if [[ -f "${PROJECT_DIR}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${PROJECT_DIR}/.env"
+  set +a
+fi
 
-# Step 1: Stop and delete PM2 process
-echo "📌 Step 1: Stopping PM2 process..."
-if pm2 list | grep -q "$BOT_NAME"; then
-    pm2 delete "$BOT_NAME" 2>/dev/null || pm2 stop "$BOT_NAME" 2>/dev/null || true
+printf "\n🔄 Force Restart Bot Service (%s)\n" "$BOT_NAME"
+echo   "==============================\n"
+
+# Helper: check command
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Step 1: Stop and delete PM2 process (if pm2 exists)
+echo "📌 Step 1: Stopping existing process..."
+if has_cmd pm2; then
+  if pm2 list | grep -q "${BOT_NAME}"; then
+    pm2 delete "${BOT_NAME}" 2>/dev/null || pm2 stop "${BOT_NAME}" 2>/dev/null || true
     echo "✅ PM2 process stopped/deleted"
-else
+  else
     echo "ℹ️  No PM2 process found"
+  fi
+else
+  echo "ℹ️  PM2 not found; will use nohup fallback"
 fi
 
-# Step 2: Kill any remaining node processes for this bot
-echo ""
-echo "📌 Step 2: Killing remaining processes..."
-cd "$PROJECT_DIR"
+# Step 2: Kill any remaining node processes for this repo
+echo "\n📌 Step 2: Killing remaining processes..."
+cd "${PROJECT_DIR}"
 
-# Find and kill processes running app.js
-PIDS=$(ps aux | grep "[n]ode.*app.js" | grep "$PROJECT_DIR" | awk '{print $2}' || true)
-
-if [ -n "$PIDS" ]; then
-    echo "Found app.js processes: $PIDS"
-    for PID in $PIDS; do
-        if [ -n "$PID" ] && [ "$PID" != "$$" ]; then
-            echo "  Killing PID: $PID"
-            kill -9 "$PID" 2>/dev/null || true
-        fi
-    done
-    echo "✅ All app.js processes killed"
+# Kill processes running app.js within this project
+PIDS=$(ps aux | grep "[n]ode.*${APP_ENTRY}" | awk '{print $2}' || true)
+if [[ -n "${PIDS}" ]]; then
+  echo "Found app.js processes: ${PIDS}"
+  for PID in ${PIDS}; do
+    if [[ -n "${PID}" && "${PID}" != "$$" ]]; then
+      echo "  Killing PID: ${PID}"
+      kill -9 "${PID}" 2>/dev/null || true
+    fi
+  done
+  echo "✅ All app.js processes killed"
 fi
 
-# Also kill any processes using port 3000 (if bot runs on this port)
-PORT_PID=$(lsof -ti:3000 2>/dev/null || true)
-if [ -n "$PORT_PID" ]; then
-    echo "Found process on port 3000: $PORT_PID"
-    kill -9 "$PORT_PID" 2>/dev/null || true
-    echo "✅ Port 3000 process killed"
+# If a PID file exists from nohup mode, try to kill it
+if [[ -f "${PID_FILE}" ]]; then
+  OLD_PID=$(cat "${PID_FILE}" || true)
+  if [[ -n "${OLD_PID}" && -e "/proc/${OLD_PID}" ]]; then
+    echo "Found previous nohup PID: ${OLD_PID}; killing..."
+    kill -9 "${OLD_PID}" 2>/dev/null || true
+  fi
+  rm -f "${PID_FILE}" || true
 fi
 
-# Wait a moment for processes to fully terminate
-sleep 2
+# Also kill any process on PORT (best-effort)
+if has_cmd lsof; then
+  PORT_PID=$(lsof -ti:"${PORT}" 2>/dev/null || true)
+  if [[ -n "${PORT_PID}" ]]; then
+    echo "Found process on port ${PORT}: ${PORT_PID}"
+    kill -9 "${PORT_PID}" 2>/dev/null || true
+    echo "✅ Port ${PORT} process killed"
+  fi
+fi
+
+sleep 1
 
 # Step 3: Clear logs
-echo ""
-echo "📌 Step 3: Clearing logs..."
+echo "\n📌 Step 3: Clearing logs..."
+mkdir -p "${LOG_DIR}"
+: > "${LOG_DIR}/combined.log" || true
+: > "${LOG_DIR}/error.log" || true
+if has_cmd pm2; then
+  pm2 flush "${BOT_NAME}" 2>/dev/null || true
+fi
+echo "✅ Logs ready at ${LOG_DIR}"
 
-# Clear PM2 logs
-if command -v pm2 &> /dev/null; then
-    pm2 flush "$BOT_NAME" 2>/dev/null || true
-    echo "✅ PM2 logs cleared"
+# Step 4: Start bot
+echo "\n📌 Step 4: Starting bot..."
+cd "${PROJECT_DIR}"
+
+# Ensure Node exists
+if ! has_cmd node; then
+  echo "❌ Node.js is not installed or not in PATH. Please install Node.js (>= 18) first."
+  echo "   Ubuntu: curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - && sudo apt-get install -y nodejs"
+  exit 1
 fi
 
-# Clear project logs
-if [ -d "$LOG_DIR" ]; then
-    > "$LOG_DIR/combined.log" 2>/dev/null || true
-    > "$LOG_DIR/error.log" 2>/dev/null || true
-    echo "✅ Project logs cleared"
+# Export any runtime overrides here
+export TP_UPDATE_THRESHOLD_TICKS="${TP_UPDATE_THRESHOLD_TICKS:-1}"
+
+if has_cmd pm2; then
+  pm2 start "${APP_ENTRY}" --name "${BOT_NAME}" --update-env
+  pm2 save || true
+  START_METHOD="pm2"
 else
-    echo "ℹ️  Log directory not found, creating..."
-    mkdir -p "$LOG_DIR"
-    touch "$LOG_DIR/combined.log"
-    touch "$LOG_DIR/error.log"
-    echo "✅ Log directory created"
+  nohup node "${APP_ENTRY}" >>"${LOG_DIR}/combined.log" 2>>"${LOG_DIR}/error.log" &
+  echo $! > "${PID_FILE}"
+  START_METHOD="nohup"
 fi
 
-# Step 4: Restart bot
-echo ""
-echo "📌 Step 4: Starting bot with PM2..."
-cd "$PROJECT_DIR"
-
-# Export runtime environment overrides
-export TP_UPDATE_THRESHOLD_TICKS=1
-
-# Start bot with updated env
-pm2 start src/app.js --name "$BOT_NAME"
-
-# Save PM2 configuration
-pm2 save
-
-# Wait a moment for bot to start
-sleep 3
+echo "✅ Bot started using ${START_METHOD}"
 
 # Step 5: Show status
-echo ""
-echo "📌 Step 5: Bot Status"
+echo "\n📌 Step 5: Bot Status"
 echo "=============================="
-pm2 status "$BOT_NAME"
+if has_cmd pm2; then
+  pm2 status "${BOT_NAME}" || true
+  echo "\n📋 Recent logs (last 20 lines):"
+  pm2 logs "${BOT_NAME}" --lines 20 --nostream || true
+else
+  if [[ -f "${PID_FILE}" ]]; then
+    CUR_PID=$(cat "${PID_FILE}")
+    echo "Started PID: ${CUR_PID} (nohup)"
+    echo "\n📋 Recent logs (last 20 lines):"
+    tail -n 20 "${LOG_DIR}/combined.log" || true
+    tail -n 20 "${LOG_DIR}/error.log" || true
+  else
+    echo "⚠️  Could not find PID file; check logs in ${LOG_DIR}"
+  fi
+fi
 
-echo ""
-echo "📋 Recent logs (last 10 lines):"
-echo "=============================="
-pm2 logs "$BOT_NAME" --lines 10 --nostream
-
-echo ""
-echo "✅ Bot restarted successfully!"
-echo ""
+echo "\n✅ Restart completed."
 echo "Useful commands:"
-echo "  pm2 logs $BOT_NAME          - View logs"
-echo "  pm2 status                  - Check status"
-echo "  pm2 restart $BOT_NAME      - Restart bot"
-echo "  pm2 stop $BOT_NAME          - Stop bot"
-
+echo "  ./restart_bot.sh                    - Restart"
+echo "  tail -f ${LOG_DIR}/combined.log      - Follow stdout logs"
+echo "  tail -f ${LOG_DIR}/error.log         - Follow error logs"
+echo "  pm2 status (if installed)            - PM2 status"
