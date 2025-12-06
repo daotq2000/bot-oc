@@ -39,11 +39,33 @@ export class PositionService {
 
       // Check if TP hit
       if (this.isTakeProfitHit(position, currentPrice)) {
+        // Guard: ensure there is an actual exchange position to close
+        try {
+          const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+          if (!qty || qty <= 0) {
+            logger.warn(`[CloseGuard] Skip TP close for position ${position.id} (${position.symbol}) - no exchange exposure`);
+            return position;
+          }
+        } catch (e) {
+          logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+          return position;
+        }
         return await this.closePosition(position, currentPrice, pnl, 'tp_hit');
       }
 
       // Check if SL hit
       if (this.isStopLossHit(position, currentPrice)) {
+        // Guard: ensure there is an actual exchange position to close
+        try {
+          const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+          if (!qty || qty <= 0) {
+            logger.warn(`[CloseGuard] Skip SL close for position ${position.id} (${position.symbol}) - no exchange exposure`);
+            return position;
+          }
+        } catch (e) {
+          logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+          return position;
+        }
         return await this.closePosition(position, currentPrice, pnl, 'sl_hit');
       }
 
@@ -57,7 +79,8 @@ export class PositionService {
       if (!baseTP || !Number.isFinite(baseTP)) {
         logger.warn(`[SL Update] Position ${position.id} ${position.symbol}: missing TP price, skip SL dynamic update. oc=${oc}, reduce=${position.reduce}, up_reduce=${position.up_reduce}, minutes=${prevMinutes}`);
       } else {
-        updatedSL = this.calculateUpdatedStopLoss(position);
+        // Use current market price for dynamic SL calculation
+        updatedSL = this.calculateUpdatedStopLoss(position, currentPrice);
         const currentReduce = Number(position.reduce || 0) + (minutesElapsed * Number(position.up_reduce || 0));
         const clampedReduce = Math.min(Math.max(currentReduce, 0), 999999.99);
         logger.info(`[SL Update] pos=${position.id} ${position.symbol} side=${position.side} oc=${oc} reduce=${position.reduce} up_reduce=${position.up_reduce} minutes ${prevMinutes} -> ${minutesElapsed} tp=${baseTP} sl_old=${position.stop_loss_price} sl_new=${updatedSL} currentReduce=${clampedReduce.toFixed(2)}`);
@@ -234,6 +257,18 @@ export class PositionService {
    */
   async closePosition(position, currentPrice, pnl, reason) {
     try {
+      // Pre-check: ensure there is exposure to close on exchange
+      try {
+        const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+        if (!qty || qty <= 0) {
+          logger.warn(`[CloseGuard] Skip close for position ${position.id} (${position.symbol}) - no exchange exposure`);
+          return position;
+        }
+      } catch (e) {
+        logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+        return position;
+      }
+
       // Close on exchange
       // ExchangeService handles exchange-specific logic (Binance, MEXC, Gate.io)
       // MEXC: Uses CCXT to close position via market order
@@ -243,6 +278,11 @@ export class PositionService {
         position.side,
         position.amount
       );
+
+      if (closeRes?.skipped) {
+        logger.warn(`[CloseGuard] Exchange reported no position to close for ${position.symbol}; skipping DB close for ${position.id}`);
+        return position;
+      }
 
       // Prefer actual fill price if available and recompute PnL
       const fillPrice = Number(closeRes?.avgFillPrice || closeRes?.average || closeRes?.price || currentPrice);
