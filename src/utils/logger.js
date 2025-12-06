@@ -1,9 +1,20 @@
 import winston from 'winston';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Ensure logs directory exists
+const LOG_DIR = path.join(__dirname, '../../logs');
+try {
+  if (!fs.existsSync(LOG_DIR)) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+} catch (_) {
+  // ignore
+}
 
 /**
  * Winston logger configuration
@@ -20,32 +31,41 @@ const logger = winston.createLogger({
   transports: [
     // Write all logs to console
     new winston.transports.Console({
+      handleExceptions: true,
+      handleRejections: true,
       format: winston.format.combine(
         winston.format.colorize(),
         winston.format.printf(({ timestamp, level, message, ...meta }) => {
           let msg = `${timestamp} [${level}]: ${message}`;
-          if (Object.keys(meta).length > 0) {
-            msg += ` ${JSON.stringify(meta)}`;
-          }
-          return msg;
+          const rest = Object.keys(meta || {}).length > 0 ? ` ${JSON.stringify(meta)}` : '';
+          return msg + rest;
         })
       )
     }),
-    // Write all logs with level 'error' and below to error.log
+    // Error file
     new winston.transports.File({
-      filename: path.join(__dirname, '../../logs/error.log'),
+      filename: path.join(LOG_DIR, 'error.log'),
       level: 'error',
-      maxsize: 5242880, // 5MB
-      maxFiles: 5
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 5,
+      tailable: true,
+      handleExceptions: true,
+      handleRejections: true
     }),
-    // Write all logs to combined.log
+    // Combined file
     new winston.transports.File({
-      filename: path.join(__dirname, '../../logs/combined.log'),
-      maxsize: 5242880, // 5MB
-      maxFiles: 5
+      filename: path.join(LOG_DIR, 'combined.log'),
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 5,
+      tailable: true
     })
+  ],
+  exceptionHandlers: [
+    new winston.transports.File({ filename: path.join(LOG_DIR, 'exceptions.log') })
+  ],
+  rejectionHandlers: [
+    new winston.transports.File({ filename: path.join(LOG_DIR, 'rejections.log') })
   ]
 });
 
 export default logger;
-

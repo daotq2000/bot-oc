@@ -73,7 +73,7 @@ export class PositionService {
       const prevMinutes = Number(position.minutes_elapsed || 0);
       const minutesElapsed = prevMinutes + 1;
       const oc = Number(position.oc || 0);
-      let updatedSL = this.calculateUpdatedStopLoss(position, currentPrice);
+      let updatedSL = this.calculateUpdatedStopLoss(position);
       const currentReduce = Number(position.reduce || 0) + (minutesElapsed * Number(position.up_reduce || 0));
       const clampedReduce = Math.min(Math.max(currentReduce, 0), 999999.99);
       logger.info(`[SL Update] pos=${position.id} ${position.symbol} side=${position.side} oc=${oc} reduce=${position.reduce} up_reduce=${position.up_reduce} minutes ${prevMinutes} -> ${minutesElapsed} sl_old=${position.stop_loss_price} sl_new=${updatedSL} currentReduce=${clampedReduce.toFixed(2)}`);
@@ -165,14 +165,9 @@ export class PositionService {
         } catch (e) {
           logger.warn(`[TP Replace] Error processing TP update: ${e?.message || e}`);
         }
-      }
 
-      // Calculate current_reduce and clamp to prevent overflow
-      // Formula: reduce + (minutesElapsed * up_reduce)
-      // Clamp to DECIMAL(10,2) max value: 99999999.99 (but we'll use a reasonable max)
-      const calculatedReduce = Number(position.reduce || 0) + (minutesElapsed * Number(position.up_reduce || 0));
-      // Clamp to reasonable max (999999.99) to prevent database overflow
-      const clampedReduce = Math.min(Math.max(calculatedReduce, 0), 999999.99);
+      // Calculate current_reduce and clamp to prevent overflow (computed above)
+      // Re-use clampedReduce computed from reduce + minutesElapsed * up_reduce
 
       // Update position
       const updated = await Position.update(position.id, {
