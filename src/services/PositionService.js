@@ -73,20 +73,13 @@ export class PositionService {
       const prevMinutes = Number(position.minutes_elapsed || 0);
       const minutesElapsed = prevMinutes + 1;
       const oc = Number(position.oc || 0);
-      const baseTP = Number(position.take_profit_price || 0);
-      let updatedSL = position.stop_loss_price;
+      let updatedSL = this.calculateUpdatedStopLoss(position, currentPrice);
+      const currentReduce = Number(position.reduce || 0) + (minutesElapsed * Number(position.up_reduce || 0));
+      const clampedReduce = Math.min(Math.max(currentReduce, 0), 999999.99);
+      logger.info(`[SL Update] pos=${position.id} ${position.symbol} side=${position.side} oc=${oc} reduce=${position.reduce} up_reduce=${position.up_reduce} minutes ${prevMinutes} -> ${minutesElapsed} sl_old=${position.stop_loss_price} sl_new=${updatedSL} currentReduce=${clampedReduce.toFixed(2)}`);
 
-      if (!baseTP || !Number.isFinite(baseTP)) {
-        logger.warn(`[SL Update] Position ${position.id} ${position.symbol}: missing TP price, skip SL dynamic update. oc=${oc}, reduce=${position.reduce}, up_reduce=${position.up_reduce}, minutes=${prevMinutes}`);
-      } else {
-        // Use current market price for dynamic SL calculation
-        updatedSL = this.calculateUpdatedStopLoss(position, currentPrice);
-        const currentReduce = Number(position.reduce || 0) + (minutesElapsed * Number(position.up_reduce || 0));
-        const clampedReduce = Math.min(Math.max(currentReduce, 0), 999999.99);
-        logger.info(`[SL Update] pos=${position.id} ${position.symbol} side=${position.side} oc=${oc} reduce=${position.reduce} up_reduce=${position.up_reduce} minutes ${prevMinutes} -> ${minutesElapsed} tp=${baseTP} sl_old=${position.stop_loss_price} sl_new=${updatedSL} currentReduce=${clampedReduce.toFixed(2)}`);
-
-        // Cancel/replace SL pending order on exchange if moved enough ticks
-        try {
+      // Cancel/replace SL pending order on exchange if moved enough ticks
+      try {
           const thresholdTicks = Number(configService.getNumber('SL_UPDATE_THRESHOLD_TICKS', 2));
           // Try to get tick size from cache first
           let tickSizeStr = exchangeInfoService.getTickSize(position.symbol);
@@ -232,19 +225,27 @@ export class PositionService {
    * @param {number} currentPrice - Current market price
    * @returns {number} Updated stop loss price
    */
-  calculateUpdatedStopLoss(position, currentPrice) {
-    // Get strategy OC from position data
-    const oc = position.oc || 2; // Default if not available
-    
-    return calculateDynamicStopLoss(
-      currentPrice,
+  calculateUpdatedStopLoss(position) {
+    const oc = Number(position.oc || 0);
+    const tp = Number(position.take_profit_price || 0);
+    if (!Number.isFinite(tp) || tp <= 0 || !Number.isFinite(oc)) {
+      return position.stop_loss_price; // cannot compute without valid TP/OC
+    }
+    const nextSL = calculateDynamicStopLoss(
+      tp,
       oc,
-      position.reduce,
-      position.up_reduce,
-      position.minutes_elapsed + 1,
-      position.side,
-      position.stop_loss_price // Previous SL to ensure it only moves in favorable direction
+      Number(position.reduce || 0),
+      Number(position.up_reduce || 0),
+      Number(position.minutes_elapsed || 0) + 1,
+      position.side
     );
+    // Monotonic constraint: move only in favorable direction
+    const prevSL = Number(position.stop_loss_price || 0);
+    if (Number.isFinite(prevSL) && prevSL > 0) {
+      if (position.side === 'long' && nextSL < prevSL) return prevSL;
+      if (position.side === 'short' && nextSL > prevSL) return prevSL;
+    }
+    return nextSL;
   }
 
   /**

@@ -147,10 +147,47 @@ export class PositionMonitor {
             if (st.status === 'open' && (st.filled || 0) === 0) {
               await orderService.cancelOrder(position, 'candle_end');
               logger.info(`Cancelled unfilled order at candle end for position ${position.id}`);
+              return; // done for this position
             }
           }
         }
       }
+
+      // Re-create entry order after manual cancel (binance-mainet) if 2 minutes passed
+      if (position.status === 'open' && position.order_id) {
+        try {
+          const st = await exchangeService.getOrderStatus(position.symbol, position.order_id);
+          const reMinutes = Number(configService.getNumber('RECREATE_CANCELED_ENTRY_MINUTES', 2));
+          const twoMinutes = Math.max(1, reMinutes) * 60 * 1000;
+          if ((st.status === 'canceled' || st.status === 'cancelled') && (st.filled || 0) === 0 && (now - openedAtMs) >= twoMinutes) {
+            // Scope to the requested bot name, if available in this query
+            if (!position.bot_name || position.bot_name === 'binance-mainet') {
+              // Re-create as passive LIMIT at original entry price
+              const side = position.side === 'long' ? 'buy' : 'sell';
+              const params = {
+                symbol: position.symbol,
+                side,
+                positionSide: position.side === 'long' ? 'LONG' : 'SHORT',
+                amount: Number(position.amount), // USDT amount
+                type: 'limit',
+                price: Number(position.entry_price)
+              };
+              try {
+                const newOrder = await exchangeService.createOrder(params);
+                if (newOrder && newOrder.id) {
+                  await Position.update(position.id, { order_id: newOrder.id });
+                  logger.info(`Recreated entry order for position ${position.id} (${position.symbol}) after manual cancel. New order_id=${newOrder.id}`);
+                }
+              } catch (e) {
+                logger.warn(`Failed to recreate entry order for position ${position.id}: ${e?.message || e}`);
+              }
+            }
+          }
+        } catch (e) {
+          logger.debug(`getOrderStatus failed for position ${position.id} during recreate check: ${e?.message || e}`);
+        }
+      }
+
     } catch (error) {
       logger.error(`Error checking unfilled orders for position ${position.id}:`, error);
     }
