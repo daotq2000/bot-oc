@@ -207,8 +207,8 @@ export class PositionMonitor {
     try {
       const openPositions = await Position.findOpen();
 
-      // Process positions in batches
-      const batchSize = 5;
+      // Process positions in batches (configurable)
+      const batchSize = Number(configService.getNumber('POSITION_MONITOR_BATCH_SIZE', 5));
       for (let i = 0; i < openPositions.length; i += batchSize) {
         const batch = openPositions.slice(i, i + batchSize);
         
@@ -223,7 +223,8 @@ export class PositionMonitor {
 
         // Small delay between batches
         if (i + batchSize < openPositions.length) {
-          await new Promise(resolve => setTimeout(resolve, 500));
+          const delayMs = Number(configService.getNumber('POSITION_MONITOR_BATCH_DELAY_MS', 500));
+          await new Promise(resolve => setTimeout(resolve, delayMs));
         }
       }
 

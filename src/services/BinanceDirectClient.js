@@ -16,7 +16,10 @@ export class BinanceDirectClient {
     this.isTestnet = isTestnet;
     this.exchangeInfoService = exchangeInfoService; // Injected service for caching
     this.restPriceFallbackCache = new Map(); // symbol -> { price, timestamp }
+    
+    // Load all config values from database with defaults
     this.restPriceFallbackCooldownMs = Number(configService.getNumber('BINANCE_REST_PRICE_COOLDOWN_MS', 5000));
+    this.minRequestInterval = Number(configService.getNumber('BINANCE_MIN_REQUEST_INTERVAL_MS', 100));
     
     // Production data URL (always use production for market data)
     this.productionDataURL = 'https://fapi.binance.com';
@@ -26,13 +29,12 @@ export class BinanceDirectClient {
       ? (configService.getString('BINANCE_FUTURES_ENDPOINT', 'https://testnet.binancefuture.com'))
       : 'https://fapi.binance.com';
     
-    this.minRequestInterval = 100; // 100ms between requests
     this.lastRequestTime = 0;
 
     // Cache for account position mode (hedge vs one-way)
     this._dualSidePosition = null; // boolean
     this._positionModeCheckedAt = 0;
-    this._positionModeTTL = 60_000; // 1 minute
+    this._positionModeTTL = Number(configService.getNumber('BINANCE_POSITION_MODE_TTL_MS', 60000)); // 1 minute default
   }
 
   /**

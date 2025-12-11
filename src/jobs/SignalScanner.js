@@ -235,12 +235,13 @@ export class SignalScanner {
       }
 
       // Update WebSocket subscriptions with all required symbols
+      logger.info(`[SignalScanner] Subscribing WebSocket to ${allSymbols.size} unique symbols`);
       webSocketManager.subscribe(Array.from(allSymbols));
 
       logger.info(`[SignalScanner] Starting scan of ${strategies.length} active strategies and ${alertConfigs.length} alert configs.`);
 
-      // Process strategies in batches
-      const batchSize = 5;
+      // Process strategies in batches (configurable)
+      const batchSize = Number(configService.getNumber('SIGNAL_SCAN_BATCH_SIZE', 5));
       for (let i = 0; i < strategies.length; i += batchSize) {
         const batch = strategies.slice(i, i + batchSize);
         await Promise.allSettled(
@@ -259,7 +260,8 @@ export class SignalScanner {
         );
 
         if (i + batchSize < strategies.length) {
-          await new Promise(resolve => setTimeout(resolve, 500));
+          const delayMs = Number(configService.getNumber('SIGNAL_SCAN_BATCH_DELAY_MS', 500));
+          await new Promise(resolve => setTimeout(resolve, delayMs));
         }
       }
 

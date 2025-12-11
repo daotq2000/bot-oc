@@ -73,10 +73,53 @@ async function start() {
     // Seed required configs into DB (idempotent)
     try {
       logger.info('Seeding default application configs...');
+      // Strategy and scanning configs
       await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '10', 'Minutes before auto-cancel unfilled entry LIMIT orders');
-      await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '20000', 'Signal scanner job interval in milliseconds');
-      await AppConfig.set('CANDLE_UPDATE_INTERVAL_MS', '20000', 'Candle updater job interval in milliseconds');
+      await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '10000', 'Signal scanner job interval in milliseconds');
+      await AppConfig.set('CANDLE_UPDATE_INTERVAL_MS', '10000', 'Candle updater job interval in milliseconds');
+      
+      // Binance API rate limiting and timeout configs
+      await AppConfig.set('BINANCE_MIN_REQUEST_INTERVAL_MS', '100', 'Minimum interval (ms) between Binance API requests for rate limiting');
+      await AppConfig.set('BINANCE_REST_PRICE_COOLDOWN_MS', '5000', 'Cooldown (ms) before reusing cached REST price fallback');
+      await AppConfig.set('BINANCE_REQUEST_TIMEOUT_MS', '10000', 'Timeout (ms) for Binance API requests');
+      await AppConfig.set('BINANCE_POSITION_MODE_TTL_MS', '30000', 'TTL (ms) for cached position mode (hedge vs one-way)');
+      await AppConfig.set('BINANCE_FUTURES_ENDPOINT', 'https://testnet.binancefuture.com', 'Binance Futures API endpoint (testnet or production)');
+      
+      // Position monitoring and order management configs
+      await AppConfig.set('ENABLE_CANDLE_END_CANCEL_FOR_ENTRY', 'false', 'Enable auto-cancel unfilled entry orders at candle end');
+      await AppConfig.set('RECREATE_CANCELED_ENTRY_MINUTES', '2', 'Minutes to wait before recreating manually canceled entry orders');
+      await AppConfig.set('SHORT_EXTEND_OVERRIDE', '0', 'Override extend value for SHORT entries (0 = use strategy extend)');
+      
+      // Position service and SL/TP update configs
+      await AppConfig.set('SL_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger SL update');
+      await AppConfig.set('TP_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger TP update');
+      
+      // WebSocket and connection configs
+      await AppConfig.set('BINANCE_TESTNET_WS_BASE', 'wss://stream.binancefuture.com/ws', 'Binance testnet WebSocket base URL');
+      await AppConfig.set('LISTEN_KEY_KEEPALIVE_MS', '1800000', 'Interval (ms) to refresh WebSocket listen key (30 minutes)');
+      await AppConfig.set('WS_RECONNECT_BACKOFF_MS', '3000', 'Backoff (ms) for WebSocket reconnection attempts');
+      
+      // Exchange initialization configs
+      await AppConfig.set('BINANCE_TESTNET', 'true', 'Use Binance testnet for trading');
+      await AppConfig.set('CCXT_SANDBOX', 'false', 'Use CCXT sandbox mode');
+      await AppConfig.set('GATE_SANDBOX', 'false', 'Use Gate.io sandbox mode');
+      await AppConfig.set('MEXC_SANDBOX', 'false', 'Use MEXC sandbox mode');
+      await AppConfig.set('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED', 'Default margin type for Binance (ISOLATED or CROSSED)');
+      await AppConfig.set('BINANCE_DEFAULT_LEVERAGE', '5', 'Default leverage for Binance positions');
+      
+      // Concurrency and locking configs
+      await AppConfig.set('CONCURRENCY_RESERVATION_TTL_SEC', '120', 'TTL (seconds) for concurrency reservation locks');
+      await AppConfig.set('CONCURRENCY_LOCK_TIMEOUT', '5', 'Timeout (seconds) for acquiring concurrency locks');
+      
+      // Batch processing configs
+      await AppConfig.set('SIGNAL_SCAN_BATCH_SIZE', '200', 'Number of strategies to scan in parallel per batch');
+      await AppConfig.set('SIGNAL_SCAN_BATCH_DELAY_MS', '300', 'Delay (ms) between signal scan batches');
+      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '200', 'Number of positions to monitor in parallel per batch');
+      await AppConfig.set('POSITION_MONITOR_BATCH_DELAY_MS', '300', 'Delay (ms) between position monitor batches');
+      
+      // Maintenance
+      await AppConfig.set('ENABLE_PRUNE_DELISTED', 'true', 'Enable pruning delisted/non-tradable symbols from strategies and alerts at startup');
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);
     }
@@ -101,6 +144,19 @@ async function start() {
     // Update symbol filters from Binance API (async, don't wait)
     exchangeInfoService.updateFiltersFromExchange()
       .catch(error => logger.error('Failed to update symbol filters from Binance:', error));
+
+    // Prune delisted/non-tradable symbols (strategies & alerts) before starting jobs
+    try {
+      const enablePrune = configService.getBoolean('ENABLE_PRUNE_DELISTED', true);
+      if (enablePrune) {
+        logger.info('Pruning delisted/non-tradable Binance symbols from DB...');
+        await exchangeInfoService.pruneDelistedSymbols();
+      } else {
+        logger.info('Delisted symbols pruning is disabled via config ENABLE_PRUNE_DELISTED=false');
+      }
+    } catch (e) {
+      logger.warn(`Pruning step failed: ${e?.message || e}`);
+    }
 
     // Initialize Telegram service
     logger.info('Initializing Telegram service...');

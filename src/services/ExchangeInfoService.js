@@ -1,5 +1,8 @@
 import { BinanceDirectClient } from './BinanceDirectClient.js';
 import { SymbolFilter } from '../models/SymbolFilter.js';
+import { Strategy } from '../models/Strategy.js';
+import { PriceAlertConfig } from '../models/PriceAlertConfig.js';
+import { configService } from './ConfigService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -67,6 +70,96 @@ class ExchangeInfoService {
 
     } catch (error) {
       logger.error('Error updating symbol filters:', error);
+    }
+  }
+
+  /**
+   * Fetch tradable futures symbols from Binance mainnet (USDT-M).
+   * @returns {Promise<Set<string>>} Set of normalized tradable symbols (e.g., BTCUSDT)
+   */
+  async getTradableSymbolsFromBinance() {
+    try {
+      const client = new BinanceDirectClient('', '', false);
+      const info = await client.getExchangeInfo();
+      const set = new Set();
+      if (info?.symbols?.length) {
+        for (const s of info.symbols) {
+          if (s.status === 'TRADING') {
+            set.add((s.symbol || '').toUpperCase());
+          }
+        }
+      }
+      return set;
+    } catch (e) {
+      logger.error('getTradableSymbolsFromBinance failed:', e?.message || e);
+      return new Set();
+    }
+  }
+
+  /**
+   * Normalize symbol to Binance format (reuse minimal logic)
+   */
+  normalizeSymbol(symbol) {
+    if (!symbol) return symbol;
+    let normalized = symbol.toString().toUpperCase().replace(/[/:]/g, '');
+    if (normalized.endsWith('USD') && !normalized.endsWith('USDT')) {
+      normalized = normalized.replace(/USD$/, 'USDT');
+    }
+    return normalized;
+  }
+
+  /**
+   * Prune delisted symbols from strategies and price alert configs for Binance.
+   * - Deletes strategies whose symbol is not tradable on Binance futures mainnet
+   * - Removes symbols from price alert configs; deactivates config if empty
+   */
+  async pruneDelistedSymbols() {
+    try {
+      logger.info('[Prune] Starting delisted symbols cleanup for Binance');
+      const tradable = await this.getTradableSymbolsFromBinance();
+      if (tradable.size === 0) {
+        logger.warn('[Prune] Tradable symbols set is empty; skip pruning to avoid accidental mass deletion');
+        return;
+      }
+
+      // 1) Prune strategies
+      const strategies = await Strategy.findAll(null, true);
+      let deletedCount = 0;
+      for (const s of strategies) {
+        if ((s.exchange || '').toLowerCase() !== 'binance') continue;
+        const sym = this.normalizeSymbol(s.symbol);
+        if (!tradable.has(sym)) {
+          await Strategy.delete(s.id);
+          deletedCount++;
+          logger.info(`[Prune] Deleted strategy ${s.id} (${s.symbol}) - not tradable on Binance mainnet`);
+        }
+      }
+
+      // 2) Prune price alert configs (binance only)
+      const alertConfigs = await PriceAlertConfig.findAll('binance');
+      let updatedAlertConfigs = 0;
+      let deactivatedAlertConfigs = 0;
+      for (const cfg of alertConfigs) {
+        const original = Array.isArray(cfg.symbols) ? cfg.symbols : [];
+        const filtered = original
+          .map(sym => this.normalizeSymbol(sym))
+          .filter(sym => tradable.has(sym));
+        if (filtered.length !== original.length) {
+          if (filtered.length === 0) {
+            await PriceAlertConfig.update(cfg.id, { symbols: [], is_active: false });
+            deactivatedAlertConfigs++;
+            logger.info(`[Prune] Deactivated alert config ${cfg.id} (no valid symbols remain)`);
+          } else {
+            await PriceAlertConfig.update(cfg.id, { symbols: filtered });
+            updatedAlertConfigs++;
+            logger.info(`[Prune] Updated alert config ${cfg.id}: ${original.length} -> ${filtered.length} symbols`);
+          }
+        }
+      }
+
+      logger.info(`[Prune] Completed. Strategies deleted: ${deletedCount}, Alert configs updated: ${updatedAlertConfigs}, deactivated: ${deactivatedAlertConfigs}`);
+    } catch (e) {
+      logger.error('[Prune] Failed pruning delisted symbols:', e?.message || e);
     }
   }
 
