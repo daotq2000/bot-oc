@@ -96,18 +96,20 @@ describe('Calculator Utilities', () => {
   describe('calculateDynamicStopLoss', () => {
     it('should calculate dynamic SL with elapsed time for long', () => {
       const sl = calculateDynamicStopLoss(55000, 2.0, 5.0, 5.0, 2, 'long');
-      // current_reduce = 5.0 + (2 * 5.0) = 15.0
-      // sl_offset = (15.0 * 2.0 / 100) = 0.3 = 30%
-      // sl = 55000 - (55000 * 0.3) = 38500
-      expect(sl).toBeCloseTo(54999.7, 4);
+      // Với công thức mới:
+      // effectiveReduce = max(5.0 - (2 * 5.0), 0) = 0
+      // sl_offset = (0 * 2.0 / 100) = 0
+      // sl = tp = 55000
+      expect(sl).toBeCloseTo(55000, 4);
     });
 
     it('should calculate dynamic SL with elapsed time for short', () => {
       const sl = calculateDynamicStopLoss(45000, 2.0, 5.0, 5.0, 2, 'short');
-      // current_reduce = 5.0 + (2 * 5.0) = 15.0
-      // sl_offset = (15.0 * 2.0 / 100) = 0.3 = 30%
-      // sl = 45000 + (45000 * 0.3) = 58500
-      expect(sl).toBeCloseTo(45000.3, 4);
+      // Với công thức mới:
+      // effectiveReduce = max(5.0 - (2 * 5.0), 0) = 0
+      // sl_offset = (0 * 2.0 / 100) = 0
+      // sl = tp = 45000
+      expect(sl).toBeCloseTo(45000, 4);
     });
   });
 

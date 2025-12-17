@@ -206,49 +206,8 @@ export class OrderService {
         logger.error(`[OrderService] Error stack:`, e?.stack);
       }
 
-      // Create TP limit order (reduce-only) if supported
-      try {
-        const quantity = Number(order.amount);
-        if (Number.isFinite(quantity) && quantity > 0) {
-          const tpRes = await this.exchangeService.createTakeProfitLimit(
-            strategy.symbol,
-            side,
-            tpPrice,
-            quantity
-          );
-          const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
-          if (tpOrderId) {
-            await Position.update(position.id, { tp_order_id: tpOrderId });
-          }
-          logger.info(`TP limit order created for position ${position.id}`);
-        } else {
-          logger.warn(`Skip creating TP: invalid quantity ${order.amount}`);
-        }
-      } catch (e) {
-        logger.warn(`Failed to create TP limit order for position ${position.id}: ${e?.message || e}`);
-      }
-
-      // Create SL limit order (initial) if supported
-      try {
-        const quantity = Number(order.amount);
-        if (Number.isFinite(quantity) && quantity > 0 && Number(slPrice) > 0) {
-          const slRes = await this.exchangeService.createStopLossLimit(
-            strategy.symbol,
-            side,
-            slPrice,
-            quantity
-          );
-          const slOrderId = slRes?.orderId ? String(slRes.orderId) : null;
-          if (slOrderId) {
-            await Position.update(position.id, { sl_order_id: slOrderId });
-          }
-          logger.info(`SL limit order created for position ${position.id}`);
-        } else {
-          logger.warn(`Skip creating SL: invalid quantity ${order.amount} or slPrice ${slPrice}`);
-        }
-      } catch (e) {
-        logger.warn(`Failed to create SL limit order for position ${position.id}: ${e?.message || e}`);
-      }
+      // TP/SL creation is now handled by PositionMonitor after entry confirmation.
+      logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
 
       // Mark reservation as 'released' (position opened)
       try {

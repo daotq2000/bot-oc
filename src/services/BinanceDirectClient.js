@@ -421,14 +421,17 @@ export class BinanceDirectClient {
   async getPrice(symbol) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
-    // Get price exclusively from WebSocket cache
+    // Lấy giá ưu tiên từ WebSocket (production stream)
     const cachedPrice = webSocketManager.getPrice(normalizedSymbol);
     if (cachedPrice) {
       return cachedPrice;
     }
 
-    // Optionally disable REST fallback for ticker price (prefer WS-only)
-    const enableRestFallback = configService.getBoolean('BINANCE_TICKER_REST_FALLBACK', false);
+    // REST fallback cho ticker price:
+    // - Production: tôn trọng cấu hình BINANCE_TICKER_REST_FALLBACK (tránh bị ban IP)
+    // - Testnet   : LUÔN cho phép REST fallback (market data là production, chỉ trading là testnet)
+    const globalFallback = configService.getBoolean('BINANCE_TICKER_REST_FALLBACK', false);
+    const enableRestFallback = globalFallback || this.isTestnet;
     if (!enableRestFallback) {
       return null;
     }

@@ -120,14 +120,93 @@ export class PositionService {
           logger.warn(`[SL Replace] Error processing SL update: ${e?.message || e}`);
         }
 
-        // Cancel/replace TP if changed by threshold ticks (due to new TP formula)
+        // Cancel/replace TP theo chiến thuật Reduce / Up Reduce (đuổi TP về phía giá market)
         try {
-          const desiredTP = calculateTakeProfit(
+          const prevTP = Number(position.take_profit_price || 0);
+          const marketPrice = Number(currentPrice);
+          const reduce = Number(position.reduce || 0);
+          const upReduce = Number(position.up_reduce || 0);
+
+          // Nếu không có TP hiện tại hoặc giá market không hợp lệ thì bỏ qua
+          if (!Number.isFinite(prevTP) || prevTP <= 0 || !Number.isFinite(marketPrice) || marketPrice <= 0) {
+            logger.debug(`[TP Replace] Skip TP chase for position ${position.id} - invalid prevTP=${prevTP} or marketPrice=${marketPrice}`);
+          } else if (reduce <= 0 && upReduce <= 0) {
+            // Chế độ tĩnh: TP không đuổi giá, giữ TP theo cấu hình ban đầu (fallback cũ)
+            const desiredTPStatic = calculateTakeProfit(
             Number(position.entry_price),
             Number(position.oc || 0),
             Number(position.take_profit || 0),
             position.side
           );
+            await this._maybeReplaceTpOrder(position, prevTP, desiredTPStatic);
+          } else {
+            // Chế độ đuổi TP: P_n = P_{n-1} + (P_market - P_{n-1}) * Rate
+            // Rate được suy ra từ reduce + up_reduce * minutesElapsed
+            const rawRate = reduce + minutesElapsed * upReduce;
+            const rate = Math.min(Math.max(rawRate / 100, 0), 1); // 10 -> 10%, clamp 0..100%
+
+            let targetTp = prevTP + (marketPrice - prevTP) * rate;
+
+            // Offset an toàn quanh market để tránh khớp ngay tại giá market
+            const offsetPct = Number(configService.getNumber('TP_CHASE_OFFSET_PCT', 0.1)); // %
+            const offset = marketPrice * (offsetPct / 100);
+
+            if (position.side === 'short') {
+              // TP phải luôn <= market - offset
+              const maxTp = marketPrice - offset;
+              targetTp = Math.min(targetTp, maxTp);
+            } else {
+              // LONG: TP phải luôn >= market + offset
+              const minTp = marketPrice + offset;
+              targetTp = Math.max(targetTp, minTp);
+            }
+
+            // Giới hạn bước nhảy mỗi lần (Max Step) để tránh nhảy quá xa
+            const maxStepPct = Number(configService.getNumber('TP_CHASE_MAX_STEP_PCT', 0.5)); // %
+            const maxStep = marketPrice * (maxStepPct / 100);
+            const delta = targetTp - prevTP;
+            const absDelta = Math.abs(delta);
+            let newTP = prevTP;
+            if (absDelta > 0) {
+              const step = Math.sign(delta) * Math.min(absDelta, maxStep);
+              newTP = prevTP + step;
+            }
+
+            logger.info(
+              `[TP Chase] pos=${position.id} ${position.symbol} side=${position.side} ` +
+              `prevTP=${prevTP} market=${marketPrice} rawRate=${rawRate.toFixed(2)}% ` +
+              `targetTp=${targetTp} newTP=${newTP}`
+            );
+
+            await this._maybeReplaceTpOrder(position, prevTP, newTP);
+          }
+        } catch (e) {
+          logger.warn(`[TP Replace] Error processing TP update: ${e?.message || e}`);
+        }
+
+      // Calculate current_reduce and clamp to prevent overflow (computed above)
+      // Re-use clampedReduce computed from reduce + minutesElapsed * up_reduce
+
+      // Update position
+      const updated = await Position.update(position.id, {
+        pnl: pnl,
+        stop_loss_price: updatedSL,
+        current_reduce: clampedReduce,
+        minutes_elapsed: minutesElapsed
+      });
+
+      return updated;
+    } catch (error) {
+      logger.error(`Failed to update position ${position.id}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Internal helper: quyết định có cần hủy / đặt lại TP order hay không
+   */
+  async _maybeReplaceTpOrder(position, prevTP, desiredTP) {
+    try {
           const thresholdTicksTP = Number(configService.getNumber('TP_UPDATE_THRESHOLD_TICKS', configService.getNumber('SL_UPDATE_THRESHOLD_TICKS', 2)));
           // Try to get tick size from cache first
           let tickSizeStrTP = exchangeInfoService.getTickSize(position.symbol);
@@ -136,7 +215,6 @@ export class PositionService {
             tickSizeStrTP = await this.exchangeService.getTickSize(position.symbol);
           }
           const tickTP = parseFloat(tickSizeStrTP || '0') || 0;
-          const prevTP = Number(position.take_profit_price || 0);
           const newTP = Number(desiredTP || 0);
           if (tickTP > 0 && newTP > 0 && prevTP > 0) {
             const movedTP = Math.abs(newTP - prevTP);
@@ -163,24 +241,7 @@ export class PositionService {
             }
           }
         } catch (e) {
-          logger.warn(`[TP Replace] Error processing TP update: ${e?.message || e}`);
-        }
-
-      // Calculate current_reduce and clamp to prevent overflow (computed above)
-      // Re-use clampedReduce computed from reduce + minutesElapsed * up_reduce
-
-      // Update position
-      const updated = await Position.update(position.id, {
-        pnl: pnl,
-        stop_loss_price: updatedSL,
-        current_reduce: clampedReduce,
-        minutes_elapsed: minutesElapsed
-      });
-
-      return updated;
-    } catch (error) {
-      logger.error(`Failed to update position ${position.id}:`, error);
-      throw error;
+      logger.warn(`[TP Replace] Error processing TP replace: ${e?.message || e}`);
     }
   }
 
@@ -304,17 +365,23 @@ export class PositionService {
 
       // Send Telegram close summary to central channel with stats
       try {
+        logger.info(`[Notification] Preparing to send close summary for position ${closed.id}`);
         const stats = await Position.getBotStats(closed.bot_id);
+        logger.debug(`[Notification] Fetched bot stats for bot ${closed.bot_id}:`, stats);
+
         if (this.telegramService?.sendCloseSummaryAlert) {
+          logger.info(`[Notification] Using existing TelegramService to send close summary for position ${closed.id}`);
           await this.telegramService.sendCloseSummaryAlert(closed, stats);
         } else {
+          logger.warn(`[Notification] No existing TelegramService found, creating temporary instance.`);
           const { TelegramService } = await import('./TelegramService.js');
           const tmpTele = new TelegramService();
           await tmpTele.initialize();
           await tmpTele.sendCloseSummaryAlert(closed, stats);
         }
+        logger.info(`[Notification] ✅ Successfully sent close summary alert for position ${closed.id}`);
       } catch (inner) {
-        logger.warn(`Failed to send close summary alert: ${inner?.message || inner}`);
+        logger.error(`[Notification] ❌ Failed to send close summary alert for position ${closed.id}:`, inner?.message || inner, inner?.stack);
       }
 
       return closed;

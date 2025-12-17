@@ -110,8 +110,29 @@ export function calculateInitialStopLoss(tpPrice, oc, reduce, side) {
  */
 export function calculateDynamicStopLoss(tpPrice, oc, reduce, upReduce, minutesElapsed, side) {
   const tp = Number(tpPrice);
-  const currentReduce = Number(reduce) + (Number(minutesElapsed) * Number(upReduce));
-  const slOffset = (currentReduce * Number(oc)) / 100;
+  const baseReduce = Number(reduce);
+  const up = Number(upReduce);
+  const minutes = Number(minutesElapsed);
+  const ocN = Number(oc);
+
+  if (!Number.isFinite(tp) || !Number.isFinite(baseReduce) || !Number.isFinite(up) || !Number.isFinite(minutes) || !Number.isFinite(ocN)) {
+    return tp; // Fallback: giữ nguyên TP nếu input không hợp lệ
+  }
+
+  // Cách 2: Đuổi theo TP (trailing về phía TP theo thời gian)
+  // - Thay vì tăng khoảng cách như công thức cũ (reduce + minutes * up_reduce),
+  //   ta cho khoảng cách GIẢM dần theo thời gian:
+  //   effectiveReduce = max(reduce - minutes * up_reduce, 0)
+  //
+  // Điều này khiến stop loss "kéo" dần về TP (thu hẹp khoảng cách),
+  // trong khi PositionService vẫn giữ ràng buộc monotonic:
+  // - LONG  : chỉ cho SL tăng lên (gần giá hơn)
+  // - SHORT : chỉ cho SL giảm xuống (gần giá hơn)
+  const effectiveReduce = Math.max(baseReduce - minutes * up, 0);
+
+  // Giữ nguyên đơn vị cũ: slOffset = (effectiveReduce * oc) / 100
+  const slOffset = (effectiveReduce * ocN) / 100;
+
   if (side === 'long') {
     return tp - slOffset;
   } else {

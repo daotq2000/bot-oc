@@ -210,7 +210,7 @@ async function start() {
     logger.info('='.repeat(60));
     logger.info('Initializing Price Alert Worker (Always-on, Independent)...');
     logger.info('='.repeat(60));
-    
+
     // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
     try {
       logger.info('[App] Pre-loading PriceAlertConfig cache...');
@@ -231,29 +231,6 @@ async function start() {
       logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
       logger.error('Price Alert system is critical - application will continue but alerts may not work');
       // Don't exit - Price Alert should be resilient
-    }
-
-    // WS Candle Ingestor for MEXC (build 1m candles from price ticks)
-    // These are used by Price Alert system
-    try {
-      const { WsCandleIngestor } = await import('./jobs/WsCandleIngestor.js');
-      const wsCandleIngestor = new WsCandleIngestor();
-      await wsCandleIngestor.initialize();
-      logger.info('✅ MEXC WS Candle Ingestor initialized');
-    } catch (error) {
-      logger.error('❌ Failed to initialize MEXC WS Candle Ingestor:', error?.message || error);
-      // Continue - Price Alert can work without candle ingestor
-    }
-
-    // WS Candle Ingestor for Binance (build 1m candles from price ticks)
-    try {
-      const { BinanceCandleIngestor } = await import('./jobs/BinanceCandleIngestor.js');
-      const binanceCandleIngestor = new BinanceCandleIngestor();
-      await binanceCandleIngestor.initialize();
-      logger.info('✅ Binance WS Candle Ingestor initialized');
-    } catch (error) {
-      logger.error('❌ Failed to initialize Binance WS Candle Ingestor:', error?.message || error);
-      // Continue - Price Alert can work without candle ingestor
     }
 
     // ============================================

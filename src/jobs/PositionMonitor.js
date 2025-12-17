@@ -87,15 +87,85 @@ export class PositionMonitor {
       // Update position (checks TP/SL and updates dynamic SL)
       const updated = await positionService.updatePosition(position);
 
-      // If position was closed, send notification
+      // Notification is now handled within PositionService.closePosition to ensure correct PNL
       if (updated.status === 'closed' && updated.close_reason) {
-        const orderService = this.orderServices.get(position.bot_id || position.strategy?.bot_id);
-        if (orderService && this.telegramService) {
-          await this.telegramService.sendCloseNotification(updated, position);
-        }
+        logger.info(`Position ${position.id} was closed with reason: ${updated.close_reason}. Notification handled by PositionService.`);
       }
     } catch (error) {
       logger.error(`Error monitoring position ${position.id}:`, error);
+    }
+  }
+
+  /**
+   * Place TP/SL orders for new positions that don't have them yet.
+   * @param {Object} position - Position object
+   */
+  async placeTpSlOrders(position) {
+    // Skip if position already has TP/SL orders or is not open
+    if (position.status !== 'open' || (position.tp_order_id && position.sl_order_id)) {
+      return;
+    }
+
+    try {
+      const exchangeService = this.exchangeServices.get(position.bot_id);
+      if (!exchangeService) {
+        logger.warn(`[Place TP/SL] ExchangeService not found for bot ${position.bot_id}`);
+        return;
+      }
+
+      // Get the actual fill price from the exchange
+      const fillPrice = await exchangeService.getOrderAverageFillPrice(position.symbol, position.order_id);
+      if (!fillPrice || !Number.isFinite(fillPrice) || fillPrice <= 0) {
+        logger.debug(`[Place TP/SL] Could not get fill price for position ${position.id}, will retry.`);
+        return;
+      }
+
+      // Update position with the real entry price
+      await Position.update(position.id, { entry_price: fillPrice });
+      position.entry_price = fillPrice;
+      logger.info(`[Place TP/SL] Updated position ${position.id} with actual fill price: ${fillPrice}`);
+
+      // Recalculate TP/SL based on the real entry price
+      const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+      const tpPrice = calculateTakeProfit(fillPrice, position.oc, position.take_profit, position.side);
+      const slPrice = calculateInitialStopLoss(tpPrice, position.oc, position.reduce, position.side);
+
+      // Get the exact quantity of the position
+      const quantity = await exchangeService.getClosableQuantity(position.symbol, position.side);
+      if (!quantity || quantity <= 0) {
+        logger.warn(`[Place TP/SL] No closable quantity found for position ${position.id}, cannot place TP/SL.`);
+        return;
+      }
+
+      // Place TP order
+      if (!position.tp_order_id) {
+        try {
+          const tpRes = await exchangeService.createTakeProfitLimit(position.symbol, position.side, tpPrice, quantity);
+          const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
+          if (tpOrderId) {
+            await Position.update(position.id, { tp_order_id: tpOrderId, take_profit_price: tpPrice });
+            logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice}`);
+          }
+        } catch (e) {
+          logger.error(`[Place TP/SL] ❌ Failed to create TP order for position ${position.id}:`, e?.message || e);
+        }
+      }
+
+      // Place SL order
+      if (!position.sl_order_id) {
+        try {
+          const slRes = await exchangeService.createStopLossLimit(position.symbol, position.side, slPrice, quantity);
+          const slOrderId = slRes?.orderId ? String(slRes.orderId) : null;
+          if (slOrderId) {
+            await Position.update(position.id, { sl_order_id: slOrderId, stop_loss_price: slPrice });
+            logger.info(`[Place TP/SL] ✅ Placed SL order ${slOrderId} for position ${position.id} @ ${slPrice}`);
+          }
+        } catch (e) {
+          logger.error(`[Place TP/SL] ❌ Failed to create SL order for position ${position.id}:`, e?.message || e);
+        }
+      }
+    } catch (error) {
+      logger.error(`[Place TP/SL] Error processing TP/SL for position ${position.id}:`, error?.message || error, error?.stack);
     }
   }
 
@@ -192,11 +262,17 @@ export class PositionMonitor {
       for (let i = 0; i < openPositions.length; i += batchSize) {
         const batch = openPositions.slice(i, i + batchSize);
         
+        // First, try to place TP/SL for new positions that might be missing them
+        await Promise.allSettled(
+          batch.map(p => this.placeTpSlOrders(p))
+        );
+
+        // Then, monitor positions (update dynamic SL, check for TP/SL hit)
         await Promise.allSettled(
           batch.map(p => this.monitorPosition(p))
         );
 
-        // Check for unfilled orders
+        // Check for other order management tasks
         await Promise.allSettled(
           batch.map(p => this.checkUnfilledOrders(p))
         );

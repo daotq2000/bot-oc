@@ -9,10 +9,7 @@ This guide shows how to securely connect from your local machine to the remote M
 
 ## 2) Open SSH tunnel (local 3307 -> remote 127.0.0.1:3306)
 ```bash
-ssh -i ~/Downloads/bot.pem \
-  -o StrictHostKeyChecking=accept-new \
-  -N -L 3307:127.0.0.1:3306 \
-  ubuntu@ec2-18-143-194-141.ap-southeast-1.compute.amazonaws.com -f
+ssh -i ~/Downloads/bot.pem -o StrictHostKeyChecking=accept-new -N -L 3307:127.0.0.1:3306 ubuntu@ec2-13-229-142-168.ap-southeast-1.compute.amazonaws.com -f
 ```
 
 Verify the tunnel is listening locally:
@@ -64,7 +61,7 @@ DB_NAME=bot_oc
 ## 7) Manage the tunnel
 - Re-open:
 ```bash
-ssh -i ~/Downloads/bot.pem -o StrictHostKeyChecking=accept-new -N -L 3307:127.0.0.1:3306 ubuntu@ec2-18-143-194-141.ap-southeast-1.compute.amazonaws.com -f
+ssh -i ~/Downloads/bot.pem -o StrictHostKeyChecking=accept-new -N -L 3307:127.0.0.1:3306 ubuntu@ec2-13-229-142-168.ap-southeast-1.compute.amazonaws.com -f
 ```
 - Check status:
 ```bash
@@ -84,7 +81,7 @@ Description=SSH Tunnel to Remote MySQL
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/autossh -M 0 -N -L 3307:127.0.0.1:3306 ubuntu@ec2-18-143-194-141.ap-southeast-1.compute.amazonaws.com -i ~/Downloads/bot.pem -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new
+ExecStart=/usr/bin/autossh -M 0 -N -L 3307:127.0.0.1:3306 ubuntu@ec2-13-229-142-168.ap-southeast-1.compute.amazonaws.com -i ~/Downloads/bot.pem -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new
 Restart=always
 RestartSec=5
 

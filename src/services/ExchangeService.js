@@ -749,8 +749,10 @@ export class ExchangeService {
       const positionSide = side === 'long' ? 'LONG' : 'SHORT';
       let pos = null;
       if (Array.isArray(positions)) {
+        logger.debug(`[getClosableQuantity] Found ${positions.length} positions on exchange for ${normalizedSymbol}:`, positions);
         pos = positions.find(p => p.symbol === normalizedSymbol && (p.positionSide ? p.positionSide === positionSide : true));
         if (!pos) pos = positions.find(p => p.symbol === normalizedSymbol && parseFloat(p.positionAmt) !== 0);
+        logger.debug(`[getClosableQuantity] Selected position:`, pos);
       }
       const posAmt = pos ? Math.abs(parseFloat(pos.positionAmt || 0)) : 0;
       if (posAmt <= 0) return 0;

@@ -204,7 +204,7 @@ class MexcWebSocketManager {
               }
               
               if (normSymbol) {
-                const price = Number(last);
+              const price = Number(last);
                 this.priceCache.set(normSymbol, price);
                 // Emit to listeners
                 this._emitPrice({ symbol: normSymbol, price, ts: Date.now() });
