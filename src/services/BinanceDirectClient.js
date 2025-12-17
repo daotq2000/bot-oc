@@ -1324,6 +1324,12 @@ export class BinanceDirectClient {
   /**
    * Cancel order by orderId
    */
+  async cancelAllOpenOrders(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    logger.info(`[BinanceDirectClient] Cancelling all open orders for ${normalizedSymbol}...`);
+    return await this.makeRequest('/fapi/v1/allOpenOrders', 'DELETE', { symbol: normalizedSymbol }, true);
+  }
+
   async cancelOrder(symbol, orderId) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
     const params = { symbol: normalizedSymbol, orderId: orderId };

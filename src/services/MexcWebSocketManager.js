@@ -21,24 +21,42 @@ class MexcWebSocketManager {
     this._reconnectTimer = null;
     this._pingTimer = null;
     this._endpointIndex = 0;
+
+    // Domain preference/failover tracking
+    this._comFailures = 0;
+    this._coFailures = 0;
+    this._lastAttemptDomain = null; // 'com' | 'co'
+    this._failoverThreshold = Number(configService.getNumber('MEXC_WS_COM_FAILOVER_THRESHOLD', 2));
   }
 
   get endpoints() {
-    // MEXC Futures WebSocket endpoint (official documentation)
+    // Build ordered endpoints list with domain preference and de-duplication
     const primary = configService.getString('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.com/edge');
-    return [
-      primary,
-      // Official futures endpoint
+    const primaryDomain = (primary || '').includes('mexc.co') ? 'co' : 'com';
+
+    const uniq = (arr) => Array.from(new Set(arr));
+
+    const comList = uniq([
+      ...(primaryDomain === 'com' ? [primary] : []),
       'wss://contract.mexc.com/edge',
+      'wss://wbs-api.mexc.com/ws'
+    ]);
+
+    const coList = uniq([
+      ...(primaryDomain === 'co' ? [primary] : []),
       'wss://contract.mexc.co/edge',
-      // Fallback to old endpoints
-      'wss://wbs-api.mexc.com/ws',
       'wss://wbs.mexc.co/ws'
-    ];
+    ]);
+
+    // Prefer .com if it is connecting; otherwise, fallback to .co
+    const preferCo = this._comFailures >= this._failoverThreshold;
+    const ordered = preferCo ? [...coList, ...comList] : [...comList, ...coList];
+    return ordered;
   }
 
   get baseUrl() {
     const eps = this.endpoints;
+    if (this._endpointIndex >= eps.length) this._endpointIndex = 0;
     const idx = Math.max(0, Math.min(this._endpointIndex, eps.length - 1));
     return eps[idx];
   }
@@ -89,6 +107,19 @@ class MexcWebSocketManager {
     }
   }
 
+  _domainOf(url) {
+    try { return (url || '').includes('.mexc.co') ? 'co' : 'com'; } catch (_) { return 'com'; }
+  }
+
+  _recordSuccess(domain) {
+    if (domain === 'com') this._comFailures = 0;
+    if (domain === 'co') this._coFailures = 0;
+  }
+
+  _recordFailure(domain) {
+    if (domain === 'com') this._comFailures++; else this._coFailures++;
+  }
+
   ensureConnected() {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
     if (this._connecting) return;
@@ -96,7 +127,9 @@ class MexcWebSocketManager {
 
     try {
       const url = this.baseUrl;
-      logger.info(`[MEXC-WS] Connecting ${url}`);
+      const domain = this._domainOf(url);
+      this._lastAttemptDomain = domain;
+      logger.info(`[MEXC-WS] Connecting ${url} (domain=${domain}, comFailures=${this._comFailures}, coFailures=${this._coFailures})`);
       this.ws = new WebSocket(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
@@ -109,6 +142,7 @@ class MexcWebSocketManager {
         try { this.ws?.terminate(); } catch (_) {}
         logger.warn('[MEXC-WS] Open timeout, rotating endpoint');
         this._cleanup();
+        this._recordFailure(domain);
         this._endpointIndex = (this._endpointIndex + 1) % this.endpoints.length;
         this._scheduleReconnect();
       }, 7000);
@@ -117,6 +151,7 @@ class MexcWebSocketManager {
         if (openGuard) { clearTimeout(openGuard); openGuard = null; }
         logger.info('[MEXC-WS] Connected');
         this._connecting = false;
+        this._recordSuccess(domain);
         
         // For futures endpoint (/edge), send ping first
         if (this.baseUrl.includes('/edge')) {
@@ -142,6 +177,7 @@ class MexcWebSocketManager {
         logger.error(`[MEXC-WS] unexpected-response: ${code}`);
         try { this.ws?.terminate(); } catch (_) {}
         this._cleanup();
+        this._recordFailure(domain);
         // rotate endpoint and reconnect quickly
         this._endpointIndex = (this._endpointIndex + 1) % this.endpoints.length;
         setTimeout(() => this.ensureConnected(), 500);
@@ -237,6 +273,7 @@ class MexcWebSocketManager {
       this.ws.on('close', () => {
         logger.warn('[MEXC-WS] Closed');
         this._cleanup();
+        this._recordFailure(domain);
         this._scheduleReconnect();
       });
 
@@ -244,6 +281,9 @@ class MexcWebSocketManager {
         logger.error('[MEXC-WS] Error:', err?.message || err);
         try { this.ws?.terminate(); } catch (_) {}
         this._cleanup();
+        this._recordFailure(domain);
+        // rotate endpoint on error as well
+        this._endpointIndex = (this._endpointIndex + 1) % this.endpoints.length;
         this._scheduleReconnect();
       });
     } catch (e) {

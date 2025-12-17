@@ -12,8 +12,8 @@ import logger from '../src/utils/logger.js';
  * Script to test PNL notifications for both winning and losing positions.
  *
  * 1. Finds a test bot.
- * 2. Creates two real positions on the exchange (one LONG, one SHORT).
- * 3. Closes one with a simulated profit and the other with a simulated loss.
+ * 2. Creates and closes a LONG position with profit.
+ * 3. Creates and closes a SHORT position with loss.
  * 4. Verifies that the correct notifications are sent.
  */
 
@@ -47,8 +47,21 @@ async function findOrCreateStrategy(botId, symbol) {
   return strategy;
 }
 
+async function waitForPosition(exchangeService, symbol) {
+    logger.info(`[Test] Waiting up to 30 seconds for ${symbol} position to appear on the exchange...`);
+    for (let i = 0; i < 15; i++) { // Poll for up to 30 seconds
+        const positions = await exchangeService.getOpenPositions(symbol);
+        const openPosition = positions.find(p => p.symbol === symbol && Math.abs(parseFloat(p.positionAmt)) > 0);
+        if (openPosition) {
+            logger.info(`[Test] ✅ Position for ${symbol} confirmed on exchange: Amount=${openPosition.positionAmt}`);
+            return openPosition;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    throw new Error(`Position for ${symbol} did not appear on the exchange.`);
+}
+
 async function runTest() {
-  let longPosition, shortPosition;
   try {
     logger.info('\n============================================================');
     logger.info('PNL Notification Test');
@@ -73,66 +86,40 @@ async function runTest() {
     const positionService = new PositionService(exchangeService, telegramService);
     logger.info('[Test] OrderService and PositionService created.');
 
-    // Create LONG position
-    logger.info(`[Test] Creating a LONG position for ${LONG_SYMBOL}...`);
+    // --- Test 1: LONG Position with Profit ---
+    logger.info('\n--- Starting Test 1: LONG Position (Profit) ---');
     const longStrategy = await findOrCreateStrategy(TEST_BOT_ID, LONG_SYMBOL);
     const longEntryPrice = await exchangeService.getTickerPrice(LONG_SYMBOL);
     const longSignal = { strategy: longStrategy, side: 'long', entryPrice: longEntryPrice, amount: TEST_AMOUNT };
-    longPosition = await orderService.executeSignal(longSignal);
-    if (!longPosition) throw new Error('Failed to create LONG position.');
-    logger.info(`[Test] ✅ Created LONG position. DB ID: ${longPosition.id}`);
+    let longPosition = await orderService.executeSignal(longSignal);
+    if (!longPosition) throw new Error('Failed to create LONG position in DB.');
+    logger.info(`[Test] ✅ Created LONG position in DB. ID: ${longPosition.id}`);
+    await waitForPosition(exchangeService, LONG_SYMBOL);
+    await exchangeService.cancelAllOpenOrders(LONG_SYMBOL);
+    logger.info(`[Test] Cancelled all open orders for ${LONG_SYMBOL}. Waiting 2s before closing.`);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const longClosePrice = longPosition.entry_price * 1.02; // 2% profit
+    await positionService.closePosition(longPosition, longClosePrice, 0, 'manual_test_win');
+    logger.info('--- Finished Test 1: LONG Position ---\n');
 
-    // Create SHORT position
-    logger.info(`[Test] Creating a SHORT position for ${SHORT_SYMBOL}...`);
+    // --- Test 2: SHORT Position with Loss ---
+    logger.info('--- Starting Test 2: SHORT Position (Loss) ---');
     const shortStrategy = await findOrCreateStrategy(TEST_BOT_ID, SHORT_SYMBOL);
     const shortEntryPrice = await exchangeService.getTickerPrice(SHORT_SYMBOL);
     const shortSignal = { strategy: shortStrategy, side: 'short', entryPrice: shortEntryPrice, amount: TEST_AMOUNT };
-    shortPosition = await orderService.executeSignal(shortSignal);
-    if (!shortPosition) throw new Error('Failed to create SHORT position.');
-    logger.info(`[Test] ✅ Created SHORT position. DB ID: ${shortPosition.id}`);
-
-    // Wait for the LONG position to be confirmed
-    logger.info(`[Test] Waiting up to 30 seconds for ${LONG_SYMBOL} position to appear on the exchange...`);
-    let longPositionOnExchange = null;
-    for (let i = 0; i < 15; i++) { // Poll for up to 30 seconds
-        const positions = await exchangeService.getOpenPositions(LONG_SYMBOL);
-        const openPosition = positions.find(p => p.symbol === LONG_SYMBOL && Math.abs(parseFloat(p.positionAmt)) > 0);
-        if (openPosition) {
-            longPositionOnExchange = openPosition;
-            logger.info(`[Test] ✅ LONG Position confirmed on exchange: Amount=${longPositionOnExchange.positionAmt}`);
-            break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-    if (!longPositionOnExchange) throw new Error(`LONG position for ${LONG_SYMBOL} did not appear on the exchange.`);
-
-    // Wait for the SHORT position to be confirmed
-    logger.info(`[Test] Waiting up to 30 seconds for ${SHORT_SYMBOL} position to appear on the exchange...`);
-    let shortPositionOnExchange = null;
-    for (let i = 0; i < 15; i++) { // Poll for up to 30 seconds
-        const positions = await exchangeService.getOpenPositions(SHORT_SYMBOL);
-        const openPosition = positions.find(p => p.symbol === SHORT_SYMBOL && Math.abs(parseFloat(p.positionAmt)) > 0);
-        if (openPosition) {
-            shortPositionOnExchange = openPosition;
-            logger.info(`[Test] ✅ SHORT Position confirmed on exchange: Amount=${shortPositionOnExchange.positionAmt}`);
-            break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-    if (!shortPositionOnExchange) throw new Error(`SHORT position for ${SHORT_SYMBOL} did not appear on the exchange.`);
-
-    // Close LONG position with profit
-    logger.info(`[Test] Closing LONG position ${longPosition.id} with a simulated profit...`);
-    const longClosePrice = longPosition.entry_price * 1.02; // 2% profit
-    await positionService.closePosition(longPosition, longClosePrice, 0, 'manual_test_win');
-
-    // Close SHORT position with loss
-    logger.info(`[Test] Closing SHORT position ${shortPosition.id} with a simulated loss...`);
+    let shortPosition = await orderService.executeSignal(shortSignal);
+    if (!shortPosition) throw new Error('Failed to create SHORT position in DB.');
+    logger.info(`[Test] ✅ Created SHORT position in DB. ID: ${shortPosition.id}`);
+    await waitForPosition(exchangeService, SHORT_SYMBOL);
+    await exchangeService.cancelAllOpenOrders(SHORT_SYMBOL);
+    logger.info(`[Test] Cancelled all open orders for ${SHORT_SYMBOL}. Waiting 2s before closing.`);
+    await new Promise(resolve => setTimeout(resolve, 2000));
     const shortClosePrice = shortPosition.entry_price * 1.02; // 2% loss
     await positionService.closePosition(shortPosition, shortClosePrice, 0, 'manual_test_loss');
+    logger.info('--- Finished Test 2: SHORT Position ---\n');
 
     logger.info('\n============================================================');
-    logger.info('✅ Test script finished.');
+    logger.info('✅ Test script finished successfully.');
     logger.info('Please check the logs and Telegram for notifications.');
     logger.info('============================================================\n');
 

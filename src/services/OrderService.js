@@ -12,6 +12,17 @@ export class OrderService {
     this.telegramService = telegramService;
   }
 
+  // Send central log to fixed tracking channel
+  async sendCentralLog(message) {
+    try {
+      const channelId = '-1003163801780';
+      if (!this.telegramService || !this.telegramService.sendMessage) return;
+      await this.telegramService.sendMessage(channelId, String(message || ''));
+    } catch (e) {
+      logger.warn(`[OrderService] Failed to send central log: ${e?.message || e}`);
+    }
+  }
+
   /**
    * Execute signal and create order
    * @param {Object} signal - Signal object from StrategyService
@@ -21,6 +32,9 @@ export class OrderService {
     try {
       const { strategy, side, entryPrice, amount, tpPrice, slPrice } = signal;
 
+      // Central log: attempt
+      await this.sendCentralLog(`Order Attempt | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} entry=${entryPrice} amt=${amount} tp=${tpPrice ?? 'n/a'} sl=${slPrice ?? 'n/a'} oc=${signal?.oc ?? 'n/a'}`);
+
       // Acquire concurrency reservation (DB-backed advisory lock)
       let reservationToken;
       try {
@@ -29,6 +43,7 @@ export class OrderService {
         if (e?.code === 'CONCURRENCY_LOCK_TIMEOUT') {
           // Lock contention: skip silently without alert; not a real limit breach
           logger.warn(`[OrderService] Concurrency lock timeout for bot ${strategy.bot_id}, skip placing order (no alert).`);
+          await this.sendCentralLog(`Order ConcurrencyLockTimeout | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol}`);
           return null;
         }
         throw e;
@@ -46,6 +61,7 @@ export class OrderService {
             strategy.bot = await Bot.findById(strategy.bot_id);
           }
           await this.telegramService?.sendConcurrencyLimitAlert?.(strategy, status);
+          await this.sendCentralLog(`Order Rejected MaxConcurrent | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(signal?.side || side).toUpperCase()} current=${status.currentCount}/${status.maxConcurrent}`);
         } catch (e) {
           logger.warn(`[OrderService] Failed to send concurrency alert: ${e?.message || e}`);
         }
@@ -116,6 +132,7 @@ export class OrderService {
             type: 'market'
           });
           orderType = 'market';
+          await this.sendCentralLog(`Order FallbackToMarket | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} reason=${em}`);
         } else {
           throw e;
         }
@@ -124,44 +141,15 @@ export class OrderService {
       // Ensure we have a valid order object before proceeding
       if (!order || !order.id) {
         logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
+        await this.sendCentralLog(`Order Failed | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} reason=InvalidOrderObject`);
         // Do not throw here, just return null to prevent crashing the scanner
         return null;
       }
 
-      // Ensure we have a valid order object before proceeding
-      if (!order || !order.id) {
-        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
-        // Do not throw here, just return null to prevent crashing the scanner
-        return null;
-      }
-
-      // Ensure we have a valid order object before proceeding
-      if (!order || !order.id) {
-        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
-        // Do not throw here, just return null to prevent crashing the scanner
-        return null;
-      }
-
-      // Ensure we have a valid order object before proceeding
-      if (!order || !order.id) {
-        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
-        // Do not throw here, just return null to prevent crashing the scanner
-        return null;
-      }
-
-      // Ensure we have a valid order object before proceeding
-      if (!order || !order.id) {
-        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
-        // Do not throw here, just return null to prevent crashing the scanner
-        return null;
-      }
-
-      // Ensure we have a valid order object before proceeding
-      if (!order || !order.id) {
-        logger.error(`[OrderService] Order creation failed or returned invalid object for ${strategy.symbol}. Aborting position creation.`);
-        // Do not throw here, just return null to prevent crashing the scanner
-        return null;
-      }
+      // Calculate temporary TP/SL prices based on the initial signal entry price
+      const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+      const tempTpPrice = calculateTakeProfit(entryPrice, strategy.oc, strategy.take_profit, side);
+      const tempSlPrice = calculateInitialStopLoss(tempTpPrice, strategy.oc, strategy.reduce, side);
 
       // Store position in database
       const position = await Position.create({
@@ -172,8 +160,8 @@ export class OrderService {
         side: side,
         entry_price: orderType === 'market' ? (Number(order?.avgFillPrice || order?.price || currentPrice)) : entryPrice,
         amount: amount,
-        take_profit_price: tpPrice,
-        stop_loss_price: slPrice,
+        take_profit_price: tempTpPrice, // Use temporary TP price
+        stop_loss_price: tempSlPrice, // Use temporary SL price
         current_reduce: strategy.reduce
       });
 
@@ -209,6 +197,9 @@ export class OrderService {
       // TP/SL creation is now handled by PositionMonitor after entry confirmation.
       logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
 
+      // Central log: success
+      await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
+
       // Mark reservation as 'released' (position opened)
       try {
         orderCreated = true;
@@ -229,6 +220,7 @@ export class OrderService {
         msg.includes('-1121') || msg.includes('-1111') || msg.includes('-4061') || msg.includes('-2027')
       ) {
         logger.warn(`Skip executing signal due to validation: ${msg}`);
+        await this.sendCentralLog(`Order SoftSkip | bot=${signal?.strategy?.bot_id} strat=${signal?.strategy?.id} ${signal?.strategy?.symbol} ${String(signal?.side).toUpperCase()} reason=${msg}`);
         return null; // do not escalate
       }
 
@@ -239,6 +231,11 @@ export class OrderService {
       if (error.message) {
         logger.error(`Error message: ${error.message}`);
       }
+      // Central log: failure
+      try {
+        const strat = signal?.strategy || {};
+        await this.sendCentralLog(`Order Error | bot=${strat?.bot_id} strat=${strat?.id} ${strat?.symbol} ${String(signal?.side).toUpperCase()} msg=${error?.message || error} code=${error?.code || ''}`);
+      } catch (_) {}
       throw error;
     } finally {
       // If order was not created, cancel reservation (if any)

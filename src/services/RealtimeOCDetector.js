@@ -154,7 +154,7 @@ export class RealtimeOCDetector {
    * @param {number} timestamp - Event timestamp
    * @returns {Array<Object>} Array of matched strategies with OC data
    */
-  async detectOC(exchange, symbol, currentPrice, timestamp = Date.now(), caller = 'unknown') {
+  async detectOC(exchange, symbol, currentPrice, timestamp = Date.now(), caller = 'unknown', options = {}) {
     try {
       const normalizedExchange = (exchange || '').toLowerCase();
       const normalizedSymbol = String(symbol || '').toUpperCase().replace(/[\/:_]/g, '');

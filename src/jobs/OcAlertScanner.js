@@ -2,6 +2,8 @@ import { PriceAlertConfig } from '../models/PriceAlertConfig.js';
 import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import { webSocketManager } from '../services/WebSocketManager.js';
 import { configService } from '../services/ConfigService.js';
+import { realtimeOCDetector } from '../services/RealtimeOCDetector.js';
+import { webSocketOCConsumer } from '../consumers/WebSocketOCConsumer.js';
 import { priceAlertSymbolTracker } from '../services/PriceAlertSymbolTracker.js';
 import logger from '../utils/logger.js';
 
@@ -339,7 +341,7 @@ export class OcAlertScanner {
           state.lastPrice = p;
           state.lastOc = oc;
 
-          const minIntervalMs = Number(configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000));
+          const minIntervalMs = Number(configService.getNumber('OC_ALERT_TICK_MIN_INTERVAL_MS', configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000)));
           const rearmRatio = Number(configService.getNumber('OC_ALERT_REARM_RATIO', 0.6));
           const absOc = Math.abs(oc);
           const absThreshold = Math.abs(Number(w.threshold || 0));
@@ -363,6 +365,25 @@ export class OcAlertScanner {
               state.lastAlertTime = now;
               state.armed = false;
               logger.info(`[OcTick] ✅ Alert sent: ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% to chat_id=${chatId}`);
+
+              // Immediately match strategies and execute orders (event-driven)
+              try {
+                const matches = await realtimeOCDetector.detectOC(exchange, sym, p, ts || Date.now(), 'OcAlertScanner.onTick');
+                if (Array.isArray(matches) && matches.length > 0) {
+                  logger.info(`[OcTick] 🎯 Strategy matches found after alert: ${matches.length} for ${exchange.toUpperCase()} ${sym}`);
+                  for (const match of matches) {
+                    try {
+                      await webSocketOCConsumer.processMatch(match);
+                    } catch (procErr) {
+                      logger.error(`[OcTick] Error processing match for strategy ${match?.strategy?.id}:`, procErr?.message || procErr);
+                    }
+                  }
+                } else {
+                  logger.debug(`[OcTick] No strategy matches for ${exchange.toUpperCase()} ${sym} right after alert`);
+                }
+              } catch (detErr) {
+                logger.error('[OcTick] Error during immediate strategy match after alert:', detErr?.message || detErr);
+              }
             }
           } else if (absOc < absThreshold * rearmRatio) {
             state.armed = true;

@@ -77,7 +77,7 @@ async function start() {
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '10', 'Minutes before auto-cancel unfilled entry LIMIT orders');
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
-      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '7000', 'Price alert scanner job interval in milliseconds');
+      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '500', 'Price alert scanner job interval in milliseconds');
       await AppConfig.set('PRICE_ALERT_CHECK_ENABLED', 'true', 'Enable price alert checking for MEXC and other exchanges');
       await AppConfig.set('PRICE_ALERT_SYMBOL_REFRESH_INTERVAL_MS', '30000', 'Interval to refresh Price Alert symbols from config/DB (ms)');
       await AppConfig.set('PRICE_ALERT_WS_SUBSCRIBE_INTERVAL_MS', '60000', 'Interval to update WebSocket subscriptions for Price Alert (ms)');
@@ -87,6 +87,7 @@ async function start() {
       await AppConfig.set('REALTIME_OC_ENABLED', 'true', 'Enable realtime OC detection from WebSocket (no database candles)');
       await AppConfig.set('PRICE_ALERTS_STRATEGY_FIRST', 'false', 'If true: when there are active strategies, PriceAlertScanner yields to SignalScanner (strategy-first). If false: always run standalone price alerts.');
       await AppConfig.set('OC_ALERT_SCAN_INTERVAL_MS', '3000', 'Interval for OC alert scan (ms)');
+      await AppConfig.set('OC_ALERT_TICK_MIN_INTERVAL_MS', '0', 'Min interval per symbol/interval between alerts on WS tick (ms)');
       await AppConfig.set('PRICE_ALERT_MIN_INTERVAL_MS', '7000', 'Min interval per symbol/interval between alerts (ms)');
       await AppConfig.set('PRICE_ALERT_USE_SYMBOL_FILTERS', 'true', 'Use symbol_filters table for price alerts when symbols not specified');
       await AppConfig.set('PRICE_ALERT_MAX_SYMBOLS', '5000', 'Max number of symbols to scan per exchange for price alerts');
@@ -117,6 +118,7 @@ async function start() {
       await AppConfig.set('LISTEN_KEY_KEEPALIVE_MS', '1800000', 'Interval (ms) to refresh WebSocket listen key (30 minutes)');
       await AppConfig.set('WS_RECONNECT_BACKOFF_MS', '3000', 'Backoff (ms) for WebSocket reconnection attempts');
       await AppConfig.set('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.com/edge', 'MEXC Futures WebSocket endpoint (official)');
+      await AppConfig.set('MEXC_WS_COM_FAILOVER_THRESHOLD', '2', 'After N consecutive .com connection failures, prefer .co endpoints until a .com connects successfully');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
 
@@ -197,7 +199,7 @@ async function start() {
     // Initialize Binance WebSocket connection for price data
     logger.info('Initializing Binance WebSocket manager...');
     webSocketManager.connect();
-    
+
     // Log WebSocket status after a short delay to allow connections to establish
     setTimeout(() => {
       const wsStatus = webSocketManager.getStatus();
