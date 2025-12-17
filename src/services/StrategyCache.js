@@ -15,7 +15,7 @@ export class StrategyCache {
     // key = `${exchange}|${symbol}|${oc}|${bot_id}`
     this.cache = new Map();
     this.lastRefreshTime = 0;
-    this.refreshTTL = 30000; // 30 seconds
+    this.refreshTTL = 1800000; // 30 minutes
     this.isRefreshing = false;
   }
 
