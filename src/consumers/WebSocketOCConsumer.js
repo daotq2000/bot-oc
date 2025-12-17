@@ -199,20 +199,39 @@ export class WebSocketOCConsumer {
 
       // Import calculator functions for TP/SL calculation
       const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
-      
-      // Calculate entry price based on side
-      const entryPrice = direction === 'bullish' 
-        ? calculateLongEntryPrice(currentPrice, Math.abs(oc), strategy.extend || 0)
-        : calculateShortEntryPrice(currentPrice, Math.abs(oc), strategy.extend || 0);
-      
-      // Calculate TP and SL
-      const tpPrice = calculateTakeProfit(entryPrice, Math.abs(oc), strategy.take_profit || 55, direction === 'bullish' ? 'long' : 'short');
-      const slPrice = calculateInitialStopLoss(tpPrice, Math.abs(oc), strategy.reduce || 10, direction === 'bullish' ? 'long' : 'short');
-      
+
+      // Counter-trend side mapping: bullish → short, bearish → long
+      const side = direction === 'bullish' ? 'short' : 'long';
+
+      // Use interval open price for entry calculation (per-bucket open)
+      const baseOpen = Number.isFinite(Number(match.openPrice)) && Number(match.openPrice) > 0
+        ? Number(match.openPrice)
+        : currentPrice;
+
+      // Calculate entry price based on counter-trend side and OPEN price
+      const entryPrice = side === 'long'
+        ? calculateLongEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0)
+        : calculateShortEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0);
+
+      // Check extend condition: only trigger when price reaches the entry zone
+      let extendOK = true;
+      const extendVal = Number(strategy.extend || 0);
+      if (extendVal > 0) {
+        if (side === 'long') {
+          extendOK = currentPrice <= entryPrice && entryPrice < baseOpen;
+        } else {
+          extendOK = currentPrice >= entryPrice && entryPrice > baseOpen;
+        }
+      }
+
+      // Calculate TP and SL (based on side)
+      const tpPrice = calculateTakeProfit(entryPrice, Math.abs(oc), strategy.take_profit || 55, side);
+      const slPrice = calculateInitialStopLoss(tpPrice, Math.abs(oc), strategy.reduce || 10, side);
+
       // Create signal object - OrderService.executeSignal expects strategy object
       const signal = {
         strategy: strategy, // Pass full strategy object
-        side: direction === 'bullish' ? 'long' : 'short',
+        side,
         entryPrice: entryPrice,
         currentPrice: currentPrice,
         oc: Math.abs(oc),
@@ -222,6 +241,18 @@ export class WebSocketOCConsumer {
         slPrice: slPrice,
         amount: strategy.amount || 1000 // Default amount if not set
       };
+
+      // If extend condition not met, either place passive LIMIT (if enabled) or skip
+      if (!extendOK) {
+        const allowPassive = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
+        if (allowPassive) {
+          signal.forcePassiveLimit = true; // OrderService will create a passive LIMIT at entryPrice
+          logger.info(`[WebSocketOCConsumer] Extend not met; placing passive LIMIT (forcePassiveLimit) for strategy ${strategy.id} at ${entryPrice}`);
+        } else {
+          logger.info(`[WebSocketOCConsumer] Extend not met; skipping order for strategy ${strategy.id}. side=${side} baseOpen=${baseOpen} entry=${entryPrice} current=${currentPrice}`);
+          return;
+        }
+      }
 
       logger.info(`[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ${signal.side} @ ${currentPrice}, OC=${oc.toFixed(2)}%`);
 
