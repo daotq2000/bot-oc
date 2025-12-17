@@ -129,29 +129,9 @@ export class PositionMonitor {
         }
       }
 
-      // Optional: candle-based safety cancel for non-filled entries from previous candle
-      
-      const candleCancelEnabled = configService.getBoolean('ENABLE_CANDLE_END_CANCEL_FOR_ENTRY', false);
-      if (candleCancelEnabled) {
-        const { CandleService } = await import('../services/CandleService.js');
-        const candleService = new CandleService(exchangeService);
-        const latestCandle = await candleService.getLatestCandle(strategy.symbol, strategy.interval);
-        if (!latestCandle) return;
-        const isCandleClosed = candleService.isCandleClosed(latestCandle);
-
-        if (isCandleClosed && position.status === 'open') {
-          const positionTime = new Date(position.opened_at).getTime();
-          const candleTime = latestCandle.open_time;
-          if (positionTime < candleTime) {
-            const st = await exchangeService.getOrderStatus(position.symbol, position.order_id);
-            if (st.status === 'open' && (st.filled || 0) === 0) {
-              await orderService.cancelOrder(position, 'candle_end');
-              logger.info(`Cancelled unfilled order at candle end for position ${position.id}`);
-              return; // done for this position
-            }
-          }
-        }
-      }
+      // DEPRECATED: Candle-based safety cancel feature removed (no longer using database candles)
+      // This feature is disabled as we no longer store candles in database
+      // Orders are now managed by TTL (ENTRY_ORDER_TTL_MINUTES) instead
 
       // Re-create entry order after manual cancel (binance-mainet) if 2 minutes passed
       if (position.status === 'open' && position.order_id) {

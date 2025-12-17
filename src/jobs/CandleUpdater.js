@@ -84,24 +84,32 @@ export class CandleUpdater {
     try {
       const strategies = await Strategy.findAll(null, true); // All active strategies
 
-      // Group by bot_id and symbol+interval to avoid duplicate updates
-      const updateKeys = new Set();
-      const strategiesToUpdate = [];
+      // Global de-dup across bots by (exchange,symbol,interval) to avoid DB deadlocks
+      const taskMap = new Map(); // key -> { bot_id, symbol, interval }
+      for (const s of strategies) {
+        const exchange = (s.exchange || '').toLowerCase();
+        const symbol = s.symbol;
+        const interval = s.interval;
+        const key = `${exchange}|${symbol}|${interval}`;
+        if (!taskMap.has(key)) {
+          taskMap.set(key, { bot_id: s.bot_id, symbol, interval });
+        }
+      }
+      const tasks = Array.from(taskMap.values());
 
-      for (const strategy of strategies) {
-        const key = `${strategy.bot_id}_${strategy.symbol}_${strategy.interval}`;
-        if (!updateKeys.has(key)) {
-          updateKeys.add(key);
-          strategiesToUpdate.push(strategy);
+      // Update candles with configurable concurrency
+      const concurrency = Number(configService.getNumber('CANDLE_UPDATE_CONCURRENCY', 8));
+      const batchDelay = Number(configService.getNumber('CANDLE_UPDATE_BATCH_DELAY_MS', 75));
+
+      for (let i = 0; i < tasks.length; i += concurrency) {
+        const batch = tasks.slice(i, i + concurrency);
+        await Promise.allSettled(batch.map(t => this.updateCandlesForStrategy({ bot_id: t.bot_id, symbol: t.symbol, interval: t.interval })));
+        if (i + concurrency < tasks.length && batchDelay > 0) {
+          await new Promise(r => setTimeout(r, batchDelay));
         }
       }
 
-      // Update candles sequentially to reduce database lock contention
-      for (const strategy of strategiesToUpdate) {
-        await this.updateCandlesForStrategy(strategy);
-      }
-
-      logger.debug(`Updated candles for ${strategiesToUpdate.length} unique symbol/interval combinations`);
+      logger.debug(`Updated candles for ${tasks.length} unique (exchange,symbol,interval) combinations (concurrency=${concurrency})`);
     } catch (error) {
       logger.error('Error in updateAllCandles:', error);
     } finally {

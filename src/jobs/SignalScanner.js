@@ -4,6 +4,7 @@ import { Strategy } from '../models/Strategy.js';
 import { Position } from '../models/Position.js';
 import { PriceAlertConfig } from '../models/PriceAlertConfig.js';
 import { webSocketManager } from '../services/WebSocketManager.js';
+import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { CandleService } from '../services/CandleService.js';
 import { StrategyService } from '../services/StrategyService.js';
@@ -72,9 +73,10 @@ export class SignalScanner {
       const maxConcurrentTrades = bot.max_concurrent_trades || 5;
       concurrencyManager.initializeBot(bot.id, maxConcurrentTrades);
 
-      logger.info(`SignalScanner initialized for bot ${bot.id} (max_concurrent_trades=${maxConcurrentTrades})`);
+      logger.info(`✅ SignalScanner initialized for bot ${bot.id} (${bot.exchange}, max_concurrent_trades=${maxConcurrentTrades})`);
     } catch (error) {
-      logger.error(`Failed to initialize SignalScanner for bot ${bot.id}:`, error);
+      logger.error(`❌ Failed to initialize SignalScanner for bot ${bot.id}:`, error?.message || error);
+      // Don't re-throw - allow app to continue even if one bot fails
     }
   }
 
@@ -192,6 +194,8 @@ export class SignalScanner {
     }
 
     this.isRunning = true;
+    const scanStartTime = Date.now();
+    const maxScanDurationMs = Number(configService.getNumber('SIGNAL_SCAN_MAX_DURATION_MS', 60000)); // 60 second timeout
 
     try {
       // Fetch strategies and alert configs from cache/db
@@ -208,10 +212,15 @@ export class SignalScanner {
 
       // Create a lookup map for alert configs for efficient access
       const alertConfigMap = new Map();
-      const allSymbols = new Set();
+      const allSymbols = new Set(); // for Binance WS manager
+      const mexcSymbols = new Set(); // for MEXC WS manager
 
       for (const strategy of strategies) {
-        allSymbols.add(normalizeSymbol(strategy.symbol));
+        const norm = normalizeSymbol(strategy.symbol);
+        allSymbols.add(norm);
+        if ((strategy.exchange || '').toLowerCase() === 'mexc') {
+          mexcSymbols.add(norm);
+        }
       }
 
       for (const config of alertConfigs) {
@@ -227,6 +236,9 @@ export class SignalScanner {
         for (const symbol of symbols) {
           const normalizedSymbol = normalizeSymbol(symbol);
           allSymbols.add(normalizedSymbol);
+          if ((config.exchange || '').toLowerCase() === 'mexc') {
+            mexcSymbols.add(normalizedSymbol);
+          }
           for (const interval of intervals) {
             const key = `${normalizedSymbol}:${interval}`;
             alertConfigMap.set(key, config);
@@ -235,8 +247,21 @@ export class SignalScanner {
       }
 
       // Update WebSocket subscriptions with all required symbols
-      logger.info(`[SignalScanner] Subscribing WebSocket to ${allSymbols.size} unique symbols`);
-      webSocketManager.subscribe(Array.from(allSymbols));
+      const binanceSymbols = Array.from(allSymbols).filter(s => !mexcSymbols.has(s));
+      logger.info(`[SignalScanner] Collected symbols: total=${allSymbols.size}, binance=${binanceSymbols.length}, mexc=${mexcSymbols.size}`);
+      if (binanceSymbols.length > 0) {
+        logger.info(`[SignalScanner] Subscribing Binance WS to ${binanceSymbols.length} symbols: ${binanceSymbols.slice(0, 5).join(', ')}${binanceSymbols.length > 5 ? '...' : ''}`);
+        webSocketManager.subscribe(binanceSymbols);
+        // Log WebSocket status after subscription
+        setTimeout(() => {
+          const wsStatus = webSocketManager.getStatus();
+          logger.info(`[SignalScanner] WebSocket status after subscription: ${wsStatus.connectedCount}/${wsStatus.totalConnections} connected, ${wsStatus.totalStreams} streams`);
+        }, 1000);
+      }
+      if (mexcSymbols.size > 0) {
+        logger.info(`[SignalScanner] Subscribing MEXC WS to ${mexcSymbols.size} symbols: ${Array.from(mexcSymbols).slice(0, 5).join(', ')}${mexcSymbols.size > 5 ? '...' : ''}`);
+        mexcPriceWs.subscribe(Array.from(mexcSymbols));
+      }
 
       logger.info(`[SignalScanner] Starting scan of ${strategies.length} active strategies and ${alertConfigs.length} alert configs.`);
 

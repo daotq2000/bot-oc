@@ -1,5 +1,6 @@
 import { Candle } from '../models/Candle.js';
 import { calculateOC, getCandleDirection } from '../utils/calculator.js';
+import { configService } from './ConfigService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -19,29 +20,26 @@ export class CandleService {
    */
   async updateCandles(symbol, interval) {
     try {
-      // Fetch latest candles from exchange (try swap first, fallback to spot)
+      // Fetch latest candles from exchange - FUTURES ONLY (swap). No spot fallback.
       let candles = [];
 
       try {
-        candles = await this.exchangeService.fetchOHLCV(symbol, interval, 100, 'swap');
+        const fetchLimit = Number(configService.getNumber('CANDLE_FETCH_LIMIT', 3));
+        candles = await this.exchangeService.fetchOHLCV(symbol, interval, fetchLimit, 'swap');
       } catch (error) {
-        // Handle invalid symbol status (symbol delisted or not trading)
+        // Gracefully skip symbols that are invalid/delisted on futures
         if (error.message?.includes('Invalid symbol status') || 
             error.message?.includes('-1122') ||
-            error.message?.includes('symbol status')) {
-          logger.debug(`Symbol ${symbol} is invalid or delisted, skipping candle update`);
-          return 0; // Skip silently for invalid symbols
+            error.message?.includes('symbol status') ||
+            error.name === 'BadSymbol' || error.message?.includes('BadSymbol')) {
+          logger.debug(`Futures symbol ${symbol} not available, skipping (no spot fallback as requested)`);
+          return 0;
         }
-        
-        if (error.name === 'BadSymbol' || error.message?.includes('BadSymbol')) {
-          candles = await this.exchangeService.fetchOHLCV(symbol, interval, 100, 'spot');
-        } else {
-          throw error;
-        }
+        throw error;
       }
       
       if (candles.length === 0) {
-        logger.warn(`No candles fetched for ${symbol} ${interval}`);
+        logger.warn(`No futures candles fetched for ${symbol} ${interval}`);
         return 0;
       }
 

@@ -4,6 +4,8 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { BinanceDirectClient } from './BinanceDirectClient.js';
 import { exchangeInfoService } from './ExchangeInfoService.js';
 import logger from '../utils/logger.js';
+import { configService } from './ConfigService.js';
+import { mexcPriceWs } from './MexcWebSocketManager.js';
 
 /**
  * Exchange Service - Wrapper for CCXT with proxy support
@@ -13,10 +15,14 @@ export class ExchangeService {
     this.bot = bot;
     this.exchange = null; // For trading operations (testnet) - CCXT
     this.publicExchange = null; // For public data (mainnet) - CCXT
+    this.publicSpotExchange = null; // For MEXC spot fallback (REST)
     this.binanceDirectClient = null; // Direct API client for Binance (no CCXT)
     this.proxyAgent = null;
     this.apiKeyValid = true; // Track if API key is valid
     this._binanceConfiguredSymbols = new Set(); // symbols configured with leverage/margin
+    // Simple REST ticker cache for non-Binance to reduce CCXT calls
+    this._tickerCache = new Map(); // key: symbol -> price
+    this._tickerCacheTime = new Map(); // key: symbol -> timestamp
   }
 
   /**
@@ -104,7 +110,39 @@ export class ExchangeService {
             defaultType: 'swap'
           }
         };
+        
+        // Set higher timeout for MEXC (slow connections from Vietnam)
+        if (this.bot.exchange === 'mexc') {
+          const mexcTimeout = Number(configService.getNumber('MEXC_API_TIMEOUT_MS', 30000));
+          config.timeout = mexcTimeout;
+          logger.debug(`MEXC API timeout set to ${mexcTimeout}ms`);
+        }
+        
         this.exchange = new exchangeClass(config);
+        // Force MEXC REST to .co domain to bypass VN block
+        if (this.bot.exchange === 'mexc') {
+          try {
+            if (this.exchange) {
+              if ('hostname' in this.exchange) this.exchange.hostname = 'mexc.co';
+              const urls = this.exchange.urls || {};
+              const deepReplace = (obj) => {
+                if (!obj) return obj;
+                if (typeof obj === 'string') return obj.replace(/mexc\.com/g, 'mexc.co');
+                if (Array.isArray(obj)) return obj.map(deepReplace);
+                if (typeof obj === 'object') {
+                  for (const k of Object.keys(obj)) obj[k] = deepReplace(obj[k]);
+                  return obj;
+                }
+                return obj;
+              };
+              this.exchange.urls = deepReplace(urls);
+              // Keep hostname consistent
+              if ('hostname' in this.exchange) this.exchange.hostname = 'mexc.co';
+            }
+          } catch (e) {
+            logger.warn(`[MEXC-URL] Failed to force .co domain: ${e?.message || e}`);
+          }
+        }
       }
 
       // For non-Binance exchanges
@@ -136,13 +174,57 @@ export class ExchangeService {
         if (this.bot.exchange === 'mexc') {
           // MEXC uses defaultType: 'swap' for futures trading
           this.exchange.options.defaultType = 'swap';
-          logger.debug(`MEXC configured for swap trading (futures) for bot ${this.bot.id}`);
+          // Increase recvWindow to tolerate time skew/network latency
+          const mexcRecv = Number(configService.getNumber('MEXC_RECV_WINDOW_MS', 60000));
+          this.exchange.options.recvWindow = mexcRecv;
+          this.exchange.recvWindow = mexcRecv; // some exchanges read from top-level
+          // Try to reduce time skew effects if supported
+          this.exchange.options.adjustForTimeDifference = true;
+          // If ccxt supports time-diff sync, use it (best-effort)
+          try {
+            if (typeof this.exchange.loadTimeDifference === 'function') {
+              await this.exchange.loadTimeDifference();
+              logger.debug(`MEXC time-diff synced: ${this.exchange.timeDifference || 0} ms`);
+            }
+          } catch (_) {}
+          logger.debug(`MEXC configured for swap trading (futures) for bot ${this.bot.id}, recvWindow=${mexcRecv}ms`);
         }
 
-        // Test connection for non-Binance
+        // Test connection for non-Binance (with retry for MEXC)
+        let loadMarketsSuccess = false;
+        let lastError = null;
+        const maxRetries = this.bot.exchange === 'mexc' ? 3 : 1;
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          try {
         await this.exchange.loadMarkets();
+            loadMarketsSuccess = true;
         logger.info(`Exchange ${this.bot.exchange} initialized for bot ${this.bot.id}`);
         this.apiKeyValid = true;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt < maxRetries) {
+              const delayMs = 2000 * attempt; // 2s, 4s, 6s
+              logger.warn(`[${this.bot.exchange}] loadMarkets attempt ${attempt}/${maxRetries} failed, retrying in ${delayMs}ms: ${error?.message || error}`);
+              await new Promise(resolve => setTimeout(resolve, delayMs));
+            } else {
+              logger.error(`[${this.bot.exchange}] loadMarkets failed after ${maxRetries} attempts for bot ${this.bot.id}:`, error);
+              // For MEXC, continue anyway (markets will be loaded on-demand)
+              if (this.bot.exchange === 'mexc') {
+                logger.warn(`[MEXC] Continuing without loadMarkets - will load markets on-demand`);
+                this.apiKeyValid = true; // Assume valid, will fail on actual trades if not
+                loadMarketsSuccess = true;
+              } else {
+                throw error;
+              }
+            }
+          }
+        }
+        
+        if (!loadMarketsSuccess && this.bot.exchange !== 'mexc') {
+          throw lastError;
+        }
       }
       // Binance uses direct client, no need to loadMarkets()
 
@@ -827,13 +909,93 @@ export class ExchangeService {
         return await this.binanceDirectClient.getPrice(symbol);
       }
       
-      // For other exchanges: use CCXT
-      const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
-      const exchange = (this.bot.exchange === 'binance' && this.publicExchange) 
-        ? this.publicExchange 
-        : this.exchange;
-      const ticker = await exchange.fetchTicker(marketSymbol);
-      return ticker.last;
+      // WebSocket-first for MEXC
+      if (this.bot.exchange === 'mexc') {
+        const wsPrice = mexcPriceWs.getPrice(symbol);
+        if (Number.isFinite(Number(wsPrice))) return wsPrice;
+        // Ensure subscribed; if REST fallback enabled, proceed to REST; otherwise skip
+        try { mexcPriceWs.subscribe([symbol]); } catch (_) {}
+        const enableRestFallback = configService.getBoolean('MEXC_TICKER_REST_FALLBACK', false);
+        if (!enableRestFallback) {
+          return null; // skip scan until WS price available
+        }
+        // else: continue below to CCXT REST swap fetchTicker
+      }
+
+      // For other exchanges (MEXC/Gate via CCXT): lightweight cache to avoid rate limits
+      const cacheMs = Number(configService.getNumber('NON_BINANCE_TICKER_CACHE_MS', 2000));
+      const now = Date.now();
+
+      // Try swap first (default)
+      const swapKey = this.formatSymbolForExchange(symbol, 'swap');
+      const lastTsSwap = this._tickerCacheTime.get(swapKey) || 0;
+      if (cacheMs > 0 && (now - lastTsSwap) < cacheMs) {
+        const cached = this._tickerCache.get(swapKey);
+        if (cached !== undefined) return cached;
+      }
+
+      try {
+        const exchange = this.exchange; // swap client for non-binance
+        const ticker = await exchange.fetchTicker(swapKey);
+        const price = ticker?.last;
+        if (Number.isFinite(Number(price))) {
+          this._tickerCache.set(swapKey, Number(price));
+          this._tickerCacheTime.set(swapKey, now);
+          return price;
+        }
+      } catch (e) {
+        // If BadSymbol on MEXC, try spot fallback
+        const msg = e?.message || '';
+        const isBadSymbol = /BadSymbol|does not have market symbol/i.test(msg);
+        if (!(this.bot.exchange === 'mexc' && isBadSymbol)) {
+          throw e;
+        }
+      }
+
+      // MEXC spot fallback (some symbols may be spot-only from REST fallback)
+      if (this.bot.exchange === 'mexc') {
+        // Lazy init publicSpotExchange
+        if (!this.publicSpotExchange) {
+          const spot = new ccxt.mexc({ enableRateLimit: true });
+          // Force .co domain
+          try {
+            if ('hostname' in spot) spot.hostname = 'mexc.co';
+            const deepReplace = (obj) => {
+              if (!obj) return obj;
+              if (typeof obj === 'string') return obj.replace(/mexc\.com/g, 'mexc.co');
+              if (Array.isArray(obj)) return obj.map(deepReplace);
+              if (typeof obj === 'object') { for (const k of Object.keys(obj)) obj[k] = deepReplace(obj[k]); return obj; }
+              return obj;
+            };
+            spot.urls = deepReplace(spot.urls || {});
+          } catch (_) {}
+          // Load spot markets once
+          try { await spot.loadMarkets(); } catch (_) {}
+          this.publicSpotExchange = spot;
+        }
+
+        const spotKey = (() => {
+          let s = symbol.toUpperCase();
+          if (!s.includes('/') && s.endsWith('USDT')) s = `${s.replace(/USDT$/, '')}/USDT`;
+          return s;
+        })();
+
+        const lastTsSpot = this._tickerCacheTime.get(spotKey) || 0;
+        if (cacheMs > 0 && (now - lastTsSpot) < cacheMs) {
+          const cached = this._tickerCache.get(spotKey);
+          if (cached !== undefined) return cached;
+        }
+
+        const tickerSpot = await this.publicSpotExchange.fetchTicker(spotKey);
+        const priceSpot = tickerSpot?.last;
+        if (Number.isFinite(Number(priceSpot))) {
+          this._tickerCache.set(spotKey, Number(priceSpot));
+          this._tickerCacheTime.set(spotKey, now);
+          return priceSpot;
+        }
+      }
+
+      return null;
     } catch (error) {
       logger.error(`Failed to get ticker price for bot ${this.bot.id}:`, error);
       throw error;

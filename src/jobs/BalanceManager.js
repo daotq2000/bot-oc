@@ -52,9 +52,11 @@ export class BalanceManager {
       const withdrawService = new WithdrawService(exchangeService, this.telegramService);
       this.withdrawServices.set(bot.id, withdrawService);
 
-      logger.info(`BalanceManager initialized for bot ${bot.id}`);
+      logger.info(`✅ BalanceManager initialized for bot ${bot.id} (${bot.exchange})`);
     } catch (error) {
-      logger.error(`Failed to initialize BalanceManager for bot ${bot.id}:`, error);
+      logger.error(`❌ Failed to initialize BalanceManager for bot ${bot.id}:`, error?.message || error);
+      // Don't re-throw - allow app to continue even if one bot fails
+      // This prevents one bad bot from crashing the entire system
     }
   }
 

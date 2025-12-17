@@ -20,6 +20,13 @@ export class BinanceDirectClient {
     // Load all config values from database with defaults
     this.restPriceFallbackCooldownMs = Number(configService.getNumber('BINANCE_REST_PRICE_COOLDOWN_MS', 5000));
     this.minRequestInterval = Number(configService.getNumber('BINANCE_MIN_REQUEST_INTERVAL_MS', 100));
+    this.recvWindow = Number(configService.getNumber('BINANCE_RECV_WINDOW_MS', 5000));
+    this.timestampSkewMs = Number(configService.getNumber('BINANCE_TIMESTAMP_SKEW_MS', 250));
+
+    // Server time sync
+    this.serverTimeOffsetMs = 0; // serverTime - clientNow
+    this._lastTimeSyncAt = 0;
+    this._timeSyncTTL = Number(configService.getNumber('BINANCE_TIME_SYNC_TTL_MS', 600000)); // 10 minutes default
     
     // Production data URL (always use production for market data)
     this.productionDataURL = 'https://fapi.binance.com';
@@ -35,6 +42,47 @@ export class BinanceDirectClient {
     this._dualSidePosition = null; // boolean
     this._positionModeCheckedAt = 0;
     this._positionModeTTL = Number(configService.getNumber('BINANCE_POSITION_MODE_TTL_MS', 60000)); // 1 minute default
+  }
+
+  /**
+   * Ensure local time is synced with Binance server time within TTL
+   */
+  async ensureTimeSync() {
+    const now = Date.now();
+    if (!Number.isFinite(this.serverTimeOffsetMs) || (now - this._lastTimeSyncAt) > this._timeSyncTTL) {
+      await this.syncServerTime(true);
+    }
+  }
+
+  /**
+   * Sync local offset against Binance server time
+   * Stores serverTimeOffsetMs = serverTime - clientNow
+   */
+  async syncServerTime(force = false) {
+    try {
+      const nowBefore = Date.now();
+      // Try trading base first (respects testnet/production), then fallback to production data URL
+      let serverTime = null;
+      try {
+        const res = await this.makeTradingPublicRequest('/fapi/v1/time', 'GET');
+        serverTime = Number(res?.serverTime || res?.server_time || null);
+      } catch (_) {}
+      if (!Number.isFinite(serverTime)) {
+        const res = await this.makeMarketDataRequest('/fapi/v1/time', 'GET');
+        serverTime = Number(res?.serverTime || res?.server_time || null);
+      }
+      const nowAfter = Date.now();
+      if (!Number.isFinite(serverTime)) {
+        throw new Error('Failed to fetch Binance server time');
+      }
+      // Approximate mid-request time to reduce latency error
+      const clientNow = Math.round((nowBefore + nowAfter) / 2);
+      this.serverTimeOffsetMs = serverTime - clientNow;
+      this._lastTimeSyncAt = Date.now();
+      logger.debug(`Synced Binance server time. Offset: ${this.serverTimeOffsetMs} ms`);
+    } catch (e) {
+      logger.warn(`Time sync failed: ${e?.message || e}`);
+    }
   }
 
   /**
@@ -83,42 +131,69 @@ export class BinanceDirectClient {
       });
     }
     
-    const timeout = configService.getNumber('BINANCE_REQUEST_TIMEOUT_MS', 10000);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    // Use longer timeout for market data (klines, ticker) to handle slow connections
+    const isMarketDataEndpoint = /klines|ticker|time/.test(endpoint);
+    const baseTimeout = configService.getNumber('BINANCE_REQUEST_TIMEOUT_MS', 10000);
+    const timeout = isMarketDataEndpoint 
+      ? Number(configService.getNumber('BINANCE_MARKET_DATA_TIMEOUT_MS', 20000))
+      : baseTimeout;
 
-    try {
-      const response = await fetch(url.toString(), {
-        method,
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        const error = new Error(`HTTP ${response.status}: ${errorText}`);
-        
-        // For invalid symbol status, log as debug instead of error to reduce spam
-        if (errorText.includes('Invalid symbol status') || errorText.includes('-1122')) {
-          logger.debug(`Market data request failed (invalid symbol): ${endpoint} - ${errorText}`);
-        } else {
-          logger.error(`❌ Market data request failed: ${endpoint}`, errorText);
+    const doFetch = async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetch(url.toString(), {
+          method,
+          headers: {
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+            'Origin': 'https://www.binance.com',
+            'Referer': 'https://www.binance.com/'
+          },
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`HTTP ${response.status}: ${text}`);
         }
-        
+        // Some proxies may return text/plain JSON
+        const ctype = response.headers.get('content-type') || '';
+        if (ctype.includes('application/json')) {
+          return await response.json();
+        }
+        const text = await response.text();
+        try { return JSON.parse(text); } catch (_) { return text; }
+      } catch (e) {
+        throw e;
+      }
+    };
+
+    // Retry on 403/5xx/timeout a few times with backoff
+    const maxAttempts = isMarketDataEndpoint ? 3 : 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await doFetch();
+      } catch (error) {
+        const msg = error?.message || '';
+        const isRetryable = /HTTP 403|HTTP 5\d{2}|network|fetch|aborted|timeout/i.test(msg);
+        if (attempt < maxAttempts && isRetryable) {
+          const backoff = 500 * attempt; // 500ms, 1s, 1.5s
+          logger.warn(`[Binance-MarketData] ${endpoint} attempt ${attempt}/${maxAttempts} failed: ${msg}. Retrying in ${backoff}ms...`);
+          await new Promise(r => setTimeout(r, backoff));
+          continue;
+        }
+        // For invalid symbol status, log as debug instead of error to reduce spam
+        if (msg.includes('Invalid symbol status') || msg.includes('-1122')) {
+          logger.debug(`Market data request failed (invalid symbol): ${endpoint} - ${msg}`);
+        } else if (msg.includes('aborted') || msg.includes('timeout')) {
+          logger.warn(`[Binance-MarketData] ⚠️ ${endpoint} timed out after ${maxAttempts} attempts (timeout=${timeout}ms). Check network/server load.`);
+        } else {
+          logger.error(`❌ Market data request failed: ${endpoint}`, msg);
+        }
         throw error;
       }
-      
-      return await response.json();
-    } catch (error) {
-      clearTimeout(timeoutId);
-      // Don't log again if already logged above
-      if (!error.message?.includes('HTTP')) {
-        logger.error(`❌ Market data request failed: ${endpoint}`, error.message);
-      }
-      throw error;
     }
   }
 
@@ -162,86 +237,103 @@ export class BinanceDirectClient {
     this.lastRequestTime = Date.now();
 
     const url = `${this.baseURL}${endpoint}`;
-    const timestamp = Date.now();
-    
-    let queryString = '';
-    let requestBody = null;
-    
-    // Authentication với API key và secret
-    if (requiresAuth) {
-      const authParams = { ...params, timestamp };
-      
-      if (method === 'GET') {
-        const sortedParams = Object.keys(authParams)
-          .sort()
-          .map(key => `${key}=${authParams[key]}`)
-          .join('&');
-        
-        const signature = crypto
-          .createHmac('sha256', this.secretKey)
-          .update(sortedParams)
-          .digest('hex');
-        
-        queryString = '?' + sortedParams + '&signature=' + signature;
-      } else {
-        // POST requests
-        requestBody = new URLSearchParams(authParams).toString();
-        const signature = crypto
-          .createHmac('sha256', this.secretKey)
-          .update(requestBody)
-          .digest('hex');
-        requestBody += '&signature=' + signature;
-      }
-    } else {
-      // No auth, just add params to query string
-      if (Object.keys(params).length > 0) {
-        queryString = '?' + new URLSearchParams(params).toString();
-      }
-    }
-    
-    const timeout = configService.getNumber('BINANCE_REQUEST_TIMEOUT_MS', 10000);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-    const headers = {
-      'Content-Type': 'application/x-www-form-urlencoded'
-    };
-    
+    const timeout = configService.getNumber('BINANCE_REQUEST_TIMEOUT_MS', 10000);
+    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+    if (requiresAuth) headers['X-MBX-APIKEY'] = this.apiKey;
+
+    // Ensure server time sync if needed before signed requests
     if (requiresAuth) {
-      headers['X-MBX-APIKEY'] = this.apiKey;
+      await this.ensureTimeSync();
     }
-    
+
     // Make request with retries
+    let useDirectServerTime = false;
     for (let i = 0; i < retries; i++) {
+      let queryString = '';
+      let requestBody = null;
+
       try {
-        const response = await fetch(url + queryString, {
-          method,
-          headers,
-          body: requestBody,
-          signal: controller.signal
-        });
+        // Build signed/unsigned params per attempt (fresh timestamp every try)
+        if (requiresAuth) {
+          let timestamp;
+          if (useDirectServerTime) {
+            // Fetch server time directly for highest accuracy
+            try {
+              const res = await this.makeTradingPublicRequest('/fapi/v1/time', 'GET');
+              const st = Number(res?.serverTime || res?.server_time || 0);
+              timestamp = st > 0 ? st : Date.now() + (this.serverTimeOffsetMs || 0);
+            } catch (_) {
+              timestamp = Date.now() + (this.serverTimeOffsetMs || 0);
+            }
+          } else {
+            timestamp = Date.now() + (this.serverTimeOffsetMs || 0) + (this.timestampSkewMs || 0);
+          }
+          const recvWindow = Math.max(1000, Number(this.recvWindow) || 5000);
+          const authParams = { ...params, timestamp, recvWindow };
+
+          // Build canonical encoded query string with sorted keys
+          const qs = new URLSearchParams();
+          Object.keys(authParams)
+            .sort()
+            .forEach((key) => {
+              const val = authParams[key];
+              if (val !== undefined && val !== null) qs.append(key, String(val));
+            });
+          const qsString = qs.toString();
+          const signature = crypto.createHmac('sha256', this.secretKey).update(qsString).digest('hex');
+
+          if (method === 'GET' || method === 'DELETE') {
+            queryString = '?' + qsString + '&signature=' + signature;
+          } else {
+            requestBody = qsString + '&signature=' + signature;
+          }
+        } else {
+          if (Object.keys(params).length > 0) {
+            queryString = '?' + new URLSearchParams(params).toString();
+          }
+        }
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+        const response = await fetch(url + queryString, { method, headers, body: requestBody, signal: controller.signal });
 
         clearTimeout(timeoutId);
-        
+
         const data = await response.json();
-        
         if (!response.ok) {
           if (data.code && data.msg) {
-            if (data.code === -1111) {
-              logger.error('Binance precision rejection', {
+            // Special handling for timestamp skew
+            if (data.code === -1021) {
+              logger.warn('Binance -1021 timestamp outside recvWindow. Syncing time and retrying...');
+              await this.syncServerTime(true);
+              useDirectServerTime = true;
+              // retry next loop iteration
+              await new Promise(r => setTimeout(r, 50));
+              continue;
+            }
+            if (data.code === -1022) {
+              // Signature invalid – often caused by param ordering/encoding or time skew; try resync then retry
+              logger.warn('Binance -1022 invalid signature. Will sync time and retry with fresh canonical params.', {
                 endpoint,
-                params: this.sanitizeParams(params),
-                response: data
+                method,
+                recvWindow: this.recvWindow,
+                serverTimeOffsetMs: this.serverTimeOffsetMs,
               });
+              await this.syncServerTime(true);
+              await new Promise(r => setTimeout(r, 50));
+              continue;
+            }
+            if (data.code === -1111) {
+              logger.error('Binance precision rejection', { endpoint, params: this.sanitizeParams(params), response: data });
             }
             throw new Error(`Binance API Error ${data.code}: ${data.msg}`);
           }
           throw new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
         }
-        
         return data;
       } catch (error) {
-        clearTimeout(timeoutId);
         if (i === retries - 1) throw error;
         await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
       }
@@ -335,6 +427,12 @@ export class BinanceDirectClient {
       return cachedPrice;
     }
 
+    // Optionally disable REST fallback for ticker price (prefer WS-only)
+    const enableRestFallback = configService.getBoolean('BINANCE_TICKER_REST_FALLBACK', false);
+    if (!enableRestFallback) {
+      return null;
+    }
+
     // Respect cooldown when reusing REST fallback price
     const fallbackEntry = this.restPriceFallbackCache.get(normalizedSymbol);
     const now = Date.now();
@@ -347,14 +445,14 @@ export class BinanceDirectClient {
       const restPrice = parseFloat(ticker?.price);
       if (Number.isFinite(restPrice) && restPrice > 0) {
         this.restPriceFallbackCache.set(normalizedSymbol, { price: restPrice, timestamp: now });
-        logger.warn(`Price for ${normalizedSymbol} not in WebSocket cache. Using REST fallback price ${restPrice}.`);
+        logger.info(`Price for ${normalizedSymbol} not in WebSocket cache. Using REST fallback price ${restPrice}.`);
         return restPrice;
       }
     } catch (error) {
-      logger.error(`Failed REST fallback price fetch for ${normalizedSymbol}:`, error.message || error);
+      logger.debug(`Failed REST fallback price fetch for ${normalizedSymbol}: ${error.message || error}`);
     }
 
-    logger.warn(`Price for ${normalizedSymbol} not found via WebSocket or REST fallback.`);
+    logger.debug(`Price for ${normalizedSymbol} not found via WebSocket or REST fallback.`);
     return null;
   }
 
@@ -439,8 +537,8 @@ export class BinanceDirectClient {
   async getTickSize(symbol) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
     
-    // Try to get from cache first
-    if (this.exchangeInfoService) {
+    // Try to get from cache first (price tick size)
+    if (this.exchangeInfoService?.getTickSize) {
       const cached = this.exchangeInfoService.getTickSize(normalizedSymbol);
       if (cached) {
         logger.debug(`[Cache Hit] getTickSize for ${normalizedSymbol}: ${cached}`);
@@ -454,6 +552,50 @@ export class BinanceDirectClient {
     if (!exchangeInfo || !exchangeInfo.filters) return '0.01';
     const priceFilter = exchangeInfo.filters.find(f => f.filterType === 'PRICE_FILTER');
     return priceFilter?.tickSize || '0.01';
+  }
+
+  /**
+   * Get trigger tickSize (stopPrice precision) for a symbol
+   * Uses TRIGGER_ORDER_PRICE_FILTER if available, falls back to PRICE_FILTER
+   */
+  async getTriggerTickSize(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+
+    // No cache layer yet; pull from exchangeInfo
+    const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
+    if (!exchangeInfo || !exchangeInfo.filters) return await this.getTickSize(normalizedSymbol);
+    const triggerFilter = exchangeInfo.filters.find(f => f.filterType === 'TRIGGER_ORDER_PRICE_FILTER');
+    if (triggerFilter?.tickSize) return triggerFilter.tickSize;
+    const priceFilter = exchangeInfo.filters.find(f => f.filterType === 'PRICE_FILTER');
+    return priceFilter?.tickSize || '0.01';
+  }
+
+  /**
+   * Get price filter (minPrice, tickSize) for limit price
+   */
+  async getPriceFilter(symbol) {
+    const info = await this.getTradingExchangeSymbol(symbol);
+    const priceFilter = info?.filters?.find(f => f.filterType === 'PRICE_FILTER');
+    return {
+      minPrice: priceFilter?.minPrice || '0',
+      tickSize: priceFilter?.tickSize || '0.01'
+    };
+  }
+
+  /**
+   * Get trigger order price filter (minPrice, tickSize) for stopPrice
+   */
+  async getTriggerOrderPriceFilter(symbol) {
+    const info = await this.getTradingExchangeSymbol(symbol);
+    const triggerFilter = info?.filters?.find(f => f.filterType === 'TRIGGER_ORDER_PRICE_FILTER');
+    if (triggerFilter) {
+      return {
+        minPrice: triggerFilter?.minPrice || '0',
+        tickSize: triggerFilter?.tickSize || '0.01'
+      };
+    }
+    // Fallback to price filter when trigger filter is not present
+    return await this.getPriceFilter(symbol);
   }
 
   /**
@@ -965,24 +1107,50 @@ export class BinanceDirectClient {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
     // Get precision info & account mode
-    const [tickSize, stepSize, dualSide] = await Promise.all([
-      this.getTickSize(normalizedSymbol),
+    const [priceTickSize, triggerTickSize, stepSize, dualSide] = await Promise.all([
+      this.getTickSize(normalizedSymbol),           // PRICE_FILTER tick for limit price
+      this.getTriggerTickSize(normalizedSymbol),    // TRIGGER_ORDER_PRICE_FILTER tick for stopPrice
       this.getStepSize(normalizedSymbol),
       this.getDualSidePosition()
     ]);
 
-    // Format price
-    const formattedPrice = this.formatPrice(tpPrice, tickSize);
+    // Use integer step arithmetic per filter
+    const priceTick = parseFloat(priceTickSize);
+    const triggerTick = parseFloat(triggerTickSize);
+    const pricePrecision = this.getPrecisionFromIncrement(priceTickSize);
+    const triggerPrecision = this.getPrecisionFromIncrement(triggerTickSize);
+
+    // Compute stop steps/price using triggerTick
+    const stopSteps = Math.round(tpPrice / triggerTick);
+    const stopNum = stopSteps * triggerTick;
+    const stopPriceStr = stopNum.toFixed(triggerPrecision);
+
+    // Compute limit price relative to stop
+    // Binance rule (U-M Futures, TP limit):
+    // - SELL (closing long): price must be >= stopPrice
+    // - BUY (closing short): price must be <= stopPrice
+    const isSell = side === 'long';
+    let limitNum = isSell ? (stopNum + priceTick) : (stopNum - priceTick);
+    // Safety: ensure limit != stop and > 0
+    if (limitNum === stopNum) {
+      limitNum = isSell ? (stopNum + 2 * priceTick) : (stopNum - 2 * priceTick);
+    }
+    if (limitNum <= 0) {
+      // push away from 0 by one more tick above 0
+      limitNum = Math.max(priceTick, stopNum + priceTick);
+    }
+    const limitPriceStr = limitNum.toFixed(pricePrecision);
 
     // Safety check to prevent -2021 "Order would immediately trigger"
     const currentPrice = await this.getPrice(normalizedSymbol);
     if (currentPrice) {
-      if (side === 'long' && formattedPrice <= currentPrice) {
-        logger.warn(`[TP-SKIP] TP price ${formattedPrice} for LONG is at or below current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
+      const stopNum = parseFloat(stopPriceStr);
+      if (side === 'long' && stopNum <= currentPrice) {
+        logger.warn(`[TP-SKIP] TP price ${stopNum} for LONG is at or below current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
         return null;
       }
-      if (side === 'short' && formattedPrice >= currentPrice) {
-        logger.warn(`[TP-SKIP] TP price ${formattedPrice} for SHORT is at or above current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
+      if (side === 'short' && stopNum >= currentPrice) {
+        logger.warn(`[TP-SKIP] TP price ${stopNum} for SHORT is at or above current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
         return null;
       }
     }
@@ -996,8 +1164,8 @@ export class BinanceDirectClient {
       symbol: normalizedSymbol,
       side: orderSide,
       type: 'TAKE_PROFIT',
-      stopPrice: formattedPrice.toString(), // Trigger price
-      price: formattedPrice.toString(), // Limit price
+      stopPrice: stopPriceStr, // Trigger price
+      price: limitPriceStr, // Limit price (adjusted to be slightly better than stop price)
       closePosition: quantity ? 'false' : 'true',
       timeInForce: 'GTC'
     };
@@ -1016,14 +1184,25 @@ export class BinanceDirectClient {
       params.quantity = formattedQuantity; // Pass as string
     }
 
-    logger.info(`Creating TP limit order: ${orderSide} ${normalizedSymbol} @ ${formattedPrice}${dualSide ? ` (${positionSide})` : ''}`);
+    logger.info(`Creating TP limit order: ${orderSide} ${normalizedSymbol} @ stopPrice=${stopPriceStr}, limitPrice=${limitPriceStr}${dualSide ? ` (${positionSide})` : ''}`);
 
     try {
       const data = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
       logger.info(`✅ TP limit order placed: Order ID: ${data.orderId}`);
       return data;
     } catch (error) {
-      logger.error(`Failed to create TP limit order:`, error);
+      logger.error(`Failed to create TP limit order:`, {
+        error: error?.message || String(error),
+        symbol: normalizedSymbol,
+        side,
+        priceTickSize,
+        triggerTickSize,
+        stepSize,
+        tpPrice,
+        stopPriceStr,
+        limitPriceStr,
+        params: this.sanitizeParams(params)
+      });
       throw error;
     }
   }
@@ -1046,8 +1225,22 @@ export class BinanceDirectClient {
       this.getDualSidePosition()
     ]);
     
-    // Format price
-    const formattedPrice = this.formatPrice(slPrice, tickSize);
+    // Format stop price (trigger price)
+    const stopPrice = this.formatPrice(slPrice, tickSize);
+    
+    // For STOP (stop loss) orders, use the same rule as TP: set limit slightly worse to increase fill probability
+    // SELL orders: limit price slightly lower than stop
+    // BUY orders: limit price slightly higher than stop
+    const tick = parseFloat(tickSize);
+    let limitPrice;
+    const orderSideForSl = side === 'long' ? 'SELL' : 'BUY';
+    if (orderSideForSl === 'SELL') {
+      // SELL: set limit below stop
+      limitPrice = this.formatPrice(stopPrice - tick, tickSize);
+    } else {
+      // BUY: set limit above stop
+      limitPrice = this.formatPrice(stopPrice + tick, tickSize);
+    }
     
     // Determine position side
     const positionSide = side === 'long' ? 'LONG' : 'SHORT';
@@ -1058,8 +1251,8 @@ export class BinanceDirectClient {
       symbol: normalizedSymbol,
       side: orderSide,
       type: 'STOP',
-      stopPrice: formattedPrice.toString(), // Trigger price (when price reaches this, order activates)
-      price: formattedPrice.toString(), // Limit price (order executes at this price)
+      stopPrice: stopPrice.toString(), // Trigger price (when price reaches this, order activates)
+      price: limitPrice.toString(), // Limit price (adjusted to be slightly better than stop price)
       closePosition: quantity ? 'false' : 'true',
       timeInForce: 'GTC'
     };
@@ -1078,7 +1271,7 @@ export class BinanceDirectClient {
       params.quantity = formattedQuantity; // Pass as string
     }
     
-    logger.info(`Creating SL limit order: ${orderSide} ${normalizedSymbol} @ ${formattedPrice}${dualSide ? ` (${positionSide})` : ''}`);
+    logger.info(`Creating SL limit order: ${orderSide} ${normalizedSymbol} @ stopPrice=${stopPrice}, limitPrice=${limitPrice}${dualSide ? ` (${positionSide})` : ''}`);
     
     try {
       const data = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
@@ -1131,7 +1324,7 @@ export class BinanceDirectClient {
   async cancelOrder(symbol, orderId) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
     const params = { symbol: normalizedSymbol, orderId: orderId };
-    const data = await this.makeRequest('/fapi/v1/order', 'DELETE', params, true);
+    const data = await this.makeRequestWithRetry('/fapi/v1/order', 'DELETE', params, true);
     return data;
   }
 

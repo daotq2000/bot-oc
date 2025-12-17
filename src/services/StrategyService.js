@@ -21,12 +21,24 @@ export class StrategyService {
 
   /**
    * Check for trading signal and/or price alert
+   * 
+   * NOTE: This method is now DEPRECATED for realtime detection.
+   * Realtime detection is handled by WebSocketOCConsumer.
+   * This method is kept for backward compatibility but should not be used for active strategies.
+   * 
    * @param {Object} strategy - Strategy object
    * @param {Object} alertConfig - Optional price alert configuration
    * @returns {Promise<Object|null>} Signal object or null
    */
   async checkSignal(strategy, alertConfig = null) {
     try {
+      // DEPRECATED: Realtime detection is now handled by WebSocketOCConsumer
+      // This method is kept for backward compatibility only
+      logger.debug(`[Signal] Strategy ${strategy.id} (${strategy.symbol}): checkSignal() called but realtime detection is handled by WebSocketOCConsumer`);
+      return null;
+
+      // OLD CODE (commented out - no longer using database candles):
+      /*
       // 1. Get latest candle from database
       const latestCandle = await this.candleService.getLatestCandle(
         strategy.symbol,
@@ -43,7 +55,7 @@ export class StrategyService {
 
       // If price is not available from WebSocket cache, skip this scan
       if (currentPrice === null) {
-        logger.debug(`Price for ${strategy.symbol} not available in cache, skipping scan.`);
+        logger.warn(`[Signal] Strategy ${strategy.id} (${strategy.symbol}): Price not available - WebSocket may not be connected or symbol not subscribed`);
         return null;
       }
 
@@ -64,6 +76,7 @@ export class StrategyService {
         direction = metrics.direction;
         logger.info(`[Signal] Strategy ${strategy.id} (${strategy.symbol}): Candle CLOSED - OC=${oc.toFixed(2)}%, direction=${direction}, threshold=${strategy.oc}%`);
       }
+      */
 
       // 4.1. Check for and send price alert if configured
       if (alertConfig) {
@@ -300,54 +313,21 @@ export class StrategyService {
 
   /**
    * Check if signal should be ignored based on previous candle
-   * @param {Object} currentCandle - Current candle
+   * 
+   * DEPRECATED: This method is no longer used as we don't store candles in database.
+   * Realtime detection handles signal generation without database dependency.
+   * 
+   * @param {Object} currentCandle - Current candle (deprecated)
    * @param {Object} strategy - Strategy object
    * @param {string} side - 'long' or 'short'
    * @param {number} currentPrice - Current market price
    * @returns {Promise<boolean>} True if should ignore
    */
   async shouldIgnoreSignal(currentCandle, strategy, side, currentPrice) {
-    try {
-      // Get previous candle
-      const previousCandle = await this.candleService.getPreviousCandle(
-        strategy.symbol,
-        strategy.interval
-      );
-
-      if (!previousCandle) {
-        return false; // No previous candle, don't ignore
-      }
-
-      // Check if previous candle was opposite direction
-      const prevDirection = this.candleService.calculateCandleMetrics(previousCandle).direction;
-      const currentDirection = this.candleService.calculateCandleMetrics(currentCandle).direction;
-
-      // If previous was same direction, don't ignore
-      if (prevDirection === currentDirection) {
-        return false;
-      }
-
-      // Calculate ignore threshold
-      const ignoreThreshold = calculateIgnoreThreshold(
-        previousCandle.high,
-        previousCandle.low,
-        strategy.ignore
-      );
-
-      // Check if price has retraced enough
-      if (side === 'long') {
-        // For long: check if price has dropped enough from previous high
-        const retracement = previousCandle.high - currentPrice;
-        return retracement < ignoreThreshold;
-      } else {
-        // For short: check if price has risen enough from previous low
-        const retracement = currentPrice - previousCandle.low;
-        return retracement < ignoreThreshold;
-      }
-    } catch (error) {
-      logger.error(`Error checking ignore signal:`, error);
-      return false; // Don't ignore on error
-    }
+    // DEPRECATED: No longer using database candles
+    // This method is kept for backward compatibility but always returns false
+    logger.debug(`[StrategyService] shouldIgnoreSignal() called but deprecated (no database candles)`);
+    return false; // Don't ignore signals (realtime detection handles this)
   }
 }
 

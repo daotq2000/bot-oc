@@ -68,13 +68,14 @@ export class Candle {
    * @returns {Promise<Array>}
    */
   static async getCandles(exchange, symbol, interval, limit = 100) {
-    const [rows] = await pool.execute(
-      `SELECT * FROM candles 
+    // Some MySQL servers do not accept a bound parameter for LIMIT in prepared statements
+    // Ensure numeric and inject as literal to avoid ER_WRONG_ARGUMENTS
+    const safeLimit = Math.max(1, parseInt(limit, 10) || 100);
+    const sql = `SELECT * FROM candles 
        WHERE exchange = ? AND symbol = ? AND \`interval\` = ? 
        ORDER BY open_time DESC 
-       LIMIT ?`,
-      [exchange, symbol, interval, limit]
-    );
+       LIMIT ${safeLimit}`;
+    const [rows] = await pool.execute(sql, [exchange, symbol, interval]);
     return rows.reverse(); // Return in chronological order
   }
 
@@ -206,6 +207,51 @@ export class Candle {
         }
         throw error;
       }
+    }
+  }
+
+  /**
+   * Prune candles older than retentionMs (by close_time)
+   * @returns {Promise<number>} number of deleted rows
+   */
+  static async pruneByAge(exchange, symbol, interval, retentionMs) {
+    try {
+      const threshold = Date.now() - Math.max(0, Number(retentionMs) || 0);
+      const [result] = await pool.execute(
+        `DELETE FROM candles WHERE exchange = ? AND symbol = ? AND \`interval\` = ? AND close_time < ?`,
+        [exchange, symbol, interval, threshold]
+      );
+      return result?.affectedRows || 0;
+    } catch (e) {
+      logger.warn(`[Candle.pruneByAge] failed for ${exchange}/${symbol}/${interval}: ${e?.message || e}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Keep only the last N candles (by open_time) for a key; delete older ones
+   * @returns {Promise<number>} number of deleted rows
+   */
+  static async pruneByLimit(exchange, symbol, interval, keepLast) {
+    const n = Math.max(0, parseInt(keepLast, 10) || 0);
+    if (n <= 0) return 0;
+
+    try {
+      // Find cutoff open_time at offset n-1 (0-based) from newest
+      const offset = Math.max(0, n - 1);
+      const sql = `SELECT open_time FROM candles WHERE exchange = ? AND symbol = ? AND \`interval\` = ? ORDER BY open_time DESC LIMIT ${offset}, 1`;
+      const [rows] = await pool.execute(sql, [exchange, symbol, interval]);
+      if (!rows || rows.length === 0) return 0; // fewer than n rows -> nothing to prune
+      const cutoff = rows[0].open_time;
+
+      const [result] = await pool.execute(
+        `DELETE FROM candles WHERE exchange = ? AND symbol = ? AND \`interval\` = ? AND open_time < ?`,
+        [exchange, symbol, interval, cutoff]
+      );
+      return result?.affectedRows || 0;
+    } catch (e) {
+      logger.warn(`[Candle.pruneByLimit] failed for ${exchange}/${symbol}/${interval}: ${e?.message || e}`);
+      return 0;
     }
   }
 }

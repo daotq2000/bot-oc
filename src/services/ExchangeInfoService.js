@@ -1,3 +1,4 @@
+import ccxt from 'ccxt';
 import { BinanceDirectClient } from './BinanceDirectClient.js';
 import { SymbolFilter } from '../models/SymbolFilter.js';
 import { Strategy } from '../models/Strategy.js';
@@ -12,6 +13,47 @@ class ExchangeInfoService {
   constructor() {
     this.filtersCache = new Map(); // symbol -> { tickSize, stepSize, minNotional, maxLeverage }
     this.isInitialized = false;
+  }
+
+  /**
+   * Return list of symbols from DB symbol_filters for a given exchange.
+   * Options:
+   * - onlyUSDT: keep only symbols ending with USDT (default true)
+   * - limit: cap number of results (optional)
+   */
+  async getSymbolsFromDB(exchange, onlyUSDT = true, limit = null) {
+    try {
+      const rows = await SymbolFilter.findAll();
+      const ex = String(exchange || '').toLowerCase();
+      let syms = rows
+        .filter(r => (r.exchange || '').toLowerCase() === ex)
+        .map(r => (r.symbol || '').toUpperCase())
+        .filter(s => s);
+      if (onlyUSDT) syms = syms.filter(s => s.endsWith('USDT'));
+      // Unique and sorted by name
+      const uniq = Array.from(new Set(syms)).sort();
+      if (Number.isFinite(limit) && limit > 0) return uniq.slice(0, limit);
+      return uniq;
+    } catch (e) {
+      logger.warn(`[ExchangeInfoService] getSymbolsFromDB failed for ${exchange}: ${e?.message || e}`);
+      return [];
+    }
+  }
+
+  // Utility: convert precision digits to step size string, e.g. 3 -> '0.001'
+  precisionToStep(precision) {
+    if (precision === undefined || precision === null) return null;
+    const p = parseInt(precision);
+    if (!Number.isFinite(p) || p < 0) return null;
+    return (1 / Math.pow(10, p)).toFixed(p);
+  }
+
+  // Utility: choose first non-empty value
+  pick(...args) {
+    for (const v of args) {
+      if (v !== undefined && v !== null && v !== '') return v;
+    }
+    return null;
   }
 
   /**
@@ -62,14 +104,196 @@ class ExchangeInfoService {
 
       // Bulk insert/update into the database
       await SymbolFilter.bulkUpsert(filtersToSave);
-      logger.info(`Successfully updated ${filtersToSave.length} symbol filters in the database.`);
+      logger.info(`Successfully updated ${filtersToSave.length} Binance symbol filters in the database.`);
 
       // Clear and reload the in-memory cache
       this.filtersCache.clear();
       await this.loadFiltersFromDB();
 
     } catch (error) {
-      logger.error('Error updating symbol filters:', error);
+      logger.error('Error updating symbol filters (Binance):', error);
+    }
+  }
+
+  /**
+   * Fetch all MEXC USDT-M swap markets and update symbol_filters.
+   */
+  async updateMexcFiltersFromExchange() {
+    logger.info('Updating symbol filters from MEXC...');
+    try {
+      const mexc = new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } });
+      // Force .co domain base and add fetch failsafe
+      try {
+        const co = 'https://api.mexc.co';
+        const coContract = 'https://contract.mexc.co';
+        if ('hostname' in mexc) mexc.hostname = 'mexc.co';
+        mexc.urls = mexc.urls || {};
+        mexc.urls.api = mexc.urls.api || {};
+        Object.assign(mexc.urls.api, {
+          public: co,
+          private: co,
+          spot: co,
+          spotPublic: co,
+          spotPrivate: co,
+          contract: coContract,
+          contractPublic: coContract,
+          contractPrivate: coContract
+        });
+        mexc.urls.www = 'https://www.mexc.co';
+        // Failsafe fetch patch
+        const _origFetch = mexc.fetch.bind(mexc);
+        mexc.fetch = async (url, method = 'GET', headers, body) => {
+          let u = typeof url === 'string' ? url : (url?.toString?.() || '');
+          u = u.replace(/mexc\.com/g, 'mexc.co');
+          if (/^undefined/.test(u)) u = u.replace(/^undefined/, co);
+          if (/^\//.test(u)) u = co + u;
+          return _origFetch(u, method, headers, body);
+        };
+      } catch (_) {}
+      // Explicitly fetch swap markets from the correct public endpoint to avoid 404s
+      await mexc.fetchMarkets({ 'type': 'swap', 'method': 'publicGetContractDetail' });
+
+      const filtersToSave = [];
+      const markets = mexc.markets || {};
+      for (const marketId in markets) {
+        const m = markets[marketId];
+        if (!m) continue;
+        // Only USDT-margined swap markets that are active
+        if ((m.type !== 'swap' && m.contract !== true) || (m.quote && m.quote.toUpperCase() !== 'USDT')) continue;
+        if (m.active === false) continue;
+
+        // Normalize symbol to e.g., BTCUSDT
+        const symbol = `${(m.base || '').toUpperCase()}${(m.quote || '').toUpperCase()}`;
+
+        // Precision -> tick/step sizes
+        let tickSize = null;
+        let stepSize = null;
+        const pricePrec = this.pick(m.precision?.price, m.info?.priceScale);
+        const amountPrec = this.pick(m.precision?.amount, m.info?.volScale, m.info?.quantityScale);
+        if (pricePrec !== null && pricePrec !== undefined) {
+          const p = parseInt(pricePrec);
+          if (Number.isFinite(p) && p >= 0) tickSize = this.precisionToStep(p);
+        }
+        if (amountPrec !== null && amountPrec !== undefined) {
+          const p = parseInt(amountPrec);
+          if (Number.isFinite(p) && p >= 0) stepSize = this.precisionToStep(p);
+        }
+
+        // Limits -> min notional and leverage
+        let minNotional = null;
+        if (m.limits?.cost?.min !== undefined) {
+          minNotional = Number(m.limits.cost.min);
+        } else if (m.info?.minCost !== undefined) {
+          minNotional = Number(m.info.minCost);
+        } else if (m.info?.minNotional !== undefined) {
+          minNotional = Number(m.info.minNotional);
+        }
+
+        let maxLeverage = null;
+        if (m.limits?.leverage?.max !== undefined) {
+          maxLeverage = Number(m.limits.leverage.max);
+        } else if (m.info?.maxLeverage !== undefined) {
+          maxLeverage = Number(m.info.maxLeverage);
+        } else if (m.info?.leverage_max !== undefined) {
+          maxLeverage = Number(m.info.leverage_max);
+        }
+
+        // Fallback defaults
+        if (!tickSize) tickSize = '0.0001';
+        if (!stepSize) stepSize = '0.001';
+        if (!minNotional || !Number.isFinite(minNotional)) minNotional = 5; // conservative default
+        if (!maxLeverage || !Number.isFinite(maxLeverage)) maxLeverage = 50; // typical on MEXC
+
+        filtersToSave.push({
+          exchange: 'mexc',
+          symbol,
+          tick_size: tickSize,
+          step_size: stepSize,
+          min_notional: minNotional,
+          max_leverage: maxLeverage
+        });
+      }
+
+      if (filtersToSave.length === 0) {
+        const futuresOnly = configService.getBoolean('MEXC_FUTURES_ONLY', true);
+        if (futuresOnly) {
+          logger.warn('No MEXC swap markets via CCXT. Futures-only mode: skipping spot fallback.');
+          return;
+        }
+        logger.warn('No MEXC swap markets via CCXT. Falling back to /api/v3/exchangeInfo');
+        await this.updateMexcFiltersFromSpotExchangeInfo();
+        return;
+      }
+
+      await SymbolFilter.bulkUpsert(filtersToSave);
+      logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters in the database.`);
+
+      // Refresh cache
+      this.filtersCache.clear();
+      await this.loadFiltersFromDB();
+    } catch (e) {
+      logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
+      const futuresOnly = configService.getBoolean('MEXC_FUTURES_ONLY', true);
+      if (futuresOnly) {
+        logger.warn('Futures-only mode enabled: skipping MEXC spot exchangeInfo fallback.');
+        return;
+      }
+      logger.info('Falling back to MEXC spot exchangeInfo (REST) ...');
+      await this.updateMexcFiltersFromSpotExchangeInfo();
+    }
+  }
+
+  // Fallback: use MEXC spot exchangeInfo endpoint to get symbols
+  async updateMexcFiltersFromSpotExchangeInfo() {
+    try {
+      const url = 'https://api.mexc.co/api/v3/exchangeInfo';
+      const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text}`);
+      }
+      const data = await res.json();
+      const symbols = data?.symbols || [];
+      const filtersToSave = [];
+      for (const s of symbols) {
+        const status = (s.status || '').toUpperCase();
+        const quote = (s.quoteAsset || '').toUpperCase();
+        if (status !== 'TRADING' || quote !== 'USDT') continue;
+        const symbol = (s.symbol || `${(s.baseAsset||'').toUpperCase()}USDT`).toUpperCase();
+
+        // Parse filters similar to Binance-compatible schema
+        const priceFilter = Array.isArray(s.filters) ? s.filters.find(f => f.filterType === 'PRICE_FILTER') : null;
+        const lotSizeFilter = Array.isArray(s.filters) ? s.filters.find(f => f.filterType === 'LOT_SIZE') : null;
+        const minNotionalFilter = Array.isArray(s.filters) ? s.filters.find(f => f.filterType === 'MIN_NOTIONAL') : null;
+
+        const tickSize = priceFilter?.tickSize || (Number.isFinite(s.quotePrecision) ? (1/Math.pow(10, s.quotePrecision)).toFixed(s.quotePrecision) : '0.0001');
+        const stepSize = lotSizeFilter?.stepSize || (Number.isFinite(s.baseAssetPrecision) ? (1/Math.pow(10, s.baseAssetPrecision)).toFixed(s.baseAssetPrecision) : '0.001');
+        const minNotional = Number(minNotionalFilter?.minNotional || minNotionalFilter?.notional || 5);
+        const maxLeverage = 50; // Spot API doesn't include leverage; use conservative default
+
+        filtersToSave.push({
+          exchange: 'mexc',
+          symbol,
+          tick_size: tickSize,
+          step_size: stepSize,
+          min_notional: minNotional,
+          max_leverage: maxLeverage
+        });
+      }
+
+      if (filtersToSave.length === 0) {
+        logger.warn('MEXC REST fallback returned no symbols. Skipping update.');
+        return;
+      }
+
+      await SymbolFilter.bulkUpsert(filtersToSave);
+      logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from REST spot exchangeInfo.`);
+
+      // Refresh cache
+      this.filtersCache.clear();
+      await this.loadFiltersFromDB();
+    } catch (err) {
+      logger.error('MEXC REST fallback failed:', err?.message || err);
     }
   }
 
@@ -84,7 +308,11 @@ class ExchangeInfoService {
       const set = new Set();
       if (info?.symbols?.length) {
         for (const s of info.symbols) {
-          if (s.status === 'TRADING') {
+          if (s.status !== 'TRADING') continue;
+          // Only USDT-margined perpetual contracts
+          const quote = (s.quoteAsset || '').toUpperCase();
+          const contractType = (s.contractType || '').toUpperCase();
+          if (quote === 'USDT' && (contractType === 'PERPETUAL' || contractType === '')) {
             set.add((s.symbol || '').toUpperCase());
           }
         }
@@ -97,71 +325,43 @@ class ExchangeInfoService {
   }
 
   /**
+   * Fetch tradable USDT-M swap symbols from MEXC
+   * @returns {Promise<Set<string>>}
+   */
+  async getTradableSymbolsFromMexc() {
+    try {
+      const mexc = new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } });
+      await mexc.loadMarkets();
+      const set = new Set();
+      for (const id in mexc.markets) {
+        const m = mexc.markets[id];
+        if (!m) continue;
+        // Only USDT-margined swap and active
+        const isSwap = m.type === 'swap' || m.contract === true;
+        const isUsdt = (m.quote || '').toUpperCase() === 'USDT';
+        if (!isSwap || !isUsdt || m.active === false) continue;
+        const sym = `${(m.base || '').toUpperCase()}USDT`;
+        set.add(sym);
+      }
+      return set;
+    } catch (e) {
+      logger.error('getTradableSymbolsFromMexc failed:', e?.message || e);
+      return new Set();
+    }
+  }
+
+  /**
    * Normalize symbol to Binance format (reuse minimal logic)
    */
   normalizeSymbol(symbol) {
     if (!symbol) return symbol;
-    let normalized = symbol.toString().toUpperCase().replace(/[/:]/g, '');
+    let normalized = symbol.toString().toUpperCase().replace(/[/:_]/g, '');
     if (normalized.endsWith('USD') && !normalized.endsWith('USDT')) {
       normalized = normalized.replace(/USD$/, 'USDT');
     }
     return normalized;
   }
 
-  /**
-   * Prune delisted symbols from strategies and price alert configs for Binance.
-   * - Deletes strategies whose symbol is not tradable on Binance futures mainnet
-   * - Removes symbols from price alert configs; deactivates config if empty
-   */
-  async pruneDelistedSymbols() {
-    try {
-      logger.info('[Prune] Starting delisted symbols cleanup for Binance');
-      const tradable = await this.getTradableSymbolsFromBinance();
-      if (tradable.size === 0) {
-        logger.warn('[Prune] Tradable symbols set is empty; skip pruning to avoid accidental mass deletion');
-        return;
-      }
-
-      // 1) Prune strategies
-      const strategies = await Strategy.findAll(null, true);
-      let deletedCount = 0;
-      for (const s of strategies) {
-        if ((s.exchange || '').toLowerCase() !== 'binance') continue;
-        const sym = this.normalizeSymbol(s.symbol);
-        if (!tradable.has(sym)) {
-          await Strategy.delete(s.id);
-          deletedCount++;
-          logger.info(`[Prune] Deleted strategy ${s.id} (${s.symbol}) - not tradable on Binance mainnet`);
-        }
-      }
-
-      // 2) Prune price alert configs (binance only)
-      const alertConfigs = await PriceAlertConfig.findAll('binance');
-      let updatedAlertConfigs = 0;
-      let deactivatedAlertConfigs = 0;
-      for (const cfg of alertConfigs) {
-        const original = Array.isArray(cfg.symbols) ? cfg.symbols : [];
-        const filtered = original
-          .map(sym => this.normalizeSymbol(sym))
-          .filter(sym => tradable.has(sym));
-        if (filtered.length !== original.length) {
-          if (filtered.length === 0) {
-            await PriceAlertConfig.update(cfg.id, { symbols: [], is_active: false });
-            deactivatedAlertConfigs++;
-            logger.info(`[Prune] Deactivated alert config ${cfg.id} (no valid symbols remain)`);
-          } else {
-            await PriceAlertConfig.update(cfg.id, { symbols: filtered });
-            updatedAlertConfigs++;
-            logger.info(`[Prune] Updated alert config ${cfg.id}: ${original.length} -> ${filtered.length} symbols`);
-          }
-        }
-      }
-
-      logger.info(`[Prune] Completed. Strategies deleted: ${deletedCount}, Alert configs updated: ${updatedAlertConfigs}, deactivated: ${deactivatedAlertConfigs}`);
-    } catch (e) {
-      logger.error('[Prune] Failed pruning delisted symbols:', e?.message || e);
-    }
-  }
 
   /**
    * Load all symbol filters from the database into the in-memory cache.
@@ -170,8 +370,21 @@ class ExchangeInfoService {
     logger.info('Loading symbol filters from database into cache...');
     try {
       const filters = await SymbolFilter.findAll();
-      for (const filter of filters) {
-        this.filtersCache.set(filter.symbol, {
+      // Prefer Binance filters when duplicate symbols exist.
+      // Load Binance first; for other exchanges, only set if not present.
+      const sorted = filters.sort((a, b) => {
+        const pa = (a.exchange || '').toLowerCase() === 'binance' ? 0 : 1;
+        const pb = (b.exchange || '').toLowerCase() === 'binance' ? 0 : 1;
+        return pa - pb;
+      });
+      for (const filter of sorted) {
+        const key = (filter.symbol || '').toUpperCase();
+        if (!key) continue;
+        if (this.filtersCache.has(key) && (filter.exchange || '').toLowerCase() !== 'binance') {
+          // Skip non-Binance if symbol already populated (keeps Binance defaults)
+          continue;
+        }
+        this.filtersCache.set(key, {
           tickSize: filter.tick_size,
           stepSize: filter.step_size,
           minNotional: filter.min_notional,

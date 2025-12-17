@@ -10,6 +10,14 @@ export class TelegramService {
     this.bot = null;
     this.initialized = false;
     this.alertChannelId = null;
+
+    // Lightweight send queue to avoid blocking and to apply rate-limits
+    this._queue = [];
+    this._processing = false;
+    this._lastSendAt = 0; // global throttle
+    this._perChatLastSend = new Map(); // chatId -> ts
+    this._minGapGlobalMs = 120; // ~8 msgs/sec globally
+    this._perChatMinGapMs = 250; // ~4 msgs/sec per chat
   }
 
   /**
@@ -66,21 +74,48 @@ export class TelegramService {
       return;
     }
 
+    // Enqueue to avoid blocking and to respect rate limits
+    this._queue.push({ chatId, message, options });
+    this._processQueue().catch(() => {});
+  }
+
+  async _processQueue() {
+    if (this._processing) return;
+    this._processing = true;
     try {
-      logger.debug(`[Telegram] Sending message to ${chatId}, length=${message.length}`);
-      await this.bot.telegram.sendMessage(chatId, message, {
-        parse_mode: 'HTML',
-        ...options
-      });
-      logger.debug(`[Telegram] ✅ Successfully sent message to ${chatId}`);
-    } catch (error) {
-      logger.error(`[Telegram] Failed to send message to ${chatId}:`, error);
-      logger.error(`[Telegram] Error details:`, {
-        message: error?.message,
-        code: error?.code,
-        response: error?.response
-      });
-      throw error; // Re-throw to let caller handle
+      while (this._queue.length > 0) {
+        const { chatId, message, options } = this._queue.shift();
+        // Throttle globally and per-chat
+        const now = Date.now();
+        const gapGlobal = now - this._lastSendAt;
+        const lastPerChat = this._perChatLastSend.get(chatId) || 0;
+        const gapPerChat = now - lastPerChat;
+        const waitMs = Math.max(0, this._minGapGlobalMs - gapGlobal, this._perChatMinGapMs - gapPerChat);
+        if (waitMs > 0) {
+          await new Promise(r => setTimeout(r, waitMs));
+        }
+
+        try {
+          logger.debug(`[Telegram] Sending message to ${chatId}, length=${message.length}`);
+          await this.bot.telegram.sendMessage(chatId, message, {
+            parse_mode: 'HTML',
+            ...options
+          });
+          this._lastSendAt = Date.now();
+          this._perChatLastSend.set(chatId, this._lastSendAt);
+          logger.debug(`[Telegram] ✅ Successfully sent message to ${chatId}`);
+        } catch (error) {
+          logger.error(`[Telegram] Failed to send message to ${chatId}:`, error?.message || error);
+          // Simple backoff and requeue once for transient errors
+          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT/i.test(error?.message || '');
+          if (transient) {
+            this._queue.unshift({ chatId, message, options });
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+      }
+    } finally {
+      this._processing = false;
     }
   }
 
