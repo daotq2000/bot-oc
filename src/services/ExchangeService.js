@@ -2,6 +2,7 @@ import ccxt from 'ccxt';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { BinanceDirectClient } from './BinanceDirectClient.js';
+import { MexcFuturesClient } from './MexcFuturesClient.js';
 import { exchangeInfoService } from './ExchangeInfoService.js';
 import logger from '../utils/logger.js';
 import { configService } from './ConfigService.js';
@@ -18,6 +19,7 @@ export class ExchangeService {
     this.publicSpotExchange = null; // For MEXC spot fallback (REST)
     this.binanceDirectClient = null; // Direct API client for Binance (no CCXT)
     this.proxyAgent = null;
+    this.mexcFuturesClient = null;
     this.apiKeyValid = true; // Track if API key is valid
     this._binanceConfiguredSymbols = new Set(); // symbols configured with leverage/margin
     // Simple REST ticker cache for non-Binance to reduce CCXT calls
@@ -141,6 +143,13 @@ export class ExchangeService {
             }
           } catch (e) {
             logger.warn(`[MEXC-URL] Failed to force .co domain: ${e?.message || e}`);
+          }
+          // Initialize direct futures client (delegates to CCXT for now)
+          try {
+            this.mexcFuturesClient = new MexcFuturesClient(this.bot, this.exchange);
+            logger.info('[MEXC] MexcFuturesClient initialized (delegating to CCXT)');
+          } catch (e) {
+            logger.warn(`[MEXC] Failed to init MexcFuturesClient: ${e?.message || e}`);
           }
         }
       }
@@ -434,6 +443,25 @@ export class ExchangeService {
         throw new Error(`Invalid current/entry price for ${marketSymbol}: ${usePrice}`);
       }
 
+      // Ensure leverage is set for MEXC using max leverage from symbol_filters (optimize margin)
+      try {
+        if ((this.bot.exchange || '').toLowerCase() === 'mexc') {
+          const maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          if (Number.isFinite(maxLev) && maxLev > 0) {
+            try {
+              if (this.mexcFuturesClient) {
+                await this.mexcFuturesClient.setLeverage(symbol, maxLev);
+              } else if (typeof this.exchange.setLeverage === 'function') {
+                await this.exchange.setLeverage(maxLev, marketSymbol);
+              }
+              logger.info(`[MEXC] Set leverage=${maxLev} for ${symbol}`);
+            } catch (levErr) {
+              logger.warn(`[MEXC] setLeverage failed for ${symbol}: ${levErr?.message || levErr}`);
+            }
+          }
+        }
+      } catch (_) {}
+
       // Load market metadata for precision and limits
       const market = this.exchange.market(marketSymbol);
 
@@ -468,15 +496,47 @@ export class ExchangeService {
         throw new Error(`Order notional ${notional.toFixed(8)} < minCost ${minCost} for ${marketSymbol}`);
       }
 
+      // Margin check for MEXC: amount = margin * leverage; use max leverage per coin from symbol_filters
+      if ((this.bot.exchange || '').toLowerCase() === 'mexc') {
+        try {
+          const maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          const feeBuffer = Number(configService.getNumber('MEXC_MARGIN_FEE_BUFFER', 0.002)); // 0.2% buffer
+          const marginNeeded = (notional / Math.max(maxLev, 1)) * (1 + Math.max(0, feeBuffer));
+          const futBal = await this.getBalance('future').catch(() => ({ free: 0 }));
+          const futFree = Number(futBal?.free || 0);
+          if (futFree + 1e-8 < marginNeeded) {
+            throw new Error(`Insufficient futures margin: need ~${marginNeeded.toFixed(6)} USDT (amount=${notional.toFixed(6)} / lev=${maxLev}), free=${futFree.toFixed(6)} USDT`);
+          }
+        } catch (merr) {
+          // escalate with clear message rather than letting exchange return 10101
+          throw merr;
+        }
+      }
+
       const extraParams = {};
-      const order = await this.exchange.createOrder(
-        marketSymbol,
-        type,
-        side,
-        qty,
-        priceOut,
-        extraParams
-      );
+
+      // Optionally route through direct MexcFuturesClient (delegates to CCXT for now)
+      let order;
+      const useDirectMexc = (this.bot.exchange === 'mexc' && this.mexcFuturesClient && configService.getBoolean('MEXC_FUTURES_DIRECT', false));
+      if (useDirectMexc) {
+        order = await this.mexcFuturesClient.createOrder({
+          symbol,
+          side,
+          type,
+          amount,
+          price: usePrice,
+          extra: extraParams
+        });
+      } else {
+        order = await this.exchange.createOrder(
+          marketSymbol,
+          type,
+          side,
+          qty,
+          priceOut,
+          extraParams
+        );
+      }
 
       logger.info(`Order created for bot ${this.bot.id}:`, {
         orderId: order.id,

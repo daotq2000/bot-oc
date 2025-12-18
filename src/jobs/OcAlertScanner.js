@@ -1,4 +1,5 @@
 import { PriceAlertConfig } from '../models/PriceAlertConfig.js';
+import { Strategy } from '../models/Strategy.js';
 import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import { webSocketManager } from '../services/WebSocketManager.js';
 import { configService } from '../services/ConfigService.js';
@@ -373,6 +374,23 @@ export class OcAlertScanner {
                   logger.info(`[OcTick] 🎯 Strategy matches found after alert: ${matches.length} for ${exchange.toUpperCase()} ${sym}`);
                   for (const match of matches) {
                     try {
+                      // Send an additional alert using the matched interval and OC (to avoid interval mismatch with watcher)
+                      const matchChatId = w.chatId || this.telegramService.alertChannelId;
+                      const mOC = Number(match.oc || match.absOC || 0);
+                      const mOpen = Number(match.openPrice || open);
+                      const mCur = Number(match.currentPrice || p);
+                      const mInt = match.interval || interval;
+                      const mDir = match.direction || (mCur >= mOpen ? 'bullish' : 'bearish');
+                      await this.telegramService.sendVolatilityAlert(matchChatId, {
+                        symbol: sym,
+                        interval: mInt,
+                        oc: mOC,
+                        open: mOpen,
+                        currentPrice: mCur,
+                        direction: mDir
+                      }).catch(() => {});
+
+                      // Continue to execute order immediately
                       await webSocketOCConsumer.processMatch(match);
                     } catch (procErr) {
                       logger.error(`[OcTick] Error processing match for strategy ${match?.strategy?.id}:`, procErr?.message || procErr);
