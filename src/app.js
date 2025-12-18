@@ -121,6 +121,7 @@ async function start() {
       await AppConfig.set('MEXC_WS_COM_FAILOVER_THRESHOLD', '2', 'After N consecutive .com connection failures, prefer .co endpoints until a .com connects successfully');
       await AppConfig.set('MEXC_FUTURES_DIRECT', 'false', 'Use direct REST client for MEXC Futures (bypass CCXT)');
       await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.com', 'MEXC Futures REST base URL (use .co if region block)');
+      await AppConfig.set('ORDER_FAILURE_COOLDOWN_MS', '60000', 'Cooldown (ms) to suppress re-attempts after a failed order placement per strategy');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
 

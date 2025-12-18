@@ -26,6 +26,8 @@ export class WebSocketOCConsumer {
     this.cleanupInterval = null;
     this.processedCount = 0;
     this.matchCount = 0;
+    // Track failure cooldown per strategy to avoid retrying failed orders too soon
+    this.failureCooldown = new Map(); // strategyId -> until timestamp (ms)
   }
 
   /**
@@ -175,6 +177,15 @@ export class WebSocketOCConsumer {
       const { strategy, oc, direction, currentPrice, interval } = match;
       const botId = strategy.bot_id;
 
+      // Failure cool-down: avoid retrying failed orders too soon per strategy
+      try {
+        const until = this.failureCooldown.get(strategy.id);
+        if (until && until > Date.now()) {
+          logger.info(`[WebSocketOCConsumer] ⏳ Skip strategy ${strategy.id} due to failure cooldown until ${new Date(until).toISOString()}`);
+          return;
+        }
+      } catch (_) {}
+
       logger.info(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
       logger.info(`[WebSocketOCConsumer] Available OrderServices: ${Array.from(this.orderServices.keys()).join(', ')} (total: ${this.orderServices.size})`);
 
@@ -257,10 +268,23 @@ export class WebSocketOCConsumer {
       logger.info(`[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ${signal.side} @ ${currentPrice}, OC=${oc.toFixed(2)}%`);
 
       // Trigger order immediately
-      await orderService.executeSignal(signal).catch(error => {
-        logger.error(`[WebSocketOCConsumer] ❌ Error executing signal for strategy ${strategy.id}:`, error?.message || error);
-        throw error; // Re-throw to be caught by outer try-catch
-      });
+      const cooldownMs = Number(configService.getNumber('ORDER_FAILURE_COOLDOWN_MS', 60000));
+      try {
+        const result = await orderService.executeSignal(signal);
+        if (!result) {
+          // Soft failure (e.g., validation/min notional) -> set cooldown
+          const until = Date.now() + cooldownMs;
+          this.failureCooldown.set(strategy.id, until);
+          logger.warn(`[WebSocketOCConsumer] ⏳ Soft failure/no order for strategy ${strategy.id}, cooldown until ${new Date(until).toISOString()}`);
+          return;
+        }
+      } catch (error) {
+        // Hard failure -> set cooldown
+        const until = Date.now() + cooldownMs;
+        this.failureCooldown.set(strategy.id, until);
+        logger.error(`[WebSocketOCConsumer] ❌ Error executing signal for strategy ${strategy.id}, cooldown until ${new Date(until).toISOString()}:`, error?.message || error);
+        return;
+      }
 
       logger.info(`[WebSocketOCConsumer] ✅ Order triggered successfully for strategy ${strategy.id}`);
     } catch (error) {
