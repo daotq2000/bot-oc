@@ -1,0 +1,1740 @@
+Subject: [PATCH] logic đúng khi update position realtime
+update
+update symbol filters
+---
+Index: src/models/SymbolFilter.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/models/SymbolFilter.js b/src/models/SymbolFilter.js
+--- a/src/models/SymbolFilter.js	(revision 02387811a4120a110c9ace1ecb73b3331410a1df)
++++ b/src/models/SymbolFilter.js	(revision d600c2a18c5134c14afb572cb6d0572cee4c5337)
+@@ -50,4 +50,45 @@
+ 
+     await pool.execute(sql, values);
+   }
++
++  /**
++   * Delete symbol filters for a given exchange that are NOT in the provided symbol list.
++   * Used to remove delisted or unavailable symbols.
++   * @param {string} exchange - Exchange name (e.g., 'binance', 'mexc')
++   * @param {Array<string>} keepSymbols - Array of symbols to keep (uppercase, e.g., ['BTCUSDT', 'ETHUSDT'])
++   * @returns {Promise<number>} Number of rows deleted
++   */
++  static async deleteByExchangeAndSymbols(exchange, keepSymbols) {
++    if (!exchange || !Array.isArray(keepSymbols) || keepSymbols.length === 0) {
++      // If keepSymbols is empty, don't delete anything (fail-safe)
++      return 0;
++    }
++
++    const normalizedSymbols = keepSymbols.map(s => s.toUpperCase()).filter(s => s);
++    if (normalizedSymbols.length === 0) {
++      return 0;
++    }
++
++    const placeholders = normalizedSymbols.map(() => '?').join(',');
++    const sql = `
++      DELETE FROM symbol_filters
++      WHERE exchange = ? AND symbol NOT IN (${placeholders})
++    `;
++
++    const [result] = await pool.execute(sql, [exchange, ...normalizedSymbols]);
++    return result.affectedRows || 0;
++  }
++
++  /**
++   * Get all symbols for a specific exchange from the database.
++   * @param {string} exchange - Exchange name (e.g., 'binance', 'mexc')
++   * @returns {Promise<Array<string>>} Array of normalized symbols (uppercase)
++   */
++  static async getSymbolsByExchange(exchange) {
++    const [rows] = await pool.execute(
++      'SELECT symbol FROM symbol_filters WHERE exchange = ?',
++      [exchange]
++    );
++    return rows.map(r => (r.symbol || '').toUpperCase()).filter(s => s);
++  }
+ }
+Index: src/services/ExchangeInfoService.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/services/ExchangeInfoService.js b/src/services/ExchangeInfoService.js
+--- a/src/services/ExchangeInfoService.js	(revision 02387811a4120a110c9ace1ecb73b3331410a1df)
++++ b/src/services/ExchangeInfoService.js	(revision d600c2a18c5134c14afb572cb6d0572cee4c5337)
+@@ -10,9 +10,14 @@
+  * Exchange Info Service - Manages fetching and caching of symbol filters
+  */
+ class ExchangeInfoService {
+-  constructor() {
++  constructor({ symbolFilterDAO = SymbolFilter, binanceClientFactory = (apiKey, secretKey, isTestnet = false, exInfoSvc = null) => new BinanceDirectClient(apiKey, secretKey, isTestnet, exInfoSvc), mexcFactory = () => new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } }), loggerInst = logger, config = configService } = {}) {
+     this.filtersCache = new Map(); // symbol -> { tickSize, stepSize, minNotional, maxLeverage }
+     this.isInitialized = false;
++    this.symbolFilterDAO = symbolFilterDAO;
++    this.binanceClientFactory = binanceClientFactory;
++    this.mexcFactory = mexcFactory;
++    this.logger = loggerInst;
++    this.config = config;
+   }
+ 
+   /**
+@@ -23,7 +28,7 @@
+    */
+   async getSymbolsFromDB(exchange, onlyUSDT = true, limit = null) {
+     try {
+-      const rows = await SymbolFilter.findAll();
++      const rows = await this.symbolFilterDAO.findAll();
+       const ex = String(exchange || '').toLowerCase();
+       let syms = rows
+         .filter(r => (r.exchange || '').toLowerCase() === ex)
+@@ -35,7 +40,7 @@
+       if (Number.isFinite(limit) && limit > 0) return uniq.slice(0, limit);
+       return uniq;
+     } catch (e) {
+-      logger.warn(`[ExchangeInfoService] getSymbolsFromDB failed for ${exchange}: ${e?.message || e}`);
++      this.logger.warn(`[ExchangeInfoService] getSymbolsFromDB failed for ${exchange}: ${e?.message || e}`);
+       return [];
+     }
+   }
+@@ -61,19 +66,23 @@
+    * This should be called on bot startup.
+    */
+   async updateFiltersFromExchange() {
+-    logger.info('Updating symbol filters from Binance...');
++    this.logger.info('Updating symbol filters from Binance...');
+     try {
+-      const binanceClient = new BinanceDirectClient('', '', false); // No keys needed for public data
++      const binanceClient = this.binanceClientFactory('', '', false, this); // No keys needed for public data
+       const exchangeInfo = await binanceClient.getExchangeInfo();
+ 
+       if (!exchangeInfo || !exchangeInfo.symbols) {
+-        logger.error('Failed to fetch exchange info from Binance.');
++        this.this.logger.error('Failed to fetch exchange info from Binance.');
+         return;
+       }
+ 
+       const filtersToSave = [];
+       for (const symbolInfo of exchangeInfo.symbols) {
+         if (symbolInfo.status !== 'TRADING') continue;
++        // Futures-only USDT-margined perpetual contracts
++        const quote = (symbolInfo.quoteAsset || '').toUpperCase();
++        const contractType = (symbolInfo.contractType || '').toUpperCase();
++        if (quote !== 'USDT' || (contractType && contractType !== 'PERPETUAL')) continue;
+ 
+         const priceFilter = symbolInfo.filters.find(f => f.filterType === 'PRICE_FILTER');
+         const lotSizeFilter = symbolInfo.filters.find(f => f.filterType === 'LOT_SIZE');
+@@ -102,16 +111,26 @@
+         }
+       }
+ 
++      // Get current symbols from DB for this exchange
++      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('binance');
++      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
++
++      // Delete symbols that are no longer available on exchange
++      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('binance', exchangeSymbols);
++      if (deletedCount > 0) {
++        this.logger.info(`Deleted ${deletedCount} delisted/unavailable Binance symbols from database.`);
++      }
++
+       // Bulk insert/update into the database
+-      await SymbolFilter.bulkUpsert(filtersToSave);
+-      logger.info(`Successfully updated ${filtersToSave.length} Binance symbol filters in the database.`);
++      await this.symbolFilterDAO.bulkUpsert(filtersToSave);
++      this.logger.info(`Successfully updated ${filtersToSave.length} Binance symbol filters in the database.`);
+ 
+       // Clear and reload the in-memory cache
+       this.filtersCache.clear();
+       await this.loadFiltersFromDB();
+ 
+     } catch (error) {
+-      logger.error('Error updating symbol filters (Binance):', error);
++      this.this.logger.error('Error updating symbol filters (Binance):', error);
+     }
+   }
+ 
+@@ -119,9 +138,9 @@
+    * Fetch all MEXC USDT-M swap markets and update symbol_filters.
+    */
+   async updateMexcFiltersFromExchange() {
+-    logger.info('Updating symbol filters from MEXC...');
++    this.logger.info('Updating symbol filters from MEXC...');
+     try {
+-      const mexc = new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } });
++      const mexc = this.mexcFactory();
+       // Force .co domain base and add fetch failsafe
+       try {
+         const co = 'https://api.mexc.co';
+@@ -215,30 +234,40 @@
+       }
+ 
+       if (filtersToSave.length === 0) {
+-        const futuresOnly = configService.getBoolean('MEXC_FUTURES_ONLY', true);
++        const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
+         if (futuresOnly) {
+-          logger.warn('No MEXC swap markets via CCXT. Futures-only mode: skipping spot fallback.');
++          this.logger.warn('No MEXC swap markets via CCXT. Futures-only mode: skipping spot fallback.');
+           return;
+         }
+-        logger.warn('No MEXC swap markets via CCXT. Falling back to /api/v3/exchangeInfo');
++        this.logger.warn('No MEXC swap markets via CCXT. Falling back to /api/v3/exchangeInfo');
+         await this.updateMexcFiltersFromSpotExchangeInfo();
+         return;
+       }
+ 
+-      await SymbolFilter.bulkUpsert(filtersToSave);
+-      logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters in the database.`);
++      // Get current symbols from DB for this exchange
++      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
++      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
++
++      // Delete symbols that are no longer available on exchange
++      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
++      if (deletedCount > 0) {
++        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database.`);
++      }
++
++      await this.symbolFilterDAO.bulkUpsert(filtersToSave);
++      this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters in the database.`);
+ 
+       // Refresh cache
+       this.filtersCache.clear();
+       await this.loadFiltersFromDB();
+     } catch (e) {
+-      logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
+-      const futuresOnly = configService.getBoolean('MEXC_FUTURES_ONLY', true);
++      this.this.logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
++      const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
+       if (futuresOnly) {
+-        logger.warn('Futures-only mode enabled: skipping MEXC spot exchangeInfo fallback.');
++        this.logger.warn('Futures-only mode enabled: skipping MEXC spot exchangeInfo fallback.');
+         return;
+       }
+-      logger.info('Falling back to MEXC spot exchangeInfo (REST) ...');
++      this.logger.info('Falling back to MEXC spot exchangeInfo (REST) ...');
+       await this.updateMexcFiltersFromSpotExchangeInfo();
+     }
+   }
+@@ -282,18 +311,28 @@
+       }
+ 
+       if (filtersToSave.length === 0) {
+-        logger.warn('MEXC REST fallback returned no symbols. Skipping update.');
++        this.logger.warn('MEXC REST fallback returned no symbols. Skipping update.');
+         return;
+       }
+ 
+-      await SymbolFilter.bulkUpsert(filtersToSave);
+-      logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from REST spot exchangeInfo.`);
++      // Get current symbols from DB for this exchange
++      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
++      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
++
++      // Delete symbols that are no longer available on exchange
++      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
++      if (deletedCount > 0) {
++        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database (REST fallback).`);
++      }
++
++      await this.symbolFilterDAO.bulkUpsert(filtersToSave);
++      this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from REST spot exchangeInfo.`);
+ 
+       // Refresh cache
+       this.filtersCache.clear();
+       await this.loadFiltersFromDB();
+     } catch (err) {
+-      logger.error('MEXC REST fallback failed:', err?.message || err);
++      this.this.logger.error('MEXC REST fallback failed:', err?.message || err);
+     }
+   }
+ 
+@@ -303,7 +342,7 @@
+    */
+   async getTradableSymbolsFromBinance() {
+     try {
+-      const client = new BinanceDirectClient('', '', false);
++      const client = this.binanceClientFactory('', '', false, this);
+       const info = await client.getExchangeInfo();
+       const set = new Set();
+       if (info?.symbols?.length) {
+@@ -319,7 +358,7 @@
+       }
+       return set;
+     } catch (e) {
+-      logger.error('getTradableSymbolsFromBinance failed:', e?.message || e);
++      this.this.logger.error('getTradableSymbolsFromBinance failed:', e?.message || e);
+       return new Set();
+     }
+   }
+@@ -330,7 +369,7 @@
+    */
+   async getTradableSymbolsFromMexc() {
+     try {
+-      const mexc = new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } });
++      const mexc = this.mexcFactory();
+       await mexc.loadMarkets();
+       const set = new Set();
+       for (const id in mexc.markets) {
+@@ -345,7 +384,7 @@
+       }
+       return set;
+     } catch (e) {
+-      logger.error('getTradableSymbolsFromMexc failed:', e?.message || e);
++      this.this.logger.error('getTradableSymbolsFromMexc failed:', e?.message || e);
+       return new Set();
+     }
+   }
+@@ -367,9 +406,9 @@
+    * Load all symbol filters from the database into the in-memory cache.
+    */
+   async loadFiltersFromDB() {
+-    logger.info('Loading symbol filters from database into cache...');
++    this.logger.info('Loading symbol filters from database into cache...');
+     try {
+-      const filters = await SymbolFilter.findAll();
++      const filters = await this.symbolFilterDAO.findAll();
+       // Prefer Binance filters when duplicate symbols exist.
+       // Load Binance first; for other exchanges, only set if not present.
+       const sorted = filters.sort((a, b) => {
+@@ -392,9 +431,9 @@
+         });
+       }
+       this.isInitialized = true;
+-      logger.info(`Loaded ${this.filtersCache.size} symbol filters into cache.`);
++      this.logger.info(`Loaded ${this.filtersCache.size} symbol filters into cache.`);
+     } catch (error) {
+-      logger.error('Error loading symbol filters from DB:', error);
++      this.this.logger.error('Error loading symbol filters from DB:', error);
+     }
+   }
+ 
+@@ -405,7 +444,7 @@
+    */
+   getFilters(symbol) {
+     if (!this.isInitialized) {
+-      logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
++      this.logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
+     }
+     return this.filtersCache.get(symbol.toUpperCase());
+   }
+@@ -451,6 +490,7 @@
+   }
+ }
+ 
+-// Export a singleton instance
++// Export class for testing and singleton instance for production
++export { ExchangeInfoService };
+ export const exchangeInfoService = new ExchangeInfoService();
+ 
+Index: tests/unit/services/ExchangeInfoService.test.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/tests/unit/services/ExchangeInfoService.test.js b/tests/unit/services/ExchangeInfoService.test.js
+new file mode 100644
+--- /dev/null	(revision d600c2a18c5134c14afb572cb6d0572cee4c5337)
++++ b/tests/unit/services/ExchangeInfoService.test.js	(revision d600c2a18c5134c14afb572cb6d0572cee4c5337)
+@@ -0,0 +1,268 @@
++import { describe, it, expect, beforeEach, jest } from '@jest/globals';
++import { ExchangeInfoService } from '../../../src/services/ExchangeInfoService.js';
++
++describe('ExchangeInfoService - Symbol Sync (unit)', () => {
++  let svc;
++  let mockDAO;
++  let mockLogger;
++  let mockConfig;
++  let mockBinanceClient;
++  let mockMexc;
++
++  beforeEach(() => {
++    mockDAO = {
++      findAll: jest.fn(),
++      bulkUpsert: jest.fn().mockResolvedValue(undefined),
++      deleteByExchangeAndSymbols: jest.fn().mockResolvedValue(0),
++      getSymbolsByExchange: jest.fn().mockResolvedValue([]),
++    };
++    mockLogger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
++    mockConfig = { getBoolean: jest.fn().mockReturnValue(true) };
++    mockBinanceClient = { getExchangeInfo: jest.fn() };
++    mockMexc = {
++      markets: {},
++      fetchMarkets: jest.fn().mockResolvedValue(undefined),
++      loadMarkets: jest.fn().mockResolvedValue(undefined),
++      urls: {},
++      hostname: 'mexc.co',
++      fetch: jest.fn(),
++    };
++    svc = new ExchangeInfoService({
++      symbolFilterDAO: mockDAO,
++      binanceClientFactory: () => mockBinanceClient,
++      mexcFactory: () => mockMexc,
++      loggerInst: mockLogger,
++      config: mockConfig,
++    });
++  });
++
++  describe('Binance: updateFiltersFromExchange', () => {
++    it('inserts new symbols from exchange', async () => {
++      mockBinanceClient.getExchangeInfo.mockResolvedValue({
++        symbols: [
++          {
++            symbol: 'BTCUSDT',
++            status: 'TRADING',
++            filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++            leverageBrackets: [{ initialLeverage: 125 }],
++          },
++          {
++            symbol: 'ETHUSDT',
++            status: 'TRADING',
++            filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++            leverageBrackets: [{ initialLeverage: 100 }],
++          },
++        ],
++      });
++
++      const clearSpy = jest.spyOn(svc.filtersCache, 'clear');
++      svc.loadFiltersFromDB = jest.fn().mockResolvedValue(undefined);
++
++      await svc.updateFiltersFromExchange();
++
++      expect(mockDAO.getSymbolsByExchange).toHaveBeenCalledWith('binance');
++      expect(mockDAO.deleteByExchangeAndSymbols).toHaveBeenCalledWith('binance', ['BTCUSDT', 'ETHUSDT']);
++      expect(mockDAO.bulkUpsert).toHaveBeenCalledWith([
++        {
++          exchange: 'binance',
++          symbol: 'BTCUSDT',
++          tick_size: '0.01',
++          step_size: '0.001',
++          min_notional: '5',
++          max_leverage: 125,
++        },
++        {
++          exchange: 'binance',
++          symbol: 'ETHUSDT',
++          tick_size: '0.01',
++          step_size: '0.001',
++          min_notional: '5',
++          max_leverage: 100,
++        },
++      ]);
++      expect(clearSpy).toHaveBeenCalledTimes(1);
++      expect(svc.loadFiltersFromDB).toHaveBeenCalledTimes(1);
++    });
++
++    it('deletes symbols not returned by exchange (delisted/unavailable) and clears cache', async () => {
++      mockBinanceClient.getExchangeInfo.mockResolvedValue({
++        symbols: [
++          {
++            symbol: 'BTCUSDT',
++            status: 'TRADING',
++            filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++          },
++        ],
++      });
++      mockDAO.getSymbolsByExchange.mockResolvedValue(['BTCUSDT', 'SOLUSDT', 'ABCUSDT']);
++      mockDAO.deleteByExchangeAndSymbols.mockResolvedValue(2);
++
++      const clearSpy = jest.spyOn(svc.filtersCache, 'clear');
++      svc.loadFiltersFromDB = jest.fn().mockResolvedValue(undefined);
++
++      await svc.updateFiltersFromExchange();
++
++      expect(mockDAO.deleteByExchangeAndSymbols).toHaveBeenCalledWith('binance', ['BTCUSDT']);
++      expect(mockLogger.info).toHaveBeenCalledWith(expect.stringContaining('Deleted 2 delisted/unavailable Binance symbols'));
++      expect(clearSpy).toHaveBeenCalledTimes(1);
++      expect(svc.loadFiltersFromDB).toHaveBeenCalledTimes(1);
++    });
++
++    it('keeps existing symbols that are still available (no deletions) and clears cache', async () => {
++      mockBinanceClient.getExchangeInfo.mockResolvedValue({
++        symbols: [
++          {
++            symbol: 'BTCUSDT', status: 'TRADING', filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++          },
++          {
++            symbol: 'ETHUSDT', status: 'TRADING', filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++          },
++        ],
++      });
++      mockDAO.getSymbolsByExchange.mockResolvedValue(['BTCUSDT', 'ETHUSDT']);
++      mockDAO.deleteByExchangeAndSymbols.mockResolvedValue(0);
++      const clearSpy = jest.spyOn(svc.filtersCache, 'clear');
++      svc.loadFiltersFromDB = jest.fn().mockResolvedValue(undefined);
++
++      await svc.updateFiltersFromExchange();
++
++      expect(mockDAO.deleteByExchangeAndSymbols).toHaveBeenCalledWith('binance', ['BTCUSDT', 'ETHUSDT']);
++      expect(mockDAO.bulkUpsert).toHaveBeenCalled();
++      expect(clearSpy).toHaveBeenCalledTimes(1);
++      expect(svc.loadFiltersFromDB).toHaveBeenCalledTimes(1);
++    });
++
++    it('does not insert spot-only symbols when not present in Futures list', async () => {
++      // Imagine SPOTONLYUSDT exists on Spot, but Futures API does not return it.
++      mockBinanceClient.getExchangeInfo.mockResolvedValue({
++        symbols: [
++          {
++            symbol: 'BTCUSDT',
++            status: 'TRADING',
++            filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++          },
++        ],
++      });
++      const clearSpy = jest.spyOn(svc.filtersCache, 'clear');
++      svc.loadFiltersFromDB = jest.fn().mockResolvedValue(undefined);
++
++      await svc.updateFiltersFromExchange();
++
++      // Ensure upsert only contains Futures symbols (BTCUSDT), not SPOTONLYUSDT
++      const upsertArg = mockDAO.bulkUpsert.mock.calls[0][0];
++      expect(upsertArg.map(x => x.symbol)).toEqual(['BTCUSDT']);
++      expect(clearSpy).toHaveBeenCalledTimes(1);
++      expect(svc.loadFiltersFromDB).toHaveBeenCalledTimes(1);
++    });
++
++    it('fail-safe when exchange returns empty symbols: no mass deletion and cache cleared', async () => {
++      mockBinanceClient.getExchangeInfo.mockResolvedValue({ symbols: [] });
++      const clearSpy = jest.spyOn(svc.filtersCache, 'clear');
++      svc.loadFiltersFromDB = jest.fn().mockResolvedValue(undefined);
++
++      await svc.updateFiltersFromExchange();
++
++      expect(mockDAO.deleteByExchangeAndSymbols).toHaveBeenCalledWith('binance', []);
++      expect(mockDAO.bulkUpsert).toHaveBeenCalledWith([]);
++      expect(clearSpy).toHaveBeenCalledTimes(1);
++      expect(svc.loadFiltersFromDB).toHaveBeenCalledTimes(1);
++    });
++
++    it('skips non-TRADING and missing-filter symbols', async () => {
++      mockBinanceClient.getExchangeInfo.mockResolvedValue({
++        symbols: [
++          {
++            symbol: 'BTCUSDT', status: 'TRADING', filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++          },
++          {
++            symbol: 'DELISTEDUSDT', status: 'BREAK', filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++              { filterType: 'LOT_SIZE', stepSize: '0.001' },
++              { filterType: 'MIN_NOTIONAL', notional: '5' },
++            ],
++          },
++          {
++            symbol: 'INVALIDUSDT', status: 'TRADING', filters: [
++              { filterType: 'PRICE_FILTER', tickSize: '0.01' },
++            ],
++          },
++        ],
++      });
++      svc.loadFiltersFromDB = jest.fn().mockResolvedValue(undefined);
++
++      await svc.updateFiltersFromExchange();
++
++      expect(mockDAO.bulkUpsert).toHaveBeenCalledWith([
++        {
++          exchange: 'binance', symbol: 'BTCUSDT', tick_size: '0.01', step_size: '0.001', min_notional: '5', max_leverage: 125,
++        },
++      ]);
++    });
++
++    it('logs error and does not upsert when fetch throws', async () => {
++      const err = new Error('Network');
++      mockBinanceClient.getExchangeInfo.mockRejectedValue(err);
++
++      await svc.updateFiltersFromExchange();
++
++      expect(mockLogger.error).toHaveBeenCalledWith('Error updating symbol filters (Binance):', err);
++      expect(mockDAO.bulkUpsert).not.toHaveBeenCalled();
++    });
++  });
++
++  describe('MEXC: updateMexcFiltersFromExchange', () => {
++    it('inserts new and deletes delisted for MEXC', async () => {
++      mockMexc.markets = {
++        'BTC/USDT:USDT': {
++          base: 'BTC', quote: 'USDT', type: 'swap', contract: true, active: true,
++          precision: { price: 2, amount: 3 },
++          limits: { cost: { min: 5 }, leverage: { max: 125 } },
++          info: {},
++        },
++      };
++
++      mockDAO.getSymbolsByExchange.mockResolvedValue(['ETHUSDT']);
++      mockDAO.deleteByExchangeAndSymbols.mockResolvedValue(1);
++      svc.loadFiltersFromDB = jest.fn().mockResolvedValue(undefined);
++
++      await svc.updateMexcFiltersFromExchange();
++
++      expect(mockDAO.getSymbolsByExchange).toHaveBeenCalledWith('mexc');
++      expect(mockDAO.deleteByExchangeAndSymbols).toHaveBeenCalledWith('mexc', ['BTCUSDT']);
++      expect(mockDAO.bulkUpsert).toHaveBeenCalledWith([
++        {
++          exchange: 'mexc', symbol: 'BTCUSDT', tick_size: '0.01', step_size: '0.001', min_notional: 5, max_leverage: 125,
++        },
++      ]);
++      expect(svc.loadFiltersFromDB).toHaveBeenCalled();
++    });
++  });
++});
+Index: src/app.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/app.js b/src/app.js
+--- a/src/app.js	(revision d600c2a18c5134c14afb572cb6d0572cee4c5337)
++++ b/src/app.js	(revision a94457e791ca16cddb81a17fed7442a4c5ee801d)
+@@ -78,6 +78,7 @@
+       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
+       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
+       await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '500', 'Price alert scanner job interval in milliseconds');
++      await AppConfig.set('PRICE_ALERT_MODULE_ENABLED', 'true', 'Enable/Disable the entire Price Alert module (workers, scanners, alerts)');
+       await AppConfig.set('PRICE_ALERT_CHECK_ENABLED', 'true', 'Enable price alert checking for MEXC and other exchanges');
+       await AppConfig.set('PRICE_ALERT_SYMBOL_REFRESH_INTERVAL_MS', '30000', 'Interval to refresh Price Alert symbols from config/DB (ms)');
+       await AppConfig.set('PRICE_ALERT_WS_SUBSCRIBE_INTERVAL_MS', '60000', 'Interval to update WebSocket subscriptions for Price Alert (ms)');
+@@ -212,30 +213,35 @@
+     // ============================================
+     // PRICE ALERT WORKER (Always-on, Independent)
+     // ============================================
++    const alertModuleEnabled = configService.getBoolean('PRICE_ALERT_MODULE_ENABLED', true);
+     logger.info('='.repeat(60));
+-    logger.info('Initializing Price Alert Worker (Always-on, Independent)...');
++    logger.info(`Initializing Price Alert Worker (Always-on, Independent) - Enabled=${alertModuleEnabled}`);
+     logger.info('='.repeat(60));
+ 
+-    // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
+-    try {
+-      logger.info('[App] Pre-loading PriceAlertConfig cache...');
+-      const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
+-      await PriceAlertConfig.findAll(); // This will cache all configs
+-      logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
+-    } catch (error) {
+-      logger.warn('[App] Failed to pre-load PriceAlertConfig cache:', error?.message || error);
+-    }
+-    
+-    try {
+-      const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
+-      priceAlertWorker = new PriceAlertWorker();
+-      await priceAlertWorker.initialize(telegramService);
+-      priceAlertWorker.start();
+-      logger.info('✅ Price Alert Worker started successfully');
+-    } catch (error) {
+-      logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
+-      logger.error('Price Alert system is critical - application will continue but alerts may not work');
+-      // Don't exit - Price Alert should be resilient
++    if (alertModuleEnabled) {
++      // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
++      try {
++        logger.info('[App] Pre-loading PriceAlertConfig cache...');
++        const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
++        await PriceAlertConfig.findAll(); // This will cache all configs
++        logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
++      } catch (error) {
++        logger.warn('[App] Failed to pre-load PriceAlertConfig cache:', error?.message || error);
++      }
++      
++      try {
++        const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
++        priceAlertWorker = new PriceAlertWorker();
++        await priceAlertWorker.initialize(telegramService);
++        priceAlertWorker.start();
++        logger.info('✅ Price Alert Worker started successfully');
++      } catch (error) {
++        logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
++        logger.error('Price Alert system is critical - application will continue but alerts may not work');
++        // Don't exit - Price Alert should be resilient
++      }
++    } else {
++      logger.warn('[App] PRICE_ALERT_MODULE_ENABLED=false → Price Alert Worker not started');
+     }
+ 
+     // ============================================
+Index: migrations/20251219100000-create-entry-orders-table.cjs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/migrations/20251219100000-create-entry-orders-table.cjs b/migrations/20251219100000-create-entry-orders-table.cjs
+new file mode 100644
+--- /dev/null	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
++++ b/migrations/20251219100000-create-entry-orders-table.cjs	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
+@@ -0,0 +1,72 @@
++'use strict';
++
++module.exports = {
++  up: async (queryInterface, Sequelize) => {
++    await queryInterface.createTable('entry_orders', {
++      id: {
++        allowNull: false,
++        autoIncrement: true,
++        primaryKey: true,
++        type: Sequelize.INTEGER
++      },
++      strategy_id: {
++        type: Sequelize.INTEGER,
++        allowNull: false,
++        references: { model: 'strategies', key: 'id' },
++        onUpdate: 'CASCADE',
++        onDelete: 'CASCADE'
++      },
++      bot_id: {
++        type: Sequelize.INTEGER,
++        allowNull: false,
++        references: { model: 'bots', key: 'id' },
++        onUpdate: 'CASCADE',
++        onDelete: 'CASCADE'
++      },
++      order_id: {
++        type: Sequelize.STRING,
++        allowNull: false,
++        unique: true
++      },
++      symbol: {
++        type: Sequelize.STRING,
++        allowNull: false
++      },
++      side: {
++        type: Sequelize.STRING(10),
++        allowNull: false
++      },
++      amount: {
++        type: Sequelize.DECIMAL(20, 8),
++        allowNull: false
++      },
++      entry_price: {
++        type: Sequelize.DECIMAL(20, 8),
++        allowNull: false
++      },
++      status: {
++        type: Sequelize.ENUM('open', 'filled', 'canceled', 'expired'),
++        allowNull: false,
++        defaultValue: 'open'
++      },
++      created_at: {
++        allowNull: false,
++        type: Sequelize.DATE,
++        defaultValue: Sequelize.literal('CURRENT_TIMESTAMP')
++      },
++      updated_at: {
++        allowNull: false,
++        type: Sequelize.DATE,
++        defaultValue: Sequelize.literal('CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP')
++      }
++    });
++
++    await queryInterface.addIndex('entry_orders', ['status']);
++    await queryInterface.addIndex('entry_orders', ['strategy_id']);
++    await queryInterface.addIndex('entry_orders', ['bot_id', 'status']);
++  },
++
++  down: async (queryInterface, Sequelize) => {
++    await queryInterface.dropTable('entry_orders');
++  }
++};
+Index: scripts/ensure_entry_orders_schema.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/scripts/ensure_entry_orders_schema.js b/scripts/ensure_entry_orders_schema.js
+new file mode 100644
+--- /dev/null	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
++++ b/scripts/ensure_entry_orders_schema.js	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
+@@ -0,0 +1,40 @@
++import pool from '../src/config/database.js';
++
++async function ensureEntryOrdersTable() {
++  await pool.execute(`
++    CREATE TABLE IF NOT EXISTS entry_orders (
++      id INT PRIMARY KEY AUTO_INCREMENT,
++      strategy_id INT NOT NULL,
++      bot_id INT NOT NULL,
++      order_id VARCHAR(100) NOT NULL,
++      symbol VARCHAR(50) NOT NULL,
++      side VARCHAR(10) NOT NULL,
++      amount DECIMAL(20,8) NOT NULL,
++      entry_price DECIMAL(20,8) NOT NULL,
++      status ENUM('open','filled','canceled','expired') NOT NULL DEFAULT 'open',
++      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
++      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++      UNIQUE KEY uniq_order (order_id),
++      INDEX idx_status (status),
++      INDEX idx_strategy (strategy_id),
++      INDEX idx_bot_status (bot_id, status),
++      CONSTRAINT fk_entry_orders_strategy FOREIGN KEY (strategy_id) REFERENCES strategies(id) ON DELETE CASCADE,
++      CONSTRAINT fk_entry_orders_bot FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++  `);
++  console.log('Ensured table entry_orders exists.');
++}
++
++(async () => {
++  try {
++    await ensureEntryOrdersTable();
++  } catch (e) {
++    console.error('Schema ensure error (entry_orders):', e?.message || e);
++    process.exit(1);
++  } finally {
++    try { await pool.end(); } catch (_) {}
++  }
++  process.exit(0);
++})();
++
++
+Index: scripts/test_entry_orders_flow_binance.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/scripts/test_entry_orders_flow_binance.js b/scripts/test_entry_orders_flow_binance.js
+new file mode 100644
+--- /dev/null	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
++++ b/scripts/test_entry_orders_flow_binance.js	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
+@@ -0,0 +1,256 @@
++#!/usr/bin/env node
++/**
++ * Test script: verify entry_orders + monitor flow on Binance Futures testnet (bot_id=3)
++ *
++ * Flow:
++ *  - Create a temporary strategy in DB for bot 3
++ *  - Place a SMALL LIMIT entry order using the real strategy_id
++ *  - Immediately inspect:
++ *      - entry_orders: new row should appear with status='open'
++ *      - positions: should NOT have new open position yet (if order not filled)
++ *  - Then:
++ *      - Wait some seconds and re-check; if order filled, EntryOrderMonitor should have:
++ *          - created a Position
++ *          - marked entry_orders.status='filled'
++ *      - If cancelled/expired, entry_orders.status should become 'canceled'/'expired' and still no Position
++ *  - Finally, clean up (delete) the temporary strategy
++ *
++ * Usage:
++ *  node scripts/test_entry_orders_flow_binance.js --symbol ETHUSDT --side long|short --amount 50 --offset_pct 0.5 --confirm
++ */
++
++import dotenv from 'dotenv';
++import logger from '../src/utils/logger.js';
++import pool from '../src/config/database.js';
++import { ExchangeService } from '../src/services/ExchangeService.js';
++import { OrderService } from '../src/services/OrderService.js';
++import { TelegramService } from '../src/services/TelegramService.js';
++
++dotenv.config();
++
++function parseArgs(argv) {
++  const out = {};
++  for (let i = 0; i < argv.length; i++) {
++    const a = argv[i];
++    if (a.startsWith('--')) {
++      const key = a.replace(/^--/, '');
++      const next = argv[i + 1];
++      if (!next || next.startsWith('--')) {
++        out[key] = true;
++      } else {
++        out[key] = next;
++        i++;
++      }
++    }
++  }
++  return out;
++}
++
++const args = parseArgs(process.argv.slice(2));
++
++function usage(msg = null) {
++  if (msg) console.error(`Error: ${msg}`);
++  console.log(`\nUsage: node scripts/test_entry_orders_flow_binance.js --symbol ETHUSDT --side long|short --amount 50 --offset_pct 0.5 --confirm\n`);
++  process.exit(msg ? 1 : 0);
++}
++
++async function sleep(ms) {
++  return new Promise(resolve => setTimeout(resolve, ms));
++}
++
++async function getBot3() {
++  const { Bot } = await import('../src/models/Bot.js');
++  const bot = await Bot.findById(3);
++  if (!bot) {
++    throw new Error('Bot id=3 not found in database');
++  }
++  if ((bot.exchange || '').toLowerCase() !== 'binance') {
++    throw new Error(`Bot id=3 must be Binance, got exchange=${bot.exchange}`);
++  }
++  if (!bot.is_active) {
++    throw new Error('Bot id=3 is not active (is_active != 1)');
++  }
++  return bot;
++}
++
++async function getCurrentPrice(exSvc, symbol) {
++  try {
++    const p = await exSvc.getTickerPrice(symbol);
++    if (Number.isFinite(Number(p)) && Number(p) > 0) return Number(p);
++  } catch (_) {}
++
++  try {
++    if (exSvc.binanceDirectClient?.makeMarketDataRequest) {
++      const normalized = exSvc.binanceDirectClient.normalizeSymbol(symbol);
++      const data = await exSvc.binanceDirectClient.makeMarketDataRequest('/fapi/v1/ticker/price', 'GET', { symbol: normalized });
++      const price = Number(data?.price);
++      if (Number.isFinite(price) && price > 0) return price;
++    }
++  } catch (e) {
++    logger.warn(`[test_entry_orders_flow] Market data fallback failed: ${e?.message || e}`);
++  }
++
++  throw new Error(`Cannot fetch current price for ${symbol}`);
++}
++
++async function queryEntryOrdersAndPositions(botId, symbol) {
++  const [entryRows] = await pool.execute(
++    `SELECT * FROM entry_orders WHERE bot_id = ? AND symbol = ? ORDER BY id DESC LIMIT 5`,
++    [botId, symbol]
++  );
++  const [posRows] = await pool.execute(
++    `SELECT * FROM positions WHERE bot_id = ? AND symbol = ? AND status = 'open' ORDER BY id DESC LIMIT 5`,
++    [botId, symbol]
++  );
++  return { entryRows, posRows };
++}
++
++async function createTempStrategy(botId, symbol, amount) {
++  const [result] = await pool.execute(
++    `INSERT INTO strategies (bot_id, symbol, \`interval\`, amount, oc, take_profit, reduce, extend, up_reduce, \`ignore\`, is_active, created_at, updated_at)
++     VALUES (?, ?, '15m', ?, 1, 50, 10, 0, 0, 0, 0, NOW(), NOW())`, // Provide defaults for all non-nullable fields
++    [botId, symbol, amount]
++  );
++  if (!result.insertId) {
++    throw new Error('Failed to create temporary strategy');
++  }
++  console.log(`[INFO] Created temporary strategy with id=${result.insertId}`);
++  return result.insertId;
++}
++
++async function deleteTempStrategy(strategyId) {
++  if (!strategyId) return;
++  try {
++    const [result] = await pool.execute(
++      `DELETE FROM strategies WHERE id = ?`,
++      [strategyId]
++    );
++    if (result.affectedRows > 0) {
++      console.log(`[INFO] Cleaned up temporary strategy id=${strategyId}`);
++    }
++  } catch (e) {
++    console.error(`[ERROR] Failed to clean up temp strategy id=${strategyId}: ${e.message}`);
++  }
++}
++
++async function main() {
++  const symbol = String(args.symbol || 'ETHUSDT').toUpperCase().replace(/[\/:_]/g, '');
++  const side = String(args.side || '').toLowerCase();
++  const amount = Number(args.amount || 50);
++  const offsetPct = Number(args.offset_pct || 0.5);
++  const confirm = !!args.confirm;
++
++  if (!['long', 'short'].includes(side)) usage('Missing/invalid --side');
++  if (!Number.isFinite(amount) || amount <= 0) usage('Missing/invalid --amount');
++
++  let tempStrategyId;
++  try {
++    const bot = await getBot3();
++    console.log(`[INFO] Using bot id=3: name=${bot.bot_name || 'N/A'}, exchange=${bot.exchange}, testnet=${bot.binance_testnet}`);
++
++    tempStrategyId = await createTempStrategy(bot.id, symbol, amount);
++
++    const exSvc = new ExchangeService(bot);
++    await exSvc.initialize();
++
++    const mockTelegramService = {
++      sendMessage: () => Promise.resolve(),
++      sendOrderNotification: () => Promise.resolve(),
++      sendEntryTradeAlert: () => Promise.resolve()
++    };
++
++    const orderSvc = new OrderService(exSvc, mockTelegramService);
++    console.log(`[INFO] Services initialized for bot 3.`);
++
++    const current = await getCurrentPrice(exSvc, symbol);
++    console.log(`[INFO] Current price for ${symbol}: ${current}`);
++
++    let limitPrice;
++    if (side === 'long') {
++      limitPrice = current * (1 - offsetPct / 100);
++    } else {
++      limitPrice = current * (1 + offsetPct / 100);
++    }
++    limitPrice = Number(limitPrice.toFixed(4));
++
++    const realStrategy = {
++      id: tempStrategyId,
++      bot_id: bot.id,
++      symbol: symbol,
++      amount: amount,
++      oc: 1, // Mock value
++      take_profit: 50, // Mock value
++      reduce: 10, // Mock value
++      bot: bot
++    };
++
++    console.log('\n=== Test Plan (Binance testnet entry_orders flow) ===');
++    console.log(`Symbol       : ${symbol}`);
++    console.log(`Side         : ${side.toUpperCase()}`);
++    console.log(`Amount (USDT): ${amount}`);
++    console.log(`Current      : ${current}`);
++    console.log(`Limit Price  : ${limitPrice} (offset ${offsetPct}% from market)`);
++    console.log(`Mode         : ${confirm ? 'CONFIRMED - WILL PLACE REAL LIMIT ORDER' : 'DRY-RUN'}`);
++
++    if (!confirm) {
++      console.log('\nPass --confirm to actually place LIMIT order on Binance testnet.');
++      return; // Exit main, finally will run
++    }
++
++    console.log('\n[0] Snapshot BEFORE placing order: entry_orders + positions');
++    let { entryRows: beforeEntries, posRows: beforePositions } = await queryEntryOrdersAndPositions(bot.id, symbol);
++    console.log('entry_orders(before):', beforeEntries);
++    console.log('positions(open,before):', beforePositions);
++
++    console.log('\n[1] Placing ENTRY LIMIT order via OrderService.executeSignal...');
++    const signal = {
++      strategy: realStrategy,
++      side: side,
++      entryPrice: limitPrice,
++      amount: amount
++    };
++
++    const result = await orderSvc.executeSignal(signal);
++
++    if (!result || (!result.pending && !result.id)) {
++      throw new Error(`Order placement failed or returned invalid result: ${JSON.stringify(result)}`);
++    }
++    const orderId = result.orderId || result.order_id;
++    console.log(`[OK] Order signal executed. Result: ${JSON.stringify(result)}`);
++
++    await sleep(2000);
++
++    console.log('\n[2] Snapshot AFTER placing order (short delay): entry_orders + positions');
++    let { entryRows: afterEntries1, posRows: afterPositions1 } = await queryEntryOrdersAndPositions(bot.id, symbol);
++    console.log('entry_orders(after 2s):', afterEntries1);
++    console.log('positions(open,after 2s):', afterPositions1);
++
++    console.log('\n[3] Waiting 20s for EntryOrderMonitor (WS/REST) to possibly confirm fill/cancel...');
++    await sleep(20000);
++
++    console.log('\n[4] Snapshot AFTER 20s: entry_orders + positions');
++    let { entryRows: afterEntries2, posRows: afterPositions2 } = await queryEntryOrdersAndPositions(bot.id, symbol);
++    console.log('entry_orders(after 20s):', afterEntries2);
++    console.log('positions(open,after 2s):', afterPositions2);
++
++    console.log('\n=== Interpretation Guide ===');
++    console.log('- Nếu LIMIT chưa khớp:');
++    console.log('  + entry_orders: row mới với status="open"');
++    console.log('  + positions: KHÔNG nên có position mới tương ứng.');
++    console.log('- Nếu LIMIT đã khớp trong khoảng thời gian chờ:');
++    console.log('  + entry_orders: status="filled"');
++    console.log('  + positions: có position mới với order_id=' + orderId);
++
++  } finally {
++    await deleteTempStrategy(tempStrategyId);
++    await pool.end();
++    console.log('[INFO] Test finished.');
++  }
++}
++
++main().catch(err => {
++  console.error('Fatal error in test_entry_orders_flow_binance:', err?.message || err);
++  console.error(err?.stack || '');
++  pool.end(); // Ensure pool is closed on error too
++  process.exit(1);
++});
+\ No newline at end of file
+Index: src/jobs/EntryOrderMonitor.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/jobs/EntryOrderMonitor.js b/src/jobs/EntryOrderMonitor.js
+new file mode 100644
+--- /dev/null	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
++++ b/src/jobs/EntryOrderMonitor.js	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
+@@ -0,0 +1,270 @@
++import cron from 'node-cron';
++import { EntryOrder } from '../models/EntryOrder.js';
++import { Position } from '../models/Position.js';
++import { ExchangeService } from '../services/ExchangeService.js';
++import { PositionWebSocketClient } from '../services/PositionWebSocketClient.js';
++import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
++import { configService } from '../services/ConfigService.js';
++import logger from '../utils/logger.js';
++
++/**
++ * EntryOrderMonitor
++ * - Tracks pending entry orders (especially LIMIT) stored in entry_orders table
++ * - Prefers Binance Futures user-data WebSocket (ORDER_TRADE_UPDATE)
++ * - Fallback to REST polling for all exchanges when WS is not available
++ */
++export class EntryOrderMonitor {
++  constructor() {
++    this.exchangeServices = new Map(); // botId -> ExchangeService
++    this.wsClients = new Map(); // botId -> PositionWebSocketClient (Binance only)
++    this.telegramService = null;
++    this.isRunning = false;
++    this.cronJob = null;
++  }
++
++  /**
++   * Initialize services for all active bots
++   */
++  async initialize(telegramService) {
++    this.telegramService = telegramService;
++
++    try {
++      const { Bot } = await import('../models/Bot.js');
++      const bots = await Bot.findAll(true); // Active bots only
++
++      for (const bot of bots) {
++        await this._addBot(bot);
++      }
++    } catch (error) {
++      logger.error('[EntryOrderMonitor] Failed to initialize:', error);
++    }
++  }
++
++  async _addBot(bot) {
++    try {
++      const exchangeService = new ExchangeService(bot);
++      await exchangeService.initialize();
++      this.exchangeServices.set(bot.id, exchangeService);
++
++      // Binance-only: start user-data WebSocket for ORDER_TRADE_UPDATE
++      if ((bot.exchange || '').toLowerCase() === 'binance' && exchangeService.binanceDirectClient) {
++        const restMakeRequest = exchangeService.binanceDirectClient.makeRequest.bind(exchangeService.binanceDirectClient);
++        const isTestnet = !!exchangeService.binanceDirectClient.isTestnet;
++        const wsClient = new PositionWebSocketClient(restMakeRequest, isTestnet);
++
++        wsClient.on('ORDER_TRADE_UPDATE', (evt) => {
++          this._handleBinanceOrderTradeUpdate(bot.id, evt).catch(err => {
++            logger.error(`[EntryOrderMonitor] Error in ORDER_TRADE_UPDATE handler for bot ${bot.id}:`, err?.message || err);
++          });
++        });
++
++        wsClient.on('listenKeyExpired', () => {
++          logger.warn(`[EntryOrderMonitor] listenKeyExpired for bot ${bot.id}, WS client will reconnect.`);
++        });
++
++        wsClient.on('raw', (evt) => {
++          // Optional raw logging / debugging
++          const eType = evt?.e || evt?.eventType;
++          if (eType === 'ORDER_TRADE_UPDATE') {
++            logger.debug(`[EntryOrderMonitor] ORDER_TRADE_UPDATE raw event received for bot ${bot.id}`);
++          }
++        });
++
++        await wsClient.connect();
++        this.wsClients.set(bot.id, wsClient);
++        logger.info(`[EntryOrderMonitor] User-data WebSocket connected for bot ${bot.id}`);
++      }
++
++      logger.info(`[EntryOrderMonitor] Initialized for bot ${bot.id}`);
++    } catch (error) {
++      logger.error(`[EntryOrderMonitor] Failed to initialize for bot ${bot.id}:`, error);
++    }
++  }
++
++  /**
++   * Handle Binance ORDER_TRADE_UPDATE user-data event
++   * @param {number} botId
++   * @param {Object} evt
++   */
++  async _handleBinanceOrderTradeUpdate(botId, evt) {
++    try {
++      const e = evt?.e || evt?.eventType;
++      if (e !== 'ORDER_TRADE_UPDATE') return;
++
++      const o = evt.o || evt.order || {};
++      const orderId = o.i ?? o.orderId; // i: orderId in futures stream
++      const symbol = o.s || o.symbol;
++      const status = o.X || o.orderStatus; // NEW, PARTIALLY_FILLED, FILLED, CANCELED, EXPIRED
++      const avgPriceStr = o.ap ?? o.avgPrice ?? o.p ?? o.price ?? null;
++      const avgPrice = avgPriceStr ? Number(avgPriceStr) : NaN;
++      const filledQtyStr = o.z ?? o.cumQty ?? o.filledQty ?? null;
++      const filledQty = filledQtyStr ? Number(filledQtyStr) : NaN;
++
++      if (!orderId || !symbol) return;
++
++      const normalizedStatus = String(status || '').toUpperCase();
++      const isFilled = normalizedStatus === 'FILLED';
++      const isCanceled = normalizedStatus === 'CANCELED' || normalizedStatus === 'CANCELLED' || normalizedStatus === 'EXPIRED';
++
++      const entry = await EntryOrder.findOpenByBotAndOrder(botId, orderId);
++      if (!entry) {
++        return; // Not an entry order we track
++      }
++
++      if (isFilled) {
++        // Confirmed filled → create Position and mark entry_orders as filled
++        await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
++      } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
++        // Cancelled/expired without fill → mark as canceled
++        await EntryOrder.markCanceled(entry.id, normalizedStatus === 'EXPIRED' ? 'expired' : 'canceled');
++        logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
++      }
++    } catch (error) {
++      logger.error('[EntryOrderMonitor] Error in _handleBinanceOrderTradeUpdate:', error?.message || error);
++    }
++  }
++
++  /**
++   * Fallback polling using REST for all exchanges
++   */
++  async pollOpenEntryOrders() {
++    try {
++      const openEntries = await EntryOrder.findOpen();
++      if (!openEntries.length) return;
++
++      logger.debug(`[EntryOrderMonitor] Polling ${openEntries.length} open entry orders via REST.`);
++
++      for (const entry of openEntries) {
++        try {
++          const exchangeService = this.exchangeServices.get(entry.bot_id);
++          if (!exchangeService) continue;
++
++          const st = await exchangeService.getOrderStatus(entry.symbol, entry.order_id);
++          const status = (st?.status || '').toLowerCase();
++          const filled = Number(st?.filled || 0);
++
++          if ((status === 'closed' || status === 'filled') && filled > 0) {
++            // Confirmed filled via REST
++            await this._confirmEntryWithPosition(entry.bot_id, entry, null);
++          } else if ((status === 'canceled' || status === 'cancelled' || status === 'expired') && filled === 0) {
++            await EntryOrder.markCanceled(entry.id, status === 'expired' ? 'expired' : 'canceled');
++            logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) canceled/expired via REST polling.`);
++          }
++        } catch (inner) {
++          logger.warn(`[EntryOrderMonitor] Failed to poll entry order ${entry.id} (${entry.symbol}): ${inner?.message || inner}`);
++        }
++      }
++    } catch (error) {
++      logger.error('[EntryOrderMonitor] Error in pollOpenEntryOrders:', error?.message || error);
++    }
++  }
++
++  /**
++   * Confirm entry order by creating Position and marking entry_orders as filled
++   * @param {number} botId
++   * @param {Object} entry
++   * @param {number|null} overrideEntryPrice
++   */
++  async _confirmEntryWithPosition(botId, entry, overrideEntryPrice = null) {
++    try {
++      const { Strategy } = await import('../models/Strategy.js');
++      const strategy = await Strategy.findById(entry.strategy_id);
++      if (!strategy) {
++        logger.warn(`[EntryOrderMonitor] Strategy ${entry.strategy_id} not found for entry order ${entry.id}, marking as canceled.`);
++        await EntryOrder.markCanceled(entry.id, 'canceled');
++        return;
++      }
++
++      const effectiveEntryPrice = Number.isFinite(overrideEntryPrice) && overrideEntryPrice > 0
++        ? overrideEntryPrice
++        : Number(entry.entry_price);
++
++      const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
++      const side = entry.side;
++      const tpPrice = calculateTakeProfit(effectiveEntryPrice, strategy.oc, strategy.take_profit, side);
++      const slPrice = calculateInitialStopLoss(tpPrice, strategy.oc, strategy.reduce, side);
++
++      const position = await Position.create({
++        strategy_id: entry.strategy_id,
++        bot_id: botId,
++        order_id: entry.order_id,
++        symbol: entry.symbol,
++        side: side,
++        entry_price: effectiveEntryPrice,
++        amount: entry.amount,
++        take_profit_price: tpPrice,
++        stop_loss_price: slPrice,
++        current_reduce: strategy.reduce
++      });
++
++      await EntryOrder.markFilled(entry.id);
++
++      logger.info(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
++
++      // Notify via Telegram (same as in OrderService)
++      try {
++        if (this.telegramService?.sendOrderNotification) {
++          await this.telegramService.sendOrderNotification(position, strategy);
++        }
++
++        if (!strategy.bot && strategy.bot_id) {
++          const { Bot } = await import('../models/Bot.js');
++          strategy.bot = await Bot.findById(strategy.bot_id);
++        }
++
++        if (this.telegramService?.sendEntryTradeAlert) {
++          await this.telegramService.sendEntryTradeAlert(position, strategy, strategy.oc);
++        }
++      } catch (e) {
++        logger.warn(`[EntryOrderMonitor] Failed to send Telegram notifications for Position ${position.id}: ${e?.message || e}`);
++      }
++    } catch (error) {
++      logger.error(`[EntryOrderMonitor] Error confirming entry order ${entry.id}:`, error?.message || error);
++    }
++  }
++
++  /**
++   * Start cron-based REST polling
++   */
++  start() {
++    if (this.isRunning) {
++      logger.warn('[EntryOrderMonitor] Already running');
++      return;
++    }
++
++    this.isRunning = true;
++
++    const defaultPattern = DEFAULT_CRON_PATTERNS.POSITION_MONITOR || '*/1 * * * *';
++    const cronPattern = configService.getString('ENTRY_ORDER_MONITOR_CRON', defaultPattern);
++
++    this.cronJob = cron.schedule(cronPattern, async () => {
++      await this.pollOpenEntryOrders();
++    });
++
++    logger.info(`[EntryOrderMonitor] Started with cron pattern: ${cronPattern}`);
++  }
++
++  /**
++   * Stop monitor
++   */
++  stop() {
++    if (!this.isRunning) return;
++    this.isRunning = false;
++
++    if (this.cronJob) {
++      this.cronJob.stop();
++      this.cronJob = null;
++    }
++
++    for (const [, ws] of this.wsClients.entries()) {
++      try {
++        ws.stop();
++      } catch (_) {}
++    }
++    this.wsClients.clear();
++
++    logger.info('[EntryOrderMonitor] Stopped');
++  }
++}
++
++
+Index: src/models/EntryOrder.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/models/EntryOrder.js b/src/models/EntryOrder.js
+new file mode 100644
+--- /dev/null	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
++++ b/src/models/EntryOrder.js	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
+@@ -0,0 +1,133 @@
++import pool from '../config/database.js';
++
++/**
++ * EntryOrder model
++ * - Tracks entry orders (especially LIMIT) before a real position is confirmed open on the exchange.
++ */
++export class EntryOrder {
++  /**
++   * Create new entry order
++   * @param {Object} data
++   * @returns {Promise<Object>}
++   */
++  static async create(data) {
++    const {
++      strategy_id,
++      bot_id,
++      order_id,
++      symbol,
++      side,
++      amount,
++      entry_price,
++      status = 'open'
++    } = data;
++
++    const [result] = await pool.execute(
++      `INSERT INTO entry_orders (
++        strategy_id, bot_id, order_id, symbol, side, amount, entry_price, status
++      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
++      [
++        strategy_id,
++        bot_id,
++        String(order_id),
++        symbol,
++        side,
++        amount,
++        entry_price,
++        status
++      ]
++    );
++
++    return this.findById(result.insertId);
++  }
++
++  /**
++   * Find by primary key
++   * @param {number} id
++   * @returns {Promise<Object|null>}
++   */
++  static async findById(id) {
++    const [rows] = await pool.execute(
++      `SELECT * FROM entry_orders WHERE id = ? LIMIT 1`,
++      [id]
++    );
++    return rows[0] || null;
++  }
++
++  /**
++   * Find open entry orders (status = 'open')
++   * @returns {Promise<Array>}
++   */
++  static async findOpen() {
++    const [rows] = await pool.execute(
++      `SELECT * FROM entry_orders WHERE status = 'open' ORDER BY created_at ASC`
++    );
++    return rows;
++  }
++
++  /**
++   * Find open entry order by bot and order id
++   * @param {number} botId
++   * @param {string|number} orderId
++   * @returns {Promise<Object|null>}
++   */
++  static async findOpenByBotAndOrder(botId, orderId) {
++    const [rows] = await pool.execute(
++      `SELECT * FROM entry_orders WHERE bot_id = ? AND order_id = ? AND status = 'open' LIMIT 1`,
++      [botId, String(orderId)]
++    );
++    return rows[0] || null;
++  }
++
++  /**
++   * Update entry order
++   * @param {number} id
++   * @param {Object} data
++   * @returns {Promise<Object>}
++   */
++  static async update(id, data) {
++    const fields = [];
++    const values = [];
++
++    for (const key in data) {
++      if (Object.hasOwn(data, key) && data[key] !== undefined) {
++        fields.push(`\`${key}\` = ?`);
++        values.push(data[key]);
++      }
++    }
++
++    if (fields.length === 0) {
++      return this.findById(id);
++    }
++
++    values.push(id);
++    await pool.execute(
++      `UPDATE entry_orders SET ${fields.join(', ')} WHERE id = ?`,
++      values
++    );
++
++    return this.findById(id);
++  }
++
++  /**
++   * Mark entry order as filled
++   * @param {number} id
++   * @returns {Promise<Object>}
++   */
++  static async markFilled(id) {
++    return this.update(id, { status: 'filled' });
++  }
++
++  /**
++   * Mark entry order as canceled / expired
++   * @param {number} id
++   * @param {string} status - 'canceled' | 'expired'
++   * @returns {Promise<Object>}
++   */
++  static async markCanceled(id, status = 'canceled') {
++    const safeStatus = ['canceled', 'expired'].includes(status) ? status : 'canceled';
++    return this.update(id, { status: safeStatus });
++  }
++}
++
++
+Index: src/services/OrderService.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/services/OrderService.js b/src/services/OrderService.js
+--- a/src/services/OrderService.js	(revision a94457e791ca16cddb81a17fed7442a4c5ee801d)
++++ b/src/services/OrderService.js	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
+@@ -1,4 +1,5 @@
+ import { Position } from '../models/Position.js';
++import { EntryOrder } from '../models/EntryOrder.js';
+ import { TelegramService } from './TelegramService.js';
+ import { concurrencyManager } from './ConcurrencyManager.js';
+ import logger from '../utils/logger.js';
+@@ -146,59 +147,122 @@
+         return null;
+       }
+ 
+-      // Calculate temporary TP/SL prices based on the initial signal entry price
++      // Determine effective entry price and whether we have confirmed exposure:
++      // - MARKET (or fallback): use avgFillPrice / price / currentPrice
++      // - LIMIT: immediately query order status; if already filled, use real fill price
++      let effectiveEntryPrice = entryPrice;
++      let hasImmediateExposure = false; // true if MARKET or LIMIT already filled
++      try {
++        if (orderType === 'market') {
++          const filled = Number(order?.avgFillPrice || order?.price || currentPrice);
++          if (Number.isFinite(filled) && filled > 0) {
++            effectiveEntryPrice = filled;
++            hasImmediateExposure = true;
++          }
++        } else if (orderType === 'limit') {
++          // Sync confirmation: check if the limit order was filled immediately
++          const st = await this.exchangeService.getOrderStatus(strategy.symbol, order.id);
++          const status = (st?.status || '').toLowerCase();
++          const filledQty = Number(st?.filled || 0);
++
++          if (status === 'closed' || status === 'filled' || filledQty > 0) {
++            // Try to get the precise average fill price
++            const avg = await this.exchangeService.getOrderAverageFillPrice(strategy.symbol, order.id);
++            if (Number.isFinite(avg) && avg > 0) {
++              effectiveEntryPrice = avg;
++              hasImmediateExposure = true;
++              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
++            } else {
++              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
++              hasImmediateExposure = true;
++            }
++          } else {
++            logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
++          }
++        }
++      } catch (e) {
++        logger.warn(`[OrderService] Failed to refine entry price from exchange for order ${order?.id} ${strategy.symbol}: ${e?.message || e}`);
++      }
++
++      // Calculate temporary TP/SL prices based on the effective entry price
+       const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+-      const tempTpPrice = calculateTakeProfit(entryPrice, strategy.oc, strategy.take_profit, side);
++      const tempTpPrice = calculateTakeProfit(effectiveEntryPrice, strategy.oc, strategy.take_profit, side);
+       const tempSlPrice = calculateInitialStopLoss(tempTpPrice, strategy.oc, strategy.reduce, side);
+ 
+-      // Store position in database
+-      const position = await Position.create({
+-        strategy_id: strategy.id,
+-        bot_id: strategy.bot_id,
+-        order_id: order.id,
+-        symbol: strategy.symbol,
+-        side: side,
+-        entry_price: orderType === 'market' ? (Number(order?.avgFillPrice || order?.price || currentPrice)) : entryPrice,
+-        amount: amount,
+-        take_profit_price: tempTpPrice, // Use temporary TP price
+-        stop_loss_price: tempSlPrice, // Use temporary SL price
+-        current_reduce: strategy.reduce
+-      });
++      let position = null;
++
++      if (hasImmediateExposure || orderType === 'market') {
++        // MARKET or immediately-filled LIMIT: create Position right away
++        position = await Position.create({
++          strategy_id: strategy.id,
++          bot_id: strategy.bot_id,
++          order_id: order.id,
++          symbol: strategy.symbol,
++          side: side,
++          entry_price: effectiveEntryPrice,
++          amount: amount,
++          take_profit_price: tempTpPrice, // Use temporary TP price
++          stop_loss_price: tempSlPrice, // Use temporary SL price
++          current_reduce: strategy.reduce
++        });
++      } else {
++        // Pending LIMIT (no confirmed fill yet): track in entry_orders table
++        try {
++          await EntryOrder.create({
++            strategy_id: strategy.id,
++            bot_id: strategy.bot_id,
++            order_id: order.id,
++            symbol: strategy.symbol,
++            side,
++            amount,
++            entry_price: effectiveEntryPrice,
++            status: 'open'
++          });
++          logger.info(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table.`);
++        } catch (e) {
++          logger.warn(`[OrderService] Failed to persist entry order ${order.id} into entry_orders: ${e?.message || e}`);
++        }
++      }
+ 
+-      logger.info(`Position opened:`, {
+-        positionId: position.id,
+-        symbol: strategy.symbol,
+-        side,
+-        entryPrice: position.entry_price,
+-        tpPrice,
+-        slPrice
+-      });
++      if (position) {
++        logger.info(`Position opened:`, {
++          positionId: position.id,
++          symbol: strategy.symbol,
++          side,
++          entryPrice: position.entry_price,
++          tpPrice,
++          slPrice
++        });
+ 
+-      // Send Telegram notification to bot chat
+-      await this.telegramService.sendOrderNotification(position, strategy);
++        // Send Telegram notification to bot chat
++        await this.telegramService.sendOrderNotification(position, strategy);
+ 
+-      // Send entry trade alert to central channel
+-      try {
+-        logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
+-        // Ensure bot info present
+-        if (!strategy.bot && strategy.bot_id) {
+-          const { Bot } = await import('../models/Bot.js');
+-          strategy.bot = await Bot.findById(strategy.bot_id);
+-          logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
+-        }
+-        logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
+-        await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
+-        logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
+-      } catch (e) {
+-        logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
+-        logger.error(`[OrderService] Error stack:`, e?.stack);
+-      }
++        // Send entry trade alert to central channel
++        try {
++          logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
++          // Ensure bot info present
++          if (!strategy.bot && strategy.bot_id) {
++            const { Bot } = await import('../models/Bot.js');
++            strategy.bot = await Bot.findById(strategy.bot_id);
++            logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
++          }
++          logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
++          await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
++          logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
++        } catch (e) {
++          logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
++          logger.error(`[OrderService] Error stack:`, e?.stack);
++        }
+ 
+-      // TP/SL creation is now handled by PositionMonitor after entry confirmation.
+-      logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
++        // TP/SL creation is now handled by PositionMonitor after entry confirmation.
++        logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
+ 
+-      // Central log: success
+-      await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
++        // Central log: success
++        await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
++      } else {
++        // Pending LIMIT only (no DB position yet)
++        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice}`);
++      }
+ 
+       // Mark reservation as 'released' (position opened)
+       try {
+@@ -206,7 +270,19 @@
+         await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
+       } catch (_) {}
+ 
+-      return position;
++      // For compatibility with callers (e.g. WebSocketOCConsumer), always return a truthy value on success:
++      // - Position object when exposure is confirmed
++      // - Lightweight descriptor when only entry_orders record exists
++      if (position) {
++        return position;
++      }
++      return {
++        pending: true,
++        orderId: order.id,
++        strategyId: strategy.id,
++        botId: strategy.bot_id,
++        type: orderType
++      };
+     } catch (error) {
+       const msg = error?.message || '';
+       const softErrors = [
+Index: src/workers/StrategiesWorker.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/workers/StrategiesWorker.js b/src/workers/StrategiesWorker.js
+--- a/src/workers/StrategiesWorker.js	(revision a94457e791ca16cddb81a17fed7442a4c5ee801d)
++++ b/src/workers/StrategiesWorker.js	(revision 0eb9c00b95d4272577a09febe3dac2f9a84d4478)
+@@ -1,6 +1,7 @@
+ import { Strategy } from '../models/Strategy.js';
+ import { Bot } from '../models/Bot.js';
+ import { PositionMonitor } from '../jobs/PositionMonitor.js';
++import { EntryOrderMonitor } from '../jobs/EntryOrderMonitor.js';
+ import { BalanceManager } from '../jobs/BalanceManager.js';
+ import { ExchangeService } from '../services/ExchangeService.js';
+ import { OrderService } from '../services/OrderService.js';
+@@ -44,11 +45,16 @@
+       // Initialize OrderServices from active bots
+       await this.initializeOrderServices(telegramService);
+ 
+-      // Initialize Position Monitor
++      // Initialize Position Monitor (confirmed positions)
+       this.positionMonitor = new PositionMonitor();
+       await this.positionMonitor.initialize(telegramService);
+       this.positionMonitor.start();
+ 
++      // Initialize Entry Order Monitor (pending LIMIT orders, user-data WS + REST fallback)
++      this.entryOrderMonitor = new EntryOrderMonitor();
++      await this.entryOrderMonitor.initialize(telegramService);
++      this.entryOrderMonitor.start();
++
+       // Initialize Balance Manager
+       this.balanceManager = new BalanceManager();
+       await this.balanceManager.initialize(telegramService);

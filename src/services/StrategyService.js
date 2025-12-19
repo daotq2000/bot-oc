@@ -199,7 +199,10 @@ export class StrategyService {
 
       // Calculate TP and SL
       const tpPrice = calculateTakeProfit(entryPrice, Math.abs(oc), strategy.take_profit, side);
-      const slPrice = calculateInitialStopLoss(tpPrice, Math.abs(oc), strategy.reduce, side);
+      // Only set SL if strategy.stoploss > 0. No fallback to reduce/up_reduce
+      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+      const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+      const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
 
       // Create signal
       return {

@@ -3,6 +3,52 @@
  */
 
 /**
+ * Calculate PnL (Profit and Loss)
+ * @param {number} entryPrice - Entry price
+ * @param {number} currentPrice - Current market price
+ * @param {number} amount - Position amount
+ * @param {'long'|'short'} side - Position side
+ * @returns {number} PnL value
+ */
+export function calculatePnL(entryPrice, currentPrice, amount, side) {
+  const entry = Number(entryPrice);
+  const current = Number(currentPrice);
+  const amt = Number(amount);
+  
+  if (!Number.isFinite(entry) || !Number.isFinite(current) || !Number.isFinite(amt)) {
+    return 0;
+  }
+  
+  if (side === 'long') {
+    return (current - entry) * amt;
+  } else {
+    return (entry - current) * amt;
+  }
+}
+
+/**
+ * Calculate PnL percentage
+ * @param {number} entryPrice - Entry price
+ * @param {number} currentPrice - Current market price
+ * @param {'long'|'short'} side - Position side
+ * @returns {number} PnL percentage
+ */
+export function calculatePnLPercent(entryPrice, currentPrice, side) {
+  const entry = Number(entryPrice);
+  const current = Number(currentPrice);
+  
+  if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(current)) {
+    return 0;
+  }
+  
+  if (side === 'long') {
+    return ((current - entry) / entry) * 100;
+  } else {
+    return ((entry - current) / entry) * 100;
+  }
+}
+
+/**
  * Calculate OC (Open-Close) percentage
  * @param {number} open - Open price
  * @param {number} close - Close price
@@ -78,107 +124,89 @@ export function calculateTakeProfit(entryPrice, oc, takeProfit, side) {
 }
 
 /**
- * Calculate initial stop loss price
- * @param {number} tpPrice - Take profit price
- * @param {number} oc - OC percentage
- * @param {number} reduce - Initial reduce value
+ * Calculate initial stop loss price based on entry price and stoploss percentage (similar to take_profit)
+ * @param {number} entryPrice - Entry price
+ * @param {number} stoploss - Stop loss percentage value (e.g., 50 = 5% if divided by 10, same format as take_profit)
  * @param {'long'|'short'} side - Position side
- * @returns {number} Stop loss price
+ * @returns {number|null} Stop loss price, or null if stoploss <= 0
  */
-export function calculateInitialStopLoss(tpPrice, oc, reduce, side) {
-  const tp = Number(tpPrice);
-  const r = Number(reduce);
-  const ocn = Number(oc);
-  if (!Number.isFinite(tp) || !Number.isFinite(r) || !Number.isFinite(ocn)) return NaN;
-  const slOffset = (r * ocn) / 100;
-  if (side === 'long') {
-    return tp - slOffset;
-  } else {
-    return tp + slOffset;
+export function calculateInitialStopLoss(entryPrice, stoploss, side) {
+  const entry = Number(entryPrice);
+  const sl = Number(stoploss);
+  
+  // If stoploss is not a valid number or <= 0, return null (no stoploss)
+  if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(sl) || sl <= 0) {
+    return null;
   }
+  
+  // Calculate stoploss percentage (same format as take_profit: divide by 10)
+  // e.g., stoploss = 50 → actualSLPercent = 5%
+  const actualSLPercent = sl / 10;
+  
+  if (side === 'long') {
+    // LONG: SL < Entry, so SL = Entry * (1 - stoploss%)
+    return entry * (1 - actualSLPercent / 100);
+  } else {
+    // SHORT: SL > Entry, so SL = Entry * (1 + stoploss%)
+    return entry * (1 + actualSLPercent / 100);
+  }
+}
+
+/**
+ * Calculate next trailing take profit price - moves from initial TP towards entry
+ * This is the NEW logic: TP trails from initial TP towards entry, NOT SL movement
+ * @param {number} prevTP - Previous take profit price
+ * @param {number} entryPrice - Entry price (target to trail towards)
+ * @param {number} initialTP - Initial take profit price (starting point)
+ * @param {number} reducePercent - Reduce percentage per minute (same format as take_profit: divide by 10)
+ * @param {'long'|'short'} side - Position side
+ * @returns {number} Next take profit price
+ */
+export function calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, reducePercent, side) {
+  const prev = Number(prevTP);
+  const entry = Number(entryPrice);
+  const initial = Number(initialTP);
+  const reduce = Number(reducePercent);
+  
+  if (!Number.isFinite(prev) || !Number.isFinite(entry) || !Number.isFinite(initial) || !Number.isFinite(reduce) || reduce <= 0) {
+    return prev; // Return previous TP if inputs are invalid
+  }
+  
+  // Calculate step value: percentage of the range from initial TP to Entry
+  // e.g., reduce = 5 → actualReducePercent = 0.5%
+  const actualReducePercent = reduce / 10; // 5 → 0.5%
+  const range = Math.abs(initial - entry);
+  const stepValue = range * (actualReducePercent / 100);
+  
+  if (side === 'long') {
+    // LONG: TP moves DOWN (decreases) from initial TP towards entry
+    // newTP = prevTP - stepValue (but don't go below entry)
+    const newTP = prev - stepValue;
+    return Math.max(newTP, entry); // Don't go below entry
+  } else { // SHORT
+    // SHORT: TP moves UP (increases) from initial TP towards entry
+    // newTP = prevTP + stepValue (but don't go above entry)
+    const newTP = prev + stepValue;
+    return Math.min(newTP, entry); // Don't go above entry
+  }
+}
+
+/**
+ * Calculate next trailing stop loss price based on previous SL and reduce/up_reduce
+ * @deprecated This function is no longer used for trailing - SL should remain static after initial setup
+ * Only used for initial SL calculation
+ */
+export function calculateNextTrailingStop(prevSL, entryPrice, reducePercent, side, tpPrice = null) {
+  // This function is deprecated - SL should not be moved after initial setup
+  // Return previous SL to keep it static
+  return Number(prevSL);
 }
 
 /**
  * Calculate dynamic stop loss based on elapsed time (converging from TP)
- * @param {number} tpPrice - Take profit price
- * @param {number} oc - OC percentage
- * @param {number} reduce - Initial reduce value
- * @param {number} upReduce - Reduce acceleration per minute
- * @param {number} minutesElapsed - Minutes since position opened
- * @param {'long'|'short'} side - Position side
- * @returns {number} Updated stop loss price
+ * @deprecated This function is kept for backward compatibility but should not be used for trailing stops
  */
-export function calculateDynamicStopLoss(tpPrice, oc, reduce, upReduce, minutesElapsed, side) {
-  const tp = Number(tpPrice);
-  const baseReduce = Number(reduce);
-  const up = Number(upReduce);
-  const minutes = Number(minutesElapsed);
-  const ocN = Number(oc);
-
-  if (!Number.isFinite(tp) || !Number.isFinite(baseReduce) || !Number.isFinite(up) || !Number.isFinite(minutes) || !Number.isFinite(ocN)) {
-    return tp; // Fallback: giữ nguyên TP nếu input không hợp lệ
-  }
-
-  // Cách 2: Đuổi theo TP (trailing về phía TP theo thời gian)
-  // - Thay vì tăng khoảng cách như công thức cũ (reduce + minutes * up_reduce),
-  //   ta cho khoảng cách GIẢM dần theo thời gian:
-  //   effectiveReduce = max(reduce - minutes * up_reduce, 0)
-  //
-  // Điều này khiến stop loss "kéo" dần về TP (thu hẹp khoảng cách),
-  // trong khi PositionService vẫn giữ ràng buộc monotonic:
-  // - LONG  : chỉ cho SL tăng lên (gần giá hơn)
-  // - SHORT : chỉ cho SL giảm xuống (gần giá hơn)
-  const effectiveReduce = Math.max(baseReduce - minutes * up, 0);
-
-  // Giữ nguyên đơn vị cũ: slOffset = (effectiveReduce * oc) / 100
-  const slOffset = (effectiveReduce * ocN) / 100;
-
-  if (side === 'long') {
-    return tp - slOffset;
-  } else {
-    return tp + slOffset;
-  }
+export function calculateDynamicStopLoss(tpPrice, oc, reduce, upReduce, minutesElapsed, side, entryPrice = null) {
+  // Deprecated - not used anymore
+  return null;
 }
-
-/**
- * Calculate PnL percentage
- * @param {number} entryPrice - Entry price
- * @param {number} currentPrice - Current price
- * @param {'long'|'short'} side - Position side
- * @returns {number} PnL percentage
- */
-export function calculatePnLPercent(entryPrice, currentPrice, side) {
-  const e = Number(entryPrice);
-  const c = Number(currentPrice);
-  if (side === 'long') {
-    return ((c - e) / e) * 100;
-  } else {
-    return ((e - c) / e) * 100;
-  }
-}
-
-/**
- * Calculate PnL in USDT
- * @param {number} entryPrice - Entry price
- * @param {number} currentPrice - Current price
- * @param {number} amount - Position amount in USDT
- * @param {'long'|'short'} side - Position side
- * @returns {number} PnL in USDT
- */
-export function calculatePnL(entryPrice, currentPrice, amount, side) {
-  const pnlPercent = calculatePnLPercent(entryPrice, currentPrice, side);
-  return (Number(amount) * pnlPercent) / 100;
-}
-
-/**
- * Calculate ignore threshold
- * @param {number} previousHigh - Previous candle high
- * @param {number} previousLow - Previous candle low
- * @param {number} ignore - Ignore percentage
- * @returns {number} Ignore threshold amount
- */
-export function calculateIgnoreThreshold(previousHigh, previousLow, ignore) {
-  const previousRange = Math.abs(Number(previousHigh) - Number(previousLow));
-  return (previousRange * Number(ignore)) / 100;
-}
-

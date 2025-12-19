@@ -237,7 +237,10 @@ export class WebSocketOCConsumer {
 
       // Calculate TP and SL (based on side)
       const tpPrice = calculateTakeProfit(entryPrice, Math.abs(oc), strategy.take_profit || 55, side);
-      const slPrice = calculateInitialStopLoss(tpPrice, Math.abs(oc), strategy.reduce || 10, side);
+      // Only compute SL when strategy.stoploss > 0. No fallback to reduce/up_reduce
+      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+      const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+      const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
 
       // Create signal object - OrderService.executeSignal expects strategy object
       const signal = {

@@ -11,7 +11,7 @@ export class Position {
    */
   static async findAll(filters = {}) {
     let query = `SELECT p.*, s.symbol, s.\`interval\`, s.oc, s.take_profit, 
-                        s.reduce, s.up_reduce, s.extend, p.bot_id, b.bot_name, b.exchange
+                        s.reduce, s.up_reduce, s.extend, s.stoploss, p.bot_id, b.bot_name, b.exchange
                  FROM positions p
                  JOIN strategies s ON p.strategy_id = s.id
                  JOIN bots b ON p.bot_id = b.id`;
@@ -52,7 +52,7 @@ export class Position {
   static async findById(id) {
     const [rows] = await pool.execute(
       `SELECT p.*, s.symbol, s.interval, s.oc, s.take_profit,
-              s.reduce, s.up_reduce, s.extend, s.bot_id,
+              s.reduce, s.up_reduce, s.extend, s.stoploss, s.bot_id,
               b.bot_name, b.exchange, b.telegram_chat_id, b.telegram_alert_channel_id
        FROM positions p
        JOIN strategies s ON p.strategy_id = s.id
@@ -70,7 +70,7 @@ export class Position {
    */
   static async findOpen(strategyId = null) {
     let query = `SELECT p.*, s.symbol, s.\`interval\`, s.oc, s.take_profit,
-                        s.reduce, s.up_reduce, s.bot_id, b.bot_name, b.exchange
+                        s.reduce, s.up_reduce, s.stoploss, s.bot_id, b.bot_name, b.exchange
                  FROM positions p
                  JOIN strategies s ON p.strategy_id = s.id
                  JOIN bots b ON p.bot_id = b.id
@@ -95,7 +95,7 @@ export class Position {
    */
   static async findOpenBySymbol(symbol) {
     const [rows] = await pool.execute(
-      `SELECT p.*, s.oc, s.take_profit, s.reduce, s.up_reduce
+      `SELECT p.*, s.oc, s.take_profit, s.reduce, s.up_reduce, s.stoploss
        FROM positions p
        JOIN strategies s ON p.strategy_id = s.id
        WHERE p.symbol = ? AND p.status = 'open'`,
@@ -135,14 +135,18 @@ export class Position {
       } catch (_) {}
     }
 
+    // Set opened_at explicitly using JavaScript Date to ensure correct timezone
+    const openedAt = new Date();
+    
     const [result] = await pool.execute(
       `INSERT INTO positions (
         strategy_id, bot_id, order_id, symbol, side, entry_price, amount,
-        take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id, opened_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         safe(strategy_id), safe(bot_id), safe(order_id), safe(symbol), safe(side), safe(entry_price), safe(amount),
-        safe(take_profit_price), safe(stop_loss_price), safe(current_reduce), safe(tp_order_id), safe(sl_order_id)
+        safe(take_profit_price), safe(stop_loss_price), safe(current_reduce), safe(tp_order_id), safe(sl_order_id),
+        openedAt
       ]
     );
 

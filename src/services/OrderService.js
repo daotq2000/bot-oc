@@ -187,24 +187,27 @@ export class OrderService {
       // Calculate temporary TP/SL prices based on the effective entry price
       const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
       const tempTpPrice = calculateTakeProfit(effectiveEntryPrice, strategy.oc, strategy.take_profit, side);
-      const tempSlPrice = calculateInitialStopLoss(tempTpPrice, strategy.oc, strategy.reduce, side);
+      // Only compute SL when strategy.stoploss > 0. No fallback to reduce/up_reduce
+      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+      const hasValidStoploss = Number.isFinite(rawStoploss) && rawStoploss > 0;
+      const tempSlPrice = hasValidStoploss ? calculateInitialStopLoss(effectiveEntryPrice, rawStoploss, side) : null;
 
       let position = null;
 
       if (hasImmediateExposure || orderType === 'market') {
         // MARKET or immediately-filled LIMIT: create Position right away
         position = await Position.create({
-          strategy_id: strategy.id,
-          bot_id: strategy.bot_id,
-          order_id: order.id,
-          symbol: strategy.symbol,
-          side: side,
+        strategy_id: strategy.id,
+        bot_id: strategy.bot_id,
+        order_id: order.id,
+        symbol: strategy.symbol,
+        side: side,
           entry_price: effectiveEntryPrice,
-          amount: amount,
-          take_profit_price: tempTpPrice, // Use temporary TP price
-          stop_loss_price: tempSlPrice, // Use temporary SL price
-          current_reduce: strategy.reduce
-        });
+        amount: amount,
+        take_profit_price: tempTpPrice, // Use temporary TP price
+        stop_loss_price: tempSlPrice, // Use temporary SL price
+        current_reduce: strategy.reduce
+      });
       } else {
         // Pending LIMIT (no confirmed fill yet): track in entry_orders table
         try {
@@ -225,37 +228,37 @@ export class OrderService {
       }
 
       if (position) {
-        logger.info(`Position opened:`, {
-          positionId: position.id,
-          symbol: strategy.symbol,
-          side,
-          entryPrice: position.entry_price,
-          tpPrice,
-          slPrice
-        });
+      logger.info(`Position opened:`, {
+        positionId: position.id,
+        symbol: strategy.symbol,
+        side,
+        entryPrice: position.entry_price,
+        tpPrice,
+        slPrice
+      });
 
-        // Send Telegram notification to bot chat
-        await this.telegramService.sendOrderNotification(position, strategy);
+      // Send Telegram notification to bot chat
+      await this.telegramService.sendOrderNotification(position, strategy);
 
-        // Send entry trade alert to central channel
-        try {
-          logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
-          // Ensure bot info present
-          if (!strategy.bot && strategy.bot_id) {
-            const { Bot } = await import('../models/Bot.js');
-            strategy.bot = await Bot.findById(strategy.bot_id);
-            logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
-          }
-          logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
-          await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
-          logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
-        } catch (e) {
-          logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
-          logger.error(`[OrderService] Error stack:`, e?.stack);
+      // Send entry trade alert to central channel
+      try {
+        logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
+        // Ensure bot info present
+        if (!strategy.bot && strategy.bot_id) {
+          const { Bot } = await import('../models/Bot.js');
+          strategy.bot = await Bot.findById(strategy.bot_id);
+          logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
         }
+        logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
+        await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
+        logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
+      } catch (e) {
+        logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
+        logger.error(`[OrderService] Error stack:`, e?.stack);
+      }
 
-        // TP/SL creation is now handled by PositionMonitor after entry confirmation.
-        logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
+      // TP/SL creation is now handled by PositionMonitor after entry confirmation.
+      logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
 
         // Central log: success
         await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
@@ -274,7 +277,7 @@ export class OrderService {
       // - Position object when exposure is confirmed
       // - Lightweight descriptor when only entry_orders record exists
       if (position) {
-        return position;
+      return position;
       }
       return {
         pending: true,

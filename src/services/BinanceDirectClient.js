@@ -1274,6 +1274,20 @@ export class BinanceDirectClient {
       params.quantity = formattedQuantity; // Pass as string
     }
     
+    // Safety check to prevent -2021 "Order would immediately trigger"
+    const currentPrice = await this.getPrice(normalizedSymbol);
+    if (currentPrice) {
+      const stopNum = parseFloat(stopPrice);
+      if (side === 'long' && stopNum >= currentPrice) {
+        logger.warn(`[SL-SKIP] SL price ${stopNum} for LONG is at or above current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
+        return null;
+      }
+      if (side === 'short' && stopNum <= currentPrice) {
+        logger.warn(`[SL-SKIP] SL price ${stopNum} for SHORT is at or below current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
+        return null;
+      }
+    }
+    
     logger.info(`Creating SL limit order: ${orderSide} ${normalizedSymbol} @ stopPrice=${stopPrice}, limitPrice=${limitPrice}${dualSide ? ` (${positionSide})` : ''}`);
     
     try {

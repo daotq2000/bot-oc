@@ -128,7 +128,10 @@ export class PositionMonitor {
       // Recalculate TP/SL based on the real entry price
       const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
       const tpPrice = calculateTakeProfit(fillPrice, position.oc, position.take_profit, position.side);
-      const slPrice = calculateInitialStopLoss(tpPrice, position.oc, position.reduce, position.side);
+      // Only set SL if strategy.stoploss > 0. No fallback to reduce/up_reduce
+      const rawStoploss = position.stoploss !== undefined ? Number(position.stoploss) : NaN;
+      const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+      const slPrice = isStoplossValid ? calculateInitialStopLoss(fillPrice, rawStoploss, position.side) : null;
 
       // Get the exact quantity of the position
       const quantity = await exchangeService.getClosableQuantity(position.symbol, position.side);
@@ -143,16 +146,49 @@ export class PositionMonitor {
           const tpRes = await exchangeService.createTakeProfitLimit(position.symbol, position.side, tpPrice, quantity);
           const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
           if (tpOrderId) {
+            // Store initial TP price for trailing calculation
+            // We'll use a comment field or calculate from strategy each time
+            // For now, initial TP = current TP (first time)
             await Position.update(position.id, { tp_order_id: tpOrderId, take_profit_price: tpPrice });
-            logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice}`);
+            logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice} (initial TP)`);
           }
         } catch (e) {
           logger.error(`[Place TP/SL] ❌ Failed to create TP order for position ${position.id}:`, e?.message || e);
         }
       }
 
-      // Place SL order
-      if (!position.sl_order_id) {
+      // Place SL order (only if slPrice is valid, i.e., stoploss > 0)
+      if (!position.sl_order_id && slPrice !== null && Number.isFinite(slPrice) && slPrice > 0) {
+        // Safety check: If SL is invalid (SL <= entry for SHORT or SL >= entry for LONG), force close position immediately
+        const entryPrice = Number(fillPrice);
+        const slPriceNum = Number(slPrice);
+        if (Number.isFinite(entryPrice) && entryPrice > 0 && Number.isFinite(slPriceNum) && slPriceNum > 0) {
+          const isInvalidSL = (position.side === 'short' && slPriceNum <= entryPrice) || 
+                             (position.side === 'long' && slPriceNum >= entryPrice);
+          
+          if (isInvalidSL) {
+            logger.warn(`[Place TP/SL] Invalid SL detected for position ${position.id}: SL=${slPriceNum}, Entry=${entryPrice}, Side=${position.side}. Force closing position immediately to minimize risk.`);
+            
+            // Cancel TP order if any
+            if (position.tp_order_id) {
+              try {
+                await exchangeService.cancelOrder(position.tp_order_id, position.symbol);
+                logger.info(`[Place TP/SL] Cancelled TP order ${position.tp_order_id} for position ${position.id}`);
+              } catch (e) {
+                logger.warn(`[Place TP/SL] Failed to cancel TP order ${position.tp_order_id}: ${e?.message || e}`);
+              }
+            }
+            
+            // Force close position immediately with market order
+            const { PositionService } = await import('../services/PositionService.js');
+            const positionService = new PositionService(exchangeService);
+            const currentPrice = await exchangeService.getTickerPrice(position.symbol);
+            const pnl = positionService.calculatePnL(position, currentPrice);
+            await positionService.closePosition(position, currentPrice, pnl, 'sl_invalid');
+            return; // Exit early, position is closed
+          }
+        }
+        
         try {
           const slRes = await exchangeService.createStopLossLimit(position.symbol, position.side, slPrice, quantity);
           const slOrderId = slRes?.orderId ? String(slRes.orderId) : null;
@@ -163,6 +199,8 @@ export class PositionMonitor {
         } catch (e) {
           logger.error(`[Place TP/SL] ❌ Failed to create SL order for position ${position.id}:`, e?.message || e);
         }
+      } else if (slPrice === null || slPrice <= 0) {
+        logger.info(`[Place TP/SL] Skipping SL order placement for position ${position.id} (stoploss <= 0 or not set)`);
       }
     } catch (error) {
       logger.error(`[Place TP/SL] Error processing TP/SL for position ${position.id}:`, error?.message || error, error?.stack);
