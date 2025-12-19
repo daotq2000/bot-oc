@@ -1,6 +1,7 @@
 import { Strategy } from '../models/Strategy.js';
 import { Bot } from '../models/Bot.js';
 import { PositionMonitor } from '../jobs/PositionMonitor.js';
+import { EntryOrderMonitor } from '../jobs/EntryOrderMonitor.js';
 import { BalanceManager } from '../jobs/BalanceManager.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { OrderService } from '../services/OrderService.js';
@@ -44,10 +45,15 @@ export class StrategiesWorker {
       // Initialize OrderServices from active bots
       await this.initializeOrderServices(telegramService);
 
-      // Initialize Position Monitor
+      // Initialize Position Monitor (confirmed positions)
       this.positionMonitor = new PositionMonitor();
       await this.positionMonitor.initialize(telegramService);
       this.positionMonitor.start();
+
+      // Initialize Entry Order Monitor (pending LIMIT orders, user-data WS + REST fallback)
+      this.entryOrderMonitor = new EntryOrderMonitor();
+      await this.entryOrderMonitor.initialize(telegramService);
+      this.entryOrderMonitor.start();
 
       // Initialize Balance Manager
       this.balanceManager = new BalanceManager();

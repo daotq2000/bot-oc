@@ -1,4 +1,5 @@
 import { Position } from '../models/Position.js';
+import { EntryOrder } from '../models/EntryOrder.js';
 import { TelegramService } from './TelegramService.js';
 import { concurrencyManager } from './ConcurrencyManager.js';
 import logger from '../utils/logger.js';
@@ -146,59 +147,122 @@ export class OrderService {
         return null;
       }
 
-      // Calculate temporary TP/SL prices based on the initial signal entry price
-      const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
-      const tempTpPrice = calculateTakeProfit(entryPrice, strategy.oc, strategy.take_profit, side);
-      const tempSlPrice = calculateInitialStopLoss(tempTpPrice, strategy.oc, strategy.reduce, side);
-
-      // Store position in database
-      const position = await Position.create({
-        strategy_id: strategy.id,
-        bot_id: strategy.bot_id,
-        order_id: order.id,
-        symbol: strategy.symbol,
-        side: side,
-        entry_price: orderType === 'market' ? (Number(order?.avgFillPrice || order?.price || currentPrice)) : entryPrice,
-        amount: amount,
-        take_profit_price: tempTpPrice, // Use temporary TP price
-        stop_loss_price: tempSlPrice, // Use temporary SL price
-        current_reduce: strategy.reduce
-      });
-
-      logger.info(`Position opened:`, {
-        positionId: position.id,
-        symbol: strategy.symbol,
-        side,
-        entryPrice: position.entry_price,
-        tpPrice,
-        slPrice
-      });
-
-      // Send Telegram notification to bot chat
-      await this.telegramService.sendOrderNotification(position, strategy);
-
-      // Send entry trade alert to central channel
+      // Determine effective entry price and whether we have confirmed exposure:
+      // - MARKET (or fallback): use avgFillPrice / price / currentPrice
+      // - LIMIT: immediately query order status; if already filled, use real fill price
+      let effectiveEntryPrice = entryPrice;
+      let hasImmediateExposure = false; // true if MARKET or LIMIT already filled
       try {
-        logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
-        // Ensure bot info present
-        if (!strategy.bot && strategy.bot_id) {
-          const { Bot } = await import('../models/Bot.js');
-          strategy.bot = await Bot.findById(strategy.bot_id);
-          logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
+        if (orderType === 'market') {
+          const filled = Number(order?.avgFillPrice || order?.price || currentPrice);
+          if (Number.isFinite(filled) && filled > 0) {
+            effectiveEntryPrice = filled;
+            hasImmediateExposure = true;
+          }
+        } else if (orderType === 'limit') {
+          // Sync confirmation: check if the limit order was filled immediately
+          const st = await this.exchangeService.getOrderStatus(strategy.symbol, order.id);
+          const status = (st?.status || '').toLowerCase();
+          const filledQty = Number(st?.filled || 0);
+
+          if (status === 'closed' || status === 'filled' || filledQty > 0) {
+            // Try to get the precise average fill price
+            const avg = await this.exchangeService.getOrderAverageFillPrice(strategy.symbol, order.id);
+            if (Number.isFinite(avg) && avg > 0) {
+              effectiveEntryPrice = avg;
+              hasImmediateExposure = true;
+              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
+            } else {
+              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
+              hasImmediateExposure = true;
+            }
+          } else {
+            logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
+          }
         }
-        logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
-        await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
-        logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
       } catch (e) {
-        logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
-        logger.error(`[OrderService] Error stack:`, e?.stack);
+        logger.warn(`[OrderService] Failed to refine entry price from exchange for order ${order?.id} ${strategy.symbol}: ${e?.message || e}`);
       }
 
-      // TP/SL creation is now handled by PositionMonitor after entry confirmation.
-      logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
+      // Calculate temporary TP/SL prices based on the effective entry price
+      const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+      const tempTpPrice = calculateTakeProfit(effectiveEntryPrice, strategy.oc, strategy.take_profit, side);
+      const tempSlPrice = calculateInitialStopLoss(tempTpPrice, strategy.oc, strategy.reduce, side);
 
-      // Central log: success
-      await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
+      let position = null;
+
+      if (hasImmediateExposure || orderType === 'market') {
+        // MARKET or immediately-filled LIMIT: create Position right away
+        position = await Position.create({
+          strategy_id: strategy.id,
+          bot_id: strategy.bot_id,
+          order_id: order.id,
+          symbol: strategy.symbol,
+          side: side,
+          entry_price: effectiveEntryPrice,
+          amount: amount,
+          take_profit_price: tempTpPrice, // Use temporary TP price
+          stop_loss_price: tempSlPrice, // Use temporary SL price
+          current_reduce: strategy.reduce
+        });
+      } else {
+        // Pending LIMIT (no confirmed fill yet): track in entry_orders table
+        try {
+          await EntryOrder.create({
+            strategy_id: strategy.id,
+            bot_id: strategy.bot_id,
+            order_id: order.id,
+            symbol: strategy.symbol,
+            side,
+            amount,
+            entry_price: effectiveEntryPrice,
+            status: 'open'
+          });
+          logger.info(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table.`);
+        } catch (e) {
+          logger.warn(`[OrderService] Failed to persist entry order ${order.id} into entry_orders: ${e?.message || e}`);
+        }
+      }
+
+      if (position) {
+        logger.info(`Position opened:`, {
+          positionId: position.id,
+          symbol: strategy.symbol,
+          side,
+          entryPrice: position.entry_price,
+          tpPrice,
+          slPrice
+        });
+
+        // Send Telegram notification to bot chat
+        await this.telegramService.sendOrderNotification(position, strategy);
+
+        // Send entry trade alert to central channel
+        try {
+          logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
+          // Ensure bot info present
+          if (!strategy.bot && strategy.bot_id) {
+            const { Bot } = await import('../models/Bot.js');
+            strategy.bot = await Bot.findById(strategy.bot_id);
+            logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
+          }
+          logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
+          await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
+          logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
+        } catch (e) {
+          logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
+          logger.error(`[OrderService] Error stack:`, e?.stack);
+        }
+
+        // TP/SL creation is now handled by PositionMonitor after entry confirmation.
+        logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
+
+        // Central log: success
+        await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
+      } else {
+        // Pending LIMIT only (no DB position yet)
+        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice}`);
+      }
 
       // Mark reservation as 'released' (position opened)
       try {
@@ -206,7 +270,19 @@ export class OrderService {
         await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
       } catch (_) {}
 
-      return position;
+      // For compatibility with callers (e.g. WebSocketOCConsumer), always return a truthy value on success:
+      // - Position object when exposure is confirmed
+      // - Lightweight descriptor when only entry_orders record exists
+      if (position) {
+        return position;
+      }
+      return {
+        pending: true,
+        orderId: order.id,
+        strategyId: strategy.id,
+        botId: strategy.bot_id,
+        type: orderType
+      };
     } catch (error) {
       const msg = error?.message || '';
       const softErrors = [
