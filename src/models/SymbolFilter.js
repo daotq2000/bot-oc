@@ -50,4 +50,45 @@ export class SymbolFilter {
 
     await pool.execute(sql, values);
   }
+
+  /**
+   * Delete symbol filters for a given exchange that are NOT in the provided symbol list.
+   * Used to remove delisted or unavailable symbols.
+   * @param {string} exchange - Exchange name (e.g., 'binance', 'mexc')
+   * @param {Array<string>} keepSymbols - Array of symbols to keep (uppercase, e.g., ['BTCUSDT', 'ETHUSDT'])
+   * @returns {Promise<number>} Number of rows deleted
+   */
+  static async deleteByExchangeAndSymbols(exchange, keepSymbols) {
+    if (!exchange || !Array.isArray(keepSymbols) || keepSymbols.length === 0) {
+      // If keepSymbols is empty, don't delete anything (fail-safe)
+      return 0;
+    }
+
+    const normalizedSymbols = keepSymbols.map(s => s.toUpperCase()).filter(s => s);
+    if (normalizedSymbols.length === 0) {
+      return 0;
+    }
+
+    const placeholders = normalizedSymbols.map(() => '?').join(',');
+    const sql = `
+      DELETE FROM symbol_filters
+      WHERE exchange = ? AND symbol NOT IN (${placeholders})
+    `;
+
+    const [result] = await pool.execute(sql, [exchange, ...normalizedSymbols]);
+    return result.affectedRows || 0;
+  }
+
+  /**
+   * Get all symbols for a specific exchange from the database.
+   * @param {string} exchange - Exchange name (e.g., 'binance', 'mexc')
+   * @returns {Promise<Array<string>>} Array of normalized symbols (uppercase)
+   */
+  static async getSymbolsByExchange(exchange) {
+    const [rows] = await pool.execute(
+      'SELECT symbol FROM symbol_filters WHERE exchange = ?',
+      [exchange]
+    );
+    return rows.map(r => (r.symbol || '').toUpperCase()).filter(s => s);
+  }
 }

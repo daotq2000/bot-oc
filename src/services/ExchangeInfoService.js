@@ -10,9 +10,14 @@ import logger from '../utils/logger.js';
  * Exchange Info Service - Manages fetching and caching of symbol filters
  */
 class ExchangeInfoService {
-  constructor() {
+  constructor({ symbolFilterDAO = SymbolFilter, binanceClientFactory = (apiKey, secretKey, isTestnet = false, exInfoSvc = null) => new BinanceDirectClient(apiKey, secretKey, isTestnet, exInfoSvc), mexcFactory = () => new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } }), loggerInst = logger, config = configService } = {}) {
     this.filtersCache = new Map(); // symbol -> { tickSize, stepSize, minNotional, maxLeverage }
     this.isInitialized = false;
+    this.symbolFilterDAO = symbolFilterDAO;
+    this.binanceClientFactory = binanceClientFactory;
+    this.mexcFactory = mexcFactory;
+    this.logger = loggerInst;
+    this.config = config;
   }
 
   /**
@@ -23,7 +28,7 @@ class ExchangeInfoService {
    */
   async getSymbolsFromDB(exchange, onlyUSDT = true, limit = null) {
     try {
-      const rows = await SymbolFilter.findAll();
+      const rows = await this.symbolFilterDAO.findAll();
       const ex = String(exchange || '').toLowerCase();
       let syms = rows
         .filter(r => (r.exchange || '').toLowerCase() === ex)
@@ -35,7 +40,7 @@ class ExchangeInfoService {
       if (Number.isFinite(limit) && limit > 0) return uniq.slice(0, limit);
       return uniq;
     } catch (e) {
-      logger.warn(`[ExchangeInfoService] getSymbolsFromDB failed for ${exchange}: ${e?.message || e}`);
+      this.logger.warn(`[ExchangeInfoService] getSymbolsFromDB failed for ${exchange}: ${e?.message || e}`);
       return [];
     }
   }
@@ -61,19 +66,23 @@ class ExchangeInfoService {
    * This should be called on bot startup.
    */
   async updateFiltersFromExchange() {
-    logger.info('Updating symbol filters from Binance...');
+    this.logger.info('Updating symbol filters from Binance...');
     try {
-      const binanceClient = new BinanceDirectClient('', '', false); // No keys needed for public data
+      const binanceClient = this.binanceClientFactory('', '', false, this); // No keys needed for public data
       const exchangeInfo = await binanceClient.getExchangeInfo();
 
       if (!exchangeInfo || !exchangeInfo.symbols) {
-        logger.error('Failed to fetch exchange info from Binance.');
+        this.this.logger.error('Failed to fetch exchange info from Binance.');
         return;
       }
 
       const filtersToSave = [];
       for (const symbolInfo of exchangeInfo.symbols) {
         if (symbolInfo.status !== 'TRADING') continue;
+        // Futures-only USDT-margined perpetual contracts
+        const quote = (symbolInfo.quoteAsset || '').toUpperCase();
+        const contractType = (symbolInfo.contractType || '').toUpperCase();
+        if (quote !== 'USDT' || (contractType && contractType !== 'PERPETUAL')) continue;
 
         const priceFilter = symbolInfo.filters.find(f => f.filterType === 'PRICE_FILTER');
         const lotSizeFilter = symbolInfo.filters.find(f => f.filterType === 'LOT_SIZE');
@@ -102,16 +111,26 @@ class ExchangeInfoService {
         }
       }
 
+      // Get current symbols from DB for this exchange
+      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('binance');
+      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+
+      // Delete symbols that are no longer available on exchange
+      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('binance', exchangeSymbols);
+      if (deletedCount > 0) {
+        this.logger.info(`Deleted ${deletedCount} delisted/unavailable Binance symbols from database.`);
+      }
+
       // Bulk insert/update into the database
-      await SymbolFilter.bulkUpsert(filtersToSave);
-      logger.info(`Successfully updated ${filtersToSave.length} Binance symbol filters in the database.`);
+      await this.symbolFilterDAO.bulkUpsert(filtersToSave);
+      this.logger.info(`Successfully updated ${filtersToSave.length} Binance symbol filters in the database.`);
 
       // Clear and reload the in-memory cache
       this.filtersCache.clear();
       await this.loadFiltersFromDB();
 
     } catch (error) {
-      logger.error('Error updating symbol filters (Binance):', error);
+      this.this.logger.error('Error updating symbol filters (Binance):', error);
     }
   }
 
@@ -119,9 +138,9 @@ class ExchangeInfoService {
    * Fetch all MEXC USDT-M swap markets and update symbol_filters.
    */
   async updateMexcFiltersFromExchange() {
-    logger.info('Updating symbol filters from MEXC...');
+    this.logger.info('Updating symbol filters from MEXC...');
     try {
-      const mexc = new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } });
+      const mexc = this.mexcFactory();
       // Force .co domain base and add fetch failsafe
       try {
         const co = 'https://api.mexc.co';
@@ -215,30 +234,40 @@ class ExchangeInfoService {
       }
 
       if (filtersToSave.length === 0) {
-        const futuresOnly = configService.getBoolean('MEXC_FUTURES_ONLY', true);
+        const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
         if (futuresOnly) {
-          logger.warn('No MEXC swap markets via CCXT. Futures-only mode: skipping spot fallback.');
+          this.logger.warn('No MEXC swap markets via CCXT. Futures-only mode: skipping spot fallback.');
           return;
         }
-        logger.warn('No MEXC swap markets via CCXT. Falling back to /api/v3/exchangeInfo');
+        this.logger.warn('No MEXC swap markets via CCXT. Falling back to /api/v3/exchangeInfo');
         await this.updateMexcFiltersFromSpotExchangeInfo();
         return;
       }
 
-      await SymbolFilter.bulkUpsert(filtersToSave);
-      logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters in the database.`);
+      // Get current symbols from DB for this exchange
+      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+
+      // Delete symbols that are no longer available on exchange
+      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
+      if (deletedCount > 0) {
+        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database.`);
+      }
+
+      await this.symbolFilterDAO.bulkUpsert(filtersToSave);
+      this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters in the database.`);
 
       // Refresh cache
       this.filtersCache.clear();
       await this.loadFiltersFromDB();
     } catch (e) {
-      logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
-      const futuresOnly = configService.getBoolean('MEXC_FUTURES_ONLY', true);
+      this.this.logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
+      const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
       if (futuresOnly) {
-        logger.warn('Futures-only mode enabled: skipping MEXC spot exchangeInfo fallback.');
+        this.logger.warn('Futures-only mode enabled: skipping MEXC spot exchangeInfo fallback.');
         return;
       }
-      logger.info('Falling back to MEXC spot exchangeInfo (REST) ...');
+      this.logger.info('Falling back to MEXC spot exchangeInfo (REST) ...');
       await this.updateMexcFiltersFromSpotExchangeInfo();
     }
   }
@@ -282,18 +311,28 @@ class ExchangeInfoService {
       }
 
       if (filtersToSave.length === 0) {
-        logger.warn('MEXC REST fallback returned no symbols. Skipping update.');
+        this.logger.warn('MEXC REST fallback returned no symbols. Skipping update.');
         return;
       }
 
-      await SymbolFilter.bulkUpsert(filtersToSave);
-      logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from REST spot exchangeInfo.`);
+      // Get current symbols from DB for this exchange
+      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+
+      // Delete symbols that are no longer available on exchange
+      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
+      if (deletedCount > 0) {
+        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database (REST fallback).`);
+      }
+
+      await this.symbolFilterDAO.bulkUpsert(filtersToSave);
+      this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from REST spot exchangeInfo.`);
 
       // Refresh cache
       this.filtersCache.clear();
       await this.loadFiltersFromDB();
     } catch (err) {
-      logger.error('MEXC REST fallback failed:', err?.message || err);
+      this.this.logger.error('MEXC REST fallback failed:', err?.message || err);
     }
   }
 
@@ -303,7 +342,7 @@ class ExchangeInfoService {
    */
   async getTradableSymbolsFromBinance() {
     try {
-      const client = new BinanceDirectClient('', '', false);
+      const client = this.binanceClientFactory('', '', false, this);
       const info = await client.getExchangeInfo();
       const set = new Set();
       if (info?.symbols?.length) {
@@ -319,7 +358,7 @@ class ExchangeInfoService {
       }
       return set;
     } catch (e) {
-      logger.error('getTradableSymbolsFromBinance failed:', e?.message || e);
+      this.this.logger.error('getTradableSymbolsFromBinance failed:', e?.message || e);
       return new Set();
     }
   }
@@ -330,7 +369,7 @@ class ExchangeInfoService {
    */
   async getTradableSymbolsFromMexc() {
     try {
-      const mexc = new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } });
+      const mexc = this.mexcFactory();
       await mexc.loadMarkets();
       const set = new Set();
       for (const id in mexc.markets) {
@@ -345,7 +384,7 @@ class ExchangeInfoService {
       }
       return set;
     } catch (e) {
-      logger.error('getTradableSymbolsFromMexc failed:', e?.message || e);
+      this.this.logger.error('getTradableSymbolsFromMexc failed:', e?.message || e);
       return new Set();
     }
   }
@@ -367,9 +406,9 @@ class ExchangeInfoService {
    * Load all symbol filters from the database into the in-memory cache.
    */
   async loadFiltersFromDB() {
-    logger.info('Loading symbol filters from database into cache...');
+    this.logger.info('Loading symbol filters from database into cache...');
     try {
-      const filters = await SymbolFilter.findAll();
+      const filters = await this.symbolFilterDAO.findAll();
       // Prefer Binance filters when duplicate symbols exist.
       // Load Binance first; for other exchanges, only set if not present.
       const sorted = filters.sort((a, b) => {
@@ -392,9 +431,9 @@ class ExchangeInfoService {
         });
       }
       this.isInitialized = true;
-      logger.info(`Loaded ${this.filtersCache.size} symbol filters into cache.`);
+      this.logger.info(`Loaded ${this.filtersCache.size} symbol filters into cache.`);
     } catch (error) {
-      logger.error('Error loading symbol filters from DB:', error);
+      this.this.logger.error('Error loading symbol filters from DB:', error);
     }
   }
 
@@ -405,7 +444,7 @@ class ExchangeInfoService {
    */
   getFilters(symbol) {
     if (!this.isInitialized) {
-      logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
+      this.logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
     }
     return this.filtersCache.get(symbol.toUpperCase());
   }
@@ -451,6 +490,7 @@ class ExchangeInfoService {
   }
 }
 
-// Export a singleton instance
+// Export class for testing and singleton instance for production
+export { ExchangeInfoService };
 export const exchangeInfoService = new ExchangeInfoService();
 
