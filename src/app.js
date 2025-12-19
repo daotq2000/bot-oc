@@ -78,6 +78,7 @@ async function start() {
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
       await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '500', 'Price alert scanner job interval in milliseconds');
+      await AppConfig.set('PRICE_ALERT_MODULE_ENABLED', 'true', 'Enable/Disable the entire Price Alert module (workers, scanners, alerts)');
       await AppConfig.set('PRICE_ALERT_CHECK_ENABLED', 'true', 'Enable price alert checking for MEXC and other exchanges');
       await AppConfig.set('PRICE_ALERT_SYMBOL_REFRESH_INTERVAL_MS', '30000', 'Interval to refresh Price Alert symbols from config/DB (ms)');
       await AppConfig.set('PRICE_ALERT_WS_SUBSCRIBE_INTERVAL_MS', '60000', 'Interval to update WebSocket subscriptions for Price Alert (ms)');
@@ -212,30 +213,35 @@ async function start() {
     // ============================================
     // PRICE ALERT WORKER (Always-on, Independent)
     // ============================================
+    const alertModuleEnabled = configService.getBoolean('PRICE_ALERT_MODULE_ENABLED', true);
     logger.info('='.repeat(60));
-    logger.info('Initializing Price Alert Worker (Always-on, Independent)...');
+    logger.info(`Initializing Price Alert Worker (Always-on, Independent) - Enabled=${alertModuleEnabled}`);
     logger.info('='.repeat(60));
 
-    // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
-    try {
-      logger.info('[App] Pre-loading PriceAlertConfig cache...');
-      const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
-      await PriceAlertConfig.findAll(); // This will cache all configs
-      logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
-    } catch (error) {
-      logger.warn('[App] Failed to pre-load PriceAlertConfig cache:', error?.message || error);
-    }
-    
-    try {
-      const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
-      priceAlertWorker = new PriceAlertWorker();
-      await priceAlertWorker.initialize(telegramService);
-      priceAlertWorker.start();
-      logger.info('✅ Price Alert Worker started successfully');
-    } catch (error) {
-      logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
-      logger.error('Price Alert system is critical - application will continue but alerts may not work');
-      // Don't exit - Price Alert should be resilient
+    if (alertModuleEnabled) {
+      // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
+      try {
+        logger.info('[App] Pre-loading PriceAlertConfig cache...');
+        const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
+        await PriceAlertConfig.findAll(); // This will cache all configs
+        logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
+      } catch (error) {
+        logger.warn('[App] Failed to pre-load PriceAlertConfig cache:', error?.message || error);
+      }
+      
+      try {
+        const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
+        priceAlertWorker = new PriceAlertWorker();
+        await priceAlertWorker.initialize(telegramService);
+        priceAlertWorker.start();
+        logger.info('✅ Price Alert Worker started successfully');
+      } catch (error) {
+        logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
+        logger.error('Price Alert system is critical - application will continue but alerts may not work');
+        // Don't exit - Price Alert should be resilient
+      }
+    } else {
+      logger.warn('[App] PRICE_ALERT_MODULE_ENABLED=false → Price Alert Worker not started');
     }
 
     // ============================================
