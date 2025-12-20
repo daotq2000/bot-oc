@@ -64,6 +64,13 @@ export class TelegramService {
    * @param {Object} options - Additional options
    */
   async sendMessage(chatId, message, options = {}) {
+    // Master toggle to enable/disable all alerts from DB config
+    const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+    if (!alertsEnabled) {
+      logger.debug(`[Telegram] Alerts disabled by config (ENABLE_ALERTS=false), skipping message to ${chatId}`);
+      return;
+    }
+
     if (!this.initialized || !this.bot) {
       logger.warn(`[Telegram] Bot not initialized, skipping message to ${chatId}`);
       return;

@@ -3,6 +3,7 @@ import { EntryOrder } from '../models/EntryOrder.js';
 import { TelegramService } from './TelegramService.js';
 import { concurrencyManager } from './ConcurrencyManager.js';
 import logger from '../utils/logger.js';
+import { configService } from './ConfigService.js';
 
 /**
  * Order Service - Order execution and management
@@ -122,7 +123,10 @@ export class OrderService {
           em.includes('Order price is too low') ||
           em.includes('Invalid order price');
         
-        if (shouldFallbackToMarket) {
+        // Check config to enable/disable fallback to market
+        const enableFallbackToMarket = configService.getBoolean('ENABLE_FALLBACK_TO_MARKET', false);
+
+        if (shouldFallbackToMarket && enableFallbackToMarket) {
           logger.warn(`[OrderService] Fallback to MARKET due to price trigger for ${strategy.symbol} (side=${side}). Error: ${em}`);
           attemptedMarketFallback = true;
           order = await this.exchangeService.createOrder({
@@ -135,6 +139,12 @@ export class OrderService {
           orderType = 'market';
           await this.sendCentralLog(`Order FallbackToMarket | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} reason=${em}`);
         } else {
+          // Log and skip order if fallback is disabled
+          if (shouldFallbackToMarket && !enableFallbackToMarket) {
+            logger.warn(`[OrderService] Order would trigger immediately but fallback to market is disabled. Skipping order for ${strategy.symbol} (side=${side}). Error: ${em}`);
+            await this.sendCentralLog(`Order SkippedNoFallback | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} reason=${em}`);
+            return null; // Skip order instead of throwing error
+          }
           throw e;
         }
       }
@@ -196,34 +206,73 @@ export class OrderService {
 
       if (hasImmediateExposure || orderType === 'market') {
         // MARKET or immediately-filled LIMIT: create Position right away
-        position = await Position.create({
-        strategy_id: strategy.id,
-        bot_id: strategy.bot_id,
-        order_id: order.id,
-        symbol: strategy.symbol,
-        side: side,
-          entry_price: effectiveEntryPrice,
-        amount: amount,
-        take_profit_price: tempTpPrice, // Use temporary TP price
-        stop_loss_price: tempSlPrice, // Use temporary SL price
-        current_reduce: strategy.reduce
-      });
-      } else {
-        // Pending LIMIT (no confirmed fill yet): track in entry_orders table
         try {
-          await EntryOrder.create({
+          position = await Position.create({
             strategy_id: strategy.id,
             bot_id: strategy.bot_id,
             order_id: order.id,
             symbol: strategy.symbol,
-            side,
-            amount,
+            side: side,
             entry_price: effectiveEntryPrice,
-            status: 'open'
+            amount: amount,
+            take_profit_price: tempTpPrice, // Use temporary TP price
+            stop_loss_price: tempSlPrice, // Use temporary SL price
+            current_reduce: strategy.reduce
           });
-          logger.info(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table.`);
+          
+          // CRITICAL: Finalize reservation immediately after Position is created
+          // This ensures reservation is released even if errors occur later
+          orderCreated = true;
+          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
+          logger.debug(`[OrderService] Position ${position.id} created and reservation finalized for bot ${strategy.bot_id}`);
+        } catch (posError) {
+          // If Position creation failed, cancel reservation
+          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'cancelled');
+          logger.error(`[OrderService] Failed to create Position: ${posError?.message || posError}`);
+          throw posError;
+        }
+      } else {
+        // Pending LIMIT (no confirmed fill yet): track in entry_orders table
+        // CRITICAL: Do NOT finalize reservation here - keep it active until Position is created
+        // EntryOrderMonitor will finalize reservation when it creates Position
+        // Store reservation_token in entry_orders for EntryOrderMonitor to finalize later
+        try {
+          // Try to store reservation_token if column exists, otherwise just create entry_order
+          try {
+            await EntryOrder.create({
+              strategy_id: strategy.id,
+              bot_id: strategy.bot_id,
+              order_id: order.id,
+              symbol: strategy.symbol,
+              side,
+              amount,
+              entry_price: effectiveEntryPrice,
+              status: 'open',
+              reservation_token: reservationToken // Store reservation token for later finalization
+            });
+          } catch (schemaError) {
+            // If reservation_token column doesn't exist, create without it
+            if (schemaError.message?.includes('reservation_token') || schemaError.code === 'ER_BAD_FIELD_ERROR') {
+              await EntryOrder.create({
+                strategy_id: strategy.id,
+                bot_id: strategy.bot_id,
+                order_id: order.id,
+                symbol: strategy.symbol,
+                side,
+                amount,
+                entry_price: effectiveEntryPrice,
+                status: 'open'
+              });
+              logger.debug(`[OrderService] entry_orders table doesn't have reservation_token column, created entry_order without it`);
+            } else {
+              throw schemaError;
+            }
+          }
+          logger.info(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table. Reservation ${reservationToken} kept active until Position is created.`);
         } catch (e) {
           logger.warn(`[OrderService] Failed to persist entry order ${order.id} into entry_orders: ${e?.message || e}`);
+          // If entry_order creation failed, cancel reservation
+          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'cancelled');
         }
       }
 
@@ -264,14 +313,9 @@ export class OrderService {
         await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
       } else {
         // Pending LIMIT only (no DB position yet)
-        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice}`);
+        // Reservation is still active and will be finalized by EntryOrderMonitor when Position is created
+        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice} reservation=${reservationToken}`);
       }
-
-      // Mark reservation as 'released' (position opened)
-      try {
-        orderCreated = true;
-        await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
-      } catch (_) {}
 
       // For compatibility with callers (e.g. WebSocketOCConsumer), always return a truthy value on success:
       // - Position object when exposure is confirmed

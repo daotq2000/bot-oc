@@ -357,7 +357,7 @@ export class ExchangeService {
         try {
           const { configService } = await import('./ConfigService.js');
           const { exchangeInfoService } = await import('./ExchangeInfoService.js');
-          
+
           // Only set margin type once per symbol (cache in _binanceConfiguredSymbols)
           if (!this._binanceConfiguredSymbols.has(normalizedSymbol)) {
             const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
@@ -365,13 +365,13 @@ export class ExchangeService {
             this._binanceConfiguredSymbols.add(normalizedSymbol);
             logger.debug(`[Cache] Set margin type for ${normalizedSymbol} to ${marginType} (cached)`);
           }
-          
+
           // Use max leverage from symbol_filters cache instead of API call
           // This avoids getLeverageBrackets API call which causes rate limits
           const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
           const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
           const desiredLev = maxLeverageFromCache || defaultLeverage;
-          
+
           // Cache last applied leverage to avoid redundant calls
           this._binanceLeverageMap = this._binanceLeverageMap || new Map();
           if (this._binanceLeverageMap.get(normalizedSymbol) !== desiredLev) {
@@ -806,34 +806,6 @@ export class ExchangeService {
       return await this.binanceDirectClient.getTickSize(symbol);
     }
     return '0.01';
-  }
-
-  /**
-   * Get average fill price for a given order (used for accurate entry/TP/SL)
-   * Currently implemented only for Binance via direct client.
-   * @param {string} symbol - Symbol in internal format (e.g. BTCUSDT)
-   * @param {string|number} orderId - Exchange orderId
-   * @returns {Promise<number|null>}
-   */
-  async getOrderAverageFillPrice(symbol, orderId) {
-    try {
-      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
-        const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
-        const price = await this.binanceDirectClient.getOrderAverageFillPrice(
-          normalizedSymbol,
-          orderId
-        );
-        const num = Number(price);
-        return Number.isFinite(num) && num > 0 ? num : null;
-      }
-      // Other exchanges: not implemented yet, let callers fallback
-      return null;
-    } catch (e) {
-      logger.warn(
-        `[ExchangeService] getOrderAverageFillPrice failed for ${symbol} order=${orderId}: ${e?.message || e}`
-      );
-      return null;
-    }
   }
 
   async createEntryTriggerOrder(symbol, side, entryPrice, quantity) {

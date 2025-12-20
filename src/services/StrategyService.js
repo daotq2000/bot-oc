@@ -143,17 +143,17 @@ export class StrategyService {
    * @returns {Array<string>} Array of sides to check
    */
   getSidesToCheck(strategy, direction) {
-    // Counter-trend logic: trade against the candle's direction
+    // Trend-following logic: trade with the candle's direction
     if (strategy.trade_type === 'both') {
-      // For bullish candle, check SHORT
-      // For bearish candle, check LONG
-      return direction === 'bullish' ? ['short'] : ['long'];
+      // For bullish candle, check LONG
+      // For bearish candle, check SHORT
+      return direction === 'bullish' ? ['long'] : ['short'];
     } else if (strategy.trade_type === 'long') {
-      // Only trade LONG if the candle is bearish
-      return direction === 'bearish' ? ['long'] : [];
+      // Only trade LONG if the candle is bullish
+      return direction === 'bullish' ? ['long'] : [];
     } else { // trade_type is 'short'
-      // Only trade SHORT if the candle is bullish
-      return direction === 'bullish' ? ['short'] : [];
+      // Only trade SHORT if the candle is bearish
+      return direction === 'bearish' ? ['short'] : [];
     }
   }
 

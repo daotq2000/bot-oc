@@ -1,0 +1,276 @@
+Subject: [PATCH] tracking position update
+---
+Index: src/jobs/EntryOrderMonitor.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/jobs/EntryOrderMonitor.js b/src/jobs/EntryOrderMonitor.js
+--- a/src/jobs/EntryOrderMonitor.js	(revision 4c55279141ba632268a9a714e8c53795c73f504b)
++++ b/src/jobs/EntryOrderMonitor.js	(revision 9e9fb1b4caa9ec1dc232e6e0bbfafb3effb45dd7)
+@@ -3,6 +3,7 @@
+ import { Position } from '../models/Position.js';
+ import { ExchangeService } from '../services/ExchangeService.js';
+ import { PositionWebSocketClient } from '../services/PositionWebSocketClient.js';
++import { orderStatusCache } from '../services/OrderStatusCache.js';
+ import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
+ import { configService } from '../services/ConfigService.js';
+ import logger from '../utils/logger.js';
+@@ -102,23 +103,46 @@
+ 
+       if (!orderId || !symbol) return;
+ 
++      // Update order status cache for ALL orders (entry, TP, SL)
++      orderStatusCache.updateOrderStatus(orderId, {
++        status: status,
++        filled: filledQty,
++        avgPrice: isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice,
++        symbol: symbol
++      });
++
+       const normalizedStatus = String(status || '').toUpperCase();
+       const isFilled = normalizedStatus === 'FILLED';
+       const isCanceled = normalizedStatus === 'CANCELED' || normalizedStatus === 'CANCELLED' || normalizedStatus === 'EXPIRED';
+ 
++      // Handle entry orders
+       const entry = await EntryOrder.findOpenByBotAndOrder(botId, orderId);
+-      if (!entry) {
+-        return; // Not an entry order we track
+-      }
+-
+-      if (isFilled) {
+-        // Confirmed filled → create Position and mark entry_orders as filled
+-        await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
+-      } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
+-        // Cancelled/expired without fill → mark as canceled
+-        await EntryOrder.markCanceled(entry.id, normalizedStatus === 'EXPIRED' ? 'expired' : 'canceled');
+-        logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
++      if (entry) {
++        if (isFilled) {
++          // Confirmed filled → create Position and mark entry_orders as filled
++          await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
++        } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
++          // Cancelled/expired without fill → mark as canceled
++          await EntryOrder.markCanceled(entry.id, normalizedStatus === 'EXPIRED' ? 'expired' : 'canceled');
++          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
++        }
++        return; // Entry order handled
+       }
++
++      // Handle TP/SL orders - check if any position has this order
++      if (isFilled) {
++        try {
++          const positions = await Position.findOpen();
++          for (const pos of positions) {
++            if (pos.bot_id === botId && (pos.tp_order_id === String(orderId) || pos.sl_order_id === String(orderId))) {
++              logger.info(`[EntryOrderMonitor] TP/SL order ${orderId} for position ${pos.id} filled via WebSocket. Position will be closed on next update.`);
++              // PositionService.updatePosition will detect this via cache
++            }
++          }
++        } catch (err) {
++          logger.debug(`[EntryOrderMonitor] Error checking positions for TP/SL order ${orderId}: ${err?.message || err}`);
++        }
++      }
+     } catch (error) {
+       logger.error('[EntryOrderMonitor] Error in _handleBinanceOrderTradeUpdate:', error?.message || error);
+     }
+Index: src/services/ExchangeService.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/services/ExchangeService.js b/src/services/ExchangeService.js
+--- a/src/services/ExchangeService.js	(revision 4c55279141ba632268a9a714e8c53795c73f504b)
++++ b/src/services/ExchangeService.js	(revision 9e9fb1b4caa9ec1dc232e6e0bbfafb3effb45dd7)
+@@ -353,19 +353,33 @@
+         }
+         const notional = Number(amount); // USDT-margined futures: price * qty = amount
+ 
+-        // Configure margin type and optimal leverage per symbol per notional
++        // Configure margin type and leverage per symbol (cached to avoid redundant API calls)
+         try {
+           const { configService } = await import('./ConfigService.js');
+-          const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
+-          await this.binanceDirectClient.setMarginType(normalizedSymbol, marginType);
+-          const optimalLev = await this.binanceDirectClient.getOptimalLeverage(normalizedSymbol, notional);
+-          const desiredLev = optimalLev || parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
++          const { exchangeInfoService } = await import('./ExchangeInfoService.js');
++          
++          // Only set margin type once per symbol (cache in _binanceConfiguredSymbols)
++          if (!this._binanceConfiguredSymbols.has(normalizedSymbol)) {
++            const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
++            await this.binanceDirectClient.setMarginType(normalizedSymbol, marginType);
++            this._binanceConfiguredSymbols.add(normalizedSymbol);
++            logger.debug(`[Cache] Set margin type for ${normalizedSymbol} to ${marginType} (cached)`);
++          }
++          
++          // Use max leverage from symbol_filters cache instead of API call
++          // This avoids getLeverageBrackets API call which causes rate limits
++          const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
++          const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
++          const desiredLev = maxLeverageFromCache || defaultLeverage;
++          
+           // Cache last applied leverage to avoid redundant calls
+           this._binanceLeverageMap = this._binanceLeverageMap || new Map();
+           if (this._binanceLeverageMap.get(normalizedSymbol) !== desiredLev) {
+             await this.binanceDirectClient.setLeverage(normalizedSymbol, desiredLev);
+             this._binanceLeverageMap.set(normalizedSymbol, desiredLev);
+-            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (optimal) for bot ${this.bot.id}`);
++            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (from cache: ${maxLeverageFromCache || 'default'}) for bot ${this.bot.id}`);
++          } else {
++            logger.debug(`[Cache] Leverage for ${normalizedSymbol} already set to ${desiredLev}, skipping`);
+           }
+         } catch (cfgErr) {
+           logger.warn(`Binance leverage/margin setup warning for ${normalizedSymbol}: ${cfgErr?.message || cfgErr}`);
+Index: src/services/PositionService.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/services/PositionService.js b/src/services/PositionService.js
+--- a/src/services/PositionService.js	(revision 4c55279141ba632268a9a714e8c53795c73f504b)
++++ b/src/services/PositionService.js	(revision 9e9fb1b4caa9ec1dc232e6e0bbfafb3effb45dd7)
+@@ -2,6 +2,7 @@
+ import { calculatePnL, calculatePnLPercent, calculateDynamicStopLoss, calculateTakeProfit, calculateInitialStopLoss, calculateNextTrailingStop, calculateNextTrailingTakeProfit } from '../utils/calculator.js';
+ import { exchangeInfoService } from './ExchangeInfoService.js';
+ import { configService } from './ConfigService.js';
++import { orderStatusCache } from './OrderStatusCache.js';
+ import logger from '../utils/logger.js';
+ 
+ /**
+@@ -20,6 +21,126 @@
+    */
+   async updatePosition(position) {
+     try {
++      // PRIORITY CHECK 1: Check order status from WebSocket cache (no REST API call)
++      // This detects when TP/SL orders are filled via WebSocket ORDER_TRADE_UPDATE events
++      if (position.tp_order_id) {
++        const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id);
++        if (cachedTpStatus && (cachedTpStatus.status === 'closed' || cachedTpStatus.status === 'FILLED')) {
++          // TP order has been filled - position is already closed on exchange
++          logger.info(`[TP/SL Check] TP order ${position.tp_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
++          
++          // Get fill price from cache or current price
++          const fillPrice = cachedTpStatus.avgPrice || await this.exchangeService.getTickerPrice(position.symbol);
++          const currentPrice = fillPrice || await this.exchangeService.getTickerPrice(position.symbol);
++          
++          if (currentPrice) {
++            const pnl = calculatePnL(
++              position.entry_price,
++              currentPrice,
++              position.amount,
++              position.side
++            );
++            return await this.closePosition(position, currentPrice, pnl, 'tp_hit');
++          }
++        }
++      }
++
++      if (position.sl_order_id) {
++        const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id);
++        if (cachedSlStatus && (cachedSlStatus.status === 'closed' || cachedSlStatus.status === 'FILLED')) {
++          // SL order has been filled - position is already closed on exchange
++          logger.info(`[TP/SL Check] SL order ${position.sl_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
++          
++          // Get fill price from cache or current price
++          const fillPrice = cachedSlStatus.avgPrice || await this.exchangeService.getTickerPrice(position.symbol);
++          const currentPrice = fillPrice || await this.exchangeService.getTickerPrice(position.symbol);
++          
++          if (currentPrice) {
++            const pnl = calculatePnL(
++              position.entry_price,
++              currentPrice,
++              position.amount,
++              position.side
++            );
++            return await this.closePosition(position, currentPrice, pnl, 'sl_hit');
++          }
++        }
++      }
++
++      // PRIORITY CHECK 2: Check if position has been closed on exchange (no exposure)
++      // This detects when position is closed on exchange but DB still shows 'open'
++      // Only check if WebSocket cache doesn't have the order status (fallback)
++      try {
++        const closableQty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
++        if (!closableQty || closableQty <= 0) {
++          // Position has no exposure on exchange - it's already closed
++          // Check cache first, then fallback to REST API only if cache miss
++          let closeReason = 'closed_on_exchange';
++          
++          if (position.tp_order_id) {
++            const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id);
++            if (cachedTpStatus?.status === 'closed' || cachedTpStatus?.status === 'FILLED') {
++              closeReason = 'tp_hit';
++            } else {
++              // Fallback to REST API only if cache miss
++              try {
++                const tpOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.tp_order_id);
++                if (tpOrderStatus?.status === 'closed' || tpOrderStatus?.status === 'FILLED') {
++                  closeReason = 'tp_hit';
++                  // Update cache for future use
++                  orderStatusCache.updateOrderStatus(position.tp_order_id, {
++                    status: tpOrderStatus.status,
++                    filled: tpOrderStatus.filled || 0,
++                    avgPrice: tpOrderStatus.raw?.avgPrice || null,
++                    symbol: position.symbol
++                  });
++                }
++              } catch (e) {
++                logger.debug(`[TP/SL Check] Failed to check TP order via REST API: ${e?.message || e}`);
++              }
++            }
++          }
++          
++          if (position.sl_order_id && closeReason !== 'tp_hit') {
++            const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id);
++            if (cachedSlStatus?.status === 'closed' || cachedSlStatus?.status === 'FILLED') {
++              closeReason = 'sl_hit';
++            } else {
++              // Fallback to REST API only if cache miss
++              try {
++                const slOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.sl_order_id);
++                if (slOrderStatus?.status === 'closed' || slOrderStatus?.status === 'FILLED') {
++                  closeReason = 'sl_hit';
++                  // Update cache for future use
++                  orderStatusCache.updateOrderStatus(position.sl_order_id, {
++                    status: slOrderStatus.status,
++                    filled: slOrderStatus.filled || 0,
++                    avgPrice: slOrderStatus.raw?.avgPrice || null,
++                    symbol: position.symbol
++                  });
++                }
++              } catch (e) {
++                logger.debug(`[TP/SL Check] Failed to check SL order via REST API: ${e?.message || e}`);
++              }
++            }
++          }
++          
++          const currentPrice = await this.exchangeService.getTickerPrice(position.symbol);
++          if (currentPrice) {
++            const pnl = calculatePnL(
++              position.entry_price,
++              currentPrice,
++              position.amount,
++              position.side
++            );
++            logger.info(`[TP/SL Check] Position ${position.id} has no exposure on exchange (already closed). Closing in DB with reason: ${closeReason}`);
++            return await this.closePosition(position, currentPrice, pnl, closeReason);
++          }
++        }
++      } catch (e) {
++        logger.debug(`[TP/SL Check] Failed to check closable quantity for position ${position.id}: ${e?.message || e}`);
++      }
++
+       // Get current price
+       const currentPrice = await this.exchangeService.getTickerPrice(position.symbol);
+ 
+@@ -37,7 +158,7 @@
+         position.side
+       );
+ 
+-      // Check if TP hit
++      // Check if TP hit (price-based check as fallback)
+       if (this.isTakeProfitHit(position, currentPrice)) {
+         // Guard: ensure there is an actual exchange position to close
+         try {

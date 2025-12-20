@@ -4,11 +4,23 @@ module.exports = {
   up: async (queryInterface, Sequelize) => {
     // Remove unique constraint unique_strategy_params from strategies table
     try {
-      await queryInterface.removeIndex('strategies', 'unique_strategy_params');
-      console.log('✅ Removed unique constraint unique_strategy_params from strategies table');
+      // First check if index exists
+      const indexes = await queryInterface.showIndex('strategies');
+      const indexExists = indexes.some(idx => idx.name === 'unique_strategy_params');
+      
+      if (indexExists) {
+        await queryInterface.removeIndex('strategies', 'unique_strategy_params');
+        console.log('✅ Removed unique constraint unique_strategy_params from strategies table');
+      } else {
+        console.log('⚠️  Constraint unique_strategy_params does not exist, skipping...');
+      }
     } catch (error) {
       // If index doesn't exist, that's okay
-      if (error.message.includes("Unknown key name") || error.message.includes("doesn't exist")) {
+      const errorMsg = error.message || '';
+      if (errorMsg.includes("Unknown key name") || 
+          errorMsg.includes("doesn't exist") || 
+          errorMsg.includes("Can't DROP") ||
+          errorMsg.includes("check that column/key exists")) {
         console.log('⚠️  Constraint unique_strategy_params does not exist, skipping...');
       } else {
         throw error;

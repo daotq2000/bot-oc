@@ -84,7 +84,7 @@ export class PriceAlertScanner {
     }
 
     this.isRunning = true;
-    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 5000);
+    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 15000); // Increased from 5s to 15s
     
     this.scanInterval = setInterval(() => {
       this.scan().catch(error => {

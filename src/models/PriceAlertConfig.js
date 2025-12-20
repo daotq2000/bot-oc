@@ -1,328 +1,298 @@
-import { PriceAlertConfig } from '../models/PriceAlertConfig.js';
-import { ExchangeService } from '../services/ExchangeService.js';
-import { TelegramService } from '../services/TelegramService.js';
-import { configService } from '../services/ConfigService.js';
-import { priceAlertSymbolTracker } from '../services/PriceAlertSymbolTracker.js';
+import pool from '../config/database.js';
 import logger from '../utils/logger.js';
 
 /**
- * Price Alert Scanner Job - Monitor price alerts for MEXC and other exchanges
+ * Price Alert Config Model
  */
-export class PriceAlertScanner {
-  constructor() {
-    this.exchangeServices = new Map(); // exchange -> ExchangeService
-    this.telegramService = null;
-    this.isRunning = false;
-    this.scanInterval = null;
-    this.isScanning = false; // prevent overlapping scans
-    this.alertStates = new Map(); // key: exch|symbol -> { lastPrice, lastAlertTime, armed }
-    this.priceCache = new Map(); // Cache prices to avoid excessive API calls
-    this.priceCacheTime = new Map(); // Track cache time
+export class PriceAlertConfig {
+  // Cache for findAll() results
+  static _cache = {
+    all: null, // Cache for findAll() without exchange filter
+    byExchange: new Map(), // Cache for findAll(exchange)
+    lastRefresh: 0,
+    ttl: 30 * 60 * 1000 // 30 minutes in milliseconds
+  };
+
+  /**
+   * Clear cache (call after create/update/delete)
+   */
+  static clearCache() {
+    this._cache.all = null;
+    this._cache.byExchange.clear();
+    this._cache.lastRefresh = 0;
+    logger.debug('[PriceAlertConfig] Cache cleared');
   }
 
   /**
-   * Initialize scanner
+   * Check if cache is valid
+   * @param {string|null} exchange - Optional exchange filter
+   * @returns {boolean} True if cache is valid
    */
-  async initialize(telegramService) {
-    this.telegramService = telegramService;
-
-    try {
-      // Get unique exchanges from active price alert configs
-      const configs = await PriceAlertConfig.findAll();
-      const activeConfigs = configs.filter(cfg => cfg.is_active === true || cfg.is_active === 1 || cfg.is_active === '1');
-      
-      // Extract unique exchanges from configs
-      const exchanges = new Set();
-      for (const config of activeConfigs) {
-        const exchange = (config.exchange || 'mexc').toLowerCase();
-        if (exchange) {
-          exchanges.add(exchange);
-        }
-      }
-
-      // Fallback to default exchanges if no configs found
-      if (exchanges.size === 0) {
-        logger.warn('[PriceAlertScanner] No active configs found, using default exchanges: binance, mexc');
-        exchanges.add('binance');
-        exchanges.add('mexc');
-      }
-
-      logger.info(`[PriceAlertScanner] Initializing for exchanges: ${Array.from(exchanges).join(', ')}`);
-      
-      for (const exchange of exchanges) {
-        try {
-          // Create a dummy bot object for exchange initialization
-          const dummyBot = {
-            id: `scanner_${exchange}`,
-            exchange: exchange,
-            access_key: process.env[`${exchange.toUpperCase()}_API_KEY`] || '',
-            secret_key: process.env[`${exchange.toUpperCase()}_SECRET_KEY`] || '',
-            uid: process.env[`${exchange.toUpperCase()}_UID`] || ''
-          };
-
-          const exchangeService = new ExchangeService(dummyBot);
-          // Always initialize for public price fetching (no keys required)
-          await exchangeService.initialize();
-          this.exchangeServices.set(exchange, exchangeService);
-          logger.info(`[PriceAlertScanner] ✅ Initialized for ${exchange} exchange (public price mode)`);
-        } catch (error) {
-          logger.warn(`[PriceAlertScanner] Failed to initialize for ${exchange}:`, error.message);
-        }
-      }
-    } catch (error) {
-      logger.error('[PriceAlertScanner] Failed to initialize:', error);
-    }
-  }
-
-  /**
-   * Start the scanner
-   */
-  start() {
-    if (this.isRunning) {
-      logger.warn('PriceAlertScanner is already running');
-      return;
-    }
-
-    this.isRunning = true;
-    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 15000); // Increased from 5s to 15s
+  static _isCacheValid(exchange = null) {
+    const now = Date.now();
+    const age = now - this._cache.lastRefresh;
     
-    this.scanInterval = setInterval(() => {
-      this.scan().catch(error => {
-        logger.error('PriceAlertScanner scan error:', error);
-      });
-    }, interval);
+    if (age >= this._cache.ttl) {
+      return false; // Cache expired
+    }
 
-    logger.info(`PriceAlertScanner started with interval ${interval}ms`);
+    if (exchange === null) {
+      return this._cache.all !== null;
+    } else {
+      return this._cache.byExchange.has(exchange);
+    }
   }
 
   /**
-   * Stop the scanner
+   * Get cached configs
+   * @param {string|null} exchange - Optional exchange filter
+   * @returns {Array|null} Cached configs or null
    */
-  stop() {
-    if (this.scanInterval) {
-      clearInterval(this.scanInterval);
-      this.scanInterval = null;
+  static _getCached(exchange = null) {
+    if (exchange === null) {
+      return this._cache.all;
+    } else {
+      return this._cache.byExchange.get(exchange) || null;
     }
-    this.isRunning = false;
-    logger.info('PriceAlertScanner stopped');
   }
 
   /**
-   * Main scan loop
+   * Set cache
+   * @param {Array} configs - Configs to cache
+   * @param {string|null} exchange - Optional exchange filter
    */
-  async scan() {
-    // Prevent overlapping scans
-    if (this.isScanning) {
-      logger.debug('[PriceAlertScanner] Scan already in progress, skipping');
-      return;
-    }
-
-    this.isScanning = true;
-    const scanStartTime = Date.now();
-    const maxScanDurationMs = Number(configService.getNumber('PRICE_ALERT_MAX_SCAN_DURATION_MS', 30000));
-
-    try {
-      const enabled = configService.getBoolean('PRICE_ALERT_CHECK_ENABLED', true);
-      if (!enabled) {
-        logger.debug('[PriceAlertScanner] Price alert checking is disabled');
-        return;
-      }
-
-      // Get all active price alert configs
-      // Note: PriceAlertConfig.findAll() already filters by is_active = TRUE in SQL
-      const configs = await PriceAlertConfig.findAll();
-      // Double-check: handle both boolean true and number 1 from MySQL
-      const activeConfigs = configs.filter(cfg => cfg.is_active === true || cfg.is_active === 1 || cfg.is_active === '1');
-      if (activeConfigs.length === 0) {
-        logger.debug('[PriceAlertScanner] No active price alert configs');
-        return;
-      }
-
-      // Process each active config
-      for (const config of activeConfigs) {
-        // Check timeout
-        if (Date.now() - scanStartTime > maxScanDurationMs) {
-          logger.warn(`[PriceAlertScanner] Scan exceeded max duration (${maxScanDurationMs}ms), stopping early`);
-          break;
+  static _setCache(configs, exchange = null) {
+    this._cache.lastRefresh = Date.now();
+    if (exchange === null) {
+      this._cache.all = configs;
+      // Also cache by exchange for faster lookup
+      const byExchange = new Map();
+      for (const cfg of configs) {
+        const ex = (cfg.exchange || 'mexc').toLowerCase();
+        if (!byExchange.has(ex)) {
+          byExchange.set(ex, []);
         }
-
-        try {
-          await this.checkAlertConfig(config);
-        } catch (error) {
-          logger.error(`[PriceAlertScanner] Error checking price alert config ${config.id}:`, error?.message || error);
-          // Continue with next config even if one fails
-        }
+        byExchange.get(ex).push(cfg);
       }
-
-      const scanDuration = Date.now() - scanStartTime;
-      logger.debug(`[PriceAlertScanner] Scan completed in ${scanDuration}ms`);
-    } catch (error) {
-      logger.error('PriceAlertScanner scan failed:', error);
-    } finally {
-      this.isScanning = false;
-    }
-  }
-
-  /**
-   * Check a single alert config
-   */
-  async checkAlertConfig(config) {
-    const { id, exchange, threshold, telegram_chat_id } = config;
-    const normalizedExchange = (exchange || 'mexc').toLowerCase();
-
-    // Get exchange service
-    const exchangeService = this.exchangeServices.get(normalizedExchange);
-    if (!exchangeService) {
-      logger.debug(`[PriceAlertScanner] No exchange service for ${normalizedExchange}, skipping alert config ${id}`);
-      return;
-    }
-
-    // Get symbols from PriceAlertSymbolTracker
-    const symbolsToScan = Array.from(priceAlertSymbolTracker.getSymbolsForExchange(normalizedExchange));
-
-    if (!symbolsToScan || symbolsToScan.length === 0) {
-      logger.debug(`[PriceAlertScanner] No symbols to scan for config ${id} (${normalizedExchange})`);
-      return;
-    }
-
-    // Check each symbol
-    for (const symbol of symbolsToScan) {
-      try {
-        await this.checkSymbolPrice(
-          exchange,
-          symbol,
-          threshold,
-          telegram_chat_id,
-          id
+      // Update byExchange cache
+      for (const [ex, cfgs] of byExchange.entries()) {
+        this._cache.byExchange.set(ex, cfgs);
+      }
+    } else {
+      this._cache.byExchange.set(exchange, configs);
+      // If we have all configs cached, we can also update the all cache
+      if (this._cache.all !== null) {
+        // Update all cache by replacing configs for this exchange
+        const allWithoutExchange = this._cache.all.filter(cfg => 
+          (cfg.exchange || 'mexc').toLowerCase() !== exchange
         );
-      } catch (error) {
-        logger.warn(`Error checking price for ${symbol} on ${exchange}:`, error.message);
+        this._cache.all = [...allWithoutExchange, ...configs];
       }
     }
   }
 
   /**
-   * Check price for a specific symbol
+   * Get all active configs (with caching)
+   * @param {string} exchange - Optional exchange filter
+   * @returns {Promise<Array>}
    */
-  async checkSymbolPrice(exchange, symbol, threshold, telegramChatId, configId) {
-    try {
-      const exchangeService = this.exchangeServices.get(exchange);
-      if (!exchangeService) {
-        return;
+  static async findAll(exchange = null) {
+    // Check cache first
+    if (this._isCacheValid(exchange)) {
+      const cached = this._getCached(exchange);
+      if (cached !== null) {
+        logger.debug(`[PriceAlertConfig] Using cached configs${exchange ? ` for ${exchange}` : ''} (${cached.length} configs)`);
+        return cached;
       }
+    }
 
-      // Get current price
-      const currentPrice = await this.getPrice(exchange, symbol);
-      if (!currentPrice) {
-        return;
+    // Cache miss or expired, fetch from database
+    logger.debug(`[PriceAlertConfig] Cache miss${exchange ? ` for ${exchange}` : ''}, fetching from database...`);
+    
+    let query = 'SELECT * FROM price_alert_config WHERE is_active = TRUE';
+    const params = [];
+
+    if (exchange) {
+      query += ' AND exchange = ?';
+      params.push(exchange);
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    const [rows] = await pool.execute(query, params);
+    // Safely parse JSON string fields into arrays
+    const configs = rows.map(config => {
+      try {
+        if (typeof config.symbols === 'string') {
+          config.symbols = JSON.parse(config.symbols);
+        }
+      } catch (e) {
+        logger.warn(`Invalid JSON in price_alert_config.symbols for ID ${config.id}: ${config.symbols}`);
+        config.symbols = [];
       }
-
-      // Initialize alert state if not exists
-      const stateKey = `${exchange}_${symbol}`;
-      if (!this.alertStates.has(stateKey)) {
-        this.alertStates.set(stateKey, {
-          lastPrice: currentPrice,
-          lastAlertTime: 0,
-          triggered: false
-        });
-        return; // Skip first check
+      try {
+        if (typeof config.intervals === 'string') {
+          config.intervals = JSON.parse(config.intervals);
+        }
+      } catch (e) {
+        logger.warn(`Invalid JSON in price_alert_config.intervals for ID ${config.id}: ${config.intervals}`);
+        config.intervals = [];
       }
+      return config;
+    });
 
-      const state = this.alertStates.get(stateKey);
-      const lastPrice = state.lastPrice;
-      const priceChange = Math.abs((currentPrice - lastPrice) / lastPrice * 100);
+    // Update cache
+    this._setCache(configs, exchange);
+    logger.info(`[PriceAlertConfig] Cached ${configs.length} configs${exchange ? ` for ${exchange}` : ''} (TTL: 30 minutes)`);
 
-      // Check if price change exceeds threshold
-      if (priceChange >= threshold) {
-        const now = Date.now();
-        const timeSinceLastAlert = now - state.lastAlertTime;
-        const minAlertInterval = 60000; // Minimum 1 minute between alerts
+    return configs;
+  }
 
-        if (timeSinceLastAlert >= minAlertInterval) {
-          // Send alert
-          await this.sendPriceAlert(
-            exchange,
-            symbol,
-            lastPrice,
-            currentPrice,
-            priceChange,
-            telegramChatId,
-            configId
-          );
+  /**
+   * Get all configs (active or inactive)
+   * @param {string|null} exchange - Optional exchange filter
+   * @returns {Promise<Array>}
+   */
+  static async findAllAny(exchange = null) {
+    let query = 'SELECT * FROM price_alert_config';
+    const params = [];
+    if (exchange) {
+      query += ' WHERE exchange = ?';
+      params.push(exchange);
+    }
+    query += ' ORDER BY created_at DESC';
+    const [rows] = await pool.execute(query, params);
+    return rows.map(config => {
+      try {
+        if (typeof config.symbols === 'string') config.symbols = JSON.parse(config.symbols);
+      } catch (_) { config.symbols = []; }
+      try {
+        if (typeof config.intervals === 'string') config.intervals = JSON.parse(config.intervals);
+      } catch (_) { config.intervals = []; }
+      return config;
+    });
+  }
 
-          state.lastAlertTime = now;
-          state.triggered = true;
+  /**
+   * Get config by ID
+   * @param {number} id - Config ID
+   * @returns {Promise<Object|null>}
+   */
+  static async findById(id) {
+    const [rows] = await pool.execute(
+      'SELECT * FROM price_alert_config WHERE id = ?',
+      [id]
+    );
+    if (rows.length === 0) return null;
+    
+    const row = rows[0];
+    return {
+      ...row,
+      symbols: JSON.parse(row.symbols || '[]'),
+      intervals: JSON.parse(row.intervals || '[]')
+    };
+  }
+
+  /**
+   * Create new config
+   * @param {Object} data - Config data
+   * @returns {Promise<Object>}
+   */
+  static async create(data) {
+    // Clear cache after create
+    this.clearCache();
+    const {
+      exchange = 'binance',
+      symbols = [],
+      intervals = [],
+      threshold = 5.00,
+      telegram_chat_id,
+      is_active = true
+    } = data;
+
+    const [result] = await pool.execute(
+      `INSERT INTO price_alert_config (
+        exchange, symbols, intervals, threshold, telegram_chat_id, is_active
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        exchange,
+        JSON.stringify(symbols),
+        JSON.stringify(intervals),
+        threshold,
+        telegram_chat_id,
+        is_active
+      ]
+    );
+
+    return this.findById(result.insertId);
+  }
+
+  /**
+   * Update config
+   * @param {number} id - Config ID
+   * @param {Object} data - Update data
+   * @returns {Promise<Object>}
+   */
+  static async update(id, data) {
+    const fields = [];
+    const values = [];
+
+    Object.keys(data).forEach(key => {
+      if (data[key] !== undefined) {
+        if (key === 'symbols' || key === 'intervals') {
+          fields.push(`${key} = ?`);
+          values.push(JSON.stringify(data[key]));
+        } else {
+          fields.push(`${key} = ?`);
+          values.push(data[key]);
         }
       }
+    });
 
-      // Update state
-      state.lastPrice = currentPrice;
-    } catch (error) {
-      logger.warn(`Error checking symbol price ${symbol} on ${exchange}:`, error.message);
+    if (fields.length === 0) {
+      return this.findById(id);
     }
+
+    values.push(id);
+    await pool.execute(
+      `UPDATE price_alert_config SET ${fields.join(', ')} WHERE id = ?`,
+      values
+    );
+
+    // Clear cache after update
+    this.clearCache();
+
+    return this.findById(id);
   }
 
   /**
-   * Get price for a symbol (with caching)
+   * Delete config
+   * @param {number} id - Config ID
+   * @returns {Promise<boolean>}
    */
-  async getPrice(exchange, symbol) {
-    try {
-      const cacheKey = `${exchange}_${symbol}`;
-      const now = Date.now();
-      const cacheTime = this.priceCacheTime.get(cacheKey) || 0;
-      const cacheDuration = 2000; // 2 seconds cache
-
-      // Return cached price if still valid
-      if (now - cacheTime < cacheDuration) {
-        return this.priceCache.get(cacheKey);
-      }
-
-      // Fetch fresh price
-      const exchangeService = this.exchangeServices.get(exchange);
-      if (!exchangeService) {
-        return null;
-      }
-
-      const price = await exchangeService.getTickerPrice(symbol);
-      
-      // Cache the price
-      this.priceCache.set(cacheKey, price);
-      this.priceCacheTime.set(cacheKey, now);
-
-      return price;
-    } catch (error) {
-      logger.warn(`Failed to get price for ${symbol} on ${exchange}:`, error.message);
-      return null;
+  static async delete(id) {
+    const [result] = await pool.execute(
+      'DELETE FROM price_alert_config WHERE id = ?',
+      [id]
+    );
+    
+    // Clear cache after delete
+    if (result.affectedRows > 0) {
+      this.clearCache();
     }
+    
+    return result.affectedRows > 0;
   }
 
   /**
-   * Send price alert via Telegram
+   * Update last alert time
+   * @param {number} id - Config ID
+   * @returns {Promise<void>}
    */
-  async sendPriceAlert(exchange, symbol, oldPrice, newPrice, changePercent, telegramChatId, configId) {
-    try {
-      if (!this.telegramService || !telegramChatId) return;
-
-      const bullish = Number(newPrice) >= Number(oldPrice);
-      const direction = bullish ? 'bullish' : 'bearish';
-
-      // Use compact line format via TelegramService
-      logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} (change: ${changePercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
-      await this.telegramService.sendVolatilityAlert(telegramChatId, {
-        symbol,
-        interval: '1m', // default interval for standalone alerts
-        oc: changePercent * (bullish ? 1 : -1), // signed percent
-        open: oldPrice,
-        currentPrice: newPrice,
-        direction
-      }).catch((error) => {
-        logger.error(`[PriceAlertScanner] Failed to send alert to chat_id=${telegramChatId}:`, error?.message || error);
-      });
-
-      logger.info(`[PriceAlertScanner] ✅ Alert sent: ${exchange.toUpperCase()} ${symbol} (change: ${changePercent.toFixed(2)}%) to chat_id=${telegramChatId}`);
-    } catch (error) {
-      logger.error(`Failed to send price alert for ${symbol}:`, error);
-    }
+  static async updateLastAlertTime(id) {
+    await pool.execute(
+      'UPDATE price_alert_config SET last_alert_time = NOW() WHERE id = ?',
+      [id]
+    );
   }
 }
-

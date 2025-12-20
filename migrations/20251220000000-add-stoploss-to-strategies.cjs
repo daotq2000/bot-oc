@@ -10,12 +10,17 @@
 
 module.exports = {
   up: async (queryInterface, Sequelize) => {
-    await queryInterface.addColumn('strategies', 'stoploss', {
-      type: Sequelize.DECIMAL(10, 2),
-      allowNull: true,
-      defaultValue: null,
-      comment: 'Stop loss percentage (same format as take_profit: e.g., 50 = 5%). If > 0, used to calculate initial SL from entry price. If <= 0 or NULL, no SL is set.'
-    });
+    // Check if column already exists before adding
+    const tableDescription = await queryInterface.describeTable('strategies');
+    
+    if (!tableDescription.stoploss) {
+      await queryInterface.addColumn('strategies', 'stoploss', {
+        type: Sequelize.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: null,
+        comment: 'Stop loss percentage (same format as take_profit: e.g., 50 = 5%). If > 0, used to calculate initial SL from entry price. If <= 0 or NULL, no SL is set.'
+      });
+    }
   },
 
   down: async (queryInterface, Sequelize) => {

@@ -19,24 +19,55 @@ export class EntryOrder {
       side,
       amount,
       entry_price,
-      status = 'open'
+      status = 'open',
+      reservation_token = null
     } = data;
 
-    const [result] = await pool.execute(
-      `INSERT INTO entry_orders (
-        strategy_id, bot_id, order_id, symbol, side, amount, entry_price, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        strategy_id,
-        bot_id,
-        String(order_id),
-        symbol,
-        side,
-        amount,
-        entry_price,
-        status
-      ]
-    );
+    // Try to insert with reservation_token if provided, fallback if column doesn't exist
+    let result;
+    try {
+      if (reservation_token) {
+        [result] = await pool.execute(
+          `INSERT INTO entry_orders (
+            strategy_id, bot_id, order_id, symbol, side, amount, entry_price, status, reservation_token
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            strategy_id,
+            bot_id,
+            String(order_id),
+            symbol,
+            side,
+            amount,
+            entry_price,
+            status,
+            reservation_token
+          ]
+        );
+      } else {
+        throw new Error('NO_RESERVATION_TOKEN'); // Force fallback path
+      }
+    } catch (e) {
+      // Fallback: insert without reservation_token (column may not exist)
+      if (e.message === 'NO_RESERVATION_TOKEN' || e.message?.includes('reservation_token') || e.code === 'ER_BAD_FIELD_ERROR') {
+        [result] = await pool.execute(
+          `INSERT INTO entry_orders (
+            strategy_id, bot_id, order_id, symbol, side, amount, entry_price, status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            strategy_id,
+            bot_id,
+            String(order_id),
+            symbol,
+            side,
+            amount,
+            entry_price,
+            status
+          ]
+        );
+      } else {
+        throw e;
+      }
+    }
 
     return this.findById(result.insertId);
   }
