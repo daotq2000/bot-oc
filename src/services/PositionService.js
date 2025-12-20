@@ -305,7 +305,7 @@ export class PositionService {
               const distanceFromMarket = Math.abs(newTP - marketPrice);
               const distancePercent = (distanceFromMarket / marketPrice) * 100;
               
-              logger.info(`[TP Trail] TP ${newTP.toFixed(2)} crossed entry ${entryPrice.toFixed(2)} for ${position.side} position ${position.id}. Distance from market: ${distancePercent.toFixed(3)}%`);
+              logger.debug(`[TP Trail] TP ${newTP.toFixed(2)} crossed entry ${entryPrice.toFixed(2)} for ${position.side} position ${position.id}. Distance from market: ${distancePercent.toFixed(3)}%`);
               
               if (distancePercent <= 0.5) {
                 // Too close to market - close position immediately
@@ -318,7 +318,7 @@ export class PositionService {
                       await this.exchangeService.closePosition(position.symbol, position.side, qtyToClose);
                     }
                     await this.closePosition(position, marketPrice, pnl, 'trailing_exit');
-                    logger.info(`[TP Trail] Closed position ${position.id} by MARKET order (TP too close to market)`);
+                    logger.debug(`[TP Trail] Closed position ${position.id} by MARKET order (TP too close to market)`);
                     return await Position.findById(position.id);
                   }
                 } catch (e) {
@@ -343,7 +343,7 @@ export class PositionService {
                 take_profit_price: newTP,
                 minutes_elapsed: actualMinutesElapsed
               });
-              logger.info(`[TP Trail] ✅ Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)} (prev=${prevTP.toFixed(2)}), minutes_elapsed=${actualMinutesElapsed}`);
+              logger.debug(`[TP Trail] ✅ Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)} (prev=${prevTP.toFixed(2)}), minutes_elapsed=${actualMinutesElapsed}`);
             }
           }
         } catch (e) {
@@ -418,7 +418,7 @@ export class PositionService {
               if (position.tp_order_id) {
                 try {
                   await this.exchangeService.cancelOrder(position.tp_order_id, position.symbol);
-                  logger.info(`[TP Replace] Cancelled old TP order ${position.tp_order_id} for position ${position.id}`);
+                  logger.debug(`[TP Replace] Cancelled old TP order ${position.tp_order_id} for position ${position.id}`);
                 } catch (e) {
                   logger.warn(`[TP Replace] Failed to cancel old TP order ${position.tp_order_id}: ${e?.message || e}`);
                 }
@@ -446,13 +446,13 @@ export class PositionService {
                     const updatePayload = { take_profit_price: newTP };
                     if (newTpOrderId) updatePayload.tp_order_id = newTpOrderId;
                     await Position.update(position.id, updatePayload);
-                    logger.info(`[TP Replace] ✅ Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id}`);
+                    logger.debug(`[TP Replace] ✅ Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id}`);
                   } catch (tpError) {
                     // If TP order creation fails, still update take_profit_price in DB
                     // This allows trailing TP to continue working even if orders can't be placed
                     logger.warn(`[TP Replace] ⚠️ Failed to place TP order @ ${newTP} for position ${position.id}: ${tpError?.message || tpError}. Updating TP price in DB only.`);
                     await Position.update(position.id, { take_profit_price: newTP });
-                    logger.info(`[TP Replace] Updated TP price in DB to ${newTP} for position ${position.id} (order not placed)`);
+                    logger.debug(`[TP Replace] Updated TP price in DB to ${newTP} for position ${position.id} (order not placed)`);
                   }
                 } else {
                   logger.debug(`[TP Replace] TP ${newTP} is on wrong side of Entry ${entryPrice}, skipping TP order creation (will be handled by SL conversion)`);

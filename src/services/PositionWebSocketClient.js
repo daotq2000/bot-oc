@@ -44,7 +44,7 @@ export class PositionWebSocketClient {
   async createListenKey() {
     const res = await this.makeRequest('/fapi/v1/listenKey', 'POST', {}, true);
     this.listenKey = res.listenKey;
-    logger.info(`[WS] Created listenKey`);
+    logger.debug(`[WS] Created listenKey`);
   }
 
   async keepAlive() {
@@ -69,11 +69,11 @@ export class PositionWebSocketClient {
       await this.createListenKey();
     }
     const url = `${this.getWsBase()}/${this.listenKey}`;
-    logger.info(`[WS] Connecting user stream: ${url}`);
+    logger.debug(`[WS] Connecting user stream: ${url}`);
     this.ws = new WebSocket(url);
 
     this.ws.on('open', () => {
-      logger.info('[WS] User stream connected');
+      logger.debug('[WS] User stream connected');
     });
 
     this.ws.on('message', (data) => {
@@ -136,7 +136,7 @@ export class PositionWebSocketClient {
     this.ws = null;
     this.keepAliveTimer = null;
     this.reconnectTimer = null;
-    logger.info('[WS] User stream stopped');
+    logger.debug('[WS] User stream stopped');
   }
 }
 

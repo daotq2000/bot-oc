@@ -16,17 +16,55 @@ class MexcWebSocketManager {
   constructor() {
     this.ws = null;
     this.subscribed = new Set(); // normalized 'BTCUSDT'
-    this.priceCache = new Map(); // 'BTCUSDT' -> price
+    this.priceCache = new Map(); // 'BTCUSDT' -> { price, lastAccess }
     this._connecting = false;
     this._reconnectTimer = null;
     this._pingTimer = null;
     this._endpointIndex = 0;
+    this.maxPriceCacheSize = 1000; // Maximum number of symbols to cache (reduced from 5000 to save memory)
+    this.priceCacheCleanupInterval = 5 * 60 * 1000; // Cleanup every 5 minutes
+    this._cleanupTimer = null;
+    this._startCacheCleanup();
 
     // Domain preference/failover tracking
     this._comFailures = 0;
     this._coFailures = 0;
     this._lastAttemptDomain = null; // 'com' | 'co'
     this._failoverThreshold = Number(configService.getNumber('MEXC_WS_COM_FAILOVER_THRESHOLD', 2));
+  }
+
+  _startCacheCleanup() {
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = setInterval(() => this._cleanupPriceCache(), this.priceCacheCleanupInterval);
+  }
+
+  _cleanupPriceCache() {
+    const now = Date.now();
+    const maxAge = 10 * 60 * 1000; // Remove entries older than 10 minutes
+    let removed = 0;
+
+    // Remove old entries
+    for (const [symbol, data] of this.priceCache.entries()) {
+      if (now - data.lastAccess > maxAge) {
+        this.priceCache.delete(symbol);
+        removed++;
+      }
+    }
+
+    // If still over limit, remove least recently used
+    if (this.priceCache.size > this.maxPriceCacheSize) {
+      const entries = Array.from(this.priceCache.entries())
+        .sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+      const toRemove = entries.slice(0, this.priceCache.size - this.maxPriceCacheSize);
+      for (const [symbol] of toRemove) {
+        this.priceCache.delete(symbol);
+        removed++;
+      }
+    }
+
+    if (removed > 0) {
+      logger.debug(`[MEXC-WS] Cleaned up ${removed} price cache entries. Current size: ${this.priceCache.size}`);
+    }
   }
 
   get endpoints() {
@@ -241,7 +279,13 @@ class MexcWebSocketManager {
               
               if (normSymbol) {
               const price = Number(last);
-                this.priceCache.set(normSymbol, price);
+                // Enforce max cache size (LRU eviction)
+                if (this.priceCache.size >= this.maxPriceCacheSize && !this.priceCache.has(normSymbol)) {
+                  const oldest = Array.from(this.priceCache.entries())
+                    .sort((a, b) => a[1].lastAccess - b[1].lastAccess)[0];
+                  if (oldest) this.priceCache.delete(oldest[0]);
+                }
+                this.priceCache.set(normSymbol, { price, lastAccess: Date.now() });
                 // Emit to listeners
                 this._emitPrice({ symbol: normSymbol, price, ts: Date.now() });
               } else {
@@ -298,6 +342,10 @@ class MexcWebSocketManager {
     if (this._pingTimer) {
       clearInterval(this._pingTimer);
       this._pingTimer = null;
+    }
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
     }
   }
 
@@ -386,7 +434,32 @@ class MexcWebSocketManager {
 
   getPrice(symbol) {
     const norm = this.normalizeSymbol(symbol);
-    return this.priceCache.get(norm);
+    const cached = this.priceCache.get(norm);
+    if (cached) {
+      cached.lastAccess = Date.now();
+      return cached.price;
+    }
+    return null;
+  }
+
+  /**
+   * Disconnect and cleanup all resources
+   */
+  disconnect() {
+    this._cleanup();
+    if (this.ws) {
+      try {
+        this.ws.terminate();
+      } catch (_) {}
+      this.ws = null;
+    }
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+    this.subscribed.clear();
+    this.priceCache.clear();
+    logger.info('[MEXC-WS] Disconnected and cleaned up all resources');
   }
 }
 

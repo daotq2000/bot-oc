@@ -25,6 +25,8 @@ export class ExchangeService {
     // Simple REST ticker cache for non-Binance to reduce CCXT calls
     this._tickerCache = new Map(); // key: symbol -> price
     this._tickerCacheTime = new Map(); // key: symbol -> timestamp
+    this._maxTickerCacheSize = 200; // Maximum number of symbols to cache (reduced from 500 to save memory)
+    this._tickerCacheTTL = 30 * 1000; // 30 seconds TTL (reduced from 1 minute)
   }
 
   /**
@@ -1015,6 +1017,16 @@ export class ExchangeService {
         const ticker = await exchange.fetchTicker(swapKey);
         const price = ticker?.last;
         if (Number.isFinite(Number(price))) {
+          // Enforce max cache size and cleanup old entries
+          this._cleanupTickerCache();
+          if (this._tickerCache.size >= this._maxTickerCacheSize && !this._tickerCache.has(swapKey)) {
+            const oldest = Array.from(this._tickerCacheTime.entries())
+              .sort((a, b) => a[1] - b[1])[0];
+            if (oldest) {
+              this._tickerCache.delete(oldest[0]);
+              this._tickerCacheTime.delete(oldest[0]);
+            }
+          }
           this._tickerCache.set(swapKey, Number(price));
           this._tickerCacheTime.set(swapKey, now);
           return price;
@@ -1065,6 +1077,16 @@ export class ExchangeService {
         const tickerSpot = await this.publicSpotExchange.fetchTicker(spotKey);
         const priceSpot = tickerSpot?.last;
         if (Number.isFinite(Number(priceSpot))) {
+          // Enforce max cache size and cleanup old entries
+          this._cleanupTickerCache();
+          if (this._tickerCache.size >= this._maxTickerCacheSize && !this._tickerCache.has(spotKey)) {
+            const oldest = Array.from(this._tickerCacheTime.entries())
+              .sort((a, b) => a[1] - b[1])[0];
+            if (oldest) {
+              this._tickerCache.delete(oldest[0]);
+              this._tickerCacheTime.delete(oldest[0]);
+            }
+          }
           this._tickerCache.set(spotKey, Number(priceSpot));
           this._tickerCacheTime.set(spotKey, now);
           return priceSpot;
@@ -1168,6 +1190,24 @@ export class ExchangeService {
     } catch (e) {
       logger.warn(`getOrderStatus failed for bot ${this.bot.id} (${symbol}/${orderId}): ${e?.message || e}`);
       return { status: 'unknown', filled: 0, raw: null };
+    }
+  }
+
+  /**
+   * Cleanup expired ticker cache entries
+   */
+  _cleanupTickerCache() {
+    const now = Date.now();
+    let removed = 0;
+    for (const [symbol, timestamp] of this._tickerCacheTime.entries()) {
+      if (now - timestamp > this._tickerCacheTTL) {
+        this._tickerCache.delete(symbol);
+        this._tickerCacheTime.delete(symbol);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      logger.debug(`[ExchangeService] Cleaned up ${removed} expired ticker cache entries for bot ${this.bot.id}`);
     }
   }
 }

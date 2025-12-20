@@ -129,7 +129,10 @@ export class WebSocketOCConsumer {
       // Log PIPPIN and first few price ticks (debug only)
       const isPippin = symbol?.toUpperCase().includes('PIPPIN');
       if (isPippin || this.processedCount <= 10) {
-        logger.debug(`[WebSocketOCConsumer] 📥 Received price tick: ${exchange} ${symbol} = ${price} (count: ${this.processedCount}, isRunning: ${this.isRunning})`);
+        // Reduce logging frequency to save memory (log every 10000 ticks instead of every tick)
+        if (this.processedCount % 10000 === 0) {
+          logger.debug(`[WebSocketOCConsumer] 📥 Received price tick: ${exchange} ${symbol} = ${price} (count: ${this.processedCount}, isRunning: ${this.isRunning})`);
+        }
       }
 
       // Log every 10000th price tick for debugging (reduced frequency)
@@ -156,7 +159,7 @@ export class WebSocketOCConsumer {
 
       // Process each match
       for (const match of matches) {
-        logger.info(`[WebSocketOCConsumer] 🎯 Processing match: strategy ${match.strategy.id}, bot_id=${match.strategy.bot_id}, symbol=${match.strategy.symbol}, OC=${match.oc.toFixed(2)}%`);
+        logger.debug(`[WebSocketOCConsumer] 🎯 Processing match: strategy ${match.strategy.id}, bot_id=${match.strategy.bot_id}, symbol=${match.strategy.symbol}, OC=${match.oc.toFixed(2)}%`);
         await this.processMatch(match).catch(error => {
           logger.error(`[WebSocketOCConsumer] ❌ Error processing match for strategy ${match.strategy.id}:`, error?.message || error, error?.stack);
         });
@@ -175,8 +178,7 @@ export class WebSocketOCConsumer {
       const { strategy, oc, direction, currentPrice, interval } = match;
       const botId = strategy.bot_id;
 
-      logger.info(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
-      logger.info(`[WebSocketOCConsumer] Available OrderServices: ${Array.from(this.orderServices.keys()).join(', ')} (total: ${this.orderServices.size})`);
+      logger.debug(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
 
       // Get OrderService for this bot
       const orderService = this.orderServices.get(botId);
@@ -184,18 +186,14 @@ export class WebSocketOCConsumer {
         logger.error(`[WebSocketOCConsumer] ❌ No OrderService found for bot ${botId}, skipping strategy ${strategy.id}. Available bots: ${Array.from(this.orderServices.keys()).join(', ')}`);
         return;
       }
-      
-      logger.info(`[WebSocketOCConsumer] ✅ Found OrderService for bot ${botId}`);
 
       // Check if strategy already has open position
       const { Position } = await import('../models/Position.js');
       const openPositions = await Position.findOpen(strategy.id);
       if (openPositions.length > 0) {
-        logger.info(`[WebSocketOCConsumer] ⏭️ Strategy ${strategy.id} already has ${openPositions.length} open position(s), skipping`);
+        logger.debug(`[WebSocketOCConsumer] ⏭️ Strategy ${strategy.id} already has ${openPositions.length} open position(s), skipping`);
         return;
       }
-      
-      logger.info(`[WebSocketOCConsumer] ✅ No open positions for strategy ${strategy.id}, proceeding to create order`);
 
       // Import calculator functions for TP/SL calculation
       const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
@@ -250,9 +248,9 @@ export class WebSocketOCConsumer {
         const allowPassive = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
         if (allowPassive) {
           signal.forcePassiveLimit = true; // OrderService will create a passive LIMIT at entryPrice
-          logger.info(`[WebSocketOCConsumer] Extend not met; placing passive LIMIT (forcePassiveLimit) for strategy ${strategy.id} at ${entryPrice}`);
+          logger.debug(`[WebSocketOCConsumer] Extend not met; placing passive LIMIT (forcePassiveLimit) for strategy ${strategy.id} at ${entryPrice}`);
         } else {
-          logger.info(`[WebSocketOCConsumer] Extend not met; skipping order for strategy ${strategy.id}. side=${side} baseOpen=${baseOpen} entry=${entryPrice} current=${currentPrice}`);
+          logger.debug(`[WebSocketOCConsumer] Extend not met; skipping order for strategy ${strategy.id}. side=${side} baseOpen=${baseOpen} entry=${entryPrice} current=${currentPrice}`);
           return;
         }
       }
@@ -265,7 +263,7 @@ export class WebSocketOCConsumer {
         throw error; // Re-throw to be caught by outer try-catch
       });
 
-      logger.info(`[WebSocketOCConsumer] ✅ Order triggered successfully for strategy ${strategy.id}`);
+      logger.debug(`[WebSocketOCConsumer] ✅ Order triggered successfully for strategy ${strategy.id}`);
     } catch (error) {
       logger.error(`[WebSocketOCConsumer] Error processing match:`, error?.message || error);
     }
@@ -279,7 +277,7 @@ export class WebSocketOCConsumer {
       // Refresh strategy cache
       await strategyCache.refresh();
 
-      logger.info(`[WebSocketOCConsumer] Strategy cache size: ${strategyCache.size()}`);
+      logger.debug(`[WebSocketOCConsumer] Strategy cache size: ${strategyCache.size()}`);
 
       // Collect symbols by exchange
       const mexcSymbols = new Set();
@@ -293,36 +291,22 @@ export class WebSocketOCConsumer {
           binanceSymbols.add(symbol);
         }
         
-        // Log PIPPIN strategies
+        // Log PIPPIN strategies (debug only)
         if (symbol?.includes('PIPPIN')) {
-          logger.info(`[WebSocketOCConsumer] Found PIPPIN strategy: ${key} -> strategy_id=${strategy.id}, bot_id=${strategy.bot_id}, oc=${strategy.oc}, interval=${strategy.interval}`);
+          logger.debug(`[WebSocketOCConsumer] Found PIPPIN strategy: ${key} -> strategy_id=${strategy.id}, bot_id=${strategy.bot_id}, oc=${strategy.oc}, interval=${strategy.interval}`);
         }
-      }
-
-      // Log PIPPIN symbols
-      const allSymbols = new Set([...mexcSymbols, ...binanceSymbols]);
-      const pippinSymbols = Array.from(allSymbols).filter(s => s.includes('PIPPIN'));
-      if (pippinSymbols.length > 0) {
-        logger.info(`[WebSocketOCConsumer] PIPPIN symbols found: ${pippinSymbols.join(', ')}`);
       }
 
       // Subscribe MEXC
       if (mexcSymbols.size > 0) {
-        logger.info(`[WebSocketOCConsumer] Subscribing MEXC WS to ${mexcSymbols.size} strategy symbols`);
+        logger.debug(`[WebSocketOCConsumer] Subscribing MEXC WS to ${mexcSymbols.size} strategy symbols`);
         mexcPriceWs.subscribe(Array.from(mexcSymbols));
       }
 
       // Subscribe Binance
       if (binanceSymbols.size > 0) {
-        logger.info(`[WebSocketOCConsumer] Subscribing Binance WS to ${binanceSymbols.size} strategy symbols`);
+        logger.debug(`[WebSocketOCConsumer] Subscribing Binance WS to ${binanceSymbols.size} strategy symbols`);
         webSocketManager.subscribe(Array.from(binanceSymbols));
-        
-        // Log if PIPPIN is in Binance symbols
-        if (Array.from(binanceSymbols).some(s => s.includes('PIPPIN'))) {
-          logger.info(`[WebSocketOCConsumer] ✅ PIPPIN is in Binance subscription list`);
-        } else {
-          logger.warn(`[WebSocketOCConsumer] ⚠️ PIPPIN is NOT in Binance subscription list! Binance symbols: ${Array.from(binanceSymbols).slice(0, 10).join(', ')}...`);
-        }
       }
 
       logger.info(`[WebSocketOCConsumer] WebSocket subscriptions updated: MEXC=${mexcSymbols.size}, Binance=${binanceSymbols.size}`);

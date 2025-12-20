@@ -180,15 +180,15 @@ export class OrderService {
             const avg = await this.exchangeService.getOrderAverageFillPrice(strategy.symbol, order.id);
             if (Number.isFinite(avg) && avg > 0) {
               effectiveEntryPrice = avg;
-              hasImmediateExposure = true;
-              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
-            } else {
-              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
-              hasImmediateExposure = true;
-            }
+            hasImmediateExposure = true;
+            logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
           } else {
-            logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
+            logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
+            hasImmediateExposure = true;
           }
+        } else {
+          logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
+        }
         }
       } catch (e) {
         logger.warn(`[OrderService] Failed to refine entry price from exchange for order ${order?.id} ${strategy.symbol}: ${e?.message || e}`);
@@ -268,7 +268,7 @@ export class OrderService {
               throw schemaError;
             }
           }
-          logger.info(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table. Reservation ${reservationToken} kept active until Position is created.`);
+          logger.debug(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table. Reservation ${reservationToken} kept active until Position is created.`);
         } catch (e) {
           logger.warn(`[OrderService] Failed to persist entry order ${order.id} into entry_orders: ${e?.message || e}`);
           // If entry_order creation failed, cancel reservation
@@ -291,23 +291,20 @@ export class OrderService {
 
       // Send entry trade alert to central channel
       try {
-        logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
         // Ensure bot info present
         if (!strategy.bot && strategy.bot_id) {
           const { Bot } = await import('../models/Bot.js');
           strategy.bot = await Bot.findById(strategy.bot_id);
-          logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
         }
-        logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
         await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
-        logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
+        logger.debug(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
       } catch (e) {
         logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
         logger.error(`[OrderService] Error stack:`, e?.stack);
       }
 
       // TP/SL creation is now handled by PositionMonitor after entry confirmation.
-      logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
+      logger.debug(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
 
         // Central log: success
         await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);

@@ -8,7 +8,8 @@ class OrderStatusCache {
   constructor() {
     // Map: orderId -> { status, filled, avgPrice, symbol, updatedAt }
     this.cache = new Map();
-    this.ttl = 5 * 60 * 1000; // 5 minutes TTL for cached entries
+    this.ttl = 3 * 60 * 1000; // 3 minutes TTL for cached entries (reduced from 5)
+    this.maxCacheSize = 500; // Maximum number of orders to cache (reduced from 10000 to save memory)
   }
 
   /**
@@ -25,6 +26,14 @@ class OrderStatusCache {
     const symbol = data.symbol || data.s || null;
 
     const normalizedStatus = this._normalizeStatus(status);
+    
+    // Enforce max cache size (LRU eviction)
+    if (this.cache.size >= this.maxCacheSize && !this.cache.has(String(orderId))) {
+      // Remove oldest entry
+      const oldest = Array.from(this.cache.entries())
+        .sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0];
+      if (oldest) this.cache.delete(oldest[0]);
+    }
     
     this.cache.set(String(orderId), {
       status: normalizedStatus,
@@ -128,8 +137,8 @@ class OrderStatusCache {
 // Singleton instance
 export const orderStatusCache = new OrderStatusCache();
 
-// Periodic cleanup
-setInterval(() => orderStatusCache.cleanup(), 60000); // Every minute
+// Periodic cleanup (more frequent to save memory)
+setInterval(() => orderStatusCache.cleanup(), 30000); // Every 30 seconds (reduced from 1 minute)
 
 export default OrderStatusCache;
 

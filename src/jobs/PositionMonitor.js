@@ -212,13 +212,13 @@ export class PositionMonitor {
           const slOrderId = slRes?.orderId ? String(slRes.orderId) : null;
           if (slOrderId) {
             await Position.update(position.id, { sl_order_id: slOrderId, stop_loss_price: slPrice });
-            logger.info(`[Place TP/SL] ✅ Placed SL order ${slOrderId} for position ${position.id} @ ${slPrice}`);
+            logger.debug(`[Place TP/SL] ✅ Placed SL order ${slOrderId} for position ${position.id} @ ${slPrice}`);
           }
         } catch (e) {
           logger.error(`[Place TP/SL] ❌ Failed to create SL order for position ${position.id}:`, e?.message || e);
         }
       } else if (slPrice === null || slPrice <= 0) {
-        logger.info(`[Place TP/SL] Skipping SL order placement for position ${position.id} (stoploss <= 0 or not set)`);
+        logger.debug(`[Place TP/SL] Skipping SL order placement for position ${position.id} (stoploss <= 0 or not set)`);
       }
     } catch (error) {
       logger.error(`[Place TP/SL] Error processing TP/SL for position ${position.id}:`, error?.message || error, error?.stack);
@@ -250,7 +250,7 @@ export class PositionMonitor {
         const st = await exchangeService.getOrderStatus(position.symbol, position.order_id);
         if (st.status === 'open' && (st.filled || 0) === 0) {
           await orderService.cancelOrder(position, 'ttl_expired');
-          logger.info(`Cancelled unfilled entry (TTL ${ttlMinutes}m) for position ${position.id}`);
+          logger.debug(`Cancelled unfilled entry (TTL ${ttlMinutes}m) for position ${position.id}`);
           return; // done for this position
         }
       }
@@ -282,7 +282,7 @@ export class PositionMonitor {
                 const newOrder = await exchangeService.createOrder(params);
                 if (newOrder && newOrder.id) {
                   await Position.update(position.id, { order_id: newOrder.id });
-                  logger.info(`Recreated entry order for position ${position.id} (${position.symbol}) after manual cancel. New order_id=${newOrder.id}`);
+                  logger.debug(`Recreated entry order for position ${position.id} (${position.symbol}) after manual cancel. New order_id=${newOrder.id}`);
                 }
               } catch (e) {
                 logger.warn(`Failed to recreate entry order for position ${position.id}: ${e?.message || e}`);

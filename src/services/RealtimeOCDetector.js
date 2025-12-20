@@ -21,10 +21,12 @@ export class RealtimeOCDetector {
     // Key: exchange|symbol|interval|bucketStart
     // Value: { open, bucketStart, lastUpdate }
     this.openPriceCache = new Map();
+    this.maxOpenPriceCacheSize = 2000; // Maximum number of entries to cache (reduced from 10000 to save memory)
 
     // Cache fetched opens from REST to avoid repeated external calls
     // Key: exchange|symbol|interval|bucketStart -> open
     this.openFetchCache = new Map();
+    this.maxOpenFetchCacheSize = 500; // Maximum number of entries to cache (reduced from 5000 to save memory)
 
     // Prime tolerance: if we are already inside the bucket more than this, try REST OHLCV open
     this.openPrimeToleranceMs = Number(configService.getNumber('OC_OPEN_PRIME_TOLERANCE_MS', 3000));
@@ -33,12 +35,14 @@ export class RealtimeOCDetector {
     // Key: exchange|symbol
     // Value: { price, timestamp }
     this.lastPriceCache = new Map();
+    this.maxLastPriceCacheSize = 1000; // Maximum number of symbols to track (reduced from 5000 to save memory)
     
     // Minimum price change threshold to trigger recalculation (0.01% default)
     this.priceChangeThreshold = 0.0001; // 0.01%
 
     // Public CCXT clients cache for REST OHLCV (no API keys)
     this._publicClients = new Map();
+    this.maxPublicClients = 10; // Maximum number of exchange clients to cache
   }
 
   /**
@@ -90,6 +94,11 @@ export class RealtimeOCDetector {
   async getPublicClient(exchange) {
     const ex = (exchange || '').toLowerCase();
     if (this._publicClients.has(ex)) return this._publicClients.get(ex);
+    // Enforce max clients cache size
+    if (this._publicClients.size >= this.maxPublicClients) {
+      const firstKey = Array.from(this._publicClients.keys())[0];
+      this._publicClients.delete(firstKey);
+    }
     let client;
     if (ex === 'mexc') {
       client = new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } });
@@ -200,6 +209,12 @@ export class RealtimeOCDetector {
       }
     }
 
+    // Enforce max cache size (LRU eviction)
+    if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(key)) {
+      const oldest = Array.from(this.openPriceCache.entries())
+        .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate)[0];
+      if (oldest) this.openPriceCache.delete(oldest[0]);
+    }
     // Store in cache
     this.openPriceCache.set(key, { open: openPrice, bucketStart, lastUpdate: timestamp });
     return openPrice;
@@ -253,7 +268,18 @@ export class RealtimeOCDetector {
           try {
             const restOpen = await this.fetchOpenFromRest(normalizedExchange, normalizedSymbol, interval, bucketStart);
             if (Number.isFinite(restOpen) && restOpen > 0) {
+              // Enforce max cache size
+              if (this.openFetchCache.size >= this.maxOpenFetchCacheSize && !this.openFetchCache.has(fetchKey)) {
+                const oldest = Array.from(this.openFetchCache.keys())[0];
+                if (oldest) this.openFetchCache.delete(oldest);
+              }
               this.openFetchCache.set(fetchKey, restOpen);
+              // Also update openPriceCache with size limit
+              if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(fetchKey)) {
+                const oldest = Array.from(this.openPriceCache.entries())
+                  .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate)[0];
+                if (oldest) this.openPriceCache.delete(oldest[0]);
+              }
               this.openPriceCache.set(fetchKey, { open: restOpen, bucketStart, lastUpdate: Date.now() });
               logger.info(`[RealtimeOCDetector] Primed REST open for ${normalizedSymbol} ${interval} at ${restOpen}`);
             }
@@ -262,6 +288,12 @@ export class RealtimeOCDetector {
       }
     }
 
+    // Enforce max cache size (LRU eviction)
+    if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(key)) {
+      const oldest = Array.from(this.openPriceCache.entries())
+        .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate)[0];
+      if (oldest) this.openPriceCache.delete(oldest[0]);
+    }
     this.openPriceCache.set(key, {
       open: openPrice,
       bucketStart,
@@ -308,6 +340,12 @@ export class RealtimeOCDetector {
 
     const lastPrice = this.lastPriceCache.get(key);
     if (!lastPrice) {
+      // Enforce max cache size (LRU eviction)
+      if (this.lastPriceCache.size >= this.maxLastPriceCacheSize && !this.lastPriceCache.has(key)) {
+        const oldest = Array.from(this.lastPriceCache.entries())
+          .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
+        if (oldest) this.lastPriceCache.delete(oldest[0]);
+      }
       this.lastPriceCache.set(key, { price: currentPrice, timestamp: Date.now() });
       return true;
     }
@@ -315,6 +353,12 @@ export class RealtimeOCDetector {
     // Check if price changed significantly
     const priceChange = Math.abs((currentPrice - lastPrice.price) / lastPrice.price);
     if (priceChange >= this.priceChangeThreshold) {
+      // Enforce max cache size (LRU eviction)
+      if (this.lastPriceCache.size >= this.maxLastPriceCacheSize && !this.lastPriceCache.has(key)) {
+        const oldest = Array.from(this.lastPriceCache.entries())
+          .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
+        if (oldest) this.lastPriceCache.delete(oldest[0]);
+      }
       this.lastPriceCache.set(key, { price: currentPrice, timestamp: Date.now() });
       return true;
     }
@@ -436,18 +480,61 @@ export class RealtimeOCDetector {
     const now = Date.now();
     let cleaned = 0;
 
-    // Clean open price cache
+    // Clean open price cache (by age and size)
     for (const [key, value] of this.openPriceCache.entries()) {
       if (now - value.lastUpdate > maxAge) {
         this.openPriceCache.delete(key);
         cleaned++;
       }
     }
+    // Enforce max size (LRU eviction)
+    if (this.openPriceCache.size > this.maxOpenPriceCacheSize) {
+      const entries = Array.from(this.openPriceCache.entries())
+        .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate);
+      const toRemove = entries.slice(0, this.openPriceCache.size - this.maxOpenPriceCacheSize);
+      for (const [key] of toRemove) {
+        this.openPriceCache.delete(key);
+        cleaned++;
+      }
+    }
 
-    // Clean last price cache
+    // Clean open fetch cache (by age and size)
+    for (const [key, timestamp] of this.openFetchCache.entries()) {
+      // openFetchCache stores just values, need to track age differently
+      // For now, just enforce size limit
+    }
+    if (this.openFetchCache.size > this.maxOpenFetchCacheSize) {
+      const toRemove = Array.from(this.openFetchCache.keys())
+        .slice(0, this.openFetchCache.size - this.maxOpenFetchCacheSize);
+      for (const key of toRemove) {
+        this.openFetchCache.delete(key);
+        cleaned++;
+      }
+    }
+
+    // Clean last price cache (by age and size)
     for (const [key, value] of this.lastPriceCache.entries()) {
       if (now - value.timestamp > maxAge) {
         this.lastPriceCache.delete(key);
+        cleaned++;
+      }
+    }
+    if (this.lastPriceCache.size > this.maxLastPriceCacheSize) {
+      const entries = Array.from(this.lastPriceCache.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp);
+      const toRemove = entries.slice(0, this.lastPriceCache.size - this.maxLastPriceCacheSize);
+      for (const [key] of toRemove) {
+        this.lastPriceCache.delete(key);
+        cleaned++;
+      }
+    }
+
+    // Clean public clients cache (size limit only)
+    if (this._publicClients.size > this.maxPublicClients) {
+      const keys = Array.from(this._publicClients.keys())
+        .slice(0, this._publicClients.size - this.maxPublicClients);
+      for (const key of keys) {
+        this._publicClients.delete(key);
         cleaned++;
       }
     }

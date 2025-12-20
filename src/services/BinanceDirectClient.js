@@ -16,6 +16,7 @@ export class BinanceDirectClient {
     this.isTestnet = isTestnet;
     this.exchangeInfoService = exchangeInfoService; // Injected service for caching
     this.restPriceFallbackCache = new Map(); // symbol -> { price, timestamp }
+    this.maxPriceCacheSize = 200; // Maximum number of symbols to cache (reduced from 1000 to save memory)
     
     // Load all config values from database with defaults
     this.restPriceFallbackCooldownMs = Number(configService.getNumber('BINANCE_REST_PRICE_COOLDOWN_MS', 5000));
@@ -471,6 +472,12 @@ export class BinanceDirectClient {
       const ticker = await this.makeMarketDataRequest('/fapi/v1/ticker/price', 'GET', { symbol: normalizedSymbol });
       const restPrice = parseFloat(ticker?.price);
       if (Number.isFinite(restPrice) && restPrice > 0) {
+        // Enforce max cache size (LRU eviction)
+        if (this.restPriceFallbackCache.size >= this.maxPriceCacheSize && !this.restPriceFallbackCache.has(normalizedSymbol)) {
+          const oldest = Array.from(this.restPriceFallbackCache.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
+          if (oldest) this.restPriceFallbackCache.delete(oldest[0]);
+        }
         this.restPriceFallbackCache.set(normalizedSymbol, { price: restPrice, timestamp: now });
         logger.info(`Price for ${normalizedSymbol} not in WebSocket cache. Using REST fallback price ${restPrice}.`);
         return restPrice;
