@@ -339,11 +339,14 @@ export class EntryOrderMonitor {
       } catch (posError) {
         // If Position creation failed, cancel reservation
         await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
-        logger.error(`[EntryOrderMonitor] Failed to create Position for entry order ${entry.id}: ${posError?.message || posError}`);
-        throw posError; // Re-throw to be caught by outer catch
+        logger.error(`[EntryOrderMonitor] ❌ Failed to create Position for entry order ${entry.id}: ${posError?.message || posError}`);
+        logger.error(`[EntryOrderMonitor] Stack trace:`, posError?.stack);
+        // Don't re-throw - log error and let EntryOrderMonitor retry later
+        // PositionSync will also try to create it from exchange
       }
     } catch (error) {
       logger.error(`[EntryOrderMonitor] Error confirming entry order ${entry.id}:`, error?.message || error);
+      logger.error(`[EntryOrderMonitor] Stack trace:`, error?.stack);
     }
   }
 
