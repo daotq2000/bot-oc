@@ -199,6 +199,18 @@ export class EntryOrderMonitor {
         return;
       }
 
+      // CRITICAL: Check concurrency before creating Position
+      // Entry orders were created with reservation, but we need to verify limit is still valid
+      const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
+      const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
+      if (!canAccept) {
+        const status = await concurrencyManager.getStatus(botId);
+        logger.warn(`[EntryOrderMonitor] ⚠️ Cannot create Position from entry order ${entry.id}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain in entry_orders table.`);
+        // Don't mark as canceled - keep in entry_orders for retry later
+        // The order is already filled on exchange, but we can't create Position due to limit
+        return;
+      }
+
       const effectiveEntryPrice = Number.isFinite(overrideEntryPrice) && overrideEntryPrice > 0
         ? overrideEntryPrice
         : Number(entry.entry_price);
@@ -211,7 +223,17 @@ export class EntryOrderMonitor {
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
       const slPrice = isStoplossValid ? calculateInitialStopLoss(effectiveEntryPrice, rawStoploss, side) : null;
 
-      const position = await Position.create({
+      // Reserve slot atomically before creating Position
+      const reservationToken = await concurrencyManager.reserveSlot(botId);
+      if (!reservationToken) {
+        const status = await concurrencyManager.getStatus(botId);
+        logger.warn(`[EntryOrderMonitor] ⚠️ Failed to reserve slot for entry order ${entry.id}: limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain for retry.`);
+        return;
+      }
+
+      let position = null;
+      try {
+        position = await Position.create({
         strategy_id: entry.strategy_id,
         bot_id: botId,
         order_id: entry.order_id,
@@ -225,6 +247,9 @@ export class EntryOrderMonitor {
       });
 
       await EntryOrder.markFilled(entry.id);
+
+      // Finalize reservation as 'released' (Position created successfully)
+      await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
 
       logger.info(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
 
@@ -244,6 +269,12 @@ export class EntryOrderMonitor {
         }
       } catch (e) {
         logger.warn(`[EntryOrderMonitor] Failed to send Telegram notifications for Position ${position.id}: ${e?.message || e}`);
+      }
+      } catch (posError) {
+        // If Position creation failed, cancel reservation
+        await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+        logger.error(`[EntryOrderMonitor] Failed to create Position for entry order ${entry.id}: ${posError?.message || posError}`);
+        throw posError; // Re-throw to be caught by outer catch
       }
     } catch (error) {
       logger.error(`[EntryOrderMonitor] Error confirming entry order ${entry.id}:`, error?.message || error);
