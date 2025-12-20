@@ -295,6 +295,14 @@ export class PositionService {
                   logger.warn(`[TP Replace] Failed to cancel old TP order ${position.tp_order_id}: ${e?.message || e}`);
                 }
               }
+              
+              // Delay before creating new TP order to avoid rate limits
+              const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
+              if (delayMs > 0) {
+                logger.info(`[TP Replace] Waiting ${delayMs}ms before placing new TP order for position ${position.id}...`);
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+              }
+              
               const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
               if (qty > 0) {
                 // Only create TP order if TP is on the correct side of Entry
@@ -517,6 +525,13 @@ export class PositionService {
         } catch (e) {
           logger.warn(`[TP->SL Convert] Failed to cancel TP order ${position.tp_order_id}: ${e?.message || e}`);
         }
+      }
+      
+      // Delay before creating STOP_LIMIT order to avoid rate limits
+      const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
+      if (delayMs > 0) {
+        logger.info(`[TP->SL Convert] Waiting ${delayMs}ms before placing STOP_LIMIT order for position ${position.id}...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
       }
       
       // Create STOP_LIMIT order at the new TP price

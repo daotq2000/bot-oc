@@ -157,6 +157,13 @@ export class PositionMonitor {
         }
       }
 
+      // Delay before placing SL order to avoid rate limits
+      const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
+      if (delayMs > 0) {
+        logger.info(`[Place TP/SL] Waiting ${delayMs}ms before placing SL order for position ${position.id}...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+
       // Place SL order (only if slPrice is valid, i.e., stoploss > 0)
       if (!position.sl_order_id && slPrice !== null && Number.isFinite(slPrice) && slPrice > 0) {
         // Safety check: If SL is invalid (SL <= entry for SHORT or SL >= entry for LONG), force close position immediately

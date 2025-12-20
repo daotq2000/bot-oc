@@ -113,6 +113,7 @@ async function start() {
       // Position service and SL/TP update configs
       await AppConfig.set('SL_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger SL update');
       await AppConfig.set('TP_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger TP update');
+      await AppConfig.set('TP_SL_PLACEMENT_DELAY_MS', '10000', 'Delay (ms) between TP and SL order placements to avoid rate limits');
 
       // WebSocket and connection configs
       await AppConfig.set('BINANCE_TESTNET_WS_BASE', 'wss://stream.binancefuture.com/ws', 'Binance testnet WebSocket base URL');
