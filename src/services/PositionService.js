@@ -330,14 +330,20 @@ export class PositionService {
               }
             } else {
               // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
-              await this._maybeReplaceTpOrder(position, prevTP, newTP);
+              // Try to replace TP order, but continue even if it fails
+              try {
+                await this._maybeReplaceTpOrder(position, prevTP, newTP);
+              } catch (replaceError) {
+                logger.warn(`[TP Trail] Failed to replace TP order for position ${position.id}: ${replaceError?.message || replaceError}. Continuing with TP price update.`);
+              }
               
-              // Update take_profit_price and minutes_elapsed in DB
+              // Always update take_profit_price and minutes_elapsed in DB
+              // This ensures trailing TP works even if order replacement fails
               await Position.update(position.id, { 
                 take_profit_price: newTP,
                 minutes_elapsed: actualMinutesElapsed
               });
-              logger.debug(`[TP Trail] Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)}, minutes_elapsed=${actualMinutesElapsed}`);
+              logger.info(`[TP Trail] ✅ Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)} (prev=${prevTP.toFixed(2)}), minutes_elapsed=${actualMinutesElapsed}`);
             }
           }
         } catch (e) {
@@ -434,12 +440,20 @@ export class PositionService {
                    (position.side === 'long' && newTP >= entryPrice));
                 
                 if (isValidTP) {
-                  const tpRes = await this.exchangeService.createTakeProfitLimit(position.symbol, position.side, newTP, qty);
-                  const newTpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
-                  const updatePayload = { take_profit_price: newTP };
-                  if (newTpOrderId) updatePayload.tp_order_id = newTpOrderId;
-                  await Position.update(position.id, updatePayload);
-                  logger.info(`[TP Replace] Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id}`);
+                  try {
+                    const tpRes = await this.exchangeService.createTakeProfitLimit(position.symbol, position.side, newTP, qty);
+                    const newTpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
+                    const updatePayload = { take_profit_price: newTP };
+                    if (newTpOrderId) updatePayload.tp_order_id = newTpOrderId;
+                    await Position.update(position.id, updatePayload);
+                    logger.info(`[TP Replace] ✅ Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id}`);
+                  } catch (tpError) {
+                    // If TP order creation fails, still update take_profit_price in DB
+                    // This allows trailing TP to continue working even if orders can't be placed
+                    logger.warn(`[TP Replace] ⚠️ Failed to place TP order @ ${newTP} for position ${position.id}: ${tpError?.message || tpError}. Updating TP price in DB only.`);
+                    await Position.update(position.id, { take_profit_price: newTP });
+                    logger.info(`[TP Replace] Updated TP price in DB to ${newTP} for position ${position.id} (order not placed)`);
+                  }
                 } else {
                   logger.debug(`[TP Replace] TP ${newTP} is on wrong side of Entry ${entryPrice}, skipping TP order creation (will be handled by SL conversion)`);
                 }

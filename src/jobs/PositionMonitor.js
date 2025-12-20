@@ -148,13 +148,23 @@ export class PositionMonitor {
           const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
           if (tpOrderId) {
             // Store initial TP price for trailing calculation
-            // We'll use a comment field or calculate from strategy each time
-            // For now, initial TP = current TP (first time)
             await Position.update(position.id, { tp_order_id: tpOrderId, take_profit_price: tpPrice });
             logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice} (initial TP)`);
+          } else {
+            // Order creation returned null (e.g., price too close to market)
+            logger.warn(`[Place TP/SL] ⚠️ TP order creation returned null for position ${position.id} @ ${tpPrice}. Updating TP price in DB only.`);
+            await Position.update(position.id, { take_profit_price: tpPrice });
           }
         } catch (e) {
+          // If TP order creation fails, still update take_profit_price in DB
+          // This allows trailing TP to work even if orders can't be placed
           logger.error(`[Place TP/SL] ❌ Failed to create TP order for position ${position.id}:`, e?.message || e);
+          logger.warn(`[Place TP/SL] Updating TP price in DB to ${tpPrice} for position ${position.id} (order not placed, trailing TP will still work)`);
+          try {
+            await Position.update(position.id, { take_profit_price: tpPrice });
+          } catch (updateError) {
+            logger.error(`[Place TP/SL] Failed to update TP price in DB:`, updateError?.message || updateError);
+          }
         }
       }
 
