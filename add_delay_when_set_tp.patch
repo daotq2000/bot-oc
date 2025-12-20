@@ -1,0 +1,77 @@
+Subject: [PATCH] add delay when set tp
+---
+Index: src/app.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/app.js b/src/app.js
+--- a/src/app.js	(revision 8a108b4f0a5c1899d7365c5bb8b333ba23d0b702)
++++ b/src/app.js	(revision b70662cf3f5698cb6128663b27d7bf36d66fe4a5)
+@@ -113,6 +113,7 @@
+       // Position service and SL/TP update configs
+       await AppConfig.set('SL_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger SL update');
+       await AppConfig.set('TP_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger TP update');
++      await AppConfig.set('TP_SL_PLACEMENT_DELAY_MS', '10000', 'Delay (ms) between TP and SL order placements to avoid rate limits');
+ 
+       // WebSocket and connection configs
+       await AppConfig.set('BINANCE_TESTNET_WS_BASE', 'wss://stream.binancefuture.com/ws', 'Binance testnet WebSocket base URL');
+Index: src/jobs/PositionMonitor.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/jobs/PositionMonitor.js b/src/jobs/PositionMonitor.js
+--- a/src/jobs/PositionMonitor.js	(revision 8a108b4f0a5c1899d7365c5bb8b333ba23d0b702)
++++ b/src/jobs/PositionMonitor.js	(revision b70662cf3f5698cb6128663b27d7bf36d66fe4a5)
+@@ -157,6 +157,13 @@
+         }
+       }
+ 
++      // Delay before placing SL order to avoid rate limits
++      const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
++      if (delayMs > 0) {
++        logger.info(`[Place TP/SL] Waiting ${delayMs}ms before placing SL order for position ${position.id}...`);
++        await new Promise(resolve => setTimeout(resolve, delayMs));
++      }
++
+       // Place SL order (only if slPrice is valid, i.e., stoploss > 0)
+       if (!position.sl_order_id && slPrice !== null && Number.isFinite(slPrice) && slPrice > 0) {
+         // Safety check: If SL is invalid (SL <= entry for SHORT or SL >= entry for LONG), force close position immediately
+Index: src/services/PositionService.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/services/PositionService.js b/src/services/PositionService.js
+--- a/src/services/PositionService.js	(revision 8a108b4f0a5c1899d7365c5bb8b333ba23d0b702)
++++ b/src/services/PositionService.js	(revision b70662cf3f5698cb6128663b27d7bf36d66fe4a5)
+@@ -295,6 +295,14 @@
+                   logger.warn(`[TP Replace] Failed to cancel old TP order ${position.tp_order_id}: ${e?.message || e}`);
+                 }
+               }
++              
++              // Delay before creating new TP order to avoid rate limits
++              const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
++              if (delayMs > 0) {
++                logger.info(`[TP Replace] Waiting ${delayMs}ms before placing new TP order for position ${position.id}...`);
++                await new Promise(resolve => setTimeout(resolve, delayMs));
++              }
++              
+               const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+               if (qty > 0) {
+                 // Only create TP order if TP is on the correct side of Entry
+@@ -519,6 +527,13 @@
+         }
+       }
+       
++      // Delay before creating STOP_LIMIT order to avoid rate limits
++      const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
++      if (delayMs > 0) {
++        logger.info(`[TP->SL Convert] Waiting ${delayMs}ms before placing STOP_LIMIT order for position ${position.id}...`);
++        await new Promise(resolve => setTimeout(resolve, delayMs));
++      }
++      
+       // Create STOP_LIMIT order at the new TP price
+       const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+       if (qty > 0) {

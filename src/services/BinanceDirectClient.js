@@ -112,11 +112,13 @@ export class BinanceDirectClient {
    * This ensures all analysis uses real market data regardless of trading mode
    */
   async makeMarketDataRequest(endpoint, method = 'GET', params = {}) {
-    // Rate limiting: ensure minimum interval between requests
+    // Rate limiting: ensure minimum interval between requests (increased for market data)
+    const marketDataMinInterval = Number(configService.getNumber('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', 200)); // 200ms default for market data
     const now = Date.now();
     const timeSinceLastRequest = now - this.lastRequestTime;
-    if (timeSinceLastRequest < this.minRequestInterval) {
-      await new Promise(resolve => setTimeout(resolve, this.minRequestInterval - timeSinceLastRequest));
+    const requiredInterval = marketDataMinInterval; // Use longer interval for market data
+    if (timeSinceLastRequest < requiredInterval) {
+      await new Promise(resolve => setTimeout(resolve, requiredInterval - timeSinceLastRequest));
     }
     this.lastRequestTime = Date.now();
 
@@ -156,7 +158,10 @@ export class BinanceDirectClient {
         clearTimeout(timeoutId);
         if (!response.ok) {
           const text = await response.text();
-          throw new Error(`HTTP ${response.status}: ${text}`);
+          const error = new Error(`HTTP ${response.status}: ${text}`);
+          error.status = response.status;
+          error.responseText = text;
+          throw error;
         }
         // Some proxies may return text/plain JSON
         const ctype = response.headers.get('content-type') || '';
@@ -170,17 +175,30 @@ export class BinanceDirectClient {
       }
     };
 
-    // Retry on 403/5xx/timeout a few times with backoff
+    // Retry on 403/429/5xx/timeout with exponential backoff
     const maxAttempts = isMarketDataEndpoint ? 3 : 2;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         return await doFetch();
       } catch (error) {
         const msg = error?.message || '';
-        const isRetryable = /HTTP 403|HTTP 5\d{2}|network|fetch|aborted|timeout/i.test(msg);
+        const status = error?.status || 0;
+        const is429 = status === 429 || /429|Too Many Requests|rate limit/i.test(msg);
+        const isRetryable = is429 || /HTTP 403|HTTP 5\d{2}|network|fetch|aborted|timeout/i.test(msg);
+        
         if (attempt < maxAttempts && isRetryable) {
-          const backoff = 500 * attempt; // 500ms, 1s, 1.5s
-          logger.warn(`[Binance-MarketData] ${endpoint} attempt ${attempt}/${maxAttempts} failed: ${msg}. Retrying in ${backoff}ms...`);
+          // Exponential backoff: longer delay for 429, shorter for other errors
+          let backoff;
+          if (is429) {
+            // For 429: exponential backoff with jitter (1s, 2s, 4s)
+            backoff = Math.min(1000 * Math.pow(2, attempt - 1), 10000) + Math.random() * 1000;
+            logger.warn(`[Binance-MarketData] ⚠️ Rate limit (429) on ${endpoint}. Waiting ${Math.round(backoff)}ms before retry ${attempt}/${maxAttempts}...`);
+            // Update lastRequestTime to prevent immediate next request
+            this.lastRequestTime = Date.now() + backoff;
+          } else {
+            backoff = 500 * attempt; // 500ms, 1s, 1.5s for other errors
+            logger.warn(`[Binance-MarketData] ${endpoint} attempt ${attempt}/${maxAttempts} failed: ${msg}. Retrying in ${backoff}ms...`);
+          }
           await new Promise(r => setTimeout(r, backoff));
           continue;
         }
@@ -228,6 +246,11 @@ export class BinanceDirectClient {
    * Make request for TRADING operations (uses testnet or production based on config)
    */
   async makeRequest(endpoint, method = 'GET', params = {}, requiresAuth = false, retries = 3) {
+    // Disable retry for order operations to avoid duplicate orders
+    const isOrderEndpoint = endpoint.includes('/fapi/v1/order') || endpoint.includes('/fapi/v1/allOpenOrders');
+    if (isOrderEndpoint) {
+      retries = 1; // Single attempt only for order operations
+    }
     // Rate limiting
     const now = Date.now();
     const timeSinceLastRequest = now - this.lastRequestTime;
@@ -436,10 +459,11 @@ export class BinanceDirectClient {
       return null;
     }
 
-    // Respect cooldown when reusing REST fallback price
+    // Respect cooldown when reusing REST fallback price (increased to avoid rate limits)
     const fallbackEntry = this.restPriceFallbackCache.get(normalizedSymbol);
     const now = Date.now();
-    if (fallbackEntry && now - fallbackEntry.timestamp < this.restPriceFallbackCooldownMs) {
+    const cooldownMs = Number(configService.getNumber('BINANCE_REST_PRICE_COOLDOWN_MS', 10000)); // Increased from 5s to 10s
+    if (fallbackEntry && now - fallbackEntry.timestamp < cooldownMs) {
       return fallbackEntry.price;
     }
 
@@ -933,7 +957,9 @@ export class BinanceDirectClient {
       quantity: formattedQuantity
     };
 
-    if (reduceOnly) {
+    // Only add reduceOnly if in hedge mode (dual-side)
+    // In one-way mode, closing is done by placing opposite order, reduceOnly not needed/not allowed
+    if (reduceOnly && dualSide) {
       params.reduceOnly = 'true';
     }
 
@@ -1310,6 +1336,12 @@ export class BinanceDirectClient {
    * @returns {Promise<Object>} Response data
    */
   async makeRequestWithRetry(endpoint, method = 'GET', params = {}, requiresAuth = false, retries = 3) {
+    // Disable retry for order operations to avoid duplicate orders
+    const isOrderEndpoint = endpoint.includes('/fapi/v1/order') || endpoint.includes('/fapi/v1/allOpenOrders');
+    if (isOrderEndpoint) {
+      retries = 0; // No retry for order operations
+    }
+    
     try {
       return await this.makeRequest(endpoint, method, params, requiresAuth);
     } catch (error) {

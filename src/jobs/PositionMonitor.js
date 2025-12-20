@@ -302,9 +302,29 @@ export class PositionMonitor {
 
     try {
       const openPositions = await Position.findOpen();
+      
+      // Ensure WebSocket subscriptions for all position symbols (Binance)
+      try {
+        const { webSocketManager } = await import('../services/WebSocketManager.js');
+        const binanceSymbols = new Set();
+        for (const pos of openPositions) {
+          if (pos.bot_id) {
+            const exchangeService = this.exchangeServices.get(pos.bot_id);
+            if (exchangeService && exchangeService.bot?.exchange === 'binance') {
+              binanceSymbols.add(pos.symbol.toUpperCase());
+            }
+          }
+        }
+        if (binanceSymbols.size > 0) {
+          webSocketManager.subscribe(Array.from(binanceSymbols));
+          logger.debug(`[PositionMonitor] Ensured WebSocket subscriptions for ${binanceSymbols.size} Binance symbols`);
+        }
+      } catch (e) {
+        logger.debug(`[PositionMonitor] Failed to ensure WebSocket subscriptions: ${e?.message || e}`);
+      }
 
-      // Process positions in batches (configurable)
-      const batchSize = Number(configService.getNumber('POSITION_MONITOR_BATCH_SIZE', 5));
+      // Process positions in batches (reduced to avoid rate limits)
+      const batchSize = Number(configService.getNumber('POSITION_MONITOR_BATCH_SIZE', 3)); // Reduced from 5 to 3
       for (let i = 0; i < openPositions.length; i += batchSize) {
         const batch = openPositions.slice(i, i + batchSize);
         
@@ -314,18 +334,24 @@ export class PositionMonitor {
         );
 
         // Then, monitor positions (update dynamic SL, check for TP/SL hit)
-        await Promise.allSettled(
-          batch.map(p => this.monitorPosition(p))
-        );
+        // Process sequentially with delay to avoid rate limits
+        for (const position of batch) {
+          await this.monitorPosition(position);
+          // Small delay between each position to avoid rate limits
+          const positionDelayMs = Number(configService.getNumber('POSITION_MONITOR_POSITION_DELAY_MS', 500));
+          if (positionDelayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, positionDelayMs));
+          }
+        }
 
         // Check for other order management tasks
         await Promise.allSettled(
           batch.map(p => this.checkUnfilledOrders(p))
         );
 
-        // Small delay between batches
+        // Increased delay between batches to avoid rate limits
         if (i + batchSize < openPositions.length) {
-          const delayMs = Number(configService.getNumber('POSITION_MONITOR_BATCH_DELAY_MS', 500));
+          const delayMs = Number(configService.getNumber('POSITION_MONITOR_BATCH_DELAY_MS', 2000)); // Increased from 500ms to 2s
           await new Promise(resolve => setTimeout(resolve, delayMs));
         }
       }

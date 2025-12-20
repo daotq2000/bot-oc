@@ -72,9 +72,11 @@ async function start() {
     // Seed required configs into DB (idempotent)
     try {
       logger.info('Seeding default application configs...');
+      // Master alert toggle
+      await AppConfig.set('ENABLE_ALERTS', 'false', 'Master switch to enable/disable all Telegram alerts from DB');
       // Strategy and scanning configs
       await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
-      await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '10', 'Minutes before auto-cancel unfilled entry LIMIT orders');
+      await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '30', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
       await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '500', 'Price alert scanner job interval in milliseconds');
@@ -123,7 +125,6 @@ async function start() {
       await AppConfig.set('MEXC_WS_COM_FAILOVER_THRESHOLD', '2', 'After N consecutive .com connection failures, prefer .co endpoints until a .com connects successfully');
       await AppConfig.set('MEXC_FUTURES_DIRECT', 'false', 'Use direct REST client for MEXC Futures (bypass CCXT)');
       await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.com', 'MEXC Futures REST base URL (use .co if region block)');
-      await AppConfig.set('ORDER_FAILURE_COOLDOWN_MS', '60000', 'Cooldown (ms) to suppress re-attempts after a failed order placement per strategy');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
 
@@ -149,9 +150,11 @@ async function start() {
       // Batch processing configs
       await AppConfig.set('SIGNAL_SCAN_BATCH_SIZE', '200', 'Number of strategies to scan in parallel per batch');
       await AppConfig.set('SIGNAL_SCAN_BATCH_DELAY_MS', '300', 'Delay (ms) between signal scan batches');
-      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '200', 'Number of positions to monitor in parallel per batch');
+      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '3', 'Number of positions to monitor in parallel per batch');
       await AppConfig.set('POSITION_MONITOR_BATCH_DELAY_MS', '300', 'Delay (ms) between position monitor batches');
-      await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '5', 'Minutes before auto-cancel unfilled entry LIMIT orders');
+      await AppConfig.set('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', '200', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
+      await AppConfig.set('BINANCE_REST_PRICE_COOLDOWN_MS', '10000', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
+      await AppConfig.set('POSITION_MONITOR_POSITION_DELAY_MS', '500', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
 
       // Symbols refresh configs
       await AppConfig.set('ENABLE_SYMBOLS_REFRESH', 'true', 'Enable periodic symbols/filters refresh for exchanges');
