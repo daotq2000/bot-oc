@@ -26,8 +26,6 @@ export class WebSocketOCConsumer {
     this.cleanupInterval = null;
     this.processedCount = 0;
     this.matchCount = 0;
-    // Track failure cooldown per strategy to avoid retrying failed orders too soon
-    this.failureCooldown = new Map(); // strategyId -> until timestamp (ms)
   }
 
   /**
@@ -128,20 +126,20 @@ export class WebSocketOCConsumer {
 
       this.processedCount++;
 
-      // Log PIPPIN and first few price ticks
+      // Log PIPPIN and first few price ticks (debug only)
       const isPippin = symbol?.toUpperCase().includes('PIPPIN');
       if (isPippin || this.processedCount <= 10) {
-        logger.info(`[WebSocketOCConsumer] 📥 Received price tick: ${exchange} ${symbol} = ${price} (count: ${this.processedCount}, isRunning: ${this.isRunning})`);
+        logger.debug(`[WebSocketOCConsumer] 📥 Received price tick: ${exchange} ${symbol} = ${price} (count: ${this.processedCount}, isRunning: ${this.isRunning})`);
       }
 
-      // Log every 1000th price tick for debugging
-      if (this.processedCount % 1000 === 0) {
-        logger.info(`[WebSocketOCConsumer] Processed ${this.processedCount} price ticks, ${this.matchCount} matches`);
+      // Log every 10000th price tick for debugging (reduced frequency)
+      if (this.processedCount % 10000 === 0) {
+        logger.debug(`[WebSocketOCConsumer] Processed ${this.processedCount} price ticks, ${this.matchCount} matches`);
       }
 
       // Detect OC and match with strategies
       if (isPippin) {
-        logger.info(`[WebSocketOCConsumer] 🔍 Calling detectOC for ${exchange} ${symbol} @ ${price}`);
+        logger.debug(`[WebSocketOCConsumer] 🔍 Calling detectOC for ${exchange} ${symbol} @ ${price}`);
       }
       const matches = await realtimeOCDetector.detectOC(exchange, symbol, price, timestamp, 'WebSocketOCConsumer');
 
@@ -177,15 +175,6 @@ export class WebSocketOCConsumer {
       const { strategy, oc, direction, currentPrice, interval } = match;
       const botId = strategy.bot_id;
 
-      // Failure cool-down: avoid retrying failed orders too soon per strategy
-      try {
-        const until = this.failureCooldown.get(strategy.id);
-        if (until && until > Date.now()) {
-          logger.info(`[WebSocketOCConsumer] ⏳ Skip strategy ${strategy.id} due to failure cooldown until ${new Date(until).toISOString()}`);
-          return;
-        }
-      } catch (_) {}
-
       logger.info(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
       logger.info(`[WebSocketOCConsumer] Available OrderServices: ${Array.from(this.orderServices.keys()).join(', ')} (total: ${this.orderServices.size})`);
 
@@ -211,15 +200,15 @@ export class WebSocketOCConsumer {
       // Import calculator functions for TP/SL calculation
       const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
 
-      // Counter-trend side mapping: bullish → short, bearish → long
-      const side = direction === 'bullish' ? 'short' : 'long';
+      // Trend-following side mapping: bullish → long, bearish → short
+      const side = direction === 'bullish' ? 'long' : 'short';
 
       // Use interval open price for entry calculation (per-bucket open)
       const baseOpen = Number.isFinite(Number(match.openPrice)) && Number(match.openPrice) > 0
         ? Number(match.openPrice)
         : currentPrice;
 
-      // Calculate entry price based on counter-trend side and OPEN price
+      // Calculate entry price based on trend-following side and OPEN price
       const entryPrice = side === 'long'
         ? calculateLongEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0)
         : calculateShortEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0);
@@ -271,23 +260,10 @@ export class WebSocketOCConsumer {
       logger.info(`[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ${signal.side} @ ${currentPrice}, OC=${oc.toFixed(2)}%`);
 
       // Trigger order immediately
-      const cooldownMs = Number(configService.getNumber('ORDER_FAILURE_COOLDOWN_MS', 60000));
-      try {
-        const result = await orderService.executeSignal(signal);
-        if (!result) {
-          // Soft failure (e.g., validation/min notional) -> set cooldown
-          const until = Date.now() + cooldownMs;
-          this.failureCooldown.set(strategy.id, until);
-          logger.warn(`[WebSocketOCConsumer] ⏳ Soft failure/no order for strategy ${strategy.id}, cooldown until ${new Date(until).toISOString()}`);
-          return;
-        }
-      } catch (error) {
-        // Hard failure -> set cooldown
-        const until = Date.now() + cooldownMs;
-        this.failureCooldown.set(strategy.id, until);
-        logger.error(`[WebSocketOCConsumer] ❌ Error executing signal for strategy ${strategy.id}, cooldown until ${new Date(until).toISOString()}:`, error?.message || error);
-        return;
-      }
+      await orderService.executeSignal(signal).catch(error => {
+        logger.error(`[WebSocketOCConsumer] ❌ Error executing signal for strategy ${strategy.id}:`, error?.message || error);
+        throw error; // Re-throw to be caught by outer try-catch
+      });
 
       logger.info(`[WebSocketOCConsumer] ✅ Order triggered successfully for strategy ${strategy.id}`);
     } catch (error) {

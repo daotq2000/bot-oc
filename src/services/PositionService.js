@@ -92,11 +92,11 @@ export class PositionService {
       if (useTimeBasedCalculation) {
         const now = Date.now();
         actualMinutesElapsed = Math.floor((now - openedAt) / (60 * 1000)); // Minutes since position opened
-        logger.info(`[TP Trail] pos=${position.id} Timing check: opened_at=${position.opened_at} openedAt=${openedAt} now=${now} actualMinutesElapsed=${actualMinutesElapsed} prevMinutes=${prevMinutes} timeDiff=${now - openedAt}ms (${Math.floor((now - openedAt) / 1000)}s)`);
+        logger.debug(`[TP Trail] pos=${position.id} Timing check: opened_at=${position.opened_at} openedAt=${openedAt} now=${now} actualMinutesElapsed=${actualMinutesElapsed} prevMinutes=${prevMinutes} timeDiff=${now - openedAt}ms (${Math.floor((now - openedAt) / 1000)}s)`);
         
         // Only update TP if actual minutes have increased (ensures exactly once per minute)
         if (actualMinutesElapsed <= prevMinutes) {
-          logger.info(`[TP Trail] pos=${position.id} actualMinutes=${actualMinutesElapsed} <= prevMinutes=${prevMinutes}, skipping TP trail (not yet time for next step)`);
+          logger.debug(`[TP Trail] pos=${position.id} actualMinutes=${actualMinutesElapsed} <= prevMinutes=${prevMinutes}, skipping TP trail (not yet time for next step)`);
           // Still update PnL and return without changing TP
           const updatePayload = {
             pnl: pnl
@@ -109,20 +109,21 @@ export class PositionService {
         const minutesToProcess = Math.min(actualMinutesElapsed - prevMinutes, 1); // Only process 1 minute at a time
         actualMinutesElapsed = prevMinutes + minutesToProcess; // Use incremental value
         
-        logger.info(`[TP Trail] pos=${position.id} Proceeding with TP trail: actualMinutes=${Math.floor((now - openedAt) / (60 * 1000))} > prevMinutes=${prevMinutes}, processing ${minutesToProcess} minute(s), targetMinutes=${actualMinutesElapsed}`);
+        logger.debug(`[TP Trail] pos=${position.id} Proceeding with TP trail: actualMinutes=${Math.floor((now - openedAt) / (60 * 1000))} > prevMinutes=${prevMinutes}, processing ${minutesToProcess} minute(s), targetMinutes=${actualMinutesElapsed}`);
       } else {
         // Fallback: increment-based calculation
         actualMinutesElapsed = prevMinutes + 1;
-        logger.info(`[TP Trail] pos=${position.id} Using increment-based calculation: prevMinutes=${prevMinutes} -> actualMinutesElapsed=${actualMinutesElapsed}`);
+        logger.debug(`[TP Trail] pos=${position.id} Using increment-based calculation: prevMinutes=${prevMinutes} -> actualMinutesElapsed=${actualMinutesElapsed}`);
       }
       
       // Only set initial SL if it doesn't exist (SL should NOT be moved after initial setup)
       const prevSL = Number(position.stop_loss_price || 0);
+      let updatedSL = null;
       if (prevSL <= 0) {
-        const updatedSL = this.calculateUpdatedStopLoss(position);
+        updatedSL = this.calculateUpdatedStopLoss(position);
         if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0) {
           await Position.update(position.id, { stop_loss_price: updatedSL });
-          logger.info(`[TP Trail] Set initial SL for position ${position.id}: ${updatedSL}`);
+          logger.debug(`[TP Trail] Set initial SL for position ${position.id}: ${updatedSL}`);
         }
       }
 
@@ -168,7 +169,7 @@ export class PositionService {
             // Calculate next TP: trails from initial TP towards entry
             const newTP = calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, trailingPercent, position.side);
             
-            logger.info(
+            logger.debug(
               `[TP Trail] pos=${position.id} ${position.symbol} side=${position.side} ` +
               `prevTP=${prevTP.toFixed(2)} newTP=${newTP.toFixed(2)} entry=${entryPrice.toFixed(2)} ` +
               `initialTP=${initialTP.toFixed(2)} trailing=${trailingPercent} minutesElapsed=${minutesElapsed}`
@@ -299,7 +300,7 @@ export class PositionService {
               // Delay before creating new TP order to avoid rate limits
               const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
               if (delayMs > 0) {
-                logger.info(`[TP Replace] Waiting ${delayMs}ms before placing new TP order for position ${position.id}...`);
+                logger.debug(`[TP Replace] Waiting ${delayMs}ms before placing new TP order for position ${position.id}...`);
                 await new Promise(resolve => setTimeout(resolve, delayMs));
               }
               
@@ -406,7 +407,7 @@ export class PositionService {
         return null;
       }
       
-      logger.info(`[calculateUpdatedStopLoss] Calculated initial SL: ${initialSL} for position ${position.id} (entry=${entry}, stoploss=${stoploss})`);
+      logger.debug(`[calculateUpdatedStopLoss] Calculated initial SL: ${initialSL} for position ${position.id} (entry=${entry}, stoploss=${stoploss})`);
       return initialSL;
     }
     
@@ -515,7 +516,7 @@ export class PositionService {
    */
   async _convertTpToStopLimit(position, newTP) {
     try {
-      logger.info(`[TP->SL Convert] Converting TP to STOP_LIMIT for position ${position.id} at price ${newTP.toFixed(2)}`);
+      logger.debug(`[TP->SL Convert] Converting TP to STOP_LIMIT for position ${position.id} at price ${newTP.toFixed(2)}`);
       
       // Cancel existing TP order
       if (position.tp_order_id) {
@@ -530,7 +531,7 @@ export class PositionService {
       // Delay before creating STOP_LIMIT order to avoid rate limits
       const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
       if (delayMs > 0) {
-        logger.info(`[TP->SL Convert] Waiting ${delayMs}ms before placing STOP_LIMIT order for position ${position.id}...`);
+        logger.debug(`[TP->SL Convert] Waiting ${delayMs}ms before placing STOP_LIMIT order for position ${position.id}...`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
       }
       

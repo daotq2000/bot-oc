@@ -72,7 +72,7 @@ class ExchangeInfoService {
       const exchangeInfo = await binanceClient.getExchangeInfo();
 
       if (!exchangeInfo || !exchangeInfo.symbols) {
-        this.this.logger.error('Failed to fetch exchange info from Binance.');
+        this.logger.error('Failed to fetch exchange info from Binance.');
         return;
       }
 
@@ -130,7 +130,7 @@ class ExchangeInfoService {
       await this.loadFiltersFromDB();
 
     } catch (error) {
-      this.this.logger.error('Error updating symbol filters (Binance):', error);
+      this.logger.error('Error updating symbol filters (Binance):', error);
     }
   }
 
@@ -261,7 +261,7 @@ class ExchangeInfoService {
       this.filtersCache.clear();
       await this.loadFiltersFromDB();
     } catch (e) {
-      this.this.logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
+      this.logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
       const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
       if (futuresOnly) {
         this.logger.warn('Futures-only mode enabled: skipping MEXC spot exchangeInfo fallback.');
@@ -332,7 +332,7 @@ class ExchangeInfoService {
       this.filtersCache.clear();
       await this.loadFiltersFromDB();
     } catch (err) {
-      this.this.logger.error('MEXC REST fallback failed:', err?.message || err);
+      this.logger.error('MEXC REST fallback failed:', err?.message || err);
     }
   }
 
@@ -358,7 +358,7 @@ class ExchangeInfoService {
       }
       return set;
     } catch (e) {
-      this.this.logger.error('getTradableSymbolsFromBinance failed:', e?.message || e);
+      this.logger.error('getTradableSymbolsFromBinance failed:', e?.message || e);
       return new Set();
     }
   }
@@ -384,7 +384,7 @@ class ExchangeInfoService {
       }
       return set;
     } catch (e) {
-      this.this.logger.error('getTradableSymbolsFromMexc failed:', e?.message || e);
+      this.logger.error('getTradableSymbolsFromMexc failed:', e?.message || e);
       return new Set();
     }
   }
@@ -433,7 +433,7 @@ class ExchangeInfoService {
       this.isInitialized = true;
       this.logger.info(`Loaded ${this.filtersCache.size} symbol filters into cache.`);
     } catch (error) {
-      this.this.logger.error('Error loading symbol filters from DB:', error);
+      this.logger.error('Error loading symbol filters from DB:', error);
     }
   }
 

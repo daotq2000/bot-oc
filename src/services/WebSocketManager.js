@@ -42,7 +42,7 @@ class WebSocketManager {
       return;
     }
     const normalized = symbols.map(s => String(s).toUpperCase());
-    logger.info(`[Binance-WS] subscribe() called with ${normalized.length} symbols (${normalized.slice(0, 5).join(', ')}${normalized.length > 5 ? '...' : ''})`);
+    logger.debug(`[Binance-WS] subscribe() called with ${normalized.length} symbols (${normalized.slice(0, 5).join(', ')}${normalized.length > 5 ? '...' : ''})`);
 
     let hasNewStreams = false;
     let newStreamsCount = 0;
@@ -69,10 +69,12 @@ class WebSocketManager {
       if (!placed) {
         const conn = this._createConnection();
         conn.streams.add(stream);
-        logger.info(`[Binance-WS] Created new connection for stream ${stream} (total connections: ${this.connections.length})`);
+        logger.debug(`[Binance-WS] Created new connection for stream ${stream} (total connections: ${this.connections.length})`);
       }
     }
-    logger.info(`[Binance-WS] Added ${newStreamsCount} new streams, skipped ${skippedCount} existing streams. Total connections: ${this.connections.length}`);
+    if (newStreamsCount > 0) {
+      logger.debug(`[Binance-WS] Added ${newStreamsCount} new streams, skipped ${skippedCount} existing streams. Total connections: ${this.connections.length}`);
+    }
 
     // Reconnect connections that had stream changes
     for (const conn of this.connections) {
@@ -83,15 +85,13 @@ class WebSocketManager {
 
     // If new streams were added, ensure connections are established
     if (hasNewStreams) {
-      logger.info(`[Binance-WS] New streams added, ensuring ${this.connections.length} connections are open...`);
+      logger.debug(`[Binance-WS] New streams added, ensuring ${this.connections.length} connections are open...`);
       for (const conn of this.connections) {
         if (conn.streams.size > 0) {
           const isOpen = conn.ws && conn.ws.readyState === WebSocket.OPEN;
           if (!isOpen) {
-            logger.info(`[Binance-WS] Connecting connection with ${conn.streams.size} streams...`);
+            logger.debug(`[Binance-WS] Connecting connection with ${conn.streams.size} streams...`);
             this._connect(conn);
-          } else {
-            logger.debug(`[Binance-WS] Connection already open (${conn.streams.size} streams)`);
           }
         }
       }
@@ -135,7 +135,7 @@ class WebSocketManager {
     }
 
     conn.url = this._buildUrl(conn);
-    logger.info(`[Binance-WS] Connecting to ${conn.url.substring(0, 80)}... (${conn.streams.size} streams)`);
+    logger.debug(`[Binance-WS] Connecting to ${conn.url.substring(0, 80)}... (${conn.streams.size} streams)`);
     try {
       conn.ws = new WebSocket(conn.url);
     } catch (e) {
@@ -243,3 +243,4 @@ class WebSocketManager {
 }
 
 export const webSocketManager = new WebSocketManager();
+

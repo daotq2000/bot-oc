@@ -19,6 +19,7 @@ export class PositionMonitor {
     this.orderServices = new Map(); // botId -> OrderService
     this.telegramService = null;
     this.isRunning = false;
+    this._lastLogTime = null; // For throttling debug logs
   }
 
   /**
@@ -329,7 +330,11 @@ export class PositionMonitor {
         }
       }
 
-      logger.debug(`Monitored ${openPositions.length} open positions`);
+      // Only log if there are positions or if it's been a while since last log
+      if (openPositions.length > 0 || !this._lastLogTime || (Date.now() - this._lastLogTime) > 60000) {
+        logger.debug(`Monitored ${openPositions.length} open positions`);
+        this._lastLogTime = Date.now();
+      }
     } catch (error) {
       logger.error('Error in monitorAllPositions:', error);
     } finally {

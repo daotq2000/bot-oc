@@ -75,7 +75,7 @@ export class OcAlertScanner {
   }
 
   start() {
-    const iv = Number(configService.getNumber('OC_ALERT_SCAN_INTERVAL_MS', 10000));
+    const iv = Number(configService.getNumber('OC_ALERT_SCAN_INTERVAL_MS', 30000)); // Increased from 10s to 30s
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(() => {
       // Skip if a scan is already running
