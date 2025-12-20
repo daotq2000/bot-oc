@@ -3,6 +3,7 @@ import { EntryOrder } from '../models/EntryOrder.js';
 import { Position } from '../models/Position.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { PositionWebSocketClient } from '../services/PositionWebSocketClient.js';
+import { orderStatusCache } from '../services/OrderStatusCache.js';
 import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
@@ -102,22 +103,45 @@ export class EntryOrderMonitor {
 
       if (!orderId || !symbol) return;
 
+      // Update order status cache for ALL orders (entry, TP, SL)
+      orderStatusCache.updateOrderStatus(orderId, {
+        status: status,
+        filled: filledQty,
+        avgPrice: isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice,
+        symbol: symbol
+      });
+
       const normalizedStatus = String(status || '').toUpperCase();
       const isFilled = normalizedStatus === 'FILLED';
       const isCanceled = normalizedStatus === 'CANCELED' || normalizedStatus === 'CANCELLED' || normalizedStatus === 'EXPIRED';
 
+      // Handle entry orders
       const entry = await EntryOrder.findOpenByBotAndOrder(botId, orderId);
-      if (!entry) {
-        return; // Not an entry order we track
+      if (entry) {
+        if (isFilled) {
+          // Confirmed filled → create Position and mark entry_orders as filled
+          await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
+        } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
+          // Cancelled/expired without fill → mark as canceled
+          await EntryOrder.markCanceled(entry.id, normalizedStatus === 'EXPIRED' ? 'expired' : 'canceled');
+          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
+        }
+        return; // Entry order handled
       }
 
+      // Handle TP/SL orders - check if any position has this order
       if (isFilled) {
-        // Confirmed filled → create Position and mark entry_orders as filled
-        await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
-      } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
-        // Cancelled/expired without fill → mark as canceled
-        await EntryOrder.markCanceled(entry.id, normalizedStatus === 'EXPIRED' ? 'expired' : 'canceled');
-        logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
+        try {
+          const positions = await Position.findOpen();
+          for (const pos of positions) {
+            if (pos.bot_id === botId && (pos.tp_order_id === String(orderId) || pos.sl_order_id === String(orderId))) {
+              logger.info(`[EntryOrderMonitor] TP/SL order ${orderId} for position ${pos.id} filled via WebSocket. Position will be closed on next update.`);
+              // PositionService.updatePosition will detect this via cache
+            }
+          }
+        } catch (err) {
+          logger.debug(`[EntryOrderMonitor] Error checking positions for TP/SL order ${orderId}: ${err?.message || err}`);
+        }
       }
     } catch (error) {
       logger.error('[EntryOrderMonitor] Error in _handleBinanceOrderTradeUpdate:', error?.message || error);

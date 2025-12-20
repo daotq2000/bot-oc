@@ -353,19 +353,33 @@ export class ExchangeService {
         }
         const notional = Number(amount); // USDT-margined futures: price * qty = amount
 
-        // Configure margin type and optimal leverage per symbol per notional
+        // Configure margin type and leverage per symbol (cached to avoid redundant API calls)
         try {
           const { configService } = await import('./ConfigService.js');
-          const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
-          await this.binanceDirectClient.setMarginType(normalizedSymbol, marginType);
-          const optimalLev = await this.binanceDirectClient.getOptimalLeverage(normalizedSymbol, notional);
-          const desiredLev = optimalLev || parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
+          const { exchangeInfoService } = await import('./ExchangeInfoService.js');
+          
+          // Only set margin type once per symbol (cache in _binanceConfiguredSymbols)
+          if (!this._binanceConfiguredSymbols.has(normalizedSymbol)) {
+            const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
+            await this.binanceDirectClient.setMarginType(normalizedSymbol, marginType);
+            this._binanceConfiguredSymbols.add(normalizedSymbol);
+            logger.debug(`[Cache] Set margin type for ${normalizedSymbol} to ${marginType} (cached)`);
+          }
+          
+          // Use max leverage from symbol_filters cache instead of API call
+          // This avoids getLeverageBrackets API call which causes rate limits
+          const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
+          const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
+          const desiredLev = maxLeverageFromCache || defaultLeverage;
+          
           // Cache last applied leverage to avoid redundant calls
           this._binanceLeverageMap = this._binanceLeverageMap || new Map();
           if (this._binanceLeverageMap.get(normalizedSymbol) !== desiredLev) {
             await this.binanceDirectClient.setLeverage(normalizedSymbol, desiredLev);
             this._binanceLeverageMap.set(normalizedSymbol, desiredLev);
-            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (optimal) for bot ${this.bot.id}`);
+            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (from cache: ${maxLeverageFromCache || 'default'}) for bot ${this.bot.id}`);
+          } else {
+            logger.debug(`[Cache] Leverage for ${normalizedSymbol} already set to ${desiredLev}, skipping`);
           }
         } catch (cfgErr) {
           logger.warn(`Binance leverage/margin setup warning for ${normalizedSymbol}: ${cfgErr?.message || cfgErr}`);
