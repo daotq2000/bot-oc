@@ -55,6 +55,7 @@ app.use((req, res) => {
 let priceAlertWorker = null;
 let strategiesWorker = null;
 let symbolsUpdaterJob = null;
+let positionSyncJob = null;
 
 
 // Initialize services and start server
@@ -146,6 +147,9 @@ async function start() {
       // Concurrency and locking configs
       await AppConfig.set('CONCURRENCY_RESERVATION_TTL_SEC', '120', 'TTL (seconds) for concurrency reservation locks');
       await AppConfig.set('CONCURRENCY_LOCK_TIMEOUT', '5', 'Timeout (seconds) for acquiring concurrency locks');
+      
+      // Position sync configs
+      await AppConfig.set('POSITION_SYNC_INTERVAL_MINUTES', '5', 'Interval (minutes) to sync positions from exchange to database');
 
       // Batch processing configs
       await AppConfig.set('SIGNAL_SCAN_BATCH_SIZE', '200', 'Number of strategies to scan in parallel per batch');
@@ -272,6 +276,22 @@ async function start() {
     await symbolsUpdaterJob.initialize();
     symbolsUpdaterJob.start();
 
+    // Position Sync Job - Sync positions from exchange to database
+    logger.info('='.repeat(60));
+    logger.info('Initializing Position Sync Job...');
+    logger.info('='.repeat(60));
+    try {
+      const { PositionSync } = await import('./jobs/PositionSync.js');
+      positionSyncJob = new PositionSync();
+      await positionSyncJob.initialize();
+      positionSyncJob.start();
+      logger.info('✅ Position Sync Job started successfully');
+    } catch (error) {
+      logger.error('❌ Failed to start Position Sync Job:', error?.message || error);
+      logger.error('Position sync will not run - positions may become inconsistent');
+      // Don't exit - other systems should continue
+    }
+
     // Start HTTP server
     app.listen(PORT, () => {
       logger.info(`Server started on port ${PORT}`);
@@ -301,6 +321,15 @@ async function start() {
         }
       }
       
+      // Stop Position Sync Job
+      if (positionSyncJob) {
+        try {
+          positionSyncJob.stop();
+        } catch (error) {
+          logger.error('Error stopping Position Sync Job:', error?.message || error);
+        }
+      }
+      
       webSocketManager.disconnect();
       await telegramBot.stop();
       process.exit(0);
@@ -324,6 +353,15 @@ async function start() {
           strategiesWorker.stop();
         } catch (error) {
           logger.error('Error stopping Strategies Worker:', error?.message || error);
+        }
+      }
+      
+      // Stop Position Sync Job
+      if (positionSyncJob) {
+        try {
+          positionSyncJob.stop();
+        } catch (error) {
+          logger.error('Error stopping Position Sync Job:', error?.message || error);
         }
       }
       

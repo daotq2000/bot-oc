@@ -87,7 +87,8 @@ class ConcurrencyManager {
   async reserveSlot(botId) {
     const lockName = `conc_bot_${botId}`;
     // Per-bot timeout override if set; else global config
-    let timeoutSec = 5;
+    // Increased default timeout to handle high concurrency scenarios
+    let timeoutSec = 10; // Increased from 5 to 10 seconds
     try {
       const [rows] = await pool.execute('SELECT concurrency_lock_timeout FROM bots WHERE id = ?', [botId]);
       const botTimeout = Number(rows?.[0]?.concurrency_lock_timeout);
@@ -95,7 +96,7 @@ class ConcurrencyManager {
     } catch (_) {}
     if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
       const { configService } = await import('./ConfigService.js');
-      timeoutSec = Number(configService.getNumber('CONCURRENCY_LOCK_TIMEOUT', 5));
+      timeoutSec = Number(configService.getNumber('CONCURRENCY_LOCK_TIMEOUT', 10)); // Increased default from 5 to 10
     }
 
     let conn;

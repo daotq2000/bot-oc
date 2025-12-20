@@ -199,16 +199,90 @@ export class EntryOrderMonitor {
         return;
       }
 
-      // CRITICAL: Check concurrency before creating Position
-      // Entry orders were created with reservation, but we need to verify limit is still valid
+      // CRITICAL: Handle reservation for Position creation
+      // Strategy: If entry_order has reservation_token from OrderService, use it (no need to reserve new slot)
+      // Otherwise, reserve a new slot atomically
       const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
-      const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
-      if (!canAccept) {
-        const status = await concurrencyManager.getStatus(botId);
-        logger.warn(`[EntryOrderMonitor] ⚠️ Cannot create Position from entry order ${entry.id}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain in entry_orders table.`);
-        // Don't mark as canceled - keep in entry_orders for retry later
-        // The order is already filled on exchange, but we can't create Position due to limit
-        return;
+      
+      let reservationToken = entry.reservation_token || null;
+      let useExistingReservation = false;
+      
+      if (reservationToken) {
+        // Entry order was created with reservation - verify it's still valid
+        // Check if reservation is still active in database
+        try {
+          const { pool } = await import('../config/database.js');
+          const [rows] = await pool.execute(
+            `SELECT status FROM concurrency_reservations WHERE bot_id = ? AND token = ? LIMIT 1`,
+            [botId, reservationToken]
+          );
+          const reservationStatus = rows?.[0]?.status;
+          
+          if (reservationStatus === 'active') {
+            // Reservation is still active - verify limit allows
+            const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
+            if (!canAccept) {
+              const status = await concurrencyManager.getStatus(botId);
+              logger.warn(`[EntryOrderMonitor] ⚠️ Cannot create Position from entry order ${entry.id}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain in entry_orders table.`);
+              return;
+            }
+            // Reservation exists and is active - use it
+            useExistingReservation = true;
+            logger.debug(`[EntryOrderMonitor] Using existing active reservation ${reservationToken} for entry order ${entry.id}`);
+          } else {
+            // Reservation is not active (expired/released/cancelled) - need to reserve new slot
+            logger.debug(`[EntryOrderMonitor] Existing reservation ${reservationToken} is ${reservationStatus || 'not found'}, will reserve new slot for entry order ${entry.id}`);
+            reservationToken = null;
+          }
+        } catch (e) {
+          // Error checking reservation - assume it's invalid and reserve new slot
+          logger.debug(`[EntryOrderMonitor] Error checking reservation ${reservationToken}: ${e?.message || e}, will reserve new slot`);
+          reservationToken = null;
+        }
+      }
+      
+      if (!useExistingReservation) {
+        // No existing reservation (old entry_order or column doesn't exist) - reserve new slot
+        // Retry logic to handle lock timeout
+        let retries = 3;
+        let lastError = null;
+        while (retries > 0) {
+          try {
+            reservationToken = await concurrencyManager.reserveSlot(botId);
+            if (reservationToken) break;
+            
+            // If reserveSlot returns null (not timeout), check if limit reached
+            const status = await concurrencyManager.getStatus(botId);
+            if (status.currentCount >= status.maxConcurrent) {
+              logger.warn(`[EntryOrderMonitor] ⚠️ Failed to reserve slot for entry order ${entry.id}: limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain for retry.`);
+              return;
+            }
+            
+            // Otherwise, retry after short delay
+            retries--;
+            if (retries > 0) {
+              await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms before retry
+            }
+          } catch (error) {
+            lastError = error;
+            if (error.code === 'CONCURRENCY_LOCK_TIMEOUT') {
+              retries--;
+              if (retries > 0) {
+                logger.debug(`[EntryOrderMonitor] Lock timeout for entry order ${entry.id}, retrying... (${retries} retries left)`);
+                await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s before retry
+              }
+            } else {
+              // Other error - don't retry
+              throw error;
+            }
+          }
+        }
+        
+        if (!reservationToken) {
+          const status = await concurrencyManager.getStatus(botId);
+          logger.error(`[EntryOrderMonitor] ❌ Failed to reserve slot for entry order ${entry.id} after retries: ${lastError?.message || 'unknown error'}. Limit: ${status.currentCount}/${status.maxConcurrent}. Entry order will remain for retry.`);
+          return;
+        }
       }
 
       const effectiveEntryPrice = Number.isFinite(overrideEntryPrice) && overrideEntryPrice > 0
@@ -222,14 +296,6 @@ export class EntryOrderMonitor {
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
       const slPrice = isStoplossValid ? calculateInitialStopLoss(effectiveEntryPrice, rawStoploss, side) : null;
-
-      // Reserve slot atomically before creating Position
-      const reservationToken = await concurrencyManager.reserveSlot(botId);
-      if (!reservationToken) {
-        const status = await concurrencyManager.getStatus(botId);
-        logger.warn(`[EntryOrderMonitor] ⚠️ Failed to reserve slot for entry order ${entry.id}: limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain for retry.`);
-        return;
-      }
 
       let position = null;
       try {
