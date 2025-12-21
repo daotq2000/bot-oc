@@ -33,7 +33,15 @@ class ConfigService {
 
   getString(key, defVal = null) {
     const v = this.getRaw(key);
-    if (v === null || v === undefined || v === '') return defVal;
+    if (v === null || v === undefined || v === '') {
+      // Fallback to environment variable if not found in database
+      const envKey = key.toUpperCase();
+      const envVal = process.env[envKey];
+      if (envVal !== undefined && envVal !== '') {
+        return String(envVal);
+      }
+      return defVal;
+    }
     return String(v);
   }
 

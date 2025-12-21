@@ -358,7 +358,12 @@ export class OcAlertScanner {
           if (absOc >= absThreshold && state.armed) {
             const elapsed = now - (state.lastAlertTime || 0);
             if (elapsed >= minIntervalMs) {
-              const chatId = w.chatId || this.telegramService.alertChannelId;
+              // Use config's telegram_chat_id, don't fallback to default
+              const chatId = w.chatId;
+              if (!chatId) {
+                logger.warn(`[OcTick] No telegram_chat_id for config ${w.cfgId} (${exchange}), skipping alert for ${sym}`);
+                continue;
+              }
               logger.info(`[OcTick] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% (thr=${absThreshold}%) to chat_id=${chatId} (config_id=${w.cfgId})`);
               this.telegramService.sendVolatilityAlert(chatId, {
                 symbol: sym,
@@ -382,7 +387,12 @@ export class OcAlertScanner {
                   for (const match of matches) {
                     try {
                       // Send an additional alert using the matched interval and OC (to avoid interval mismatch with watcher)
-                      const matchChatId = w.chatId || this.telegramService.alertChannelId;
+                      // Use config's telegram_chat_id, don't fallback to default
+                      const matchChatId = w.chatId;
+                      if (!matchChatId) {
+                        logger.debug(`[OcTick] No telegram_chat_id for config ${w.cfgId}, skipping match alert`);
+                        continue;
+                      }
                       const mOC = Number(match.oc || match.absOC || 0);
                       const mOpen = Number(match.openPrice || open);
                       const mCur = Number(match.currentPrice || p);
@@ -575,7 +585,12 @@ export class OcAlertScanner {
               logger.info(`[OcAlertScanner] ${sym} ${interval}: Alert condition met! oc=${oc.toFixed(2)}% >= ${absThreshold}%, timeSinceLastAlert=${timeSinceLastAlert}ms, minInterval=${minIntervalMs}ms`);
               
               if (timeSinceLastAlert >= minIntervalMs) {
-                const chatId = cfg.telegram_chat_id || this.telegramService.alertChannelId;
+                // Use config's telegram_chat_id, don't fallback to default
+                const chatId = cfg.telegram_chat_id;
+                if (!chatId) {
+                  logger.warn(`[OcAlertScanner] No telegram_chat_id for config ${cfg.id} (${exchange}), skipping alert for ${sym}`);
+                  continue;
+                }
                 logger.info(`[OcAlertScanner] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% to chat_id=${chatId} (config_id=${cfg.id})`);
                 await this.telegramService.sendVolatilityAlert(chatId, {
                   symbol: sym,

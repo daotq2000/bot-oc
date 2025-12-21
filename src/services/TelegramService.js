@@ -487,9 +487,29 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
    * └ 0.003788 → 0.004186
    */
   async sendVolatilityAlert(chatId, alertData) {
-    if (!chatId) return;
+    if (!chatId) {
+      logger.warn(`[VolatilityAlert] Chat ID is empty, skipping alert`);
+      return;
+    }
 
-    const { oc, open, currentPrice, direction, interval,symbol } = alertData;
+    // Check master ENABLE_ALERTS switch
+    const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+    if (!alertsEnabled) {
+      logger.debug(`[VolatilityAlert] Alerts disabled by ENABLE_ALERTS config, skipping alert to ${chatId}`);
+      return;
+    }
+
+    if (!this.initialized || !this.bot) {
+      logger.warn(`[VolatilityAlert] Telegram bot not initialized, skipping alert to ${chatId}`);
+      return;
+    }
+
+    const { oc, open, currentPrice, direction, interval, symbol } = alertData;
+    
+    if (!symbol || oc === undefined || open === undefined || currentPrice === undefined) {
+      logger.warn(`[VolatilityAlert] Missing required alert data: symbol=${symbol}, oc=${oc}, open=${open}, currentPrice=${currentPrice}`);
+      return;
+    }
 
     const directionEmoji = direction === 'bullish' ? '🟢' : '🔴';
 
@@ -523,7 +543,14 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
 └ ${formatPrice(open)} → ${formatPrice(currentPrice)}
     `.trim();
 
-    await this.sendMessage(chatId, message);
+    logger.info(`[VolatilityAlert] Sending alert to ${chatId}: ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
+    try {
+      await this.sendMessage(chatId, message);
+      logger.debug(`[VolatilityAlert] ✅ Alert sent successfully to ${chatId}`);
+    } catch (error) {
+      logger.error(`[VolatilityAlert] Failed to send alert to ${chatId}:`, error?.message || error);
+      throw error;
+    }
   }
 
   /**

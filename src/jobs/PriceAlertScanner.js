@@ -308,7 +308,16 @@ export class PriceAlertScanner {
    */
   async sendPriceAlert(exchange, symbol, oldPrice, newPrice, changePercent, telegramChatId, configId) {
     try {
-      if (!this.telegramService || !telegramChatId) return;
+      if (!this.telegramService) {
+        logger.warn(`[PriceAlertScanner] Telegram service not available, skipping alert for ${exchange} ${symbol}`);
+        return;
+      }
+      
+      // Use config's telegram_chat_id, don't fallback to default
+      if (!telegramChatId) {
+        logger.warn(`[PriceAlertScanner] No telegram_chat_id for config ${configId} (${exchange}), skipping alert for ${symbol}`);
+        return;
+      }
 
       const bullish = Number(newPrice) >= Number(oldPrice);
       const direction = bullish ? 'bullish' : 'bearish';
