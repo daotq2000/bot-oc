@@ -132,11 +132,27 @@ export class TelegramService {
    * @param {Object} strategy - Strategy object
    */
   async sendOrderNotification(position, strategy) {
-    if (!position || !strategy) return;
+    if (!position || !strategy) {
+      logger.warn(`[OrderNotification] Missing position or strategy, skipping notification`);
+      return;
+    }
 
-    const bot = strategy.bot || {};
+    // Try to get bot info from strategy, or load it if missing
+    let bot = strategy.bot || {};
+    if (!bot.telegram_chat_id && strategy.bot_id) {
+      try {
+        const { Bot } = await import('../models/Bot.js');
+        bot = await Bot.findById(strategy.bot_id) || bot;
+      } catch (e) {
+        logger.warn(`[OrderNotification] Failed to load bot ${strategy.bot_id}:`, e?.message || e);
+      }
+    }
+
     const chatId = bot.telegram_chat_id;
-    if (!chatId) return;
+    if (!chatId) {
+      logger.warn(`[OrderNotification] No telegram_chat_id for bot ${bot.id || strategy.bot_id}, skipping notification for position ${position.id}`);
+      return;
+    }
 
     const sideEmoji = position.side === 'long' ? '🟢' : '🔴';
     const sideText = position.side.toUpperCase();
@@ -219,7 +235,29 @@ Amount: ${amountStr} (100%)`.trim();
 
   async sendCloseSummaryAlert(position, stats) {
     try {
-      const channelId = position?.telegram_alert_channel_id || this.alertChannelId;
+      if (!position) {
+        logger.warn(`[CloseSummaryAlert] Missing position, skipping notification`);
+        return;
+      }
+
+      // Try to get channel ID from position, or use default alert channel
+      let channelId = position?.telegram_alert_channel_id;
+      
+      // If no alert channel, try telegram_chat_id from bot
+      if (!channelId && position?.telegram_chat_id) {
+        channelId = position.telegram_chat_id;
+      }
+      
+      // Fall back to default alert channel
+      if (!channelId) {
+        channelId = this.alertChannelId;
+      }
+      
+      if (!channelId) {
+        logger.warn(`[CloseSummaryAlert] No channel ID available for position ${position.id}, skipping notification`);
+        return;
+      }
+
       const symbol = this.formatSymbolUnderscore(position.symbol);
       const isWin = (position.close_reason === 'tp_hit');
       const sideTitle = position.side === 'long' ? 'Long' : 'Short';

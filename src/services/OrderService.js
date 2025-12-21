@@ -286,16 +286,22 @@ export class OrderService {
         slPrice
       });
 
+      // Ensure bot info present before sending notifications
+      if (!strategy.bot && strategy.bot_id) {
+        const { Bot } = await import('../models/Bot.js');
+        strategy.bot = await Bot.findById(strategy.bot_id);
+      }
+
       // Send Telegram notification to bot chat
-      await this.telegramService.sendOrderNotification(position, strategy);
+      try {
+        await this.telegramService.sendOrderNotification(position, strategy);
+        logger.debug(`[OrderService] ✅ Order notification sent successfully for position ${position.id}`);
+      } catch (e) {
+        logger.error(`[OrderService] Failed to send order notification for position ${position.id}:`, e);
+      }
 
       // Send entry trade alert to central channel
       try {
-        // Ensure bot info present
-        if (!strategy.bot && strategy.bot_id) {
-          const { Bot } = await import('../models/Bot.js');
-          strategy.bot = await Bot.findById(strategy.bot_id);
-        }
         await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
         logger.debug(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
       } catch (e) {

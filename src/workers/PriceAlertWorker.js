@@ -82,6 +82,13 @@ export class PriceAlertWorker {
       return;
     }
 
+    // Check master ENABLE_ALERTS switch
+    const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+    if (!alertsEnabled) {
+      logger.info('[PriceAlertWorker] ENABLE_ALERTS=false, Price Alert Worker will not start');
+      return;
+    }
+
     try {
       this.isRunning = true;
 

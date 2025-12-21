@@ -278,6 +278,13 @@ export class OcAlertScanner {
   // Event-driven tick handler (non-blocking send)
   async onTick(exchange, symbol, price, ts = Date.now()) {
     try {
+      // Check master ENABLE_ALERTS switch first
+      const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+      if (!alertsEnabled) {
+        logger.debug(`[OcTick] Alerts disabled by ENABLE_ALERTS config, skipping tick for ${exchange} ${symbol}`);
+        return;
+      }
+
       if (!this.watchers || this.watchers.length === 0) {
         logger.debug(`[OcTick] No watchers for ${exchange} ${symbol}`);
         return;
@@ -414,6 +421,13 @@ export class OcAlertScanner {
   }
 
   async scan() {
+    // Check master ENABLE_ALERTS switch first
+    const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+    if (!alertsEnabled) {
+      logger.debug('[OcAlertScanner] Alerts disabled by ENABLE_ALERTS config, skipping scan');
+      return;
+    }
+
     if (this.isRunning) {
       logger.debug('[OcAlertScanner] Scan already in progress, skipping');
       return; // avoid overlap

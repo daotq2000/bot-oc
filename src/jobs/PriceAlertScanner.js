@@ -122,6 +122,13 @@ export class PriceAlertScanner {
     const maxScanDurationMs = Number(configService.getNumber('PRICE_ALERT_MAX_SCAN_DURATION_MS', 30000));
 
     try {
+      // Check master ENABLE_ALERTS switch first
+      const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+      if (!alertsEnabled) {
+        logger.debug('[PriceAlertScanner] Alerts disabled by ENABLE_ALERTS config, skipping scan');
+        return;
+      }
+
       const enabled = configService.getBoolean('PRICE_ALERT_CHECK_ENABLED', true);
       if (!enabled) {
         logger.debug('[PriceAlertScanner] Price alert checking is disabled');

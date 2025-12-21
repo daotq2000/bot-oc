@@ -368,18 +368,26 @@ export class ExchangeService {
             logger.debug(`[Cache] Set margin type for ${normalizedSymbol} to ${marginType} (cached)`);
           }
 
-          // Use max leverage from symbol_filters cache instead of API call
+          // Use bot's default_leverage if set, otherwise use max leverage from symbol_filters cache
           // This avoids getLeverageBrackets API call which causes rate limits
-          const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
-          const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
-          const desiredLev = maxLeverageFromCache || defaultLeverage;
+          let desiredLev;
+          if (this.bot.default_leverage != null && Number.isFinite(Number(this.bot.default_leverage))) {
+            // Use bot's configured default leverage
+            desiredLev = parseInt(this.bot.default_leverage);
+          } else {
+            // Fall back to max leverage from cache or default config
+            const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
+            const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
+            desiredLev = maxLeverageFromCache || defaultLeverage;
+          }
 
           // Cache last applied leverage to avoid redundant calls
           this._binanceLeverageMap = this._binanceLeverageMap || new Map();
           if (this._binanceLeverageMap.get(normalizedSymbol) !== desiredLev) {
             await this.binanceDirectClient.setLeverage(normalizedSymbol, desiredLev);
             this._binanceLeverageMap.set(normalizedSymbol, desiredLev);
-            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (from cache: ${maxLeverageFromCache || 'default'}) for bot ${this.bot.id}`);
+            const leverageSource = this.bot.default_leverage != null ? `bot default_leverage=${this.bot.default_leverage}` : 'max leverage from cache/default';
+            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (${leverageSource}) for bot ${this.bot.id}`);
           } else {
             logger.debug(`[Cache] Leverage for ${normalizedSymbol} already set to ${desiredLev}, skipping`);
           }
@@ -459,10 +467,17 @@ export class ExchangeService {
         throw new Error(`Invalid current/entry price for ${marketSymbol}: ${usePrice}`);
       }
 
-      // Ensure leverage is set for MEXC using max leverage from symbol_filters (optimize margin)
+      // Ensure leverage is set for MEXC using bot's default_leverage if set, otherwise max leverage from symbol_filters
       try {
         if ((this.bot.exchange || '').toLowerCase() === 'mexc') {
-          const maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          let maxLev;
+          if (this.bot.default_leverage != null && Number.isFinite(Number(this.bot.default_leverage))) {
+            // Use bot's configured default leverage
+            maxLev = Number(this.bot.default_leverage);
+          } else {
+            // Fall back to max leverage from cache or default config
+            maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          }
           if (Number.isFinite(maxLev) && maxLev > 0) {
             try {
               if (this.mexcFuturesClient) {
@@ -512,10 +527,17 @@ export class ExchangeService {
         throw new Error(`Order notional ${notional.toFixed(8)} < minCost ${minCost} for ${marketSymbol}`);
       }
 
-      // Margin check for MEXC: amount = margin * leverage; use max leverage per coin from symbol_filters
+      // Margin check for MEXC: amount = margin * leverage; use bot's default_leverage if set, otherwise max leverage per coin from symbol_filters
       if ((this.bot.exchange || '').toLowerCase() === 'mexc') {
         try {
-          const maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          let maxLev;
+          if (this.bot.default_leverage != null && Number.isFinite(Number(this.bot.default_leverage))) {
+            // Use bot's configured default leverage
+            maxLev = Number(this.bot.default_leverage);
+          } else {
+            // Fall back to max leverage from cache or default config
+            maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          }
           const feeBuffer = Number(configService.getNumber('MEXC_MARGIN_FEE_BUFFER', 0.002)); // 0.2% buffer
           const marginNeeded = (notional / Math.max(maxLev, 1)) * (1 + Math.max(0, feeBuffer));
           const futBal = await this.getBalance('future').catch(() => ({ free: 0 }));

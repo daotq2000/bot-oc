@@ -566,9 +566,22 @@ export class PositionService {
         return;
       }
       logger.info(`[Notification] Preparing to send close summary for position ${closedPosition.id}`);
-      const stats = await Position.getBotStats(closedPosition.bot_id);
-      logger.debug(`[Notification] Fetched bot stats for bot ${closedPosition.bot_id}:`, stats);
-      await this.telegramService.sendCloseSummaryAlert(closedPosition, stats);
+      
+      // Ensure position has all required fields (telegram_alert_channel_id, bot_name, etc.)
+      // Position.close() returns position from findById which includes bot info, but let's verify
+      let positionWithBotInfo = closedPosition;
+      if (!closedPosition.telegram_alert_channel_id && !closedPosition.telegram_chat_id) {
+        // Re-fetch position with bot info if missing
+        positionWithBotInfo = await Position.findById(closedPosition.id);
+        if (!positionWithBotInfo) {
+          logger.warn(`[Notification] Could not find position ${closedPosition.id} to send notification`);
+          return;
+        }
+      }
+      
+      const stats = await Position.getBotStats(positionWithBotInfo.bot_id);
+      logger.debug(`[Notification] Fetched bot stats for bot ${positionWithBotInfo.bot_id}:`, stats);
+      await this.telegramService.sendCloseSummaryAlert(positionWithBotInfo, stats);
       logger.info(`[Notification] ✅ Successfully sent close summary alert for position ${closedPosition.id}`);
     } catch (inner) {
       logger.error(`[Notification] ❌ Failed to send close summary alert for position ${closedPosition.id}:`, inner?.message || inner, inner?.stack);
