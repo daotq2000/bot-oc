@@ -92,8 +92,8 @@ async function createTempStrategy(botId, symbol, amountUSDT, reduce, upReduce) {
   }
   
   const [res] = await pool.execute(
-    `INSERT INTO strategies (bot_id, symbol, \`interval\`, amount, oc, take_profit, reduce, extend, up_reduce, \`ignore\`, is_active, created_at, updated_at)
-     VALUES (?, ?, '15m', ?, 2, 20, ?, 0, ?, 0, 0, NOW(), NOW())`,
+    `INSERT INTO strategies (bot_id, symbol, \`interval\`, amount, oc, take_profit, reduce, extend, up_reduce, stoploss, \`ignore\`, is_active, created_at, updated_at)
+     VALUES (?, ?, '15m', ?, 2, 20, ?, 0, ?, 2, 0, 0, NOW(), NOW())`,
     [botId, symbol, amountUSDT, reduce, upReduce]
   );
   if (!res.insertId) {

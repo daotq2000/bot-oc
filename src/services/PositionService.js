@@ -269,20 +269,29 @@ export class PositionService {
             // Static mode: TP stays at initial value
           } else {
             // Trailing mode: TP moves from initial TP towards entry
-            // Calculate initial TP from strategy (same as when position was opened)
-            const entryPriceForTP = Number(position.entry_price || 0);
-            const oc = Number(position.oc || 0);
-            const takeProfit = Number(position.take_profit || 0);
-            let initialTP = prevTP; // Fallback to current TP
+            // Use stored initial_tp_price (set when position was opened)
+            let initialTP = Number(position.initial_tp_price || 0);
             
-            if (entryPriceForTP > 0 && takeProfit > 0) {
-              // Recalculate initial TP from strategy (same calculation as placeTpSlOrders)
-              initialTP = calculateTakeProfit(entryPriceForTP, oc, takeProfit, position.side);
-              logger.debug(`[TP Trail] Calculated initial TP from strategy: ${initialTP.toFixed(2)} (entry=${entryPriceForTP}, take_profit=${takeProfit})`);
+            // If initial_tp_price is not set (old positions), calculate and save it
+            if (!Number.isFinite(initialTP) || initialTP <= 0) {
+              const entryPriceForTP = Number(position.entry_price || 0);
+              const oc = Number(position.oc || 0);
+              const takeProfit = Number(position.take_profit || 0);
+              
+              if (entryPriceForTP > 0 && takeProfit > 0) {
+                // Calculate initial TP from strategy (same calculation as placeTpSlOrders)
+                initialTP = calculateTakeProfit(entryPriceForTP, oc, takeProfit, position.side);
+                // Save it to DB for future use
+                await Position.update(position.id, { initial_tp_price: initialTP });
+                logger.debug(`[TP Trail] Calculated and saved initial TP: ${initialTP.toFixed(2)} (entry=${entryPriceForTP}, take_profit=${takeProfit})`);
+              } else {
+                // If we can't calculate, use current TP as initial (fallback)
+                initialTP = prevTP;
+                await Position.update(position.id, { initial_tp_price: initialTP });
+                logger.debug(`[TP Trail] Using current TP as initial: ${initialTP.toFixed(2)}`);
+              }
             } else {
-              // If we can't calculate, use current TP as initial (first time)
-              initialTP = prevTP;
-              logger.debug(`[TP Trail] Using current TP as initial: ${initialTP.toFixed(2)}`);
+              logger.debug(`[TP Trail] Using stored initial TP: ${initialTP.toFixed(2)}`);
             }
             
             const trailingPercent = position.side === 'long' ? upReduce : reduce;

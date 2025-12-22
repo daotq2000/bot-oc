@@ -158,6 +158,21 @@ class ExchangeInfoService {
       const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('binance', exchangeSymbols);
       if (deletedCount > 0) {
         this.logger.info(`Deleted ${deletedCount} delisted/unavailable Binance symbols from database.`);
+        
+        // Also delete strategies for delisted symbols
+        try {
+          const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('binance');
+          const delistedSymbols = currentDbSymbols.filter(s => !exchangeSymbols.includes(s));
+          
+          if (delistedSymbols.length > 0) {
+            const deletedStrategiesCount = await Strategy.deleteBySymbols('binance', delistedSymbols);
+            if (deletedStrategiesCount > 0) {
+              this.logger.info(`Deleted ${deletedStrategiesCount} strategies for ${delistedSymbols.length} delisted Binance symbols: ${delistedSymbols.join(', ')}`);
+            }
+          }
+        } catch (e) {
+          this.logger.error('Failed to delete strategies for delisted Binance symbols:', e?.message || e);
+        }
       }
 
       // Bulk insert/update into the database
@@ -291,6 +306,21 @@ class ExchangeInfoService {
       const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
       if (deletedCount > 0) {
         this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database.`);
+        
+        // Also delete strategies for delisted symbols
+        try {
+          const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+          const delistedSymbols = currentDbSymbols.filter(s => !exchangeSymbols.includes(s));
+          
+          if (delistedSymbols.length > 0) {
+            const deletedStrategiesCount = await Strategy.deleteBySymbols('mexc', delistedSymbols);
+            if (deletedStrategiesCount > 0) {
+              this.logger.info(`Deleted ${deletedStrategiesCount} strategies for ${delistedSymbols.length} delisted MEXC symbols: ${delistedSymbols.join(', ')}`);
+            }
+          }
+        } catch (e) {
+          this.logger.error('Failed to delete strategies for delisted MEXC symbols:', e?.message || e);
+        }
       }
 
       await this.symbolFilterDAO.bulkUpsert(filtersToSave);
@@ -362,6 +392,21 @@ class ExchangeInfoService {
       const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
       if (deletedCount > 0) {
         this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database (REST fallback).`);
+        
+        // Also delete strategies for delisted symbols
+        try {
+          const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+          const delistedSymbols = currentDbSymbols.filter(s => !exchangeSymbols.includes(s));
+          
+          if (delistedSymbols.length > 0) {
+            const deletedStrategiesCount = await Strategy.deleteBySymbols('mexc', delistedSymbols);
+            if (deletedStrategiesCount > 0) {
+              this.logger.info(`Deleted ${deletedStrategiesCount} strategies for ${delistedSymbols.length} delisted MEXC symbols (REST fallback): ${delistedSymbols.join(', ')}`);
+            }
+          }
+        } catch (e) {
+          this.logger.error('Failed to delete strategies for delisted MEXC symbols (REST fallback):', e?.message || e);
+        }
       }
 
       await this.symbolFilterDAO.bulkUpsert(filtersToSave);
