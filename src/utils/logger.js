@@ -18,9 +18,15 @@ try {
 
 /**
  * Winston logger configuration
+ * 
+ * Log levels: error, warn, info, http, verbose, debug, silly
+ * Set LOG_LEVEL environment variable to control verbosity (default: 'info')
+ * For production, use 'warn' or 'error' to reduce memory usage
  */
+const logLevel = (process.env.LOG_LEVEL || 'info').toLowerCase();
+
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: logLevel,
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.errors({ stack: true }),
@@ -42,29 +48,38 @@ const logger = winston.createLogger({
         })
       )
     }),
-    // Error file
+    // Error file (only errors)
     new winston.transports.File({
       filename: path.join(LOG_DIR, 'error.log'),
       level: 'error',
-      maxsize: 10 * 1024 * 1024, // 10MB
-      maxFiles: 5,
+      maxsize: 5 * 1024 * 1024, // 5MB (reduced from 10MB to save memory)
+      maxFiles: 3, // Reduced from 5 to save disk space
       tailable: true,
       handleExceptions: true,
       handleRejections: true
     }),
-    // Combined file
+    // Combined file (warn and above by default, or all if LOG_LEVEL is debug)
     new winston.transports.File({
       filename: path.join(LOG_DIR, 'combined.log'),
-      maxsize: 10 * 1024 * 1024, // 10MB
-      maxFiles: 5,
+      level: logLevel === 'debug' || logLevel === 'verbose' ? 'debug' : 'warn', // Only log warnings and above unless debug mode
+      maxsize: 5 * 1024 * 1024, // 5MB (reduced from 10MB to save memory)
+      maxFiles: 3, // Reduced from 5 to save disk space
       tailable: true
     })
   ],
   exceptionHandlers: [
-    new winston.transports.File({ filename: path.join(LOG_DIR, 'exceptions.log') })
+    new winston.transports.File({ 
+      filename: path.join(LOG_DIR, 'exceptions.log'),
+      maxsize: 5 * 1024 * 1024, // 5MB
+      maxFiles: 2
+    })
   ],
   rejectionHandlers: [
-    new winston.transports.File({ filename: path.join(LOG_DIR, 'rejections.log') })
+    new winston.transports.File({ 
+      filename: path.join(LOG_DIR, 'rejections.log'),
+      maxsize: 5 * 1024 * 1024, // 5MB
+      maxFiles: 2
+    })
   ]
 });
 

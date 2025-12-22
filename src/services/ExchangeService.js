@@ -25,6 +25,8 @@ export class ExchangeService {
     // Simple REST ticker cache for non-Binance to reduce CCXT calls
     this._tickerCache = new Map(); // key: symbol -> price
     this._tickerCacheTime = new Map(); // key: symbol -> timestamp
+    this._maxTickerCacheSize = 200; // Maximum number of symbols to cache (reduced from 500 to save memory)
+    this._tickerCacheTTL = 30 * 1000; // 30 seconds TTL (reduced from 1 minute)
   }
 
   /**
@@ -357,7 +359,7 @@ export class ExchangeService {
         try {
           const { configService } = await import('./ConfigService.js');
           const { exchangeInfoService } = await import('./ExchangeInfoService.js');
-          
+
           // Only set margin type once per symbol (cache in _binanceConfiguredSymbols)
           if (!this._binanceConfiguredSymbols.has(normalizedSymbol)) {
             const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
@@ -365,19 +367,27 @@ export class ExchangeService {
             this._binanceConfiguredSymbols.add(normalizedSymbol);
             logger.debug(`[Cache] Set margin type for ${normalizedSymbol} to ${marginType} (cached)`);
           }
-          
-          // Use max leverage from symbol_filters cache instead of API call
+
+          // Use bot's default_leverage if set, otherwise use max leverage from symbol_filters cache
           // This avoids getLeverageBrackets API call which causes rate limits
-          const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
-          const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
-          const desiredLev = maxLeverageFromCache || defaultLeverage;
-          
+          let desiredLev;
+          if (this.bot.default_leverage != null && Number.isFinite(Number(this.bot.default_leverage))) {
+            // Use bot's configured default leverage
+            desiredLev = parseInt(this.bot.default_leverage);
+          } else {
+            // Fall back to max leverage from cache or default config
+            const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
+            const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
+            desiredLev = maxLeverageFromCache || defaultLeverage;
+          }
+
           // Cache last applied leverage to avoid redundant calls
           this._binanceLeverageMap = this._binanceLeverageMap || new Map();
           if (this._binanceLeverageMap.get(normalizedSymbol) !== desiredLev) {
             await this.binanceDirectClient.setLeverage(normalizedSymbol, desiredLev);
             this._binanceLeverageMap.set(normalizedSymbol, desiredLev);
-            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (from cache: ${maxLeverageFromCache || 'default'}) for bot ${this.bot.id}`);
+            const leverageSource = this.bot.default_leverage != null ? `bot default_leverage=${this.bot.default_leverage}` : 'max leverage from cache/default';
+            logger.info(`Set leverage for ${normalizedSymbol} to ${desiredLev} (${leverageSource}) for bot ${this.bot.id}`);
           } else {
             logger.debug(`[Cache] Leverage for ${normalizedSymbol} already set to ${desiredLev}, skipping`);
           }
@@ -457,10 +467,17 @@ export class ExchangeService {
         throw new Error(`Invalid current/entry price for ${marketSymbol}: ${usePrice}`);
       }
 
-      // Ensure leverage is set for MEXC using max leverage from symbol_filters (optimize margin)
+      // Ensure leverage is set for MEXC using bot's default_leverage if set, otherwise max leverage from symbol_filters
       try {
         if ((this.bot.exchange || '').toLowerCase() === 'mexc') {
-          const maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          let maxLev;
+          if (this.bot.default_leverage != null && Number.isFinite(Number(this.bot.default_leverage))) {
+            // Use bot's configured default leverage
+            maxLev = Number(this.bot.default_leverage);
+          } else {
+            // Fall back to max leverage from cache or default config
+            maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          }
           if (Number.isFinite(maxLev) && maxLev > 0) {
             try {
               if (this.mexcFuturesClient) {
@@ -510,10 +527,17 @@ export class ExchangeService {
         throw new Error(`Order notional ${notional.toFixed(8)} < minCost ${minCost} for ${marketSymbol}`);
       }
 
-      // Margin check for MEXC: amount = margin * leverage; use max leverage per coin from symbol_filters
+      // Margin check for MEXC: amount = margin * leverage; use bot's default_leverage if set, otherwise max leverage per coin from symbol_filters
       if ((this.bot.exchange || '').toLowerCase() === 'mexc') {
         try {
-          const maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          let maxLev;
+          if (this.bot.default_leverage != null && Number.isFinite(Number(this.bot.default_leverage))) {
+            // Use bot's configured default leverage
+            maxLev = Number(this.bot.default_leverage);
+          } else {
+            // Fall back to max leverage from cache or default config
+            maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+          }
           const feeBuffer = Number(configService.getNumber('MEXC_MARGIN_FEE_BUFFER', 0.002)); // 0.2% buffer
           const marginNeeded = (notional / Math.max(maxLev, 1)) * (1 + Math.max(0, feeBuffer));
           const futBal = await this.getBalance('future').catch(() => ({ free: 0 }));
@@ -808,34 +832,6 @@ export class ExchangeService {
     return '0.01';
   }
 
-  /**
-   * Get average fill price for a given order (used for accurate entry/TP/SL)
-   * Currently implemented only for Binance via direct client.
-   * @param {string} symbol - Symbol in internal format (e.g. BTCUSDT)
-   * @param {string|number} orderId - Exchange orderId
-   * @returns {Promise<number|null>}
-   */
-  async getOrderAverageFillPrice(symbol, orderId) {
-    try {
-      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
-        const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
-        const price = await this.binanceDirectClient.getOrderAverageFillPrice(
-          normalizedSymbol,
-          orderId
-        );
-        const num = Number(price);
-        return Number.isFinite(num) && num > 0 ? num : null;
-      }
-      // Other exchanges: not implemented yet, let callers fallback
-      return null;
-    } catch (e) {
-      logger.warn(
-        `[ExchangeService] getOrderAverageFillPrice failed for ${symbol} order=${orderId}: ${e?.message || e}`
-      );
-      return null;
-    }
-  }
-
   async createEntryTriggerOrder(symbol, side, entryPrice, quantity) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
       const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
@@ -1043,6 +1039,16 @@ export class ExchangeService {
         const ticker = await exchange.fetchTicker(swapKey);
         const price = ticker?.last;
         if (Number.isFinite(Number(price))) {
+          // Enforce max cache size and cleanup old entries
+          this._cleanupTickerCache();
+          if (this._tickerCache.size >= this._maxTickerCacheSize && !this._tickerCache.has(swapKey)) {
+            const oldest = Array.from(this._tickerCacheTime.entries())
+              .sort((a, b) => a[1] - b[1])[0];
+            if (oldest) {
+              this._tickerCache.delete(oldest[0]);
+              this._tickerCacheTime.delete(oldest[0]);
+            }
+          }
           this._tickerCache.set(swapKey, Number(price));
           this._tickerCacheTime.set(swapKey, now);
           return price;
@@ -1093,6 +1099,16 @@ export class ExchangeService {
         const tickerSpot = await this.publicSpotExchange.fetchTicker(spotKey);
         const priceSpot = tickerSpot?.last;
         if (Number.isFinite(Number(priceSpot))) {
+          // Enforce max cache size and cleanup old entries
+          this._cleanupTickerCache();
+          if (this._tickerCache.size >= this._maxTickerCacheSize && !this._tickerCache.has(spotKey)) {
+            const oldest = Array.from(this._tickerCacheTime.entries())
+              .sort((a, b) => a[1] - b[1])[0];
+            if (oldest) {
+              this._tickerCache.delete(oldest[0]);
+              this._tickerCacheTime.delete(oldest[0]);
+            }
+          }
           this._tickerCache.set(spotKey, Number(priceSpot));
           this._tickerCacheTime.set(spotKey, now);
           return priceSpot;
@@ -1196,6 +1212,24 @@ export class ExchangeService {
     } catch (e) {
       logger.warn(`getOrderStatus failed for bot ${this.bot.id} (${symbol}/${orderId}): ${e?.message || e}`);
       return { status: 'unknown', filled: 0, raw: null };
+    }
+  }
+
+  /**
+   * Cleanup expired ticker cache entries
+   */
+  _cleanupTickerCache() {
+    const now = Date.now();
+    let removed = 0;
+    for (const [symbol, timestamp] of this._tickerCacheTime.entries()) {
+      if (now - timestamp > this._tickerCacheTTL) {
+        this._tickerCache.delete(symbol);
+        this._tickerCacheTime.delete(symbol);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      logger.debug(`[ExchangeService] Cleaned up ${removed} expired ticker cache entries for bot ${this.bot.id}`);
     }
   }
 }

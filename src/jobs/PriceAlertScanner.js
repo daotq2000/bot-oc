@@ -84,7 +84,7 @@ export class PriceAlertScanner {
     }
 
     this.isRunning = true;
-    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 5000);
+    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 15000); // Increased from 5s to 15s
     
     this.scanInterval = setInterval(() => {
       this.scan().catch(error => {
@@ -122,6 +122,13 @@ export class PriceAlertScanner {
     const maxScanDurationMs = Number(configService.getNumber('PRICE_ALERT_MAX_SCAN_DURATION_MS', 30000));
 
     try {
+      // Check master ENABLE_ALERTS switch first
+      const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+      if (!alertsEnabled) {
+        logger.debug('[PriceAlertScanner] Alerts disabled by ENABLE_ALERTS config, skipping scan');
+        return;
+      }
+
       const enabled = configService.getBoolean('PRICE_ALERT_CHECK_ENABLED', true);
       if (!enabled) {
         logger.debug('[PriceAlertScanner] Price alert checking is disabled');
@@ -301,7 +308,16 @@ export class PriceAlertScanner {
    */
   async sendPriceAlert(exchange, symbol, oldPrice, newPrice, changePercent, telegramChatId, configId) {
     try {
-      if (!this.telegramService || !telegramChatId) return;
+      if (!this.telegramService) {
+        logger.warn(`[PriceAlertScanner] Telegram service not available, skipping alert for ${exchange} ${symbol}`);
+        return;
+      }
+      
+      // Use config's telegram_chat_id, don't fallback to default
+      if (!telegramChatId) {
+        logger.warn(`[PriceAlertScanner] No telegram_chat_id for config ${configId} (${exchange}), skipping alert for ${symbol}`);
+        return;
+      }
 
       const bullish = Number(newPrice) >= Number(oldPrice);
       const direction = bullish ? 'bullish' : 'bearish';

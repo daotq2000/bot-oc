@@ -11,13 +11,52 @@ import logger from '../utils/logger.js';
  */
 class ExchangeInfoService {
   constructor({ symbolFilterDAO = SymbolFilter, binanceClientFactory = (apiKey, secretKey, isTestnet = false, exInfoSvc = null) => new BinanceDirectClient(apiKey, secretKey, isTestnet, exInfoSvc), mexcFactory = () => new ccxt.mexc({ enableRateLimit: true, options: { defaultType: 'swap' } }), loggerInst = logger, config = configService } = {}) {
-    this.filtersCache = new Map(); // symbol -> { tickSize, stepSize, minNotional, maxLeverage }
+    this.filtersCache = new Map(); // symbol -> { tickSize, stepSize, minNotional, maxLeverage, lastAccess }
     this.isInitialized = false;
     this.symbolFilterDAO = symbolFilterDAO;
     this.binanceClientFactory = binanceClientFactory;
     this.mexcFactory = mexcFactory;
     this.logger = loggerInst;
     this.config = config;
+    this.maxCacheSize = 2000; // Maximum number of symbols to cache (reduced from 10000 to save memory)
+    this.cacheCleanupInterval = 2 * 60 * 1000; // Cleanup every 2 minutes (reduced from 30 minutes)
+    this._cleanupTimer = null;
+    this._startCacheCleanup();
+  }
+
+  _startCacheCleanup() {
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = setInterval(() => this._cleanupCache(), this.cacheCleanupInterval);
+  }
+
+  _cleanupCache() {
+    const now = Date.now();
+    const maxAge = 10 * 60 * 1000; // Remove entries older than 10 minutes (reduced from 1 hour)
+    let removed = 0;
+
+    // Remove old entries
+    for (const [symbol, data] of this.filtersCache.entries()) {
+      if (data.lastAccess && (now - data.lastAccess > maxAge)) {
+        this.filtersCache.delete(symbol);
+        removed++;
+      }
+    }
+
+    // If still over limit, remove least recently used
+    if (this.filtersCache.size > this.maxCacheSize) {
+      const entries = Array.from(this.filtersCache.entries())
+        .filter(([_, data]) => data.lastAccess)
+        .sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+      const toRemove = entries.slice(0, this.filtersCache.size - this.maxCacheSize);
+      for (const [symbol] of toRemove) {
+        this.filtersCache.delete(symbol);
+        removed++;
+      }
+    }
+
+    if (removed > 0) {
+      this.logger.debug(`[ExchangeInfoService] Cleaned up ${removed} cache entries. Current size: ${this.filtersCache.size}`);
+    }
   }
 
   /**
@@ -423,11 +462,19 @@ class ExchangeInfoService {
           // Skip non-Binance if symbol already populated (keeps Binance defaults)
           continue;
         }
+        // Enforce max cache size (LRU eviction)
+        if (this.filtersCache.size >= this.maxCacheSize && !this.filtersCache.has(key)) {
+          const oldest = Array.from(this.filtersCache.entries())
+            .filter(([_, data]) => data.lastAccess)
+            .sort((a, b) => a[1].lastAccess - b[1].lastAccess)[0];
+          if (oldest) this.filtersCache.delete(oldest[0]);
+        }
         this.filtersCache.set(key, {
           tickSize: filter.tick_size,
           stepSize: filter.step_size,
           minNotional: filter.min_notional,
-          maxLeverage: filter.max_leverage || 125
+          maxLeverage: filter.max_leverage || 125,
+          lastAccess: Date.now()
         });
       }
       this.isInitialized = true;
@@ -446,7 +493,12 @@ class ExchangeInfoService {
     if (!this.isInitialized) {
       this.logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
     }
-    return this.filtersCache.get(symbol.toUpperCase());
+    const key = symbol.toUpperCase();
+    const cached = this.filtersCache.get(key);
+    if (cached) {
+      cached.lastAccess = Date.now();
+    }
+    return cached;
   }
 
   /**

@@ -124,7 +124,7 @@ export class EntryOrderMonitor {
         } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
           // Cancelled/expired without fill → mark as canceled
           await EntryOrder.markCanceled(entry.id, normalizedStatus === 'EXPIRED' ? 'expired' : 'canceled');
-          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
+          logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
         }
         return; // Entry order handled
       }
@@ -135,7 +135,7 @@ export class EntryOrderMonitor {
           const positions = await Position.findOpen();
           for (const pos of positions) {
             if (pos.bot_id === botId && (pos.tp_order_id === String(orderId) || pos.sl_order_id === String(orderId))) {
-              logger.info(`[EntryOrderMonitor] TP/SL order ${orderId} for position ${pos.id} filled via WebSocket. Position will be closed on next update.`);
+              logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} for position ${pos.id} filled via WebSocket. Position will be closed on next update.`);
               // PositionService.updatePosition will detect this via cache
             }
           }
@@ -172,7 +172,7 @@ export class EntryOrderMonitor {
             await this._confirmEntryWithPosition(entry.bot_id, entry, null);
           } else if ((status === 'canceled' || status === 'cancelled' || status === 'expired') && filled === 0) {
             await EntryOrder.markCanceled(entry.id, status === 'expired' ? 'expired' : 'canceled');
-            logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) canceled/expired via REST polling.`);
+            logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) canceled/expired via REST polling.`);
           }
         } catch (inner) {
           logger.warn(`[EntryOrderMonitor] Failed to poll entry order ${entry.id} (${entry.symbol}): ${inner?.message || inner}`);
@@ -317,7 +317,7 @@ export class EntryOrderMonitor {
       // Finalize reservation as 'released' (Position created successfully)
       await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
 
-      logger.info(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
+      logger.debug(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
 
       // Notify via Telegram (same as in OrderService)
       try {
@@ -339,11 +339,14 @@ export class EntryOrderMonitor {
       } catch (posError) {
         // If Position creation failed, cancel reservation
         await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
-        logger.error(`[EntryOrderMonitor] Failed to create Position for entry order ${entry.id}: ${posError?.message || posError}`);
-        throw posError; // Re-throw to be caught by outer catch
+        logger.error(`[EntryOrderMonitor] ❌ Failed to create Position for entry order ${entry.id}: ${posError?.message || posError}`);
+        logger.error(`[EntryOrderMonitor] Stack trace:`, posError?.stack);
+        // Don't re-throw - log error and let EntryOrderMonitor retry later
+        // PositionSync will also try to create it from exchange
       }
     } catch (error) {
       logger.error(`[EntryOrderMonitor] Error confirming entry order ${entry.id}:`, error?.message || error);
+      logger.error(`[EntryOrderMonitor] Stack trace:`, error?.stack);
     }
   }
 

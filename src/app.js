@@ -26,9 +26,9 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Request logging
+// Request logging (reduced to debug level to save memory)
 app.use((req, res, next) => {
-  logger.info(`${req.method} ${req.path}`);
+  logger.debug(`${req.method} ${req.path}`);
   next();
 });
 
@@ -292,6 +292,19 @@ async function start() {
       // Don't exit - other systems should continue
     }
 
+    // Memory Monitor - Monitor and auto-cleanup when memory usage is high
+    logger.info('='.repeat(60));
+    logger.info('Initializing Memory Monitor...');
+    logger.info('='.repeat(60));
+    try {
+      const { memoryMonitor } = await import('./utils/MemoryMonitor.js');
+      memoryMonitor.start();
+      logger.info('✅ Memory Monitor started successfully');
+    } catch (error) {
+      logger.error('❌ Failed to start Memory Monitor:', error?.message || error);
+      // Don't exit - memory monitoring is optional
+    }
+
     // Start HTTP server
     app.listen(PORT, () => {
       logger.info(`Server started on port ${PORT}`);
@@ -330,7 +343,35 @@ async function start() {
         }
       }
       
+      // Cleanup WebSocket connections
       webSocketManager.disconnect();
+      // Cleanup MEXC WebSocket
+      try {
+        const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
+        mexcPriceWs.disconnect();
+        logger.info('Disconnected MEXC WebSocket');
+      } catch (e) {
+        logger.warn('Failed to disconnect MEXC WebSocket:', e?.message || e);
+      }
+      
+      // Cleanup all caches to free memory
+      try {
+        const { orderStatusCache } = await import('./services/OrderStatusCache.js');
+        orderStatusCache.clear();
+        logger.info('Cleared OrderStatusCache');
+      } catch (e) {
+        logger.warn('Failed to clear OrderStatusCache:', e?.message || e);
+      }
+      
+      // Stop Memory Monitor
+      try {
+        const { memoryMonitor } = await import('./utils/MemoryMonitor.js');
+        memoryMonitor.stop();
+        logger.info('Stopped Memory Monitor');
+      } catch (e) {
+        logger.warn('Failed to stop Memory Monitor:', e?.message || e);
+      }
+      
       await telegramBot.stop();
       process.exit(0);
     });
@@ -365,7 +406,35 @@ async function start() {
         }
       }
       
+      // Cleanup WebSocket connections
       webSocketManager.disconnect();
+      // Cleanup MEXC WebSocket
+      try {
+        const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
+        mexcPriceWs.disconnect();
+        logger.info('Disconnected MEXC WebSocket');
+      } catch (e) {
+        logger.warn('Failed to disconnect MEXC WebSocket:', e?.message || e);
+      }
+      
+      // Cleanup all caches to free memory
+      try {
+        const { orderStatusCache } = await import('./services/OrderStatusCache.js');
+        orderStatusCache.clear();
+        logger.info('Cleared OrderStatusCache');
+      } catch (e) {
+        logger.warn('Failed to clear OrderStatusCache:', e?.message || e);
+      }
+
+      // Stop Memory Monitor
+      try {
+        const { memoryMonitor } = await import('./utils/MemoryMonitor.js');
+        memoryMonitor.stop();
+        logger.info('Stopped Memory Monitor');
+      } catch (e) {
+        logger.warn('Failed to stop Memory Monitor:', e?.message || e);
+      }
+      
       await telegramBot.stop();
       process.exit(0);
     });

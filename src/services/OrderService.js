@@ -3,6 +3,7 @@ import { EntryOrder } from '../models/EntryOrder.js';
 import { TelegramService } from './TelegramService.js';
 import { concurrencyManager } from './ConcurrencyManager.js';
 import logger from '../utils/logger.js';
+import { configService } from './ConfigService.js';
 
 /**
  * Order Service - Order execution and management
@@ -122,7 +123,10 @@ export class OrderService {
           em.includes('Order price is too low') ||
           em.includes('Invalid order price');
         
-        if (shouldFallbackToMarket) {
+        // Check config to enable/disable fallback to market
+        const enableFallbackToMarket = configService.getBoolean('ENABLE_FALLBACK_TO_MARKET', false);
+
+        if (shouldFallbackToMarket && enableFallbackToMarket) {
           logger.warn(`[OrderService] Fallback to MARKET due to price trigger for ${strategy.symbol} (side=${side}). Error: ${em}`);
           attemptedMarketFallback = true;
           order = await this.exchangeService.createOrder({
@@ -135,6 +139,12 @@ export class OrderService {
           orderType = 'market';
           await this.sendCentralLog(`Order FallbackToMarket | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} reason=${em}`);
         } else {
+          // Log and skip order if fallback is disabled
+          if (shouldFallbackToMarket && !enableFallbackToMarket) {
+            logger.warn(`[OrderService] Order would trigger immediately but fallback to market is disabled. Skipping order for ${strategy.symbol} (side=${side}). Error: ${em}`);
+            await this.sendCentralLog(`Order SkippedNoFallback | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} reason=${em}`);
+            return null; // Skip order instead of throwing error
+          }
           throw e;
         }
       }
@@ -170,15 +180,15 @@ export class OrderService {
             const avg = await this.exchangeService.getOrderAverageFillPrice(strategy.symbol, order.id);
             if (Number.isFinite(avg) && avg > 0) {
               effectiveEntryPrice = avg;
-              hasImmediateExposure = true;
-              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
-            } else {
-              logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
-              hasImmediateExposure = true;
-            }
+            hasImmediateExposure = true;
+            logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
           } else {
-            logger.info(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
+            logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
+            hasImmediateExposure = true;
           }
+        } else {
+          logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
+        }
         }
       } catch (e) {
         logger.warn(`[OrderService] Failed to refine entry price from exchange for order ${order?.id} ${strategy.symbol}: ${e?.message || e}`);
@@ -196,34 +206,73 @@ export class OrderService {
 
       if (hasImmediateExposure || orderType === 'market') {
         // MARKET or immediately-filled LIMIT: create Position right away
-        position = await Position.create({
-        strategy_id: strategy.id,
-        bot_id: strategy.bot_id,
-        order_id: order.id,
-        symbol: strategy.symbol,
-        side: side,
-          entry_price: effectiveEntryPrice,
-        amount: amount,
-        take_profit_price: tempTpPrice, // Use temporary TP price
-        stop_loss_price: tempSlPrice, // Use temporary SL price
-        current_reduce: strategy.reduce
-      });
-      } else {
-        // Pending LIMIT (no confirmed fill yet): track in entry_orders table
         try {
-          await EntryOrder.create({
+          position = await Position.create({
             strategy_id: strategy.id,
             bot_id: strategy.bot_id,
             order_id: order.id,
             symbol: strategy.symbol,
-            side,
-            amount,
+            side: side,
             entry_price: effectiveEntryPrice,
-            status: 'open'
+            amount: amount,
+            take_profit_price: tempTpPrice, // Use temporary TP price
+            stop_loss_price: tempSlPrice, // Use temporary SL price
+            current_reduce: strategy.reduce
           });
-          logger.info(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table.`);
+          
+          // CRITICAL: Finalize reservation immediately after Position is created
+          // This ensures reservation is released even if errors occur later
+          orderCreated = true;
+          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
+          logger.debug(`[OrderService] Position ${position.id} created and reservation finalized for bot ${strategy.bot_id}`);
+        } catch (posError) {
+          // If Position creation failed, cancel reservation
+          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'cancelled');
+          logger.error(`[OrderService] Failed to create Position: ${posError?.message || posError}`);
+          throw posError;
+        }
+      } else {
+        // Pending LIMIT (no confirmed fill yet): track in entry_orders table
+        // CRITICAL: Do NOT finalize reservation here - keep it active until Position is created
+        // EntryOrderMonitor will finalize reservation when it creates Position
+        // Store reservation_token in entry_orders for EntryOrderMonitor to finalize later
+        try {
+          // Try to store reservation_token if column exists, otherwise just create entry_order
+          try {
+            await EntryOrder.create({
+              strategy_id: strategy.id,
+              bot_id: strategy.bot_id,
+              order_id: order.id,
+              symbol: strategy.symbol,
+              side,
+              amount,
+              entry_price: effectiveEntryPrice,
+              status: 'open',
+              reservation_token: reservationToken // Store reservation token for later finalization
+            });
+          } catch (schemaError) {
+            // If reservation_token column doesn't exist, create without it
+            if (schemaError.message?.includes('reservation_token') || schemaError.code === 'ER_BAD_FIELD_ERROR') {
+              await EntryOrder.create({
+                strategy_id: strategy.id,
+                bot_id: strategy.bot_id,
+                order_id: order.id,
+                symbol: strategy.symbol,
+                side,
+                amount,
+                entry_price: effectiveEntryPrice,
+                status: 'open'
+              });
+              logger.debug(`[OrderService] entry_orders table doesn't have reservation_token column, created entry_order without it`);
+            } else {
+              throw schemaError;
+            }
+          }
+          logger.debug(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table. Reservation ${reservationToken} kept active until Position is created.`);
         } catch (e) {
           logger.warn(`[OrderService] Failed to persist entry order ${order.id} into entry_orders: ${e?.message || e}`);
+          // If entry_order creation failed, cancel reservation
+          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'cancelled');
         }
       }
 
@@ -237,41 +286,39 @@ export class OrderService {
         slPrice
       });
 
+      // Ensure bot info present before sending notifications
+      if (!strategy.bot && strategy.bot_id) {
+        const { Bot } = await import('../models/Bot.js');
+        strategy.bot = await Bot.findById(strategy.bot_id);
+      }
+
       // Send Telegram notification to bot chat
-      await this.telegramService.sendOrderNotification(position, strategy);
+      try {
+        await this.telegramService.sendOrderNotification(position, strategy);
+        logger.debug(`[OrderService] ✅ Order notification sent successfully for position ${position.id}`);
+      } catch (e) {
+        logger.error(`[OrderService] Failed to send order notification for position ${position.id}:`, e);
+      }
 
       // Send entry trade alert to central channel
       try {
-        logger.info(`[OrderService] Preparing to send entry trade alert for position ${position.id}`);
-        // Ensure bot info present
-        if (!strategy.bot && strategy.bot_id) {
-          const { Bot } = await import('../models/Bot.js');
-          strategy.bot = await Bot.findById(strategy.bot_id);
-          logger.info(`[OrderService] Fetched bot info: ${strategy.bot?.bot_name || 'N/A'}`);
-        }
-        logger.info(`[OrderService] Calling sendEntryTradeAlert for position ${position.id}, strategy ${strategy.id}`);
         await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
-        logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
+        logger.debug(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
       } catch (e) {
         logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
         logger.error(`[OrderService] Error stack:`, e?.stack);
       }
 
       // TP/SL creation is now handled by PositionMonitor after entry confirmation.
-      logger.info(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
+      logger.debug(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
 
         // Central log: success
         await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
       } else {
         // Pending LIMIT only (no DB position yet)
-        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice}`);
+        // Reservation is still active and will be finalized by EntryOrderMonitor when Position is created
+        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice} reservation=${reservationToken}`);
       }
-
-      // Mark reservation as 'released' (position opened)
-      try {
-        orderCreated = true;
-        await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
-      } catch (_) {}
 
       // For compatibility with callers (e.g. WebSocketOCConsumer), always return a truthy value on success:
       // - Position object when exposure is confirmed

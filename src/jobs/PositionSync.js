@@ -97,8 +97,17 @@ export class PositionSync {
   async syncBotPositions(botId, exchangeService) {
     try {
       // Fetch positions from exchange
-      const exchangePositions = await exchangeService.exchange.fetchPositions();
+      let exchangePositions;
+      try {
+        exchangePositions = await exchangeService.exchange.fetchPositions();
+        logger.debug(`[PositionSync] Fetched ${Array.isArray(exchangePositions) ? exchangePositions.length : 0} positions from exchange for bot ${botId}`);
+      } catch (error) {
+        logger.error(`[PositionSync] Failed to fetch positions from exchange for bot ${botId}:`, error?.message || error);
+        return;
+      }
+      
       if (!Array.isArray(exchangePositions) || exchangePositions.length === 0) {
+        logger.debug(`[PositionSync] No positions on exchange for bot ${botId}`);
         return; // No positions on exchange
       }
 
@@ -119,35 +128,66 @@ export class PositionSync {
       }
 
       // Process exchange positions
+      let processedCount = 0;
+      let createdCount = 0;
       for (const exPos of exchangePositions) {
         try {
           // Normalize position data
-          const symbol = exPos.symbol || exPos.info?.symbol;
-          const contracts = exPos.contracts ?? Math.abs(parseFloat(exPos.positionAmt || 0));
+          const symbol = exPos.symbol || exPos.info?.symbol || exPos.market;
+          const contracts = exPos.contracts ?? Math.abs(parseFloat(exPos.positionAmt || exPos.size || 0));
           const side = contracts > 0 ? 'long' : (contracts < 0 ? 'short' : null);
           
           if (!symbol || !side || Math.abs(contracts) <= 0) {
+            logger.debug(`[PositionSync] Skipping invalid position: symbol=${symbol}, side=${side}, contracts=${contracts}`);
             continue; // Skip invalid positions
           }
 
-          // Normalize symbol format (remove /USDT, etc)
-          const normalizedSymbol = symbol.replace(/\/USDT$/, 'USDT').replace('/', '');
+          // Normalize symbol format - handle different exchange formats
+          // Binance: BTCUSDT, MEXC: BTC/USDT:USDT, Gate: BTC_USDT
+          let normalizedSymbol = symbol;
+          normalizedSymbol = normalizedSymbol.replace(/\/USDT:USDT$/, 'USDT'); // MEXC format
+          normalizedSymbol = normalizedSymbol.replace(/\/USDT$/, 'USDT'); // Standard format
+          normalizedSymbol = normalizedSymbol.replace(/_USDT$/, 'USDT'); // Gate format
+          normalizedSymbol = normalizedSymbol.replace(/\//g, ''); // Remove any remaining slashes
+          
+          logger.debug(`[PositionSync] Processing position: ${symbol} -> ${normalizedSymbol}, ${side}, contracts=${contracts}`);
 
           // Check if position exists in database
-          const key = `${normalizedSymbol}_${side}`;
-          const dbPos = dbPositionsMap.get(key);
+          // Try multiple key formats for matching
+          const key1 = `${normalizedSymbol}_${side}`;
+          const key2 = `${symbol}_${side}`;
+          let dbPos = dbPositionsMap.get(key1) || dbPositionsMap.get(key2);
+          
+          // Also try direct symbol match
+          if (!dbPos) {
+            for (const [key, pos] of dbPositionsMap.entries()) {
+              if (pos.symbol === normalizedSymbol || pos.symbol === symbol) {
+                dbPos = pos;
+                break;
+              }
+            }
+          }
 
           if (!dbPos) {
             // Position exists on exchange but not in database - try to find matching entry_order or strategy
-            await this.createMissingPosition(botId, normalizedSymbol, side, exPos, exchangeService);
+            logger.info(`[PositionSync] Position ${normalizedSymbol} ${side} exists on exchange but not in database, attempting to create...`);
+            try {
+              const created = await this.createMissingPosition(botId, normalizedSymbol, side, exPos, exchangeService);
+              if (created) createdCount++;
+            } catch (createError) {
+              logger.error(`[PositionSync] Failed to create position ${normalizedSymbol} ${side}:`, createError?.message || createError);
+            }
           } else {
             // Position exists in both - verify consistency
             await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
           }
+          processedCount++;
         } catch (error) {
-          logger.warn(`[PositionSync] Error processing exchange position ${exPos.symbol}:`, error?.message || error);
+          logger.warn(`[PositionSync] Error processing exchange position ${exPos.symbol || 'unknown'}:`, error?.message || error);
         }
       }
+      
+      logger.info(`[PositionSync] Processed ${processedCount} exchange positions for bot ${botId}, created ${createdCount} missing positions`);
     } catch (error) {
       logger.error(`[PositionSync] Error syncing bot ${botId}:`, error?.message || error);
       throw error;
@@ -174,10 +214,63 @@ export class PositionSync {
 
       if (entryOrders.length > 0) {
         const entry = entryOrders[0];
-        logger.info(`[PositionSync] Found matching entry_order ${entry.id} for missing position ${symbol} ${side}, will trigger EntryOrderMonitor`);
-        // EntryOrderMonitor will handle this, but we can also try to create Position directly
-        // For now, just log - EntryOrderMonitor should pick it up
-        return;
+        logger.info(`[PositionSync] Found matching entry_order ${entry.id} for missing position ${symbol} ${side}`);
+        // Try to create Position directly using entry_order data
+        try {
+          const { Strategy } = await import('../models/Strategy.js');
+          const strategy = await Strategy.findById(entry.strategy_id);
+          if (!strategy) {
+            logger.warn(`[PositionSync] Strategy ${entry.strategy_id} not found for entry_order ${entry.id}`);
+            return false;
+          }
+          
+          // Use entry_order data to create Position
+          const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+          const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || entry.entry_price || 0);
+          const tpPrice = calculateTakeProfit(entryPrice, strategy.oc, strategy.take_profit, side);
+          const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+          const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+          const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
+          
+          // Check concurrency
+          const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
+          const reservationToken = entry.reservation_token 
+            ? entry.reservation_token 
+            : await concurrencyManager.reserveSlot(botId);
+          
+          if (!reservationToken) {
+            const status = await concurrencyManager.getStatus(botId);
+            logger.warn(`[PositionSync] Cannot create Position from entry_order ${entry.id}: limit reached (${status.currentCount}/${status.maxConcurrent})`);
+            return false;
+          }
+          
+          try {
+            const position = await Position.create({
+              strategy_id: entry.strategy_id,
+              bot_id: botId,
+              order_id: entry.order_id,
+              symbol: entry.symbol,
+              side: side,
+              entry_price: entryPrice,
+              amount: entry.amount,
+              take_profit_price: tpPrice,
+              stop_loss_price: slPrice,
+              current_reduce: strategy.reduce
+            });
+            
+            await EntryOrder.markFilled(entry.id);
+            await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
+            
+            logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${symbol} ${side}`);
+            return true;
+          } catch (posError) {
+            await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+            throw posError;
+          }
+        } catch (error) {
+          logger.error(`[PositionSync] Error creating Position from entry_order ${entry.id}:`, error?.message || error);
+          return false;
+        }
       }
 
       // Try to find matching strategy
@@ -190,7 +283,7 @@ export class PositionSync {
 
       if (strategies.length === 0) {
         logger.debug(`[PositionSync] No matching strategy found for missing position ${symbol} ${side} on bot ${botId}`);
-        return; // Can't create Position without strategy
+        return false; // Can't create Position without strategy
       }
 
       const strategy = strategies[0];
@@ -216,7 +309,7 @@ export class PositionSync {
       if (!canAccept) {
         const status = await concurrencyManager.getStatus(botId);
         logger.warn(`[PositionSync] Cannot create Position for ${symbol} ${side}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent})`);
-        return;
+        return false;
       }
 
       // Reserve slot
@@ -224,7 +317,7 @@ export class PositionSync {
       if (!reservationToken) {
         const status = await concurrencyManager.getStatus(botId);
         logger.warn(`[PositionSync] Failed to reserve slot for ${symbol} ${side}: limit reached (${status.currentCount}/${status.maxConcurrent})`);
-        return;
+        return false;
       }
 
       try {
@@ -246,13 +339,16 @@ export class PositionSync {
         await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
 
         logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${symbol} ${side} on bot ${botId} (synced from exchange)`);
+        return true;
       } catch (error) {
         // Cancel reservation if Position creation failed
         await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+        logger.error(`[PositionSync] Failed to create Position for ${symbol} ${side}:`, error?.message || error);
         throw error;
       }
     } catch (error) {
       logger.error(`[PositionSync] Error creating missing position for ${symbol} ${side}:`, error?.message || error);
+      return false;
     }
   }
 

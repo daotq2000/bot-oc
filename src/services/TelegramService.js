@@ -64,6 +64,13 @@ export class TelegramService {
    * @param {Object} options - Additional options
    */
   async sendMessage(chatId, message, options = {}) {
+    // Master toggle to enable/disable all alerts from DB config
+    const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+    if (!alertsEnabled) {
+      logger.debug(`[Telegram] Alerts disabled by config (ENABLE_ALERTS=false), skipping message to ${chatId}`);
+      return;
+    }
+
     if (!this.initialized || !this.bot) {
       logger.warn(`[Telegram] Bot not initialized, skipping message to ${chatId}`);
       return;
@@ -125,11 +132,27 @@ export class TelegramService {
    * @param {Object} strategy - Strategy object
    */
   async sendOrderNotification(position, strategy) {
-    if (!position || !strategy) return;
+    if (!position || !strategy) {
+      logger.warn(`[OrderNotification] Missing position or strategy, skipping notification`);
+      return;
+    }
 
-    const bot = strategy.bot || {};
+    // Try to get bot info from strategy, or load it if missing
+    let bot = strategy.bot || {};
+    if (!bot.telegram_chat_id && strategy.bot_id) {
+      try {
+        const { Bot } = await import('../models/Bot.js');
+        bot = await Bot.findById(strategy.bot_id) || bot;
+      } catch (e) {
+        logger.warn(`[OrderNotification] Failed to load bot ${strategy.bot_id}:`, e?.message || e);
+      }
+    }
+
     const chatId = bot.telegram_chat_id;
-    if (!chatId) return;
+    if (!chatId) {
+      logger.warn(`[OrderNotification] No telegram_chat_id for bot ${bot.id || strategy.bot_id}, skipping notification for position ${position.id}`);
+      return;
+    }
 
     const sideEmoji = position.side === 'long' ? '🟢' : '🔴';
     const sideText = position.side.toUpperCase();
@@ -212,7 +235,29 @@ Amount: ${amountStr} (100%)`.trim();
 
   async sendCloseSummaryAlert(position, stats) {
     try {
-      const channelId = position?.telegram_alert_channel_id || this.alertChannelId;
+      if (!position) {
+        logger.warn(`[CloseSummaryAlert] Missing position, skipping notification`);
+        return;
+      }
+
+      // Try to get channel ID from position, or use default alert channel
+      let channelId = position?.telegram_alert_channel_id;
+      
+      // If no alert channel, try telegram_chat_id from bot
+      if (!channelId && position?.telegram_chat_id) {
+        channelId = position.telegram_chat_id;
+      }
+      
+      // Fall back to default alert channel
+      if (!channelId) {
+        channelId = this.alertChannelId;
+      }
+      
+      if (!channelId) {
+        logger.warn(`[CloseSummaryAlert] No channel ID available for position ${position.id}, skipping notification`);
+        return;
+      }
+
       const symbol = this.formatSymbolUnderscore(position.symbol);
       const isWin = (position.close_reason === 'tp_hit');
       const sideTitle = position.side === 'long' ? 'Long' : 'Short';
@@ -442,9 +487,29 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
    * └ 0.003788 → 0.004186
    */
   async sendVolatilityAlert(chatId, alertData) {
-    if (!chatId) return;
+    if (!chatId) {
+      logger.warn(`[VolatilityAlert] Chat ID is empty, skipping alert`);
+      return;
+    }
 
-    const { oc, open, currentPrice, direction, interval,symbol } = alertData;
+    // Check master ENABLE_ALERTS switch
+    const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+    if (!alertsEnabled) {
+      logger.debug(`[VolatilityAlert] Alerts disabled by ENABLE_ALERTS config, skipping alert to ${chatId}`);
+      return;
+    }
+
+    if (!this.initialized || !this.bot) {
+      logger.warn(`[VolatilityAlert] Telegram bot not initialized, skipping alert to ${chatId}`);
+      return;
+    }
+
+    const { oc, open, currentPrice, direction, interval, symbol } = alertData;
+    
+    if (!symbol || oc === undefined || open === undefined || currentPrice === undefined) {
+      logger.warn(`[VolatilityAlert] Missing required alert data: symbol=${symbol}, oc=${oc}, open=${open}, currentPrice=${currentPrice}`);
+      return;
+    }
 
     const directionEmoji = direction === 'bullish' ? '🟢' : '🔴';
 
@@ -478,7 +543,14 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
 └ ${formatPrice(open)} → ${formatPrice(currentPrice)}
     `.trim();
 
-    await this.sendMessage(chatId, message);
+    logger.info(`[VolatilityAlert] Sending alert to ${chatId}: ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
+    try {
+      await this.sendMessage(chatId, message);
+      logger.debug(`[VolatilityAlert] ✅ Alert sent successfully to ${chatId}`);
+    } catch (error) {
+      logger.error(`[VolatilityAlert] Failed to send alert to ${chatId}:`, error?.message || error);
+      throw error;
+    }
   }
 
   /**

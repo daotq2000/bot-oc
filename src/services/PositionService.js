@@ -305,7 +305,7 @@ export class PositionService {
               const distanceFromMarket = Math.abs(newTP - marketPrice);
               const distancePercent = (distanceFromMarket / marketPrice) * 100;
               
-              logger.info(`[TP Trail] TP ${newTP.toFixed(2)} crossed entry ${entryPrice.toFixed(2)} for ${position.side} position ${position.id}. Distance from market: ${distancePercent.toFixed(3)}%`);
+              logger.debug(`[TP Trail] TP ${newTP.toFixed(2)} crossed entry ${entryPrice.toFixed(2)} for ${position.side} position ${position.id}. Distance from market: ${distancePercent.toFixed(3)}%`);
               
               if (distancePercent <= 0.5) {
                 // Too close to market - close position immediately
@@ -318,7 +318,7 @@ export class PositionService {
                       await this.exchangeService.closePosition(position.symbol, position.side, qtyToClose);
                     }
                     await this.closePosition(position, marketPrice, pnl, 'trailing_exit');
-                    logger.info(`[TP Trail] Closed position ${position.id} by MARKET order (TP too close to market)`);
+                    logger.debug(`[TP Trail] Closed position ${position.id} by MARKET order (TP too close to market)`);
                     return await Position.findById(position.id);
                   }
                 } catch (e) {
@@ -330,14 +330,20 @@ export class PositionService {
               }
             } else {
               // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
-              await this._maybeReplaceTpOrder(position, prevTP, newTP);
+              // Try to replace TP order, but continue even if it fails
+              try {
+                await this._maybeReplaceTpOrder(position, prevTP, newTP);
+              } catch (replaceError) {
+                logger.warn(`[TP Trail] Failed to replace TP order for position ${position.id}: ${replaceError?.message || replaceError}. Continuing with TP price update.`);
+              }
               
-              // Update take_profit_price and minutes_elapsed in DB
+              // Always update take_profit_price and minutes_elapsed in DB
+              // This ensures trailing TP works even if order replacement fails
               await Position.update(position.id, { 
                 take_profit_price: newTP,
                 minutes_elapsed: actualMinutesElapsed
               });
-              logger.debug(`[TP Trail] Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)}, minutes_elapsed=${actualMinutesElapsed}`);
+              logger.debug(`[TP Trail] ✅ Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)} (prev=${prevTP.toFixed(2)}), minutes_elapsed=${actualMinutesElapsed}`);
             }
           }
         } catch (e) {
@@ -412,7 +418,7 @@ export class PositionService {
               if (position.tp_order_id) {
                 try {
                   await this.exchangeService.cancelOrder(position.tp_order_id, position.symbol);
-                  logger.info(`[TP Replace] Cancelled old TP order ${position.tp_order_id} for position ${position.id}`);
+                  logger.debug(`[TP Replace] Cancelled old TP order ${position.tp_order_id} for position ${position.id}`);
                 } catch (e) {
                   logger.warn(`[TP Replace] Failed to cancel old TP order ${position.tp_order_id}: ${e?.message || e}`);
                 }
@@ -434,12 +440,20 @@ export class PositionService {
                    (position.side === 'long' && newTP >= entryPrice));
                 
                 if (isValidTP) {
-                  const tpRes = await this.exchangeService.createTakeProfitLimit(position.symbol, position.side, newTP, qty);
-                  const newTpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
-                  const updatePayload = { take_profit_price: newTP };
-                  if (newTpOrderId) updatePayload.tp_order_id = newTpOrderId;
-                  await Position.update(position.id, updatePayload);
-                  logger.info(`[TP Replace] Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id}`);
+                  try {
+                    const tpRes = await this.exchangeService.createTakeProfitLimit(position.symbol, position.side, newTP, qty);
+                    const newTpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
+                    const updatePayload = { take_profit_price: newTP };
+                    if (newTpOrderId) updatePayload.tp_order_id = newTpOrderId;
+                    await Position.update(position.id, updatePayload);
+                    logger.debug(`[TP Replace] ✅ Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id}`);
+                  } catch (tpError) {
+                    // If TP order creation fails, still update take_profit_price in DB
+                    // This allows trailing TP to continue working even if orders can't be placed
+                    logger.warn(`[TP Replace] ⚠️ Failed to place TP order @ ${newTP} for position ${position.id}: ${tpError?.message || tpError}. Updating TP price in DB only.`);
+                    await Position.update(position.id, { take_profit_price: newTP });
+                    logger.debug(`[TP Replace] Updated TP price in DB to ${newTP} for position ${position.id} (order not placed)`);
+                  }
                 } else {
                   logger.debug(`[TP Replace] TP ${newTP} is on wrong side of Entry ${entryPrice}, skipping TP order creation (will be handled by SL conversion)`);
                 }
@@ -552,9 +566,22 @@ export class PositionService {
         return;
       }
       logger.info(`[Notification] Preparing to send close summary for position ${closedPosition.id}`);
-      const stats = await Position.getBotStats(closedPosition.bot_id);
-      logger.debug(`[Notification] Fetched bot stats for bot ${closedPosition.bot_id}:`, stats);
-      await this.telegramService.sendCloseSummaryAlert(closedPosition, stats);
+      
+      // Ensure position has all required fields (telegram_alert_channel_id, bot_name, etc.)
+      // Position.close() returns position from findById which includes bot info, but let's verify
+      let positionWithBotInfo = closedPosition;
+      if (!closedPosition.telegram_alert_channel_id && !closedPosition.telegram_chat_id) {
+        // Re-fetch position with bot info if missing
+        positionWithBotInfo = await Position.findById(closedPosition.id);
+        if (!positionWithBotInfo) {
+          logger.warn(`[Notification] Could not find position ${closedPosition.id} to send notification`);
+          return;
+        }
+      }
+      
+      const stats = await Position.getBotStats(positionWithBotInfo.bot_id);
+      logger.debug(`[Notification] Fetched bot stats for bot ${positionWithBotInfo.bot_id}:`, stats);
+      await this.telegramService.sendCloseSummaryAlert(positionWithBotInfo, stats);
       logger.info(`[Notification] ✅ Successfully sent close summary alert for position ${closedPosition.id}`);
     } catch (inner) {
       logger.error(`[Notification] ❌ Failed to send close summary alert for position ${closedPosition.id}:`, inner?.message || inner, inner?.stack);

@@ -9,12 +9,50 @@ import logger from '../utils/logger.js';
 class WebSocketManager {
   constructor() {
     this.connections = []; // [{ ws, streams:Set<string>, url, reconnectAttempts }]
-    this.priceCache = new Map(); // symbol -> price
+    this.priceCache = new Map(); // symbol -> { price, lastAccess }
     this._priceHandlers = new Set(); // listeners for price ticks
 
     this.baseUrl = 'wss://fstream.binance.com/stream?streams=';
     this.maxStreamsPerConn = 180; // keep well below 200 limit and URL length issues
     this.maxReconnectAttempts = 10;
+    this.maxPriceCacheSize = 1000; // Maximum number of symbols to cache (reduced from 5000 to save memory)
+    this.priceCacheCleanupInterval = 1 * 60 * 1000; // Cleanup every 1 minute (reduced from 5 minutes)
+    this._cleanupTimer = null;
+    this._startCacheCleanup();
+  }
+
+  _startCacheCleanup() {
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = setInterval(() => this._cleanupPriceCache(), this.priceCacheCleanupInterval);
+  }
+
+  _cleanupPriceCache() {
+    const now = Date.now();
+    const maxAge = 5 * 60 * 1000; // Remove entries older than 5 minutes (reduced from 10 minutes)
+    let removed = 0;
+
+    // Remove old entries
+    for (const [symbol, data] of this.priceCache.entries()) {
+      if (now - data.lastAccess > maxAge) {
+        this.priceCache.delete(symbol);
+        removed++;
+      }
+    }
+
+    // If still over limit, remove least recently used
+    if (this.priceCache.size > this.maxPriceCacheSize) {
+      const entries = Array.from(this.priceCache.entries())
+        .sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+      const toRemove = entries.slice(0, this.priceCache.size - this.maxPriceCacheSize);
+      for (const [symbol] of toRemove) {
+        this.priceCache.delete(symbol);
+        removed++;
+      }
+    }
+
+    if (removed > 0) {
+      logger.debug(`[Binance-WS] Cleaned up ${removed} price cache entries. Current size: ${this.priceCache.size}`);
+    }
   }
 
   // Register listener for price ticks
@@ -32,7 +70,13 @@ class WebSocketManager {
 
   // Return latest cached price
   getPrice(symbol) {
-    return this.priceCache.get(String(symbol).toUpperCase());
+    const key = String(symbol).toUpperCase();
+    const cached = this.priceCache.get(key);
+    if (cached) {
+      cached.lastAccess = Date.now();
+      return cached.price;
+    }
+    return null;
   }
 
   // Subscribe a list of symbols (normalized like BTCUSDT)
@@ -157,7 +201,14 @@ class WebSocketManager {
           const symbol = String(payload.s).toUpperCase();
           const price = parseFloat(payload.p);
           if (Number.isFinite(price)) {
-            this.priceCache.set(symbol, price);
+            // Use LRU-style caching with size limit
+            if (this.priceCache.size >= this.maxPriceCacheSize && !this.priceCache.has(symbol)) {
+              // Remove oldest entry if at limit
+              const oldest = Array.from(this.priceCache.entries())
+                .sort((a, b) => a[1].lastAccess - b[1].lastAccess)[0];
+              if (oldest) this.priceCache.delete(oldest[0]);
+            }
+            this.priceCache.set(symbol, { price, lastAccess: Date.now() });
             this._emitPrice({ symbol, price, ts: Date.now() });
           }
         }
@@ -215,6 +266,10 @@ class WebSocketManager {
   disconnect() {
     for (const conn of this.connections) this._disconnect(conn);
     this.connections = [];
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
     logger.info('[Binance-WS] All shards disconnected.');
   }
 
