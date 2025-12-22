@@ -158,7 +158,7 @@ export function calculateInitialStopLoss(entryPrice, stoploss, side) {
  * @param {number} prevTP - Previous take profit price
  * @param {number} entryPrice - Entry price (target to trail towards)
  * @param {number} initialTP - Initial take profit price (starting point)
- * @param {number} reducePercent - Reduce percentage per minute (same format as take_profit: divide by 10)
+ * @param {number} reducePercent - Reduce percentage per minute (direct percentage, e.g., 40 = 40%)
  * @param {'long'|'short'} side - Position side
  * @returns {number} Next take profit price
  */
@@ -173,10 +173,10 @@ export function calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, r
   }
   
   // Calculate step value: percentage of the range from initial TP to Entry
-  // e.g., reduce = 5 → actualReducePercent = 0.5%
-  const actualReducePercent = reduce / 10; // 5 → 0.5%
+  // reduce/up_reduce are direct percentages (e.g., 40 = 40%, not divided by 10)
+  // This is different from take_profit which uses divide-by-10 format
   const range = Math.abs(initial - entry);
-  const stepValue = range * (actualReducePercent / 100);
+  const stepValue = range * (reduce / 100);
   
   if (side === 'long') {
     // LONG: TP moves DOWN (decreases) from initial TP towards entry

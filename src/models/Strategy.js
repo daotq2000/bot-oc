@@ -177,5 +177,32 @@ export class Strategy {
     );
     return result.affectedRows > 0;
   }
+
+  /**
+   * Delete strategies for delisted symbols
+   * @param {string} exchange - Exchange name (binance, mexc)
+   * @param {Array<string>} delistedSymbols - Array of delisted symbols
+   * @returns {Promise<number>} Number of deleted strategies
+   */
+  static async deleteBySymbols(exchange, delistedSymbols) {
+    if (!Array.isArray(delistedSymbols) || delistedSymbols.length === 0) {
+      return 0;
+    }
+
+    const normalizedSymbols = delistedSymbols.map(s => s.toUpperCase()).filter(s => s);
+    if (normalizedSymbols.length === 0) {
+      return 0;
+    }
+
+    const placeholders = normalizedSymbols.map(() => '?').join(',');
+    const sql = `
+      DELETE s FROM strategies s
+      JOIN bots b ON s.bot_id = b.id
+      WHERE b.exchange = ? AND s.symbol IN (${placeholders})
+    `;
+
+    const [result] = await pool.execute(sql, [exchange, ...normalizedSymbols]);
+    return result.affectedRows || 0;
+  }
 }
 

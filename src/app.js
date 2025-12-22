@@ -74,9 +74,9 @@ async function start() {
     try {
       logger.info('Seeding default application configs...');
       // Master alert toggle
-      await AppConfig.set('ENABLE_ALERTS', 'false', 'Master switch to enable/disable all Telegram alerts from DB');
+      await AppConfig.set('ENABLE_ALERTS', 'true', 'Master switch to enable/disable all Telegram alerts from DB');
       // Strategy and scanning configs
-      await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
+      await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'false', 'Allow placing passive LIMIT when extend condition is not met');
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '30', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
@@ -149,7 +149,7 @@ async function start() {
       await AppConfig.set('CONCURRENCY_LOCK_TIMEOUT', '5', 'Timeout (seconds) for acquiring concurrency locks');
       
       // Position sync configs
-      await AppConfig.set('POSITION_SYNC_INTERVAL_MINUTES', '5', 'Interval (minutes) to sync positions from exchange to database');
+      await AppConfig.set('POSITION_SYNC_INTERVAL_MINUTES', '1', 'Interval (minutes) to sync positions from exchange to database');
 
       // Batch processing configs
       await AppConfig.set('SIGNAL_SCAN_BATCH_SIZE', '200', 'Number of strategies to scan in parallel per batch');

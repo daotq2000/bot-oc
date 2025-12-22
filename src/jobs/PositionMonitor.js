@@ -115,7 +115,7 @@ export class PositionMonitor {
       }
 
       // Get the actual fill price from the exchange
-      const fillPrice = await exchangeService.getOrderAverageFillPrice(position.symbol, position.order_id);
+      const fillPrice = await exchangeService.binanceDirectClient.getOrderAverageFillPrice(position.symbol, position.order_id);
       if (!fillPrice || !Number.isFinite(fillPrice) || fillPrice <= 0) {
         logger.debug(`[Place TP/SL] Could not get fill price for position ${position.id}, will retry.`);
         return;
@@ -148,12 +148,19 @@ export class PositionMonitor {
           const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
           if (tpOrderId) {
             // Store initial TP price for trailing calculation
-            await Position.update(position.id, { tp_order_id: tpOrderId, take_profit_price: tpPrice });
+            await Position.update(position.id, { 
+              tp_order_id: tpOrderId, 
+              take_profit_price: tpPrice,
+              initial_tp_price: tpPrice  // Save initial TP for trailing calculation
+            });
             logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice} (initial TP)`);
           } else {
             // Order creation returned null (e.g., price too close to market)
             logger.warn(`[Place TP/SL] ⚠️ TP order creation returned null for position ${position.id} @ ${tpPrice}. Updating TP price in DB only.`);
-            await Position.update(position.id, { take_profit_price: tpPrice });
+            await Position.update(position.id, { 
+              take_profit_price: tpPrice,
+              initial_tp_price: tpPrice  // Save initial TP for trailing calculation
+            });
           }
         } catch (e) {
           // If TP order creation fails, still update take_profit_price in DB
@@ -161,7 +168,10 @@ export class PositionMonitor {
           logger.error(`[Place TP/SL] ❌ Failed to create TP order for position ${position.id}:`, e?.message || e);
           logger.warn(`[Place TP/SL] Updating TP price in DB to ${tpPrice} for position ${position.id} (order not placed, trailing TP will still work)`);
           try {
-            await Position.update(position.id, { take_profit_price: tpPrice });
+            await Position.update(position.id, { 
+              take_profit_price: tpPrice,
+              initial_tp_price: tpPrice  // Save initial TP for trailing calculation
+            });
           } catch (updateError) {
             logger.error(`[Place TP/SL] Failed to update TP price in DB:`, updateError?.message || updateError);
           }
@@ -391,4 +401,3 @@ export class PositionMonitor {
     logger.info(`PositionMonitor started with pattern: ${pattern}`);
   }
 }
-
