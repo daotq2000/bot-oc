@@ -452,13 +452,31 @@ export class OcAlertScanner {
           state.lastPrice = p;
           state.lastOc = oc;
 
-          const minIntervalMs = Number(configService.getNumber('OC_ALERT_TICK_MIN_INTERVAL_MS', configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000)));
+          const minIntervalMs = Number(configService.getNumber(
+            'OC_ALERT_TICK_MIN_INTERVAL_MS',
+            configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000)
+          ));
           const rearmRatio = Number(configService.getNumber('OC_ALERT_REARM_RATIO', 0.6));
+          // Step tracking: cho phép tiếp tục gửi alert khi OC tăng thêm từng nấc,
+          // thay vì chỉ bắn một lần ở điểm chạm threshold đầu tiên.
+          // Nếu không cấu hình riêng, mặc định step = threshold (tức 1x, 2x, 3x ngưỡng).
+          const stepPercentCfg = Number(configService.getNumber('OC_ALERT_STEP_PERCENT', NaN));
           const absOc = Math.abs(oc);
           const absThreshold = Math.abs(Number(w.threshold || 0));
           if (absThreshold <= 0) continue;
 
-          if (absOc >= absThreshold && state.armed) {
+          // Giá trị OC của lần alert trước (tính theo trị tuyệt đối)
+          const lastAlertOcAbs = Number.isFinite(state.lastAlertOcAbs) ? state.lastAlertOcAbs : 0;
+          const stepPercent = Number.isFinite(stepPercentCfg) ? Math.abs(stepPercentCfg) : absThreshold;
+
+          // Điều kiện để bắn alert mới:
+          // 1) OC hiện tại vượt ngưỡng tối thiểu (absThreshold)
+          // 2) OC đã đi thêm ít nhất "stepPercent" so với lần alert trước
+          // 3) Thỏa rate-limit theo thời gian (minIntervalMs)
+          const ocDeltaFromLastAlert = absOc - lastAlertOcAbs;
+          const shouldFireByStep = absOc >= absThreshold && ocDeltaFromLastAlert >= stepPercent;
+
+          if (shouldFireByStep && state.armed) {
             const elapsed = now - (state.lastAlertTime || 0);
             if (elapsed >= minIntervalMs) {
               // Use config's telegram_chat_id, don't fallback to default
@@ -467,7 +485,11 @@ export class OcAlertScanner {
                 logger.warn(`[OcTick] No telegram_chat_id for config ${w.cfgId} (${exchange}), skipping alert for ${sym}`);
                 continue;
               }
-              logger.info(`[OcTick] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% (thr=${absThreshold}%) to chat_id=${chatId} (config_id=${w.cfgId})`);
+              logger.info(
+                `[OcTick] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} ` +
+                `oc=${oc.toFixed(2)}% (thr=${absThreshold}%, step=${stepPercent}%, ` +
+                `lastAlertOcAbs=${lastAlertOcAbs.toFixed(2)}%) to chat_id=${chatId} (config_id=${w.cfgId})`
+              );
               this.telegramService.sendVolatilityAlert(chatId, {
                 symbol: sym,
                 interval,
@@ -479,6 +501,7 @@ export class OcAlertScanner {
                 logger.error(`[OcTick] Failed to send alert to chat_id=${chatId}:`, error?.message || error);
               });
               state.lastAlertTime = now;
+              state.lastAlertOcAbs = absOc;
               state.armed = false;
               logger.info(`[OcTick] ✅ Alert sent: ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% to chat_id=${chatId}`);
 
@@ -518,7 +541,10 @@ export class OcAlertScanner {
               }
             }
           } else if (absOc < absThreshold * rearmRatio) {
+            // Khi OC giảm về dưới rearmRatio * threshold, reset để chuẩn bị cho
+            // một chu kỳ biến động mới (và reset lastAlertOcAbs để bậc thang tính lại từ đầu).
             state.armed = true;
+            state.lastAlertOcAbs = 0;
           }
         }
       }
@@ -601,6 +627,7 @@ export class OcAlertScanner {
       const thresholdByConfig = (cfg) => Number(cfg.threshold || 0);
       const minIntervalMs = Number(configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000));
       const rearmRatio = Number(configService.getNumber('OC_ALERT_REARM_RATIO', 0.6)); // re-arm when oc falls below ratio*threshold
+      const stepPercentCfg = Number(configService.getNumber('OC_ALERT_STEP_PERCENT', NaN));
       const now = Date.now();
 
       for (const cfg of configs) {
@@ -656,7 +683,7 @@ export class OcAlertScanner {
             
             let state = this.state.get(stateKey);
             if (!state) {
-              state = { lastAlertTime: 0, armed: true, lastOc: oc, lastPrice: Number(currentPrice) };
+              state = { lastAlertTime: 0, armed: true, lastOc: oc, lastPrice: Number(currentPrice), lastAlertOcAbs: 0 };
               this.state.set(stateKey, state);
               logger.debug(`[OcAlertScanner] New state for ${sym} ${interval}: oc=${oc.toFixed(2)}%, armed=true`);
             }
@@ -668,15 +695,21 @@ export class OcAlertScanner {
             // Check if we should send an alert
             const absOc = Math.abs(oc);
             const absThreshold = Math.abs(threshold);
+            const lastAlertOcAbs = Number.isFinite(state.lastAlertOcAbs) ? state.lastAlertOcAbs : 0;
+            const stepPercent = Number.isFinite(stepPercentCfg) ? Math.abs(stepPercentCfg) : absThreshold;
+            const ocDeltaFromLastAlert = absOc - lastAlertOcAbs;
             
-            // Log at info level when OC is close to threshold to help debug
+            // Log at info level khi OC tiến gần threshold để debug
             if (absOc >= absThreshold * 0.7) {
               logger.info(`[OcAlertScanner] ${sym} ${interval}: oc=${oc.toFixed(2)}% vs threshold=${absThreshold}%, armed=${state.armed}`);
             } else {
             logger.debug(`[OcAlertScanner] ${sym} ${interval}: oc=${oc.toFixed(2)}% vs threshold=${absThreshold}%, armed=${state.armed}`);
             }
             
-            if (absOc >= absThreshold && state.armed) {
+            // Điều kiện bắn alert: vượt ngưỡng tối thiểu + đi thêm ít nhất step kể từ lần alert trước
+            const shouldFireByStep = absOc >= absThreshold && ocDeltaFromLastAlert >= stepPercent;
+
+            if (shouldFireByStep && state.armed) {
               const last = state.lastAlertTime || 0;
               const timeSinceLastAlert = now - last;
               logger.info(`[OcAlertScanner] ${sym} ${interval}: Alert condition met! oc=${oc.toFixed(2)}% >= ${absThreshold}%, timeSinceLastAlert=${timeSinceLastAlert}ms, minInterval=${minIntervalMs}ms`);
@@ -688,7 +721,11 @@ export class OcAlertScanner {
                   logger.warn(`[OcAlertScanner] No telegram_chat_id for config ${cfg.id} (${exchange}), skipping alert for ${sym}`);
                   continue;
                 }
-                logger.info(`[OcAlertScanner] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% to chat_id=${chatId} (config_id=${cfg.id})`);
+                logger.info(
+                  `[OcAlertScanner] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} ` +
+                  `oc=${oc.toFixed(2)}% (thr=${absThreshold}%, step=${stepPercent}%, ` +
+                  `lastAlertOcAbs=${lastAlertOcAbs.toFixed(2)}%) to chat_id=${chatId} (config_id=${cfg.id})`
+                );
                 await this.telegramService.sendVolatilityAlert(chatId, {
                   symbol: sym,
                   interval,
@@ -700,6 +737,7 @@ export class OcAlertScanner {
                   logger.error(`[OcAlertScanner] Failed to send alert to chat_id=${chatId}:`, error?.message || error);
                 });
                 state.lastAlertTime = now;
+                state.lastAlertOcAbs = absOc;
                 state.armed = false; // Disarm after alert
                 logger.info(`[OcAlertScanner] ✅ Alert sent: ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% >= ${absThreshold}% to chat_id=${chatId}`);
               } else {
@@ -710,6 +748,7 @@ export class OcAlertScanner {
               if (!state.armed) {
                 logger.debug(`[OcAlertScanner] Re-arming ${sym} ${interval} (oc=${oc.toFixed(2)}% < ${(absThreshold * rearmRatio).toFixed(2)}%)`);
                 state.armed = true;
+                state.lastAlertOcAbs = 0;
               }
             }
           }
