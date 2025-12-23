@@ -422,42 +422,35 @@ export class RealtimeOCDetector {
       const normalizedExchange = (exchange || '').toLowerCase();
       const normalizedSymbol = String(symbol || '').toUpperCase().replace(/[\/:_]/g, '');
 
-      // Log every detection call for debugging (first 50, then every 1000th)
+      // Log every detection call for debugging (first 10, then every 5000th to reduce logging)
       if (!this._detectCount) this._detectCount = 0;
       this._detectCount++;
-      if (this._detectCount <= 50 || this._detectCount % 1000 === 0) {
-        logger.info(`[RealtimeOCDetector] detectOC called by ${caller} for ${normalizedExchange} ${normalizedSymbol} @ ${currentPrice} (count: ${this._detectCount})`);
+      if (this._detectCount <= 10 || this._detectCount % 5000 === 0) {
+        logger.debug(`[RealtimeOCDetector] detectOC called by ${caller} for ${normalizedExchange} ${normalizedSymbol} @ ${currentPrice} (count: ${this._detectCount})`);
       }
 
       // Check if price changed significantly
       if (!this.hasPriceChanged(normalizedExchange, normalizedSymbol, currentPrice)) {
-        if (this._detectCount <= 50) {
-          logger.debug(`[RealtimeOCDetector] Price not changed significantly for ${normalizedExchange} ${normalizedSymbol}`);
-        }
+        // Skip logging - too frequent
         return []; // Skip if price hasn't changed significantly
       }
 
       // Get strategies for this symbol
       const strategies = strategyCache.getStrategies(normalizedExchange, normalizedSymbol);
       
-      // Log strategy lookup result
+      // Log strategy lookup result (reduced logging)
       if (strategies.length === 0) {
-        if (this._detectCount <= 50 || normalizedSymbol.includes('PIPPIN')) {
-          logger.warn(`[RealtimeOCDetector] ⚠️ No strategies found for ${normalizedExchange} ${normalizedSymbol} (cache size: ${strategyCache.size()})`);
-          // Log all cached symbols for debugging
-          if (normalizedSymbol.includes('PIPPIN')) {
-            const allSymbols = new Set();
-            for (const [key] of strategyCache.cache.entries()) {
-              const [, sym] = key.split('|');
-              allSymbols.add(sym);
-            }
-            logger.warn(`[RealtimeOCDetector] Available symbols in cache: ${Array.from(allSymbols).slice(0, 20).join(', ')}${allSymbols.size > 20 ? '...' : ''}`);
-          }
+        // Only log for specific symbols or first few times
+        if (normalizedSymbol.includes('PIPPIN') && this._detectCount % 100 === 0) {
+          logger.debug(`[RealtimeOCDetector] No strategies found for ${normalizedExchange} ${normalizedSymbol}`);
         }
         return []; // No strategies for this symbol
       }
 
-      logger.info(`[RealtimeOCDetector] 🔍 Checking ${strategies.length} strategies for ${normalizedExchange} ${normalizedSymbol} @ ${currentPrice}`);
+      // Only log when checking strategies (reduced frequency)
+      if (this._detectCount <= 10 || this._detectCount % 1000 === 0) {
+        logger.debug(`[RealtimeOCDetector] Checking ${strategies.length} strategies for ${normalizedExchange} ${normalizedSymbol}`);
+      }
 
       const matches = [];
 
@@ -478,9 +471,9 @@ export class RealtimeOCDetector {
         const absOC = Math.abs(oc);
         const direction = this.getDirection(openPrice, currentPrice);
 
-        // Log calculation details for debugging
-        if (normalizedSymbol.includes('PIPPIN') || absOC >= ocThreshold * 0.8) {
-          logger.info(`[RealtimeOCDetector] Strategy ${strategy.id}: ${normalizedSymbol} ${interval} open=${openPrice} current=${currentPrice} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction}`);
+        // Log calculation details for debugging (reduced frequency)
+        if ((normalizedSymbol.includes('PIPPIN') || absOC >= ocThreshold * 0.8) && this._detectCount % 100 === 0) {
+          logger.debug(`[RealtimeOCDetector] Strategy ${strategy.id}: ${normalizedSymbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%)`);
         }
 
         // Check if OC meets threshold
@@ -497,11 +490,8 @@ export class RealtimeOCDetector {
           });
 
           logger.info(`[RealtimeOCDetector] ✅ MATCH FOUND: ${normalizedSymbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} strategy_id=${strategy.id} bot_id=${strategy.bot_id}`);
-        } else {
-          if (normalizedSymbol.includes('PIPPIN') || absOC >= ocThreshold * 0.8) {
-            logger.debug(`[RealtimeOCDetector] Strategy ${strategy.id}: OC ${absOC.toFixed(2)}% < threshold ${ocThreshold}%`);
-          }
         }
+        // Removed else logging - too frequent
       }
 
       if (matches.length > 0) {

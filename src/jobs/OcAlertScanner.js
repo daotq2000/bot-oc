@@ -32,6 +32,106 @@ export class OcAlertScanner {
     this.configsCacheTime = 0;
     this.configsCacheTTL = 30_000; // 30s
     this.watchByExchange = new Map(); // exchange -> { symbols:Set, intervals:Set, threshold:number, chatId:string, cfgId:number }
+    
+    // Cache size limits to prevent memory leaks
+    this.maxStateCacheSize = 1000; // Maximum state entries
+    this.maxOpenCacheSize = 500; // Maximum open cache entries
+    this.maxLastSentSize = 500; // Maximum lastSent entries
+    
+    // Start periodic cleanup
+    this.startCacheCleanup();
+  }
+
+  /**
+   * Start periodic cache cleanup
+   */
+  startCacheCleanup() {
+    // Clean up old cache entries every 5 minutes
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = setInterval(() => {
+      this.cleanupCaches();
+    }, 5 * 60 * 1000); // 5 minutes
+  }
+
+  /**
+   * Clean up old cache entries to prevent memory leaks
+   */
+  cleanupCaches() {
+    const now = Date.now();
+    const maxAge = 30 * 60 * 1000; // 30 minutes
+    let cleaned = 0;
+    
+    // Clean state cache (by age and size)
+    for (const [key, value] of this.state.entries()) {
+      if (value.lastAlertTime && (now - value.lastAlertTime > maxAge * 2)) {
+        this.state.delete(key);
+        cleaned++;
+      }
+    }
+    if (this.state.size > this.maxStateCacheSize) {
+      const entries = Array.from(this.state.entries())
+        .sort((a, b) => (a[1].lastAlertTime || 0) - (b[1].lastAlertTime || 0));
+      const toRemove = entries.slice(0, this.state.size - this.maxStateCacheSize);
+      for (const [key] of toRemove) {
+        this.state.delete(key);
+        cleaned++;
+      }
+    }
+    
+    // Clean openCache (by age - bucketStart indicates age)
+    const currentTime = Date.now();
+    for (const [key, value] of this.openCache.entries()) {
+      // Extract bucketStart from key or use value if it's an object
+      const bucketStart = typeof value === 'object' && value.bucketStart 
+        ? value.bucketStart 
+        : this.getBucketStart('1m', currentTime) - (60 * 60 * 1000); // Assume 1h old if can't determine
+      if (currentTime - bucketStart > maxAge) {
+        this.openCache.delete(key);
+        cleaned++;
+      }
+    }
+    if (this.openCache.size > this.maxOpenCacheSize) {
+      const entries = Array.from(this.openCache.entries());
+      const toRemove = entries.slice(0, this.openCache.size - this.maxOpenCacheSize);
+      for (const [key] of toRemove) {
+        this.openCache.delete(key);
+        cleaned++;
+      }
+    }
+    
+    // Clean lastSent (by age)
+    for (const [key, timestamp] of this.lastSent.entries()) {
+      if (now - timestamp > maxAge) {
+        this.lastSent.delete(key);
+        cleaned++;
+      }
+    }
+    if (this.lastSent.size > this.maxLastSentSize) {
+      const entries = Array.from(this.lastSent.entries())
+        .sort((a, b) => a[1] - b[1]);
+      const toRemove = entries.slice(0, this.lastSent.size - this.maxLastSentSize);
+      for (const [key] of toRemove) {
+        this.lastSent.delete(key);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      logger.debug(`[OcAlertScanner] Cleaned ${cleaned} cache entries. Sizes: state=${this.state.size}, open=${this.openCache.size}, lastSent=${this.lastSent.size}`);
+    }
+  }
+
+  getBucketStart(interval, ts = Date.now()) {
+    const iv = this.getIntervalMs(interval);
+    return Math.floor(ts / iv) * iv;
+  }
+
+  getIntervalMs(interval) {
+    const m = interval.match(/^(\d+)m$/i);
+    if (m) return Number(m[1]) * 60_000;
+    const h = interval.match(/^(\d+)h$/i);
+    if (h) return Number(h[1]) * 3_600_000;
+    return 60_000;
   }
 
   async initialize(telegramService) {
@@ -45,8 +145,9 @@ export class OcAlertScanner {
         // Log first few calls to verify handler is invoked
         if (!this._mexcHandlerCount) this._mexcHandlerCount = 0;
         this._mexcHandlerCount++;
-        if (this._mexcHandlerCount <= 20 || this._mexcHandlerCount % 1000 === 0) {
-          logger.info(`[OcAlertScanner] MEXC price handler called: ${symbol} = ${price} (count: ${this._mexcHandlerCount})`);
+        // Reduced logging frequency
+        if (this._mexcHandlerCount <= 5 || this._mexcHandlerCount % 5000 === 0) {
+          logger.debug(`[OcAlertScanner] MEXC price handler called: ${symbol} = ${price} (count: ${this._mexcHandlerCount})`);
         }
         this.onTick('mexc', symbol, price, ts).catch(error => {
           logger.error(`[OcAlertScanner] Error in MEXC onTick:`, error?.message || error);
@@ -95,6 +196,8 @@ export class OcAlertScanner {
     this.timer = null;
     if (this.scanTimeout) clearTimeout(this.scanTimeout);
     this.scanTimeout = null;
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = null;
     this.isRunning = false;
     logger.info('[OcAlertScanner] Stopped');
   }
@@ -296,14 +399,15 @@ export class OcAlertScanner {
         return;
       }
       
-      // Log first few ticks to verify handler is called
+      // Log first few ticks to verify handler is called (reduced frequency)
       if (this._onTickCount === undefined) this._onTickCount = new Map();
       const exchangeKey = exchange.toLowerCase();
       const count = (this._onTickCount.get(exchangeKey) || 0) + 1;
       this._onTickCount.set(exchangeKey, count);
       
-      if (count <= 20 || count % 1000 === 0) {
-        logger.info(`[OcTick] Received tick: ${exchange.toUpperCase()} ${sym} = ${p} (count: ${count})`);
+      // Reduced logging frequency to save CPU
+      if (count <= 5 || count % 5000 === 0) {
+        logger.debug(`[OcTick] Received tick: ${exchange.toUpperCase()} ${sym} = ${p} (count: ${count})`);
       }
 
       for (const w of this.watchers) {
@@ -331,13 +435,12 @@ export class OcAlertScanner {
 
           const oc = ((p - open) / open) * 100;
           
-          // Log first few ticks for debugging
+          // Reduced logging frequency to save CPU
           if (this._tickCount === undefined) this._tickCount = 0;
           this._tickCount++;
-          if (this._tickCount <= 20 || this._tickCount % 100 === 0) {
-            logger.info(`[OcTick] ${exchange.toUpperCase()} ${sym} ${interval}: open=${open} price=${p} oc=${oc.toFixed(2)}% (tick #${this._tickCount})`);
-          } else {
-          logger.debug(`[OcTick] ${exchange.toUpperCase()} ${sym} ${interval}: open=${open} price=${p} oc=${oc.toFixed(2)}%`);
+          // Only log when OC is significant or very infrequently
+          if (Math.abs(oc) >= 1.0 && (this._tickCount <= 10 || this._tickCount % 1000 === 0)) {
+            logger.debug(`[OcTick] ${exchange.toUpperCase()} ${sym} ${interval}: oc=${oc.toFixed(2)}%`);
           }
           const now = Date.now();
           const stateKey = `${w.cfgId}|${exchange}|${sym}|${interval}`;

@@ -49,7 +49,10 @@ export class PriceAlertScanner {
 
       logger.info(`[PriceAlertScanner] Initializing for exchanges: ${Array.from(exchanges).join(', ')}`);
       
-      for (const exchange of exchanges) {
+      // Initialize exchanges sequentially with delay to reduce CPU load
+      const exchangeArray = Array.from(exchanges);
+      for (let i = 0; i < exchangeArray.length; i++) {
+        const exchange = exchangeArray[i];
         try {
           // Create a dummy bot object for exchange initialization
           const dummyBot = {
@@ -65,6 +68,11 @@ export class PriceAlertScanner {
           await exchangeService.initialize();
           this.exchangeServices.set(exchange, exchangeService);
           logger.info(`[PriceAlertScanner] ✅ Initialized for ${exchange} exchange (public price mode)`);
+          
+          // Add delay between exchange initializations to reduce CPU load
+          if (i < exchangeArray.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay
+          }
         } catch (error) {
           logger.warn(`[PriceAlertScanner] Failed to initialize for ${exchange}:`, error.message);
         }

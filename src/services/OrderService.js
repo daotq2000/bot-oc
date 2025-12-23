@@ -16,6 +16,62 @@ export class OrderService {
     // Cache for position counts to avoid excessive DB queries
     this.positionCountCache = new Map(); // botId -> { count, timestamp }
     this.positionCountCacheTTL = 5000; // 5 seconds
+    this.maxCacheSize = 100; // Maximum number of bot entries to cache
+    
+    // Start periodic cleanup to prevent memory leaks
+    this.startCacheCleanup();
+  }
+
+  /**
+   * Start periodic cache cleanup
+   */
+  startCacheCleanup() {
+    // Clean up old cache entries every 30 seconds
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = setInterval(() => {
+      this.cleanupCache();
+    }, 30000); // 30 seconds
+  }
+
+  /**
+   * Clean up old cache entries to prevent memory leaks
+   */
+  cleanupCache() {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    // Remove expired entries
+    for (const [botId, value] of this.positionCountCache.entries()) {
+      if (now - value.timestamp > this.positionCountCacheTTL * 2) {
+        this.positionCountCache.delete(botId);
+        cleaned++;
+      }
+    }
+    
+    // Enforce max size (LRU eviction)
+    if (this.positionCountCache.size > this.maxCacheSize) {
+      const entries = Array.from(this.positionCountCache.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp);
+      const toRemove = entries.slice(0, this.positionCountCache.size - this.maxCacheSize);
+      for (const [botId] of toRemove) {
+        this.positionCountCache.delete(botId);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      logger.debug(`[OrderService] Cleaned ${cleaned} cache entries. Current size: ${this.positionCountCache.size}`);
+    }
+  }
+
+  /**
+   * Stop cache cleanup timer
+   */
+  stopCacheCleanup() {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
   }
 
   // Send central log to fixed tracking channel

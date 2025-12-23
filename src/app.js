@@ -189,13 +189,18 @@ async function start() {
     logger.info('Initializing exchange info service...');
     await exchangeInfoService.loadFiltersFromDB();
 
-    // Update symbol filters from Binance API (async, don't wait)
-    exchangeInfoService.updateFiltersFromExchange()
-      .catch(error => logger.error('Failed to update symbol filters from Binance:', error));
+    // Delay API updates to reduce startup CPU load - run after critical services
+    setTimeout(() => {
+      // Update symbol filters from Binance API (async, don't wait)
+      exchangeInfoService.updateFiltersFromExchange()
+        .catch(error => logger.error('Failed to update symbol filters from Binance:', error));
+    }, 10000); // Delay 10 seconds
 
-    // Update symbol filters from MEXC API (async, don't wait)
-    exchangeInfoService.updateMexcFiltersFromExchange()
-      .catch(error => logger.error('Failed to update symbol filters from MEXC:', error));
+    setTimeout(() => {
+      // Update symbol filters from MEXC API (async, don't wait)
+      exchangeInfoService.updateMexcFiltersFromExchange()
+        .catch(error => logger.error('Failed to update symbol filters from MEXC:', error));
+    }, 15000); // Delay 15 seconds
 
 
     // Initialize Telegram service
@@ -203,12 +208,18 @@ async function start() {
     const telegramService = new TelegramService();
     await telegramService.initialize();
 
-    // Initialize Telegram bot
-    logger.info('Initializing Telegram bot...');
-    const telegramBot = new TelegramBot();
-    telegramBot.start()
-      .then(() => logger.info('Telegram bot started'))
-      .catch(error => logger.error('Telegram bot failed to start, continuing without it:', error));
+    // Delay Telegram bot startup to reduce CPU load
+    setTimeout(() => {
+      // Initialize Telegram bot
+      logger.info('Initializing Telegram bot...');
+      const telegramBot = new TelegramBot();
+      telegramBot.start()
+        .then(() => logger.info('Telegram bot started'))
+        .catch(error => logger.error('Telegram bot failed to start, continuing without it:', error));
+    }, 2000); // Delay 2 seconds
+
+    // Small delay before starting heavy operations
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
     // Initialize and start cron jobs
     logger.info('Initializing cron jobs...');
@@ -243,27 +254,28 @@ async function start() {
     logger.info('='.repeat(60));
 
     if (alertModuleEnabled) {
-      // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
-      try {
-        logger.info('[App] Pre-loading PriceAlertConfig cache...');
-        const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
-        await PriceAlertConfig.findAll(); // This will cache all configs
-        logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
-      } catch (error) {
-        logger.warn('[App] Failed to pre-load PriceAlertConfig cache:', error?.message || error);
-      }
-      
-      try {
-        const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
-        priceAlertWorker = new PriceAlertWorker();
-        await priceAlertWorker.initialize(telegramService);
-        priceAlertWorker.start();
-        logger.info('✅ Price Alert Worker started successfully');
-      } catch (error) {
-        logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
-        logger.error('Price Alert system is critical - application will continue but alerts may not work');
-        // Don't exit - Price Alert should be resilient
-      }
+      // Delay Price Alert Worker initialization to reduce startup CPU load
+      setTimeout(async () => {
+        try {
+          // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
+          logger.info('[App] Pre-loading PriceAlertConfig cache...');
+          const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
+          await PriceAlertConfig.findAll(); // This will cache all configs
+          logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
+          
+          // Small delay before initializing worker
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
+          priceAlertWorker = new PriceAlertWorker();
+          await priceAlertWorker.initialize(telegramService);
+          priceAlertWorker.start();
+          logger.info('✅ Price Alert Worker started successfully');
+        } catch (error) {
+          logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
+          logger.error('Price Alert system is critical - application will continue but alerts may not work');
+        }
+      }, 3000); // Delay 3 seconds
     } else {
       logger.warn('[App] PRICE_ALERT_MODULE_ENABLED=false → Price Alert Worker not started');
     }
@@ -271,42 +283,49 @@ async function start() {
     // ============================================
     // STRATEGIES WORKER (Only when active strategies exist)
     // ============================================
-    logger.info('='.repeat(60));
-    logger.info('Initializing Strategies Worker (Conditional, Independent)...');
-    logger.info('='.repeat(60));
-    
-    try {
-      const { StrategiesWorker } = await import('./workers/StrategiesWorker.js');
-      strategiesWorker = new StrategiesWorker();
-      await strategiesWorker.initialize(telegramService);
-      // Strategies worker will auto-start when active strategies are detected
-      logger.info('✅ Strategies Worker initialized (will start when active strategies are detected)');
-    } catch (error) {
-      logger.error('❌ Failed to initialize Strategies Worker:', error?.message || error);
-      logger.error('Strategies system failed - Price Alert will continue to work independently');
-      // Don't exit - Price Alert should continue working
-    }
+    // Delay Strategies Worker initialization to reduce startup CPU load
+    setTimeout(async () => {
+      logger.info('='.repeat(60));
+      logger.info('Initializing Strategies Worker (Conditional, Independent)...');
+      logger.info('='.repeat(60));
+      
+      try {
+        const { StrategiesWorker } = await import('./workers/StrategiesWorker.js');
+        strategiesWorker = new StrategiesWorker();
+        await strategiesWorker.initialize(telegramService);
+        // Strategies worker will auto-start when active strategies are detected
+        logger.info('✅ Strategies Worker initialized (will start when active strategies are detected)');
+      } catch (error) {
+        logger.error('❌ Failed to initialize Strategies Worker:', error?.message || error);
+        logger.error('Strategies system failed - Price Alert will continue to work independently');
+      }
+    }, 5000); // Delay 5 seconds
 
-    // Symbols Updater (default every 15 minutes via SYMBOLS_REFRESH_CRON)
-    symbolsUpdaterJob = new SymbolsUpdater();
-    await symbolsUpdaterJob.initialize();
-    symbolsUpdaterJob.start();
+    // Delay Symbols Updater to reduce startup CPU load
+    setTimeout(async () => {
+      // Symbols Updater (default every 15 minutes via SYMBOLS_REFRESH_CRON)
+      symbolsUpdaterJob = new SymbolsUpdater();
+      await symbolsUpdaterJob.initialize();
+      symbolsUpdaterJob.start();
+    }, 7000); // Delay 7 seconds
 
     // Position Sync Job - Sync positions from exchange to database
-    logger.info('='.repeat(60));
-    logger.info('Initializing Position Sync Job...');
-    logger.info('='.repeat(60));
-    try {
-      const { PositionSync } = await import('./jobs/PositionSync.js');
-      positionSyncJob = new PositionSync();
-      await positionSyncJob.initialize();
-      positionSyncJob.start();
-      logger.info('✅ Position Sync Job started successfully');
-    } catch (error) {
-      logger.error('❌ Failed to start Position Sync Job:', error?.message || error);
-      logger.error('Position sync will not run - positions may become inconsistent');
-      // Don't exit - other systems should continue
-    }
+    // Delay to reduce startup CPU load - initialize bots sequentially
+    setTimeout(async () => {
+      logger.info('='.repeat(60));
+      logger.info('Initializing Position Sync Job...');
+      logger.info('='.repeat(60));
+      try {
+        const { PositionSync } = await import('./jobs/PositionSync.js');
+        positionSyncJob = new PositionSync();
+        await positionSyncJob.initialize();
+        positionSyncJob.start();
+        logger.info('✅ Position Sync Job started successfully');
+      } catch (error) {
+        logger.error('❌ Failed to start Position Sync Job:', error?.message || error);
+        logger.error('Position sync will not run - positions may become inconsistent');
+      }
+    }, 8000); // Delay 8 seconds
 
     // Memory Monitor - Monitor and auto-cleanup when memory usage is high
     logger.info('='.repeat(60));

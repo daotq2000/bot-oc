@@ -38,14 +38,23 @@ export class PriceAlertWorker {
 
       // Initialize symbol tracker
       await priceAlertSymbolTracker.refresh();
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       // Initialize Price Alert Scanner
       this.priceAlertScanner = new PriceAlertScanner();
       await this.priceAlertScanner.initialize(telegramService);
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       // Initialize OC Alert Scanner
       this.ocAlertScanner = new OcAlertScanner();
       await this.ocAlertScanner.initialize(telegramService);
+      
+      // Small delay before WebSocket subscriptions
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Subscribe WebSocket for tracked symbols
       await this.subscribeWebSockets();

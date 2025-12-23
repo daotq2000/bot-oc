@@ -44,21 +44,33 @@ export class StrategiesWorker {
 
       // Initialize OrderServices from active bots
       await this.initializeOrderServices(telegramService);
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Initialize Position Monitor (confirmed positions)
       this.positionMonitor = new PositionMonitor();
       await this.positionMonitor.initialize(telegramService);
       this.positionMonitor.start();
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Initialize Entry Order Monitor (pending LIMIT orders, user-data WS + REST fallback)
       this.entryOrderMonitor = new EntryOrderMonitor();
       await this.entryOrderMonitor.initialize(telegramService);
       this.entryOrderMonitor.start();
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Initialize Balance Manager
       this.balanceManager = new BalanceManager();
       await this.balanceManager.initialize(telegramService);
       this.balanceManager.start();
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Initialize WebSocket OC Consumer (realtime detection)
       // Note: OrderServices will be populated in initializeOrderServices()
@@ -67,6 +79,9 @@ export class StrategiesWorker {
       
       // Update OrderServices reference after initialization
       webSocketOCConsumer.orderServices = this.orderServices;
+      
+      // Small delay before checking strategies
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Check for active strategies
       await this.checkAndSubscribe();
@@ -243,7 +258,9 @@ export class StrategiesWorker {
     try {
       const bots = await Bot.findAll(true); // Active bots only
 
-      for (const bot of bots) {
+      // Initialize bots sequentially with delay to reduce CPU load
+      for (let i = 0; i < bots.length; i++) {
+        const bot = bots[i];
         try {
           const exchangeService = new ExchangeService(bot);
           await exchangeService.initialize();
@@ -256,6 +273,11 @@ export class StrategiesWorker {
           // concurrencyManager.initializeBot(bot.id, maxConcurrentTrades); // Disabled
 
           logger.info(`[StrategiesWorker] ✅ Initialized OrderService for bot ${bot.id} (${bot.exchange}, max_concurrent_trades=${maxConcurrentTrades})`);
+          
+          // Add delay between bot initializations to avoid CPU spike
+          if (i < bots.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 800)); // 800ms delay between bots
+          }
         } catch (error) {
           logger.error(`[StrategiesWorker] ❌ Failed to initialize OrderService for bot ${bot.id}:`, error?.message || error);
           // Continue with other bots

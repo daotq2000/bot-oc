@@ -27,8 +27,13 @@ export class PositionSync {
       const { Bot } = await import('../models/Bot.js');
       const bots = await Bot.findAll(true); // Active bots only
 
-      for (const bot of bots) {
-        await this.addBot(bot);
+      // Initialize bots sequentially with delay to reduce CPU load
+      for (let i = 0; i < bots.length; i++) {
+        await this.addBot(bots[i]);
+        // Add delay between bot initializations to avoid CPU spike
+        if (i < bots.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay between bots
+        }
       }
     } catch (error) {
       logger.error('Failed to initialize PositionSync:', error);

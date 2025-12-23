@@ -202,6 +202,9 @@ export class ExchangeService {
         }
 
         // Test connection for non-Binance (with retry for MEXC)
+        // Add small delay before loadMarkets to reduce CPU spike during startup
+        await new Promise(resolve => setTimeout(resolve, 200)); // 200ms delay
+        
         let loadMarketsSuccess = false;
         let lastError = null;
         const maxRetries = this.bot.exchange === 'mexc' ? 3 : 1;
