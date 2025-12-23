@@ -1,0 +1,247 @@
+{
+  "presets": {
+    "volatile_market": {
+      "name": "Thị trường Volatile (BTC, ETH, Altcoin lớn)",
+      "description": "Tối ưu cho thị trường biến động mạnh",
+      "config": {
+        "oc": 1.5,
+        "extend": 30,
+        "take_profit": 60,
+        "stoploss": 25,
+        "reduce": 35,
+        "up_reduce": 35,
+        "amount": 100,
+        "interval": "5m",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.4:1",
+      "win_rate_needed": "29.4%"
+    },
+    "sideways_market": {
+      "name": "Thị trường Sideways (Range-bound)",
+      "description": "Tối ưu cho thị trường đi ngang",
+      "config": {
+        "oc": 0.8,
+        "extend": 50,
+        "take_profit": 45,
+        "stoploss": 20,
+        "reduce": 40,
+        "up_reduce": 40,
+        "amount": 80,
+        "interval": "15m",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.25:1",
+      "win_rate_needed": "30.8%"
+    },
+    "trending_market": {
+      "name": "Thị trường Trending (Xu hướng mạnh)",
+      "description": "Tối ưu cho thị trường có xu hướng rõ ràng",
+      "config": {
+        "oc": 2.0,
+        "extend": 20,
+        "take_profit": 80,
+        "stoploss": 30,
+        "reduce": 30,
+        "up_reduce": 30,
+        "amount": 120,
+        "interval": "5m",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.67:1",
+      "win_rate_needed": "27.2%"
+    },
+    "conservative": {
+      "name": "Conservative (An toàn - Vốn nhỏ)",
+      "description": "Chiến lược an toàn cho người mới hoặc vốn nhỏ",
+      "config": {
+        "oc": 1.2,
+        "extend": 40,
+        "take_profit": 50,
+        "stoploss": 20,
+        "reduce": 45,
+        "up_reduce": 45,
+        "amount": 50,
+        "interval": "15m",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.5:1",
+      "win_rate_needed": "28.6%"
+    },
+    "scalper": {
+      "name": "Scalper (Giao dịch nhanh)",
+      "description": "Nhiều lệnh nhỏ, target nhỏ, lock profit nhanh",
+      "config": {
+        "oc": 0.8,
+        "extend": 25,
+        "take_profit": 40,
+        "stoploss": 18,
+        "reduce": 50,
+        "up_reduce": 50,
+        "amount": 50,
+        "interval": "5m",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.22:1",
+      "win_rate_needed": "31.1%"
+    },
+    "day_trader": {
+      "name": "Day Trader (Giao dịch trong ngày)",
+      "description": "Cân bằng giữa số lượng và chất lượng lệnh",
+      "config": {
+        "oc": 1.5,
+        "extend": 35,
+        "take_profit": 60,
+        "stoploss": 25,
+        "reduce": 35,
+        "up_reduce": 35,
+        "amount": 100,
+        "interval": "15m",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.4:1",
+      "win_rate_needed": "29.4%"
+    },
+    "swing_trader": {
+      "name": "Swing Trader (Giao dịch vài ngày)",
+      "description": "Ít lệnh, target lớn, ride trend lâu",
+      "config": {
+        "oc": 2.5,
+        "extend": 40,
+        "take_profit": 100,
+        "stoploss": 40,
+        "reduce": 25,
+        "up_reduce": 25,
+        "amount": 200,
+        "interval": "1h",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.5:1",
+      "win_rate_needed": "28.6%"
+    },
+    "recommended_default": {
+      "name": "Recommended Default (Đa số trường hợp)",
+      "description": "Config tối ưu nhất cho đa số trường hợp - BẮT ĐẦU TỪ ĐÂY",
+      "config": {
+        "oc": 1.5,
+        "extend": 35,
+        "take_profit": 60,
+        "stoploss": 25,
+        "reduce": 35,
+        "up_reduce": 35,
+        "amount": 100,
+        "interval": "15m",
+        "trade_type": "both"
+      },
+      "risk_reward": "2.4:1",
+      "win_rate_needed": "29.4%",
+      "notes": [
+        "R:R = 2.4:1 (tốt)",
+        "Win rate cần chỉ 29.4% (dễ đạt)",
+        "Extend 35% cân bằng",
+        "OC 1.5% filter noise tốt",
+        "Interval 15m giảm false signals"
+      ]
+    }
+  },
+  "parameter_explanations": {
+    "oc": {
+      "name": "Open-Close Threshold",
+      "description": "Ngưỡng biến động giá tối thiểu để trigger signal (%)",
+      "range": "0.5 - 3.0",
+      "optimal": "1.0 - 2.0"
+    },
+    "extend": {
+      "name": "Extend (Pullback)",
+      "description": "Phần trăm pullback để tính entry price (%)",
+      "range": "20 - 70",
+      "optimal": "30 - 50",
+      "formula_long": "Entry = Open - (Open * OC * Extend / 10000)",
+      "formula_short": "Entry = Open + (Open * OC * Extend / 10000)"
+    },
+    "take_profit": {
+      "name": "Take Profit",
+      "description": "Target lợi nhuận (giá trị chia 10, ví dụ: 60 = 6%)",
+      "range": "30 - 100",
+      "optimal": "50 - 70"
+    },
+    "stoploss": {
+      "name": "Stop Loss",
+      "description": "Mức cắt lỗ (giá trị chia 10, ví dụ: 25 = 2.5%)",
+      "range": "15 - 40",
+      "optimal": "20 - 30"
+    },
+    "reduce": {
+      "name": "Reduce (LONG)",
+      "description": "Phần trăm trailing TP mỗi phút cho LONG (direct %, ví dụ: 35 = 35%)",
+      "range": "20 - 50",
+      "optimal": "30 - 40"
+    },
+    "up_reduce": {
+      "name": "Up Reduce (SHORT)",
+      "description": "Phần trăm trailing TP mỗi phút cho SHORT (direct %, ví dụ: 35 = 35%)",
+      "range": "20 - 50",
+      "optimal": "30 - 40"
+    },
+    "amount": {
+      "name": "Amount",
+      "description": "Số tiền mỗi lệnh (USDT)",
+      "recommendation": "5-10% vốn mỗi lệnh"
+    },
+    "interval": {
+      "name": "Interval",
+      "description": "Khung thời gian nến",
+      "options": ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"],
+      "optimal": "5m, 15m cho day trading"
+    },
+    "trade_type": {
+      "name": "Trade Type",
+      "description": "Loại lệnh",
+      "options": ["long", "short", "both"],
+      "recommendation": "both (trade cả 2 hướng)"
+    }
+  },
+  "quick_reference": {
+    "risk_reward_calculation": "R:R = TP% / SL%",
+    "win_rate_needed": "Win Rate = 1 / (1 + R:R)",
+    "example": {
+      "tp": 6,
+      "sl": 2.5,
+      "rr": "6 / 2.5 = 2.4:1",
+      "win_rate_needed": "1 / (1 + 2.4) = 29.4%"
+    }
+  },
+  "market_conditions": {
+    "bull_market": {
+      "adjustments": {
+        "take_profit": "+10 to +20",
+        "extend": "-5 to -10",
+        "note": "Tăng TP, giảm Extend để vào nhanh hơn"
+      }
+    },
+    "bear_market": {
+      "adjustments": {
+        "take_profit": "-10 to -20",
+        "extend": "+5 to +10",
+        "note": "Giảm TP, tăng Extend để vào giá tốt hơn"
+      }
+    },
+    "high_volatility": {
+      "adjustments": {
+        "oc": "+0.3 to +0.5",
+        "stoploss": "+5 to +10",
+        "note": "Tăng OC và SL để tránh noise"
+      }
+    },
+    "low_volatility": {
+      "adjustments": {
+        "oc": "-0.3 to -0.5",
+        "stoploss": "-5 to -10",
+        "note": "Giảm OC và SL để catch move nhỏ"
+      }
+    }
+  }
+}
+
+
+

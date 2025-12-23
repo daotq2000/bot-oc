@@ -229,6 +229,9 @@ export class WebSocketOCConsumer {
         ? calculateLongEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0)
         : calculateShortEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0);
 
+      // Pre-calculate extend distance (full 100% extend move from baseOpen to entryPrice)
+      const totalExtendDistance = Math.abs(baseOpen - entryPrice);
+
       // Check extend condition: only trigger when price reaches the entry zone
       let extendOK = true;
       const extendVal = Number(strategy.extend || 0);
@@ -240,7 +243,7 @@ export class WebSocketOCConsumer {
         }
       }
       
-      logger.info(`[WebSocketOCConsumer] Extend check for strategy ${strategy.id}: extendOK=${extendOK}, extendVal=${extendVal}, side=${side}, currentPrice=${currentPrice}, entryPrice=${entryPrice}, baseOpen=${baseOpen}`);
+      logger.info(`[WebSocketOCConsumer] Extend check for strategy ${strategy.id}: extendOK=${extendOK}, extendVal=${extendVal}, side=${side}, currentPrice=${currentPrice}, entryPrice=${entryPrice}, baseOpen=${baseOpen}, totalExtendDistance=${totalExtendDistance}`);
 
       // Calculate TP and SL (based on side)
       const tpPrice = calculateTakeProfit(entryPrice, Math.abs(oc), strategy.take_profit || 55, side);
@@ -263,14 +266,45 @@ export class WebSocketOCConsumer {
         amount: strategy.amount || 1000 // Default amount if not set
       };
 
-      // If extend condition not met, either place passive LIMIT (if enabled) or skip
+      // If extend condition not met, either place passive LIMIT (if enabled) or skip.
+      // New behaviour:
+      // - Không yêu cầu giá phải chạm 100% mức extend.
+      // - Cho phép đặt LIMIT nếu chênh lệch giữa currentPrice và entryPrice <= EXTEND_LIMIT_MAX_DIFF_RATIO * quãng đường extend.
       if (!extendOK) {
         const allowPassive = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
         if (allowPassive) {
-          signal.forcePassiveLimit = true; // OrderService will create a passive LIMIT at entryPrice
-          logger.info(`[WebSocketOCConsumer] ⚠️ Extend not met; placing passive LIMIT for strategy ${strategy.id} at ${entryPrice}`);
+          // Allow overriding max diff ratio via config (default 0.5 = 50%)
+          const maxDiffRatio = Number(configService.getNumber('EXTEND_LIMIT_MAX_DIFF_RATIO', 0.5)) || 0.5;
+          let priceDiffRatio = 0;
+          if (totalExtendDistance > 0) {
+            priceDiffRatio = Math.abs(currentPrice - entryPrice) / totalExtendDistance; // 0.0 → 1.0+
+          }
+
+          logger.info(
+            `[WebSocketOCConsumer] Extend miss for strategy ${strategy.id}: ` +
+            `allowPassive=${allowPassive}, priceDiffRatio=${priceDiffRatio.toFixed(4)}, maxDiffRatio=${maxDiffRatio}, ` +
+            `totalExtendDistance=${totalExtendDistance}, currentPrice=${currentPrice}, entryPrice=${entryPrice}`
+          );
+
+          // Chỉ đặt LIMIT nếu chênh lệch giá <= maxDiffRatio * quãng đường extend
+          if (totalExtendDistance === 0 || priceDiffRatio <= maxDiffRatio) {
+            signal.forcePassiveLimit = true; // OrderService sẽ tạo LIMIT thụ động tại entryPrice
+            logger.info(
+              `[WebSocketOCConsumer] ⚠️ Extend not fully met; placing passive LIMIT for strategy ${strategy.id} at ${entryPrice} (priceDiffRatio=${priceDiffRatio.toFixed(4)}, maxDiffRatio=${maxDiffRatio})`
+            );
+          } else {
+            logger.warn(
+              `[WebSocketOCConsumer] ❌ Extend not met and price difference too large; ` +
+              `SKIPPING order for strategy ${strategy.id}. ` +
+              `priceDiffRatio=${priceDiffRatio.toFixed(4)} > maxDiffRatio=${maxDiffRatio}, side=${side}, baseOpen=${baseOpen}, entry=${entryPrice}, current=${currentPrice}`
+            );
+            return;
+          }
         } else {
-          logger.warn(`[WebSocketOCConsumer] ❌ Extend not met; SKIPPING order for strategy ${strategy.id}. side=${side} baseOpen=${baseOpen} entry=${entryPrice} current=${currentPrice}`);
+          logger.warn(
+            `[WebSocketOCConsumer] ❌ Extend not met; SKIPPING order for strategy ${strategy.id} because passive LIMIT is disabled. ` +
+            `side=${side} baseOpen=${baseOpen} entry=${entryPrice} current=${currentPrice}`
+          );
           return;
         }
       }

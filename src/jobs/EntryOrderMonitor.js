@@ -178,6 +178,30 @@ export class EntryOrderMonitor {
           } else if ((status === 'canceled' || status === 'cancelled' || status === 'expired') && filled === 0) {
             await EntryOrder.markCanceled(entry.id, status === 'expired' ? 'expired' : 'canceled');
             logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) canceled/expired via REST polling.`);
+          } else {
+            // TTL-based auto-cancel for stale LIMIT entry orders (including extend-miss passive LIMIT)
+            const ttlMinutes = Number(configService.getNumber('EXTEND_LIMIT_AUTO_CANCEL_MINUTES', 10));
+            const ttlMs = Math.max(1, ttlMinutes) * 60 * 1000;
+            const createdAtMs = new Date(entry.created_at || entry.createdAt || entry.created || Date.now()).getTime();
+            const now = Date.now();
+
+            if (!Number.isNaN(createdAtMs) && now - createdAtMs >= ttlMs) {
+              try {
+                // Cancel on exchange first
+                await exchangeService.cancelOrder(entry.order_id, entry.symbol);
+              } catch (cancelErr) {
+                logger.warn(
+                  `[EntryOrderMonitor] Failed to cancel stale entry order ${entry.id} on exchange (orderId=${entry.order_id}, ${entry.symbol}): ${cancelErr?.message || cancelErr}`
+                );
+              }
+
+              // Mark as canceled in DB regardless of remote cancel result
+              await EntryOrder.markCanceled(entry.id, 'expired_ttl');
+              logger.info(
+                `[EntryOrderMonitor] ⏱️ Auto-canceled stale entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) after TTL ` +
+                `${ttlMinutes} minutes (created_at=${new Date(createdAtMs).toISOString()})`
+              );
+            }
           }
         } catch (inner) {
           logger.warn(`[EntryOrderMonitor] Failed to poll entry order ${entry.id} (${entry.symbol}): ${inner?.message || inner}`);

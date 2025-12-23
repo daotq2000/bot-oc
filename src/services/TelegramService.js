@@ -16,8 +16,9 @@ export class TelegramService {
     this._processing = false;
     this._lastSendAt = 0; // global throttle
     this._perChatLastSend = new Map(); // chatId -> ts
-    this._minGapGlobalMs = 120; // ~8 msgs/sec globally
-    this._perChatMinGapMs = 250; // ~4 msgs/sec per chat
+    // Default throttles (Telegram 30 msg/sec global, 1 msg/sec per chat is safer)
+    this._minGapGlobalMs = 200;   // 5 msgs/sec global
+    this._perChatMinGapMs = 1000; // 1 msg/sec per chat to avoid 429
   }
 
   /**
@@ -112,12 +113,18 @@ export class TelegramService {
           this._perChatLastSend.set(chatId, this._lastSendAt);
           logger.debug(`[Telegram] ✅ Successfully sent message to ${chatId}`);
         } catch (error) {
-          logger.error(`[Telegram] Failed to send message to ${chatId}:`, error?.message || error);
-          // Simple backoff and requeue once for transient errors
-          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT/i.test(error?.message || '');
+          const msg = error?.message || '';
+          const retryAfter = Number(error?.response?.parameters?.retry_after || error?.parameters?.retry_after || NaN);
+          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT/i.test(msg);
+
           if (transient) {
-            this._queue.unshift({ chatId, message, options });
-            await new Promise(r => setTimeout(r, 500));
+            // Respect Telegram retry_after when present
+            const backoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000) : 1000;
+            logger.warn(`[Telegram] Throttled or transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, msg=${msg}`);
+            this._queue.unshift({ chatId, message, options }); // requeue
+            await new Promise(r => setTimeout(r, backoffMs));
+          } else {
+            logger.error(`[Telegram] Failed to send message to ${chatId}:`, msg);
           }
         }
       }

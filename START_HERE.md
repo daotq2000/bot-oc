@@ -152,9 +152,22 @@ PRICE_ALERT_CHECK_ENABLED=true
 ENTRY_ORDER_TTL_MINUTES=60
 ENABLE_CANDLE_END_CANCEL_FOR_ENTRY=false
 max_concurrent_trades=10
+EXTEND_LIMIT_MAX_DIFF_RATIO=0.5
+EXTEND_LIMIT_AUTO_CANCEL_MINUTES=10
 ```
 
 See **ORIGINAL_ISSUE_EXPLANATION.md** for details about these settings.
+
+#### Giải thích nhanh 2 config mới:
+- **EXTEND_LIMIT_MAX_DIFF_RATIO**  
+  - Tỉ lệ (0–1) cho biết **giá hiện tại được phép lệch bao nhiêu so với entry** (quy đổi theo toàn bộ quãng đường extend từ open → entry) mà bot vẫn đặt LIMIT khi extend chưa chạm đủ 100%.  
+  - Ví dụ: `0.5` = cho phép đặt LIMIT nếu giá còn cách entry ≤ 50% quãng đường extend.
+
+- **EXTEND_LIMIT_AUTO_CANCEL_MINUTES**  
+  - Thời gian (phút) cho phép các **lệnh entry LIMIT** (nhất là lệnh do logic extend-miss tạo ra) treo mà không khớp.  
+  - Hết thời gian này, job `EntryOrderMonitor` sẽ tự:
+    - Hủy lệnh trên sàn.
+    - Đánh dấu entry tương ứng trong DB là `expired_ttl`.
 
 ---
 
