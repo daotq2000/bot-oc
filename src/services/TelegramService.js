@@ -278,7 +278,12 @@ Amount: ${amountStr} (100%)`.trim();
 
       const pnlVal = Number(position.pnl || 0);
       const pnlPct = this.calculatePercent(position.entry_price, position.close_price, position.side);
-      const pnlLine = `${pnlVal >= 0 ? '' : ''}${pnlVal.toFixed(2)}$ ~ ${pnlPct >= 0 ? '' : ''}${pnlPct.toFixed(2)}%`;
+      
+      // Estimate trading fees (0.04% maker + 0.06% taker = ~0.1% total)
+      const estimatedFees = Number(position.amount) * 0.001; // 0.1%
+      const pnlAfterFees = pnlVal - estimatedFees;
+      
+      const pnlLine = `${pnlVal >= 0 ? '' : ''}${pnlVal.toFixed(2)}$ ~ ${pnlPct >= 0 ? '' : ''}${pnlPct.toFixed(2)}% (before fees)`;
 
       const msg = `
 ${title}
@@ -287,7 +292,8 @@ Bot: ${botName}
 Strategy: ${intervalLabel} | OC: ${ocStr}% | Extend: ${extendStr}% | TP: ${tpStr}%
 Close price: ${closePrice}$
 Amount: ${amountStr}
-💰 PNL: ${pnlLine}`.trim();
+💰 PNL: ${pnlLine}
+📊 Est. After Fees: ~${pnlAfterFees.toFixed(2)}$ (fees: ~${estimatedFees.toFixed(2)}$)`.trim();
 
       await this.sendMessage(channelId, msg);
     } catch (e) {

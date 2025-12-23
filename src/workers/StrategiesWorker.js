@@ -8,7 +8,7 @@ import { OrderService } from '../services/OrderService.js';
 import { webSocketOCConsumer } from '../consumers/WebSocketOCConsumer.js';
 import { strategyCache } from '../services/StrategyCache.js';
 import { configService } from '../services/ConfigService.js';
-import { concurrencyManager } from '../services/ConcurrencyManager.js';
+// Concurrency management removed
 import logger from '../utils/logger.js';
 
 /**
@@ -179,7 +179,7 @@ export class StrategiesWorker {
 
           // Initialize concurrency manager for this bot
           const maxConcurrentTrades = bot.max_concurrent_trades || 5;
-          concurrencyManager.initializeBot(bot.id, maxConcurrentTrades);
+          // concurrencyManager.initializeBot(bot.id, maxConcurrentTrades); // Disabled
 
           logger.info(`[StrategiesWorker] ✅ Initialized OrderService for bot ${bot.id} (${bot.exchange}, max_concurrent_trades=${maxConcurrentTrades})`);
         } catch (error) {
@@ -253,7 +253,7 @@ export class StrategiesWorker {
 
           // Initialize concurrency manager for this bot
           const maxConcurrentTrades = bot.max_concurrent_trades || 5;
-          concurrencyManager.initializeBot(bot.id, maxConcurrentTrades);
+          // concurrencyManager.initializeBot(bot.id, maxConcurrentTrades); // Disabled
 
           logger.info(`[StrategiesWorker] ✅ Initialized OrderService for bot ${bot.id} (${bot.exchange}, max_concurrent_trades=${maxConcurrentTrades})`);
         } catch (error) {

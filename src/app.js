@@ -122,10 +122,10 @@ async function start() {
       await AppConfig.set('BINANCE_TESTNET_WS_BASE', 'wss://stream.binancefuture.com/ws', 'Binance testnet WebSocket base URL');
       await AppConfig.set('LISTEN_KEY_KEEPALIVE_MS', '1800000', 'Interval (ms) to refresh WebSocket listen key (30 minutes)');
       await AppConfig.set('WS_RECONNECT_BACKOFF_MS', '3000', 'Backoff (ms) for WebSocket reconnection attempts');
-      await AppConfig.set('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.com/edge', 'MEXC Futures WebSocket endpoint (official)');
+      await AppConfig.set('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.co/edge', 'MEXC Futures WebSocket endpoint (using .co domain for better connectivity)');
       await AppConfig.set('MEXC_WS_COM_FAILOVER_THRESHOLD', '2', 'After N consecutive .com connection failures, prefer .co endpoints until a .com connects successfully');
       await AppConfig.set('MEXC_FUTURES_DIRECT', 'false', 'Use direct REST client for MEXC Futures (bypass CCXT)');
-      await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.com', 'MEXC Futures REST base URL (use .co if region block)');
+      await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.co', 'MEXC Futures REST base URL (using .co domain for better connectivity)');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
 
@@ -143,6 +143,11 @@ async function start() {
       await AppConfig.set('MEXC_FUTURES_ONLY', 'true', 'Futures-only mode for MEXC: disable all spot fallbacks');
       await AppConfig.set('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED', 'Default margin type for Binance (ISOLATED or CROSSED)');
       await AppConfig.set('BINANCE_DEFAULT_LEVERAGE', '5', 'Default leverage for Binance positions');
+
+      // Logging configs
+      await AppConfig.set('LOG_LEVEL', 'error', 'Log level: error, warn, info, debug, verbose (default: error)');
+      await AppConfig.set('LOG_FILE_MAX_SIZE_MB', '10', 'Maximum size (MB) for each log file before rotation');
+      await AppConfig.set('LOG_FILE_MAX_FILES', '5', 'Maximum number of rotated log files to keep');
 
       // Concurrency and locking configs
       await AppConfig.set('CONCURRENCY_RESERVATION_TTL_SEC', '120', 'TTL (seconds) for concurrency reservation locks');
@@ -212,10 +217,21 @@ async function start() {
     logger.info('Initializing Binance WebSocket manager...');
     webSocketManager.connect();
 
+    // Initialize MEXC WebSocket connection for price data
+    logger.info('Initializing MEXC WebSocket manager...');
+    const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
+    // MEXC WebSocket will auto-connect when symbols are subscribed
+    // But we can ensure it's ready by calling ensureConnected() if needed
+    // For now, it will connect automatically when PriceAlertWorker subscribes symbols
+
     // Log WebSocket status after a short delay to allow connections to establish
     setTimeout(() => {
       const wsStatus = webSocketManager.getStatus();
       logger.info(`[Binance-WS] Status: ${wsStatus.connectedCount}/${wsStatus.totalConnections} connections open, ${wsStatus.totalStreams} total streams`);
+      
+      const mexcWsStatus = mexcPriceWs?.ws?.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED';
+      const mexcSubscribed = mexcPriceWs?.subscribed?.size || 0;
+      logger.info(`[MEXC-WS] Status: ${mexcWsStatus}, subscribed symbols: ${mexcSubscribed}`);
     }, 2000);
 
     // ============================================

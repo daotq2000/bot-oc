@@ -202,7 +202,7 @@ export class EntryOrderMonitor {
       // CRITICAL: Handle reservation for Position creation
       // Strategy: If entry_order has reservation_token from OrderService, use it (no need to reserve new slot)
       // Otherwise, reserve a new slot atomically
-      const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
+      // Concurrency management removed
       
       let reservationToken = entry.reservation_token || null;
       let useExistingReservation = false;
@@ -220,12 +220,9 @@ export class EntryOrderMonitor {
           
           if (reservationStatus === 'active') {
             // Reservation is still active - verify limit allows
-            const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
-            if (!canAccept) {
-              const status = await concurrencyManager.getStatus(botId);
-              logger.warn(`[EntryOrderMonitor] ⚠️ Cannot create Position from entry order ${entry.id}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain in entry_orders table.`);
-              return;
-            }
+            // Concurrency check disabled
+            // const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
+            // if (!canAccept) { return; }
             // Reservation exists and is active - use it
             useExistingReservation = true;
             logger.debug(`[EntryOrderMonitor] Using existing active reservation ${reservationToken} for entry order ${entry.id}`);
@@ -248,11 +245,12 @@ export class EntryOrderMonitor {
         let lastError = null;
         while (retries > 0) {
           try {
-            reservationToken = await concurrencyManager.reserveSlot(botId);
+            // reservationToken = await concurrencyManager.reserveSlot(botId);
+            reservationToken = 'disabled'; // Concurrency disabled
             if (reservationToken) break;
             
             // If reserveSlot returns null (not timeout), check if limit reached
-            const status = await concurrencyManager.getStatus(botId);
+            // const status = await concurrencyManager.getStatus(botId);
             if (status.currentCount >= status.maxConcurrent) {
               logger.warn(`[EntryOrderMonitor] ⚠️ Failed to reserve slot for entry order ${entry.id}: limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain for retry.`);
               return;
@@ -315,7 +313,7 @@ export class EntryOrderMonitor {
       await EntryOrder.markFilled(entry.id);
 
       // Finalize reservation as 'released' (Position created successfully)
-      await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
+      // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
 
       logger.debug(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
 
@@ -338,7 +336,7 @@ export class EntryOrderMonitor {
       }
       } catch (posError) {
         // If Position creation failed, cancel reservation
-        await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
         logger.error(`[EntryOrderMonitor] ❌ Failed to create Position for entry order ${entry.id}: ${posError?.message || posError}`);
         logger.error(`[EntryOrderMonitor] Stack trace:`, posError?.stack);
         // Don't re-throw - log error and let EntryOrderMonitor retry later

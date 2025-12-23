@@ -21,12 +21,12 @@ export class RealtimeOCDetector {
     // Key: exchange|symbol|interval|bucketStart
     // Value: { open, bucketStart, lastUpdate }
     this.openPriceCache = new Map();
-    this.maxOpenPriceCacheSize = 2000; // Maximum number of entries to cache (reduced from 10000 to save memory)
+    this.maxOpenPriceCacheSize = 1000; // Reduced from 2000 to save memory
 
     // Cache fetched opens from REST to avoid repeated external calls
     // Key: exchange|symbol|interval|bucketStart -> open
     this.openFetchCache = new Map();
-    this.maxOpenFetchCacheSize = 500; // Maximum number of entries to cache (reduced from 5000 to save memory)
+    this.maxOpenFetchCacheSize = 200; // Reduced from 500 to save memory
 
     // Prime tolerance: if we are already inside the bucket more than this, try REST OHLCV open
     this.openPrimeToleranceMs = Number(configService.getNumber('OC_OPEN_PRIME_TOLERANCE_MS', 3000));
@@ -35,7 +35,7 @@ export class RealtimeOCDetector {
     // Key: exchange|symbol
     // Value: { price, timestamp }
     this.lastPriceCache = new Map();
-    this.maxLastPriceCacheSize = 1000; // Maximum number of symbols to track (reduced from 5000 to save memory)
+    this.maxLastPriceCacheSize = 600; // Reduced from 1000 to save memory (534 Binance + MEXC symbols)
     
     // Minimum price change threshold to trigger recalculation (0.01% default)
     this.priceChangeThreshold = 0.0001; // 0.01%
@@ -43,6 +43,49 @@ export class RealtimeOCDetector {
     // Public CCXT clients cache for REST OHLCV (no API keys)
     this._publicClients = new Map();
     this.maxPublicClients = 10; // Maximum number of exchange clients to cache
+    
+    // Start periodic cache cleanup to prevent memory leaks
+    this.startCacheCleanup();
+  }
+
+  /**
+   * Start periodic cache cleanup
+   */
+  startCacheCleanup() {
+    // Clean up old cache entries every 5 minutes
+    setInterval(() => {
+      this.cleanupOldCacheEntries();
+    }, 5 * 60 * 1000); // 5 minutes
+  }
+
+  /**
+   * Clean up old cache entries to prevent memory leaks
+   */
+  cleanupOldCacheEntries() {
+    const now = Date.now();
+    const maxAge = 15 * 60 * 1000; // 15 minutes
+    
+    let cleaned = 0;
+    
+    // Clean openPriceCache
+    for (const [key, value] of this.openPriceCache.entries()) {
+      if (now - value.lastUpdate > maxAge) {
+        this.openPriceCache.delete(key);
+        cleaned++;
+      }
+    }
+    
+    // Clean openFetchCache
+    for (const [key, value] of this.openFetchCache.entries()) {
+      if (now - value.timestamp > maxAge) {
+        this.openFetchCache.delete(key);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      logger.debug(`[RealtimeOCDetector] Cleaned ${cleaned} old cache entries. Cache sizes: openPrice=${this.openPriceCache.size}, openFetch=${this.openFetchCache.size}`);
+    }
   }
 
   /**

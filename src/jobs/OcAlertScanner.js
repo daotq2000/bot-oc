@@ -398,14 +398,8 @@ export class OcAlertScanner {
                       const mCur = Number(match.currentPrice || p);
                       const mInt = match.interval || interval;
                       const mDir = match.direction || (mCur >= mOpen ? 'bullish' : 'bearish');
-                      await this.telegramService.sendVolatilityAlert(matchChatId, {
-                        symbol: sym,
-                        interval: mInt,
-                        oc: mOC,
-                        open: mOpen,
-                        currentPrice: mCur,
-                        direction: mDir
-                      }).catch(() => {});
+                      // Skip sending duplicate alert for each match (already sent above)
+                      // await this.telegramService.sendVolatilityAlert(matchChatId, ...).catch(() => {});
 
                       // Continue to execute order immediately
                       await webSocketOCConsumer.processMatch(match);

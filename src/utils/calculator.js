@@ -6,9 +6,9 @@
  * Calculate PnL (Profit and Loss)
  * @param {number} entryPrice - Entry price
  * @param {number} currentPrice - Current market price
- * @param {number} amount - Position amount
+ * @param {number} amount - Position amount in USDT (not quantity!)
  * @param {'long'|'short'} side - Position side
- * @returns {number} PnL value
+ * @returns {number} PnL value in USDT
  */
 export function calculatePnL(entryPrice, currentPrice, amount, side) {
   const entry = Number(entryPrice);
@@ -19,10 +19,13 @@ export function calculatePnL(entryPrice, currentPrice, amount, side) {
     return 0;
   }
   
+  // Convert USDT amount to quantity
+  const quantity = amt / entry;
+  
   if (side === 'long') {
-    return (current - entry) * amt;
+    return (current - entry) * quantity;
   } else {
-    return (entry - current) * amt;
+    return (entry - current) * quantity;
   }
 }
 

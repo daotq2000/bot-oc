@@ -97,9 +97,10 @@ export class PositionSync {
   async syncBotPositions(botId, exchangeService) {
     try {
       // Fetch positions from exchange
+      // Use exchangeService.getOpenPositions() which handles Binance DirectClient properly
       let exchangePositions;
       try {
-        exchangePositions = await exchangeService.exchange.fetchPositions();
+        exchangePositions = await exchangeService.getOpenPositions();
         logger.debug(`[PositionSync] Fetched ${Array.isArray(exchangePositions) ? exchangePositions.length : 0} positions from exchange for bot ${botId}`);
       } catch (error) {
         logger.error(`[PositionSync] Failed to fetch positions from exchange for bot ${botId}:`, error?.message || error);
@@ -233,10 +234,10 @@ export class PositionSync {
           const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
           
           // Check concurrency
-          const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
+          // Concurrency management removed
           const reservationToken = entry.reservation_token 
             ? entry.reservation_token 
-            : await concurrencyManager.reserveSlot(botId);
+            : 'disabled'; // Concurrency disabled
           
           if (!reservationToken) {
             const status = await concurrencyManager.getStatus(botId);
@@ -259,12 +260,12 @@ export class PositionSync {
             });
             
             await EntryOrder.markFilled(entry.id);
-            await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
+            // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
             
             logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${symbol} ${side}`);
             return true;
           } catch (posError) {
-            await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+            // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
             throw posError;
           }
         } catch (error) {
@@ -305,7 +306,8 @@ export class PositionSync {
 
       // Check concurrency limit before creating
       const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
-      const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
+      // const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
+      const canAccept = true; // Concurrency disabled
       if (!canAccept) {
         const status = await concurrencyManager.getStatus(botId);
         logger.warn(`[PositionSync] Cannot create Position for ${symbol} ${side}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent})`);
@@ -313,7 +315,8 @@ export class PositionSync {
       }
 
       // Reserve slot
-      const reservationToken = await concurrencyManager.reserveSlot(botId);
+      // const reservationToken = await concurrencyManager.reserveSlot(botId);
+      const reservationToken = 'disabled'; // Concurrency disabled
       if (!reservationToken) {
         const status = await concurrencyManager.getStatus(botId);
         logger.warn(`[PositionSync] Failed to reserve slot for ${symbol} ${side}: limit reached (${status.currentCount}/${status.maxConcurrent})`);
@@ -336,13 +339,13 @@ export class PositionSync {
         });
 
         // Finalize reservation
-        await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
+        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
 
         logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${symbol} ${side} on bot ${botId} (synced from exchange)`);
         return true;
       } catch (error) {
         // Cancel reservation if Position creation failed
-        await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
         logger.error(`[PositionSync] Failed to create Position for ${symbol} ${side}:`, error?.message || error);
         throw error;
       }
