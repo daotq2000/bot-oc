@@ -218,8 +218,13 @@ export class RealtimeOCDetector {
   }
 
   /**
-   * Get accurate OPEN for interval bucket. If already inside the bucket more than tolerance,
-   * attempt a synchronous REST OHLCV fetch to get the true candle open.
+   * Get accurate OPEN for interval bucket.
+   *
+   * IMPORTANT:
+   * - This function is now STRICT: it always tries to fetch the true candle OPEN
+   *   from REST OHLCV and will NOT fall back to currentPrice.
+   * - If REST data is not available or invalid, it returns null and callers
+   *   should skip OC detection for this tick.
    */
   async getAccurateOpen(exchange, symbol, interval, currentPrice, timestamp = Date.now()) {
     const ex = (exchange || '').toLowerCase();
@@ -233,24 +238,35 @@ export class RealtimeOCDetector {
       return cached.open;
     }
 
-    // Decide approach based on elapsed time inside bucket
-    const elapsed = Math.max(0, timestamp - bucketStart);
-    const useRestPrime = configService.getBoolean('OC_OPEN_PRIME_USE_REST', true);
-    const allowRest = useRestPrime && elapsed >= this.openPrimeToleranceMs;
-
-    let openPrice = currentPrice;
-
-    if (allowRest) {
-      // Try REST OHLCV open
-      const fetched = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
-      if (Number.isFinite(fetched) && fetched > 0) {
-        openPrice = fetched;
-        this.openFetchCache.set(key, fetched);
-        logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
-      } else {
-        logger.debug(`[RealtimeOCDetector] REST open not available, fallback to current price for ${sym} ${interval}`);
+    // 1) Try WebSocket kline OPEN cache first (no REST)
+    try {
+      if (ex === 'binance') {
+        const { webSocketManager } = await import('./WebSocketManager.js');
+        const wsOpen = webSocketManager.getKlineOpen(sym, interval, bucketStart);
+        if (Number.isFinite(wsOpen) && wsOpen > 0) {
+          logger.info(`[RealtimeOCDetector] Using WS kline open for ${sym} ${interval}: ${wsOpen}`);
+          // Store in cache
+          this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp });
+          return wsOpen;
+        }
       }
+    } catch (wsErr) {
+      logger.debug(`[RealtimeOCDetector] getKlineOpen failed for ${sym} ${interval}: ${wsErr?.message || wsErr}`);
     }
+
+    // 2) Fallback: REST OHLCV open
+    const fetched = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
+    if (!Number.isFinite(fetched) || fetched <= 0) {
+      logger.warn(
+        `[RealtimeOCDetector] ❌ Unable to fetch REST OPEN for ${sym} ${interval} (bucketStart=${bucketStart}). ` +
+        `Skipping OC calculation for this tick.`
+      );
+      return null;
+    }
+
+    const openPrice = fetched;
+    this.openFetchCache.set(key, fetched);
+    logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
 
     // Enforce max cache size (LRU eviction)
     if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(key)) {

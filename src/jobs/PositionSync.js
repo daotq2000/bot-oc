@@ -126,11 +126,27 @@ export class PositionSync {
         [botId]
       );
 
-      // Create a map of DB positions by symbol+side
+      // Helper to normalize symbol exactly like we do for exchange positions
+      const normalizeSymbol = (symbol) => {
+        if (!symbol) return symbol;
+        let normalizedSymbol = symbol;
+        normalizedSymbol = normalizedSymbol.replace(/\/USDT:USDT$/, 'USDT'); // MEXC format
+        normalizedSymbol = normalizedSymbol.replace(/\/USDT$/, 'USDT'); // Standard format with slash
+        normalizedSymbol = normalizedSymbol.replace(/_USDT$/, 'USDT'); // Gate format
+        normalizedSymbol = normalizedSymbol.replace(/\//g, ''); // Remove any remaining slashes
+        return normalizedSymbol;
+      };
+
+      // Create a map of DB positions by *normalized* symbol+side
+      // This prevents duplicates like "H/USDT" vs "HUSDT" for the same underlying coin.
       const dbPositionsMap = new Map();
       for (const pos of dbPositions) {
-        const key = `${pos.symbol}_${pos.side}`;
-        dbPositionsMap.set(key, pos);
+        const rawSym = pos.symbol;
+        const normSym = normalizeSymbol(rawSym);
+        const keyRaw = `${rawSym}_${pos.side}`;
+        const keyNorm = `${normSym}_${pos.side}`;
+        dbPositionsMap.set(keyRaw, pos);
+        dbPositionsMap.set(keyNorm, pos);
       }
 
       // Process exchange positions
@@ -150,11 +166,7 @@ export class PositionSync {
 
           // Normalize symbol format - handle different exchange formats
           // Binance: BTCUSDT, MEXC: BTC/USDT:USDT, Gate: BTC_USDT
-          let normalizedSymbol = symbol;
-          normalizedSymbol = normalizedSymbol.replace(/\/USDT:USDT$/, 'USDT'); // MEXC format
-          normalizedSymbol = normalizedSymbol.replace(/\/USDT$/, 'USDT'); // Standard format
-          normalizedSymbol = normalizedSymbol.replace(/_USDT$/, 'USDT'); // Gate format
-          normalizedSymbol = normalizedSymbol.replace(/\//g, ''); // Remove any remaining slashes
+          const normalizedSymbol = normalizeSymbol(symbol);
           
           logger.debug(`[PositionSync] Processing position: ${symbol} -> ${normalizedSymbol}, ${side}, contracts=${contracts}`);
 
@@ -162,17 +174,7 @@ export class PositionSync {
           // Try multiple key formats for matching
           const key1 = `${normalizedSymbol}_${side}`;
           const key2 = `${symbol}_${side}`;
-          let dbPos = dbPositionsMap.get(key1) || dbPositionsMap.get(key2);
-          
-          // Also try direct symbol match
-          if (!dbPos) {
-            for (const [key, pos] of dbPositionsMap.entries()) {
-              if (pos.symbol === normalizedSymbol || pos.symbol === symbol) {
-                dbPos = pos;
-                break;
-              }
-            }
-          }
+          const dbPos = dbPositionsMap.get(key1) || dbPositionsMap.get(key2);
 
           if (!dbPos) {
             // Position exists on exchange but not in database - try to find matching entry_order or strategy
@@ -210,6 +212,53 @@ export class PositionSync {
    */
   async createMissingPosition(botId, symbol, side, exPos, exchangeService) {
     try {
+      // SAFEGUARD: ensure we never create more than one open Position
+      // per (botId, normalized symbol, side). This prevents cases where
+      // the same net position on exchange is represented by many DB rows.
+      const normalizeSymbol = (sym) => {
+        if (!sym) return sym;
+        let normalizedSymbol = sym;
+        normalizedSymbol = normalizedSymbol.replace(/\/USDT:USDT$/, 'USDT');
+        normalizedSymbol = normalizedSymbol.replace(/\/USDT$/, 'USDT');
+        normalizedSymbol = normalizedSymbol.replace(/_USDT$/, 'USDT');
+        normalizedSymbol = normalizedSymbol.replace(/\//g, '');
+        return normalizedSymbol;
+      };
+
+      const normalizedSymbol = normalizeSymbol(symbol);
+
+      const [existing] = await pool.execute(
+        `SELECT p.id, p.symbol, p.side
+         FROM positions p
+         JOIN strategies s ON p.strategy_id = s.id
+         WHERE s.bot_id = ? 
+           AND p.status = 'open'
+           AND p.side = ?
+           AND (
+             p.symbol = ? OR 
+             p.symbol = ? OR 
+             s.symbol = ? OR 
+             s.symbol = ?
+           )
+         LIMIT 1`,
+        [
+          botId,
+          side,
+          normalizedSymbol,
+          `${normalizedSymbol}/USDT`,
+          normalizedSymbol,
+          `${normalizedSymbol}/USDT`
+        ]
+      );
+
+      if (existing.length > 0) {
+        logger.info(
+          `[PositionSync] Skip creating duplicate Position for ${normalizedSymbol} ${side} on bot ${botId} ` +
+          `(found existing position id=${existing[0].id}, symbol=${existing[0].symbol})`
+        );
+        return false;
+      }
+
       // Try to find matching entry_order first
       const [entryOrders] = await pool.execute(
         `SELECT * FROM entry_orders 

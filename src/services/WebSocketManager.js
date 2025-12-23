@@ -11,6 +11,7 @@ class WebSocketManager {
     this.connections = []; // [{ ws, streams:Set<string>, url, reconnectAttempts }]
     this.priceCache = new Map(); // symbol -> { price, lastAccess }
     this._priceHandlers = new Set(); // listeners for price ticks
+    this.klineOpenCache = new Map(); // key: symbol|interval|bucketStart -> { open, lastUpdate }
 
     this.baseUrl = 'wss://fstream.binance.com/stream?streams=';
     this.maxStreamsPerConn = 180; // keep well below 200 limit and URL length issues
@@ -79,6 +80,34 @@ class WebSocketManager {
     return null;
   }
 
+  /**
+   * Get cached kline OPEN price for a given symbol/interval/bucket.
+   * @param {string} symbol - e.g. 'BTCUSDT'
+   * @param {string} interval - e.g. '1m' or '5m'
+   * @param {number} bucketStart - bucket start timestamp (ms)
+   * @returns {number|null}
+   */
+  getKlineOpen(symbol, interval, bucketStart) {
+    const sym = String(symbol).toUpperCase();
+    const key = `${sym}|${interval}|${bucketStart}`;
+    const cached = this.klineOpenCache.get(key);
+    if (!cached || !Number.isFinite(cached.open) || cached.open <= 0) {
+      return null;
+    }
+    cached.lastUpdate = Date.now();
+    return cached.open;
+  }
+
+  _storeKlineOpen(symbol, interval, open, startTime) {
+    if (!Number.isFinite(open) || open <= 0 || !startTime) return;
+    const sym = String(symbol).toUpperCase();
+    const key = `${sym}|${interval}|${startTime}`;
+    this.klineOpenCache.set(key, {
+      open,
+      lastUpdate: Date.now()
+    });
+  }
+
   // Subscribe a list of symbols (normalized like BTCUSDT)
   subscribe(symbols) {
     if (!Array.isArray(symbols) || symbols.length === 0) {
@@ -92,28 +121,36 @@ class WebSocketManager {
     let newStreamsCount = 0;
     let skippedCount = 0;
     for (const sym of normalized) {
-      const stream = `${sym.toLowerCase()}@markPrice`;
-      // If already in any connection, skip
-      if (this._hasStream(stream)) {
-        skippedCount++;
-        continue;
-      }
+      // We subscribe both markPrice and kline (1m, 5m) to build accurate OPEN cache.
+      const streamsForSymbol = [
+        `${sym.toLowerCase()}@markPrice`,
+        `${sym.toLowerCase()}@kline_1m`,
+        `${sym.toLowerCase()}@kline_5m`
+      ];
 
-      hasNewStreams = true;
-      newStreamsCount++;
-      // Put into an existing connection with space, else create new
-      let placed = false;
-      for (const conn of this.connections) {
-        if (conn.streams.size < this.maxStreamsPerConn) {
-          conn.streams.add(stream);
-          placed = true;
-          break;
+      for (const stream of streamsForSymbol) {
+        // If already in any connection, skip
+        if (this._hasStream(stream)) {
+          skippedCount++;
+          continue;
         }
-      }
-      if (!placed) {
-        const conn = this._createConnection();
-        conn.streams.add(stream);
-        logger.debug(`[Binance-WS] Created new connection for stream ${stream} (total connections: ${this.connections.length})`);
+
+        hasNewStreams = true;
+        newStreamsCount++;
+        // Put into an existing connection with space, else create new
+        let placed = false;
+        for (const conn of this.connections) {
+          if (conn.streams.size < this.maxStreamsPerConn) {
+            conn.streams.add(stream);
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) {
+          const conn = this._createConnection();
+          conn.streams.add(stream);
+          logger.debug(`[Binance-WS] Created new connection for stream ${stream} (total connections: ${this.connections.length})`);
+        }
       }
     }
     if (newStreamsCount > 0) {
@@ -197,6 +234,8 @@ class WebSocketManager {
       try {
         const msg = JSON.parse(raw);
         const payload = msg?.data || msg; // combined stream or direct
+
+        // Mark price tick (markPrice stream)
         if (payload && payload.s && payload.p !== undefined) {
           const symbol = String(payload.s).toUpperCase();
           const price = parseFloat(payload.p);
@@ -210,6 +249,19 @@ class WebSocketManager {
             }
             this.priceCache.set(symbol, { price, lastAccess: Date.now() });
             this._emitPrice({ symbol, price, ts: Date.now() });
+          }
+        }
+
+        // Kline stream (for OPEN caching)
+        if (payload && payload.e === 'kline' && payload.s && payload.k) {
+          const symbol = String(payload.s).toUpperCase();
+          const k = payload.k;
+          const interval = String(k.i || '').toLowerCase(); // e.g. '1m', '5m'
+          const openStr = k.o;
+          const startTime = Number(k.t); // candle start time (ms)
+          const open = parseFloat(openStr);
+          if (Number.isFinite(open) && open > 0 && startTime > 0 && (interval === '1m' || interval === '5m')) {
+            this._storeKlineOpen(symbol, interval, open, startTime);
           }
         }
       } catch (_) {}

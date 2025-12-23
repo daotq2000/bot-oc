@@ -254,12 +254,12 @@ export class OcAlertScanner {
     return Math.floor(ts / iv) * iv;
   }
 
-  // Compute open price for arbitrary interval from 1m candles (current bucket)
-  async getOpenFromAggregated1m(exchange, symbol, interval, currentPrice = null) {
+  // Compute open price for arbitrary interval from realtime candles (current bucket)
+  // ts: exchange event timestamp (ms) to align exactly with kline open time
+  async getOpenFromAggregated1m(exchange, symbol, interval, currentPrice = null, ts = Date.now()) {
     const ex = (exchange || 'mexc').toLowerCase();
-    const now = Date.now();
     const ivMs = this.getIntervalMs(interval);
-    const bucketStart = Math.floor(now / ivMs) * ivMs;
+    const bucketStart = Math.floor(ts / ivMs) * ivMs;
     const cacheKey = `${ex}|${symbol}|${interval}|${bucketStart}`;
 
     // Check if we already have open price cached for this bucket
@@ -268,53 +268,30 @@ export class OcAlertScanner {
       return cached;
     }
 
-    // For real-time OC detection without database:
-    // Use current price as open for new bucket, or fetch from REST API as fallback
-    if (currentPrice && Number.isFinite(currentPrice) && currentPrice > 0) {
-      // Use current price as open for new bucket (similar to RealtimeOCDetector)
-      this.openCache.set(cacheKey, currentPrice);
-      logger.debug(`[OcAlertScanner] Using current price as open for ${symbol} ${interval}: ${currentPrice} (new bucket)`);
-      return currentPrice;
-    }
-    
-    // Fallback: Try to get current price from WebSocket cache or REST API
     try {
-      let price = null;
-      
-      // Try WebSocket price cache first
-      if (ex === 'mexc') {
-        const { mexcPriceWs } = await import('../services/MexcWebSocketManager.js');
-        price = mexcPriceWs.priceCache.get(symbol.toUpperCase().replace(/[\/:_]/g, ''));
-      } else if (ex === 'binance') {
-        const { webSocketManager } = await import('../services/WebSocketManager.js');
-        price = webSocketManager.getPrice(symbol);
+      // Reuse RealtimeOCDetector's strict REST-based OPEN logic to ensure
+      // OC Alert and Strategy detection share the exact same candle open.
+      const { realtimeOCDetector } = await import('../services/RealtimeOCDetector.js');
+      const open = await realtimeOCDetector.getAccurateOpen(ex, symbol, interval, currentPrice, ts);
+
+      if (!Number.isFinite(open) || open <= 0) {
+        logger.warn(
+          `[OcAlertScanner] ❌ Unable to fetch REST OPEN for ${ex.toUpperCase()} ${symbol} ${interval} ` +
+          `(bucketStart=${bucketStart}). Skipping OC alert for this symbol/interval.`
+        );
+        return null;
       }
 
-      if (price && Number.isFinite(price) && price > 0) {
-        this.openCache.set(cacheKey, price);
-        logger.debug(`[OcAlertScanner] Using WS price as open for ${symbol} ${interval}: ${price}`);
-        return price;
-    }
-
-      // Final fallback: Use REST API to get current price
-      logger.debug(`[OcAlertScanner] Fetching current price from REST API for ${symbol} on ${ex}...`);
-      const { ExchangeService } = await import('../services/ExchangeService.js');
-      const dummyBot = { id: `alert_${ex}`, exchange: ex };
-      const exchangeService = new ExchangeService(dummyBot);
-      await exchangeService.initialize();
-      price = await exchangeService.getTickerPrice(symbol);
-      
-      if (price && Number.isFinite(price) && price > 0) {
-        this.openCache.set(cacheKey, price);
-        logger.debug(`[OcAlertScanner] Using REST price as open for ${symbol} ${interval}: ${price}`);
-        return price;
-    }
+      this.openCache.set(cacheKey, open);
+      logger.debug(`[OcAlertScanner] Using REST open for ${ex.toUpperCase()} ${symbol} ${interval}: ${open}`);
+      return open;
     } catch (error) {
-      logger.warn(`[OcAlertScanner] Failed to get open price for ${symbol} on ${ex}:`, error?.message || error);
+      logger.warn(
+        `[OcAlertScanner] Failed to get accurate OPEN for ${ex.toUpperCase()} ${symbol} ${interval}:`,
+        error?.message || error
+      );
+      return null;
     }
-
-    logger.debug(`[OcAlertScanner] No open price available for ${symbol} ${interval} on ${ex}`);
-    return null;
   }
 
   // Build/refresh watch list from active configs and subscribe WS
@@ -373,7 +350,7 @@ export class OcAlertScanner {
       const cached = this.openCache.get(key);
       if (Number.isFinite(cached) && cached > 0) return cached;
     }
-    const open = await this.getOpenFromAggregated1m(exchange, symbol, interval, currentPrice);
+    const open = await this.getOpenFromAggregated1m(exchange, symbol, interval, currentPrice, ts);
     if (Number.isFinite(open) && open > 0) this.openCache.set(key, open);
     return open;
   }

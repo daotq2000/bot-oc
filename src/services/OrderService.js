@@ -129,6 +129,42 @@ export class OrderService {
           return null;
         }
       }
+
+      // Per-coin exposure limit (max_amount_per_coin, in USDT) - configurable per bot
+      const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
+      if (Number.isFinite(maxAmountPerCoin) && maxAmountPerCoin > 0) {
+        try {
+          const pool = (await import('../config/database.js')).default;
+          // NOTE: amount is stored in USDT (strategy.amount), so we sum p.amount.
+          const [rows] = await pool.execute(
+            `SELECT COALESCE(SUM(p.amount), 0) AS total_amount
+             FROM positions p
+             JOIN strategies s ON p.strategy_id = s.id
+             WHERE s.bot_id = ? AND p.status = 'open' AND p.symbol = ?`,
+            [strategy.bot_id, strategy.symbol]
+          );
+          const currentAmount = Number(rows?.[0]?.total_amount || 0);
+          const projectedAmount = currentAmount + Number(amount || 0);
+
+          if (projectedAmount > maxAmountPerCoin) {
+            logger.warn(
+              `[OrderService] max_amount_per_coin exceeded for bot ${strategy.bot_id}, symbol=${strategy.symbol}. ` +
+              `current=${currentAmount}, new=${amount}, projected=${projectedAmount}, limit=${maxAmountPerCoin}. Skipping strategy ${strategy.id}`
+            );
+            await this.sendCentralLog(
+              `Order SkipMaxPerCoin | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
+              `${String(side).toUpperCase()} current=${currentAmount} new=${amount} limit=${maxAmountPerCoin}`
+            );
+            return null;
+          }
+        } catch (exposureErr) {
+          logger.warn(
+            `[OrderService] Failed to check max_amount_per_coin for bot ${strategy.bot_id}, symbol=${strategy.symbol}:`,
+            exposureErr?.message || exposureErr
+          );
+          // If exposure check fails, we proceed but log the issue.
+        }
+      }
       
       let orderCreated = false;
 

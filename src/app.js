@@ -78,7 +78,7 @@ async function start() {
       await AppConfig.set('ENABLE_ALERTS', 'true', 'Master switch to enable/disable all Telegram alerts from DB');
       // Strategy and scanning configs
       await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
-      await AppConfig.set('EXTEND_LIMIT_MAX_DIFF_RATIO', '5', 'Max relative distance (0-1) between current and entry price (as fraction of full extend) to allow passive LIMIT on extend miss');
+      await AppConfig.set('EXTEND_LIMIT_MAX_DIFF_RATIO', '10', 'Max relative distance (0-1) between current and entry price (as fraction of full extend) to allow passive LIMIT on extend miss');
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '30', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
       await AppConfig.set('EXTEND_LIMIT_AUTO_CANCEL_MINUTES', '10', 'Minutes after placement before auto-cancel unfilled LIMIT orders created from extend-miss logic');
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
