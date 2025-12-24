@@ -1037,6 +1037,7 @@ export class BinanceDirectClient {
   async getOpenPositions(symbol = null) {
     const params = symbol ? { symbol: this.normalizeSymbol(symbol) } : {};
     const data = await this.makeRequest('/fapi/v2/positionRisk', 'GET', params, true);
+    if(null == data) return 0;
     return data.filter(p => parseFloat(p.positionAmt) !== 0);
   }
 
