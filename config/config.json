@@ -2,7 +2,7 @@
   "development": {
     "username": "root",
     "password": "rootpassword",
-    "database": "bot_oc",
+    "database": "bot_oc_xuoi",
     "host": "127.0.0.1",
     "dialect": "mysql"
   }

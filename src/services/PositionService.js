@@ -158,37 +158,37 @@ export class PositionService {
         position.side
       );
 
-      // Check if TP hit (price-based check as fallback)
-      if (this.isTakeProfitHit(position, currentPrice)) {
-        // Guard: ensure there is an actual exchange position to close
-        try {
-          const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
-          if (!qty || qty <= 0) {
-            logger.warn(`[CloseGuard] Skip TP close for position ${position.id} (${position.symbol}) - no exchange exposure`);
-            return position;
-          }
-        } catch (e) {
-          logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
-          return position;
-        }
-        return await this.closePosition(position, currentPrice, pnl, 'tp_hit');
-      }
+      // Check if TP hit (price-based check as fallback) - DISABLED to prevent premature closing
+      // if (this.isTakeProfitHit(position, currentPrice)) {
+      //   // Guard: ensure there is an actual exchange position to close
+      //   try {
+      //     const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+      //     if (!qty || qty <= 0) {
+      //       logger.warn(`[CloseGuard] Skip TP close for position ${position.id} (${position.symbol}) - no exchange exposure`);
+      //       return position;
+      //     }
+      //   } catch (e) {
+      //     logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+      //     return position;
+      //   }
+      //   return await this.closePosition(position, currentPrice, pnl, 'tp_hit');
+      // }
 
-      // Check if SL hit
-      if (this.isStopLossHit(position, currentPrice)) {
-        // Guard: ensure there is an actual exchange position to close
-        try {
-          const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
-          if (!qty || qty <= 0) {
-            logger.warn(`[CloseGuard] Skip SL close for position ${position.id} (${position.symbol}) - no exchange exposure`);
-            return position;
-          }
-        } catch (e) {
-          logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
-          return position;
-        }
-        return await this.closePosition(position, currentPrice, pnl, 'sl_hit');
-      }
+      // Check if SL hit - DISABLED to prevent premature closing
+      // if (this.isStopLossHit(position, currentPrice)) {
+      //   // Guard: ensure there is an actual exchange position to close
+      //   try {
+      //     const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+      //     if (!qty || qty <= 0) {
+      //       logger.warn(`[CloseGuard] Skip SL close for position ${position.id} (${position.symbol}) - no exchange exposure`);
+      //       return position;
+      //     }
+      //   } catch (e) {
+      //     logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+      //     return position;
+      //   }
+      //   return await this.closePosition(position, currentPrice, pnl, 'sl_hit');
+      // }
 
       // NEW LOGIC: Trailing Take Profit (NOT Stop Loss)
       // Calculate minutes_elapsed from actual time elapsed

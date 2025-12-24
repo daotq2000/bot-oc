@@ -255,7 +255,7 @@ export class RealtimeOCDetector {
     }
 
     // 2) Fallback: REST OHLCV open
-    const fetched = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
+      const fetched = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
     if (!Number.isFinite(fetched) || fetched <= 0) {
       logger.warn(
         `[RealtimeOCDetector] ❌ Unable to fetch REST OPEN for ${sym} ${interval} (bucketStart=${bucketStart}). ` +
@@ -265,8 +265,8 @@ export class RealtimeOCDetector {
     }
 
     const openPrice = fetched;
-    this.openFetchCache.set(key, fetched);
-    logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
+        this.openFetchCache.set(key, fetched);
+        logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
 
     // Enforce max cache size (LRU eviction)
     if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(key)) {

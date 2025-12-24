@@ -129,7 +129,7 @@ export class OrderService {
           return null;
         }
       }
-
+      
       // Per-coin exposure limit (max_amount_per_coin, in USDT) - configurable per bot
       const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
       if (Number.isFinite(maxAmountPerCoin) && maxAmountPerCoin > 0) {
@@ -187,17 +187,6 @@ export class OrderService {
       let order;
       let attemptedMarketFallback = false;
       try {
-        if (side === 'short' && orderType === 'limit' && !signal.forcePassiveLimit && this.exchangeService?.bot?.exchange === 'binance') {
-          const mktPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
-          if (!mktPrice || mktPrice <= 0) throw new Error('Cannot fetch current price for short trigger');
-          const qty = amount / mktPrice;
-          order = await this.exchangeService.createEntryTriggerOrder(
-            strategy.symbol,
-            side,
-            entryPrice,
-            qty
-          );
-        } else {
           // Note: amount here is in USDT, ExchangeService will calculate quantity
           order = await this.exchangeService.createOrder({
             symbol: strategy.symbol,
@@ -207,7 +196,6 @@ export class OrderService {
             type: orderType,
             price: orderType === 'limit' ? entryPrice : undefined
           });
-        }
       } catch (e) {
         const em = e?.message || '';
         
@@ -440,7 +428,21 @@ export class OrderService {
         return null; // do not escalate
       }
 
-      logger.error(`Failed to execute signal:`, error);
+            logger.error(`Failed to execute signal:`, error);
+
+      // Detailed error logging for order placement failures
+      const errorContext = {
+        message: 'Order placement failed',
+        bot_id: signal?.strategy?.bot_id,
+        strategy_id: signal?.strategy?.id,
+        symbol: signal?.strategy?.symbol,
+        side: signal?.side,
+        oc: signal?.oc,
+        errorMessage: error?.message,
+        errorCode: error?.code,
+        errorStack: error?.stack
+      };
+      logger.error('Order Execution Error', errorContext);
       if (error.code) {
         logger.error(`Error code: ${error.code}`);
       }

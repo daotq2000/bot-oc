@@ -290,7 +290,7 @@ export class OcAlertScanner {
         `[OcAlertScanner] Failed to get accurate OPEN for ${ex.toUpperCase()} ${symbol} ${interval}:`,
         error?.message || error
       );
-      return null;
+    return null;
     }
   }
 

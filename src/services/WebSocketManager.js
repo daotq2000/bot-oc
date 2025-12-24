@@ -129,27 +129,27 @@ class WebSocketManager {
       ];
 
       for (const stream of streamsForSymbol) {
-        // If already in any connection, skip
-        if (this._hasStream(stream)) {
-          skippedCount++;
-          continue;
-        }
+      // If already in any connection, skip
+      if (this._hasStream(stream)) {
+        skippedCount++;
+        continue;
+      }
 
-        hasNewStreams = true;
-        newStreamsCount++;
-        // Put into an existing connection with space, else create new
-        let placed = false;
-        for (const conn of this.connections) {
-          if (conn.streams.size < this.maxStreamsPerConn) {
-            conn.streams.add(stream);
-            placed = true;
-            break;
-          }
-        }
-        if (!placed) {
-          const conn = this._createConnection();
+      hasNewStreams = true;
+      newStreamsCount++;
+      // Put into an existing connection with space, else create new
+      let placed = false;
+      for (const conn of this.connections) {
+        if (conn.streams.size < this.maxStreamsPerConn) {
           conn.streams.add(stream);
-          logger.debug(`[Binance-WS] Created new connection for stream ${stream} (total connections: ${this.connections.length})`);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        const conn = this._createConnection();
+        conn.streams.add(stream);
+        logger.debug(`[Binance-WS] Created new connection for stream ${stream} (total connections: ${this.connections.length})`);
         }
       }
     }

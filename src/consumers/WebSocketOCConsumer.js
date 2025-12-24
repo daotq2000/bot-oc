@@ -216,8 +216,8 @@ export class WebSocketOCConsumer {
       // Import calculator functions for TP/SL calculation
       const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
 
-      // Trend-following side mapping: bullish → long, bearish → short
-      const side = direction === 'bullish' ? 'long' : 'short';
+      // Counter-trend side mapping: bullish → short, bearish → long
+      const side = direction === 'bullish' ? 'short' : 'long';
 
       // Use interval open price for entry calculation (per-bucket open)
       const baseOpen = Number.isFinite(Number(match.openPrice)) && Number(match.openPrice) > 0
@@ -226,22 +226,14 @@ export class WebSocketOCConsumer {
 
       // Calculate entry price based on trend-following side and OPEN price
       const entryPrice = side === 'long'
-        ? calculateLongEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0)
-        : calculateShortEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0);
+        ? calculateLongEntryPrice(currentPrice, Math.abs(oc), strategy.extend || 0)
+        : calculateShortEntryPrice(currentPrice, Math.abs(oc), strategy.extend || 0);
 
       // Pre-calculate extend distance (full 100% extend move from baseOpen to entryPrice)
       const totalExtendDistance = Math.abs(baseOpen - entryPrice);
 
-      // Check extend condition: only trigger when price reaches the entry zone
-      let extendOK = true;
-      const extendVal = Number(strategy.extend || 0);
-      if (extendVal > 0) {
-        if (side === 'long') {
-          extendOK = currentPrice <= entryPrice && entryPrice < baseOpen;
-        } else {
-          extendOK = currentPrice >= entryPrice && entryPrice > baseOpen;
-        }
-      }
+      // The 'extend' logic is disabled for the counter-trend strategy as it's based on the previous trend-following model.
+      const extendOK = true;
       
       logger.info(`[WebSocketOCConsumer] Extend check for strategy ${strategy.id}: extendOK=${extendOK}, extendVal=${extendVal}, side=${side}, currentPrice=${currentPrice}, entryPrice=${entryPrice}, baseOpen=${baseOpen}, totalExtendDistance=${totalExtendDistance}`);
 
