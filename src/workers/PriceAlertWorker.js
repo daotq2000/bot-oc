@@ -38,14 +38,23 @@ export class PriceAlertWorker {
 
       // Initialize symbol tracker
       await priceAlertSymbolTracker.refresh();
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       // Initialize Price Alert Scanner
       this.priceAlertScanner = new PriceAlertScanner();
       await this.priceAlertScanner.initialize(telegramService);
+      
+      // Small delay to reduce CPU load
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       // Initialize OC Alert Scanner
       this.ocAlertScanner = new OcAlertScanner();
       await this.ocAlertScanner.initialize(telegramService);
+      
+      // Small delay before WebSocket subscriptions
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Subscribe WebSocket for tracked symbols
       await this.subscribeWebSockets();
@@ -173,17 +182,45 @@ export class PriceAlertWorker {
       const mexcSymbols = Array.from(trackingSymbols.get('mexc') || []);
       if (mexcSymbols.length > 0) {
         logger.info(`[PriceAlertWorker] Subscribing MEXC WS to ${mexcSymbols.length} Price Alert symbols`);
-        mexcPriceWs.subscribe(mexcSymbols);
+        try {
+          mexcPriceWs.subscribe(mexcSymbols);
+          // Ensure WebSocket is connected (subscribe() calls ensureConnected(), but verify after a delay)
+          setTimeout(() => {
+            if (mexcPriceWs.ws?.readyState !== 1) {
+              logger.warn(`[PriceAlertWorker] MEXC WebSocket not connected after subscribe, ensuring connection...`);
+              mexcPriceWs.ensureConnected();
+            } else {
+              logger.debug(`[PriceAlertWorker] MEXC WebSocket connected successfully`);
+            }
+          }, 1000);
+        } catch (error) {
+          logger.error(`[PriceAlertWorker] Failed to subscribe MEXC symbols:`, error?.message || error);
+        }
+      } else {
+        logger.debug(`[PriceAlertWorker] No MEXC symbols to subscribe`);
       }
 
       // Subscribe Binance symbols
       const binanceSymbols = Array.from(trackingSymbols.get('binance') || []);
       if (binanceSymbols.length > 0) {
         logger.info(`[PriceAlertWorker] Subscribing Binance WS to ${binanceSymbols.length} Price Alert symbols`);
-        webSocketManager.subscribe(binanceSymbols);
+        try {
+          webSocketManager.subscribe(binanceSymbols);
+          // Binance WebSocket should auto-connect via connect() call in app.js
+          // But ensure it's connected
+          const status = webSocketManager.getStatus();
+          if (status.connectedCount === 0) {
+            logger.warn(`[PriceAlertWorker] Binance WebSocket not connected, calling connect()...`);
+            webSocketManager.connect();
+          }
+        } catch (error) {
+          logger.error(`[PriceAlertWorker] Failed to subscribe Binance symbols:`, error?.message || error);
+        }
+      } else {
+        logger.debug(`[PriceAlertWorker] No Binance symbols to subscribe`);
       }
 
-      logger.debug(`[PriceAlertWorker] WebSocket subscriptions updated: MEXC=${mexcSymbols.length}, Binance=${binanceSymbols.length}`);
+      logger.info(`[PriceAlertWorker] WebSocket subscriptions updated: MEXC=${mexcSymbols.length}, Binance=${binanceSymbols.length}`);
     } catch (error) {
       logger.error('[PriceAlertWorker] Error subscribing WebSockets:', error?.message || error);
     }

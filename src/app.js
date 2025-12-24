@@ -56,6 +56,7 @@ let priceAlertWorker = null;
 let strategiesWorker = null;
 let symbolsUpdaterJob = null;
 let positionSyncJob = null;
+let telegramBot = null;
 
 
 // Initialize services and start server
@@ -76,8 +77,10 @@ async function start() {
       // Master alert toggle
       await AppConfig.set('ENABLE_ALERTS', 'true', 'Master switch to enable/disable all Telegram alerts from DB');
       // Strategy and scanning configs
-      await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'false', 'Allow placing passive LIMIT when extend condition is not met');
+      await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
+      await AppConfig.set('EXTEND_LIMIT_MAX_DIFF_RATIO', '10', 'Max relative distance (0-1) between current and entry price (as fraction of full extend) to allow passive LIMIT on extend miss');
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '30', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
+      await AppConfig.set('EXTEND_LIMIT_AUTO_CANCEL_MINUTES', '10', 'Minutes after placement before auto-cancel unfilled LIMIT orders created from extend-miss logic');
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
       await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '500', 'Price alert scanner job interval in milliseconds');
@@ -122,10 +125,10 @@ async function start() {
       await AppConfig.set('BINANCE_TESTNET_WS_BASE', 'wss://stream.binancefuture.com/ws', 'Binance testnet WebSocket base URL');
       await AppConfig.set('LISTEN_KEY_KEEPALIVE_MS', '1800000', 'Interval (ms) to refresh WebSocket listen key (30 minutes)');
       await AppConfig.set('WS_RECONNECT_BACKOFF_MS', '3000', 'Backoff (ms) for WebSocket reconnection attempts');
-      await AppConfig.set('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.com/edge', 'MEXC Futures WebSocket endpoint (official)');
+      await AppConfig.set('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.co/edge', 'MEXC Futures WebSocket endpoint (using .co domain for better connectivity)');
       await AppConfig.set('MEXC_WS_COM_FAILOVER_THRESHOLD', '2', 'After N consecutive .com connection failures, prefer .co endpoints until a .com connects successfully');
       await AppConfig.set('MEXC_FUTURES_DIRECT', 'false', 'Use direct REST client for MEXC Futures (bypass CCXT)');
-      await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.com', 'MEXC Futures REST base URL (use .co if region block)');
+      await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.co', 'MEXC Futures REST base URL (using .co domain for better connectivity)');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
 
@@ -143,6 +146,11 @@ async function start() {
       await AppConfig.set('MEXC_FUTURES_ONLY', 'true', 'Futures-only mode for MEXC: disable all spot fallbacks');
       await AppConfig.set('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED', 'Default margin type for Binance (ISOLATED or CROSSED)');
       await AppConfig.set('BINANCE_DEFAULT_LEVERAGE', '5', 'Default leverage for Binance positions');
+
+      // Logging configs
+      await AppConfig.set('LOG_LEVEL', 'error', 'Log level: error, warn, info, debug, verbose (default: error)');
+      await AppConfig.set('LOG_FILE_MAX_SIZE_MB', '10', 'Maximum size (MB) for each log file before rotation');
+      await AppConfig.set('LOG_FILE_MAX_FILES', '5', 'Maximum number of rotated log files to keep');
 
       // Concurrency and locking configs
       await AppConfig.set('CONCURRENCY_RESERVATION_TTL_SEC', '120', 'TTL (seconds) for concurrency reservation locks');
@@ -184,13 +192,18 @@ async function start() {
     logger.info('Initializing exchange info service...');
     await exchangeInfoService.loadFiltersFromDB();
 
-    // Update symbol filters from Binance API (async, don't wait)
-    exchangeInfoService.updateFiltersFromExchange()
-      .catch(error => logger.error('Failed to update symbol filters from Binance:', error));
+    // Delay API updates to reduce startup CPU load - run after critical services
+    setTimeout(() => {
+      // Update symbol filters from Binance API (async, don't wait)
+      exchangeInfoService.updateFiltersFromExchange()
+        .catch(error => logger.error('Failed to update symbol filters from Binance:', error));
+    }, 10000); // Delay 10 seconds
 
-    // Update symbol filters from MEXC API (async, don't wait)
-    exchangeInfoService.updateMexcFiltersFromExchange()
-      .catch(error => logger.error('Failed to update symbol filters from MEXC:', error));
+    setTimeout(() => {
+      // Update symbol filters from MEXC API (async, don't wait)
+      exchangeInfoService.updateMexcFiltersFromExchange()
+        .catch(error => logger.error('Failed to update symbol filters from MEXC:', error));
+    }, 15000); // Delay 15 seconds
 
 
     // Initialize Telegram service
@@ -198,12 +211,18 @@ async function start() {
     const telegramService = new TelegramService();
     await telegramService.initialize();
 
-    // Initialize Telegram bot
-    logger.info('Initializing Telegram bot...');
-    const telegramBot = new TelegramBot();
-    telegramBot.start()
-      .then(() => logger.info('Telegram bot started'))
-      .catch(error => logger.error('Telegram bot failed to start, continuing without it:', error));
+    // Delay Telegram bot startup to reduce CPU load
+    setTimeout(() => {
+      // Initialize Telegram bot
+      logger.info('Initializing Telegram bot...');
+      telegramBot = new TelegramBot();
+      telegramBot.start()
+        .then(() => logger.info('Telegram bot started'))
+        .catch(error => logger.error('Telegram bot failed to start, continuing without it:', error));
+    }, 2000); // Delay 2 seconds
+
+    // Small delay before starting heavy operations
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
     // Initialize and start cron jobs
     logger.info('Initializing cron jobs...');
@@ -212,10 +231,21 @@ async function start() {
     logger.info('Initializing Binance WebSocket manager...');
     webSocketManager.connect();
 
+    // Initialize MEXC WebSocket connection for price data
+    logger.info('Initializing MEXC WebSocket manager...');
+    const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
+    // MEXC WebSocket will auto-connect when symbols are subscribed
+    // But we can ensure it's ready by calling ensureConnected() if needed
+    // For now, it will connect automatically when PriceAlertWorker subscribes symbols
+
     // Log WebSocket status after a short delay to allow connections to establish
     setTimeout(() => {
       const wsStatus = webSocketManager.getStatus();
       logger.info(`[Binance-WS] Status: ${wsStatus.connectedCount}/${wsStatus.totalConnections} connections open, ${wsStatus.totalStreams} total streams`);
+      
+      const mexcWsStatus = mexcPriceWs?.ws?.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED';
+      const mexcSubscribed = mexcPriceWs?.subscribed?.size || 0;
+      logger.info(`[MEXC-WS] Status: ${mexcWsStatus}, subscribed symbols: ${mexcSubscribed}`);
     }, 2000);
 
     // ============================================
@@ -227,27 +257,28 @@ async function start() {
     logger.info('='.repeat(60));
 
     if (alertModuleEnabled) {
-      // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
-      try {
-        logger.info('[App] Pre-loading PriceAlertConfig cache...');
-        const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
-        await PriceAlertConfig.findAll(); // This will cache all configs
-        logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
-      } catch (error) {
-        logger.warn('[App] Failed to pre-load PriceAlertConfig cache:', error?.message || error);
-      }
-      
-      try {
-        const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
-        priceAlertWorker = new PriceAlertWorker();
-        await priceAlertWorker.initialize(telegramService);
-        priceAlertWorker.start();
-        logger.info('✅ Price Alert Worker started successfully');
-      } catch (error) {
-        logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
-        logger.error('Price Alert system is critical - application will continue but alerts may not work');
-        // Don't exit - Price Alert should be resilient
-      }
+      // Delay Price Alert Worker initialization to reduce startup CPU load
+      setTimeout(async () => {
+        try {
+          // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
+          logger.info('[App] Pre-loading PriceAlertConfig cache...');
+          const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
+          await PriceAlertConfig.findAll(); // This will cache all configs
+          logger.info('[App] ✅ PriceAlertConfig cache pre-loaded (TTL: 30 minutes)');
+          
+          // Small delay before initializing worker
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
+          priceAlertWorker = new PriceAlertWorker();
+          await priceAlertWorker.initialize(telegramService);
+          priceAlertWorker.start();
+          logger.info('✅ Price Alert Worker started successfully');
+        } catch (error) {
+          logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
+          logger.error('Price Alert system is critical - application will continue but alerts may not work');
+        }
+      }, 3000); // Delay 3 seconds
     } else {
       logger.warn('[App] PRICE_ALERT_MODULE_ENABLED=false → Price Alert Worker not started');
     }
@@ -255,42 +286,49 @@ async function start() {
     // ============================================
     // STRATEGIES WORKER (Only when active strategies exist)
     // ============================================
-    logger.info('='.repeat(60));
-    logger.info('Initializing Strategies Worker (Conditional, Independent)...');
-    logger.info('='.repeat(60));
-    
-    try {
-      const { StrategiesWorker } = await import('./workers/StrategiesWorker.js');
-      strategiesWorker = new StrategiesWorker();
-      await strategiesWorker.initialize(telegramService);
-      // Strategies worker will auto-start when active strategies are detected
-      logger.info('✅ Strategies Worker initialized (will start when active strategies are detected)');
-    } catch (error) {
-      logger.error('❌ Failed to initialize Strategies Worker:', error?.message || error);
-      logger.error('Strategies system failed - Price Alert will continue to work independently');
-      // Don't exit - Price Alert should continue working
-    }
+    // Delay Strategies Worker initialization to reduce startup CPU load
+    setTimeout(async () => {
+      logger.info('='.repeat(60));
+      logger.info('Initializing Strategies Worker (Conditional, Independent)...');
+      logger.info('='.repeat(60));
+      
+      try {
+        const { StrategiesWorker } = await import('./workers/StrategiesWorker.js');
+        strategiesWorker = new StrategiesWorker();
+        await strategiesWorker.initialize(telegramService);
+        // Strategies worker will auto-start when active strategies are detected
+        logger.info('✅ Strategies Worker initialized (will start when active strategies are detected)');
+      } catch (error) {
+        logger.error('❌ Failed to initialize Strategies Worker:', error?.message || error);
+        logger.error('Strategies system failed - Price Alert will continue to work independently');
+      }
+    }, 5000); // Delay 5 seconds
 
-    // Symbols Updater (default every 15 minutes via SYMBOLS_REFRESH_CRON)
-    symbolsUpdaterJob = new SymbolsUpdater();
-    await symbolsUpdaterJob.initialize();
-    symbolsUpdaterJob.start();
+    // Delay Symbols Updater to reduce startup CPU load
+    setTimeout(async () => {
+      // Symbols Updater (default every 15 minutes via SYMBOLS_REFRESH_CRON)
+      symbolsUpdaterJob = new SymbolsUpdater();
+      await symbolsUpdaterJob.initialize();
+      symbolsUpdaterJob.start();
+    }, 7000); // Delay 7 seconds
 
     // Position Sync Job - Sync positions from exchange to database
-    logger.info('='.repeat(60));
-    logger.info('Initializing Position Sync Job...');
-    logger.info('='.repeat(60));
-    try {
-      const { PositionSync } = await import('./jobs/PositionSync.js');
-      positionSyncJob = new PositionSync();
-      await positionSyncJob.initialize();
-      positionSyncJob.start();
-      logger.info('✅ Position Sync Job started successfully');
-    } catch (error) {
-      logger.error('❌ Failed to start Position Sync Job:', error?.message || error);
-      logger.error('Position sync will not run - positions may become inconsistent');
-      // Don't exit - other systems should continue
-    }
+    // Delay to reduce startup CPU load - initialize bots sequentially
+    setTimeout(async () => {
+      logger.info('='.repeat(60));
+      logger.info('Initializing Position Sync Job...');
+      logger.info('='.repeat(60));
+      try {
+        const { PositionSync } = await import('./jobs/PositionSync.js');
+        positionSyncJob = new PositionSync();
+        await positionSyncJob.initialize();
+        positionSyncJob.start();
+        logger.info('✅ Position Sync Job started successfully');
+      } catch (error) {
+        logger.error('❌ Failed to start Position Sync Job:', error?.message || error);
+        logger.error('Position sync will not run - positions may become inconsistent');
+      }
+    }, 8000); // Delay 8 seconds
 
     // Memory Monitor - Monitor and auto-cleanup when memory usage is high
     logger.info('='.repeat(60));

@@ -20,10 +20,12 @@ try {
  * Winston logger configuration
  * 
  * Log levels: error, warn, info, http, verbose, debug, silly
- * Set LOG_LEVEL environment variable to control verbosity (default: 'info')
+ * Set LOG_LEVEL environment variable or app_configs to control verbosity (default: 'info')
  * For production, use 'warn' or 'error' to reduce memory usage
+ * 
+ * Priority: app_configs > env variable > default
  */
-const logLevel = (process.env.LOG_LEVEL || 'info').toLowerCase();
+const logLevel = (process.env.LOG_LEVEL || 'error').toLowerCase();
 
 const logger = winston.createLogger({
   level: logLevel,
@@ -58,12 +60,12 @@ const logger = winston.createLogger({
       handleExceptions: true,
       handleRejections: true
     }),
-    // Combined file (warn and above by default, or all if LOG_LEVEL is debug)
+    // Combined file (info and above by default, or all if LOG_LEVEL is debug)
     new winston.transports.File({
       filename: path.join(LOG_DIR, 'combined.log'),
-      level: logLevel === 'debug' || logLevel === 'verbose' ? 'debug' : 'warn', // Only log warnings and above unless debug mode
-      maxsize: 5 * 1024 * 1024, // 5MB (reduced from 10MB to save memory)
-      maxFiles: 3, // Reduced from 5 to save disk space
+      level: logLevel === 'debug' || logLevel === 'verbose' ? 'debug' : 'info', // Log info and above (changed from 'warn')
+      maxsize: 10 * 1024 * 1024, // 10MB (increased for more detailed logs)
+      maxFiles: 5, // Increased to keep more history
       tailable: true
     })
   ],
@@ -82,5 +84,29 @@ const logger = winston.createLogger({
     })
   ]
 });
+
+/**
+ * Update logger level dynamically
+ * @param {string} level - New log level (error, warn, info, debug, verbose)
+ */
+logger.setLevel = function(level) {
+  const validLevels = ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'];
+  const newLevel = level.toLowerCase();
+  
+  if (!validLevels.includes(newLevel)) {
+    logger.warn(`Invalid log level: ${level}. Valid levels: ${validLevels.join(', ')}`);
+    return false;
+  }
+  
+  this.level = newLevel;
+  this.transports.forEach(transport => {
+    if (transport.filename && transport.filename.includes('combined.log')) {
+      transport.level = newLevel === 'debug' || newLevel === 'verbose' ? 'debug' : 'info';
+    }
+  });
+  
+  logger.info(`Log level updated to: ${newLevel}`);
+  return true;
+};
 
 export default logger;

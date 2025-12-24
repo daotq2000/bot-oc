@@ -33,8 +33,13 @@ export class EntryOrderMonitor {
       const { Bot } = await import('../models/Bot.js');
       const bots = await Bot.findAll(true); // Active bots only
 
-      for (const bot of bots) {
-        await this._addBot(bot);
+      // Initialize bots sequentially with delay to reduce CPU load
+      for (let i = 0; i < bots.length; i++) {
+        await this._addBot(bots[i]);
+        // Add delay between bot initializations to avoid CPU spike
+        if (i < bots.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 600)); // 600ms delay
+        }
       }
     } catch (error) {
       logger.error('[EntryOrderMonitor] Failed to initialize:', error);
@@ -173,6 +178,30 @@ export class EntryOrderMonitor {
           } else if ((status === 'canceled' || status === 'cancelled' || status === 'expired') && filled === 0) {
             await EntryOrder.markCanceled(entry.id, status === 'expired' ? 'expired' : 'canceled');
             logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) canceled/expired via REST polling.`);
+          } else {
+            // TTL-based auto-cancel for stale LIMIT entry orders (including extend-miss passive LIMIT)
+            const ttlMinutes = Number(configService.getNumber('EXTEND_LIMIT_AUTO_CANCEL_MINUTES', 10));
+            const ttlMs = Math.max(1, ttlMinutes) * 60 * 1000;
+            const createdAtMs = new Date(entry.created_at || entry.createdAt || entry.created || Date.now()).getTime();
+            const now = Date.now();
+
+            if (!Number.isNaN(createdAtMs) && now - createdAtMs >= ttlMs) {
+              try {
+                // Cancel on exchange first
+                await exchangeService.cancelOrder(entry.order_id, entry.symbol);
+              } catch (cancelErr) {
+                logger.warn(
+                  `[EntryOrderMonitor] Failed to cancel stale entry order ${entry.id} on exchange (orderId=${entry.order_id}, ${entry.symbol}): ${cancelErr?.message || cancelErr}`
+                );
+              }
+
+              // Mark as canceled in DB regardless of remote cancel result
+              await EntryOrder.markCanceled(entry.id, 'expired_ttl');
+              logger.info(
+                `[EntryOrderMonitor] ⏱️ Auto-canceled stale entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) after TTL ` +
+                `${ttlMinutes} minutes (created_at=${new Date(createdAtMs).toISOString()})`
+              );
+            }
           }
         } catch (inner) {
           logger.warn(`[EntryOrderMonitor] Failed to poll entry order ${entry.id} (${entry.symbol}): ${inner?.message || inner}`);
@@ -202,7 +231,7 @@ export class EntryOrderMonitor {
       // CRITICAL: Handle reservation for Position creation
       // Strategy: If entry_order has reservation_token from OrderService, use it (no need to reserve new slot)
       // Otherwise, reserve a new slot atomically
-      const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
+      // Concurrency management removed
       
       let reservationToken = entry.reservation_token || null;
       let useExistingReservation = false;
@@ -220,12 +249,9 @@ export class EntryOrderMonitor {
           
           if (reservationStatus === 'active') {
             // Reservation is still active - verify limit allows
-            const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
-            if (!canAccept) {
-              const status = await concurrencyManager.getStatus(botId);
-              logger.warn(`[EntryOrderMonitor] ⚠️ Cannot create Position from entry order ${entry.id}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain in entry_orders table.`);
-              return;
-            }
+            // Concurrency check disabled
+            // const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
+            // if (!canAccept) { return; }
             // Reservation exists and is active - use it
             useExistingReservation = true;
             logger.debug(`[EntryOrderMonitor] Using existing active reservation ${reservationToken} for entry order ${entry.id}`);
@@ -248,11 +274,12 @@ export class EntryOrderMonitor {
         let lastError = null;
         while (retries > 0) {
           try {
-            reservationToken = await concurrencyManager.reserveSlot(botId);
+            // reservationToken = await concurrencyManager.reserveSlot(botId);
+            reservationToken = 'disabled'; // Concurrency disabled
             if (reservationToken) break;
             
             // If reserveSlot returns null (not timeout), check if limit reached
-            const status = await concurrencyManager.getStatus(botId);
+            // const status = await concurrencyManager.getStatus(botId);
             if (status.currentCount >= status.maxConcurrent) {
               logger.warn(`[EntryOrderMonitor] ⚠️ Failed to reserve slot for entry order ${entry.id}: limit reached (${status.currentCount}/${status.maxConcurrent}). Entry order will remain for retry.`);
               return;
@@ -315,7 +342,7 @@ export class EntryOrderMonitor {
       await EntryOrder.markFilled(entry.id);
 
       // Finalize reservation as 'released' (Position created successfully)
-      await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
+      // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
 
       logger.debug(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
 
@@ -338,7 +365,7 @@ export class EntryOrderMonitor {
       }
       } catch (posError) {
         // If Position creation failed, cancel reservation
-        await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
         logger.error(`[EntryOrderMonitor] ❌ Failed to create Position for entry order ${entry.id}: ${posError?.message || posError}`);
         logger.error(`[EntryOrderMonitor] Stack trace:`, posError?.stack);
         // Don't re-throw - log error and let EntryOrderMonitor retry later

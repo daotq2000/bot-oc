@@ -49,7 +49,10 @@ export class PriceAlertScanner {
 
       logger.info(`[PriceAlertScanner] Initializing for exchanges: ${Array.from(exchanges).join(', ')}`);
       
-      for (const exchange of exchanges) {
+      // Initialize exchanges sequentially with delay to reduce CPU load
+      const exchangeArray = Array.from(exchanges);
+      for (let i = 0; i < exchangeArray.length; i++) {
+        const exchange = exchangeArray[i];
         try {
           // Create a dummy bot object for exchange initialization
           const dummyBot = {
@@ -65,6 +68,11 @@ export class PriceAlertScanner {
           await exchangeService.initialize();
           this.exchangeServices.set(exchange, exchangeService);
           logger.info(`[PriceAlertScanner] ✅ Initialized for ${exchange} exchange (public price mode)`);
+          
+          // Add delay between exchange initializations to reduce CPU load
+          if (i < exchangeArray.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay
+          }
         } catch (error) {
           logger.warn(`[PriceAlertScanner] Failed to initialize for ${exchange}:`, error.message);
         }
@@ -192,16 +200,28 @@ export class PriceAlertScanner {
       return;
     }
 
-    // Check each symbol
+    // Determine intervals from config; default to ['1m'] if empty
+    const intervals = Array.isArray(config.intervals) && config.intervals.length > 0
+      ? config.intervals
+      : ['1m'];
+
+    // Check each symbol (fetch price once, reuse for intervals)
     for (const symbol of symbolsToScan) {
       try {
-        await this.checkSymbolPrice(
-          exchange,
-          symbol,
-          threshold,
-          telegram_chat_id,
-          id
-        );
+        const currentPrice = await this.getPrice(normalizedExchange, symbol);
+        if (!currentPrice) continue;
+
+        for (const interval of intervals) {
+          await this.checkSymbolPrice(
+            normalizedExchange,
+            symbol,
+            threshold,
+            telegram_chat_id,
+            id,
+            interval,
+            currentPrice
+          );
+        }
       } catch (error) {
         logger.warn(`Error checking price for ${symbol} on ${exchange}:`, error.message);
       }
@@ -211,59 +231,77 @@ export class PriceAlertScanner {
   /**
    * Check price for a specific symbol
    */
-  async checkSymbolPrice(exchange, symbol, threshold, telegramChatId, configId) {
+  async checkSymbolPrice(exchange, symbol, threshold, telegramChatId, configId, interval = '1m', currentPrice = null) {
     try {
       const exchangeService = this.exchangeServices.get(exchange);
       if (!exchangeService) {
         return;
       }
 
-      // Get current price
-      const currentPrice = await this.getPrice(exchange, symbol);
-      if (!currentPrice) {
+      // Use provided currentPrice if given, otherwise fetch
+      const price = currentPrice !== null ? currentPrice : await this.getPrice(exchange, symbol);
+      if (!price) return;
+
+      // Resolve interval ms
+      const intervalMs = this.getIntervalMs(interval);
+      if (!intervalMs) {
+        logger.warn(`[PriceAlertScanner] Unsupported interval ${interval} for ${symbol}, skipping`);
         return;
       }
 
-      // Initialize alert state if not exists
-      const stateKey = `${exchange}_${symbol}`;
+      const now = Date.now();
+      const bucket = Math.floor(now / intervalMs);
+
+      // State per exchange-symbol-interval
+      const stateKey = `${exchange}_${symbol}_${interval}`;
       if (!this.alertStates.has(stateKey)) {
         this.alertStates.set(stateKey, {
-          lastPrice: currentPrice,
+          openPrice: price,
+          bucket,
           lastAlertTime: 0,
-          triggered: false
+          alerted: false
         });
-        return; // Skip first check
+        return; // first tick initializes bucket open
       }
 
       const state = this.alertStates.get(stateKey);
-      const lastPrice = state.lastPrice;
-      const priceChange = Math.abs((currentPrice - lastPrice) / lastPrice * 100);
 
-      // Check if price change exceeds threshold
-      if (priceChange >= threshold) {
-        const now = Date.now();
-        const timeSinceLastAlert = now - state.lastAlertTime;
-        const minAlertInterval = 60000; // Minimum 1 minute between alerts
+      // New bucket -> reset openPrice and alerted flag
+      if (state.bucket !== bucket) {
+        state.openPrice = price;
+        state.bucket = bucket;
+        state.alerted = false;
+      }
 
-        if (timeSinceLastAlert >= minAlertInterval) {
-          // Send alert
+      const openPrice = state.openPrice;
+      if (!openPrice || Number(openPrice) === 0) return;
+
+      const oc = ((price - openPrice) / openPrice) * 100; // signed
+      const ocAbs = Math.abs(oc);
+
+      const nowMs = now;
+      const minAlertInterval = 60000; // 1 minute between alerts
+
+      if (ocAbs >= threshold) {
+        const timeSinceLastAlert = nowMs - state.lastAlertTime;
+        if (!state.alerted || timeSinceLastAlert >= minAlertInterval) {
           await this.sendPriceAlert(
             exchange,
             symbol,
-            lastPrice,
-            currentPrice,
-            priceChange,
+            openPrice,
+            price,
+            oc,
+            interval,
             telegramChatId,
             configId
           );
-
-          state.lastAlertTime = now;
-          state.triggered = true;
+          state.lastAlertTime = nowMs;
+          state.alerted = true;
         }
+      } else {
+        // Reset alerted flag when oc drops below threshold
+        state.alerted = false;
       }
-
-      // Update state
-      state.lastPrice = currentPrice;
     } catch (error) {
       logger.warn(`Error checking symbol price ${symbol} on ${exchange}:`, error.message);
     }
@@ -306,7 +344,7 @@ export class PriceAlertScanner {
   /**
    * Send price alert via Telegram
    */
-  async sendPriceAlert(exchange, symbol, oldPrice, newPrice, changePercent, telegramChatId, configId) {
+  async sendPriceAlert(exchange, symbol, openPrice, currentPrice, ocPercent, interval, telegramChatId, configId) {
     try {
       if (!this.telegramService) {
         logger.warn(`[PriceAlertScanner] Telegram service not available, skipping alert for ${exchange} ${symbol}`);
@@ -319,26 +357,48 @@ export class PriceAlertScanner {
         return;
       }
 
-      const bullish = Number(newPrice) >= Number(oldPrice);
+      const bullish = Number(currentPrice) >= Number(openPrice);
       const direction = bullish ? 'bullish' : 'bearish';
 
       // Use compact line format via TelegramService
-      logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} (change: ${changePercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
+      const ocAbs = Math.abs(ocPercent);
+      logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
       await this.telegramService.sendVolatilityAlert(telegramChatId, {
         symbol,
-        interval: '1m', // default interval for standalone alerts
-        oc: changePercent * (bullish ? 1 : -1), // signed percent
-        open: oldPrice,
-        currentPrice: newPrice,
+        interval: interval || '1m',
+        oc: ocPercent,
+        open: openPrice,
+        currentPrice,
         direction
       }).catch((error) => {
         logger.error(`[PriceAlertScanner] Failed to send alert to chat_id=${telegramChatId}:`, error?.message || error);
       });
 
-      logger.info(`[PriceAlertScanner] ✅ Alert sent: ${exchange.toUpperCase()} ${symbol} (change: ${changePercent.toFixed(2)}%) to chat_id=${telegramChatId}`);
+      logger.info(`[PriceAlertScanner] ✅ Alert sent: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
     } catch (error) {
       logger.error(`Failed to send price alert for ${symbol}:`, error);
     }
+  }
+
+  /**
+   * Interval string to milliseconds
+   */
+  getIntervalMs(interval) {
+    const map = {
+      '1m': 60_000,
+      '3m': 180_000,
+      '5m': 300_000,
+      '15m': 900_000,
+      '30m': 1_800_000,
+      '1h': 3_600_000,
+      '2h': 7_200_000,
+      '4h': 14_400_000,
+      '6h': 21_600_000,
+      '8h': 28_800_000,
+      '12h': 43_200_000,
+      '1d': 86_400_000
+    };
+    return map[interval] || null;
   }
 }
 

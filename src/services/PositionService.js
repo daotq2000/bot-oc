@@ -601,30 +601,38 @@ export class PositionService {
     try {
 
       // Pre-check: ensure there is exposure to close on exchange
+      let hasExposure = false;
       try {
         const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
-        if (!qty || qty <= 0) {
-          logger.warn(`[CloseGuard] Skip close for position ${position.id} (${position.symbol}) - no exchange exposure`);
-          return position;
+        hasExposure = qty && qty > 0;
+        
+        if (!hasExposure) {
+          logger.warn(`[CloseGuard] Position ${position.id} (${position.symbol}) has no exchange exposure - closing in DB only`);
+          // Don't return - continue to close in DB
         }
       } catch (e) {
         logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
-        return position;
+        // Continue to close in DB anyway
       }
 
-      // Close on exchange
-      // ExchangeService handles exchange-specific logic (Binance, MEXC, Gate.io)
-      // MEXC: Uses CCXT to close position via market order
-      // Binance: Uses direct API with reduce-only flag
-      const closeRes = await this.exchangeService.closePosition(
-        position.symbol,
-        position.side,
-        position.amount
-      );
+      // Close on exchange (only if position exists)
+      let closeRes = null;
+      if (hasExposure) {
+        // ExchangeService handles exchange-specific logic (Binance, MEXC, Gate.io)
+        // MEXC: Uses CCXT to close position via market order
+        // Binance: Uses direct API with reduce-only flag
+        closeRes = await this.exchangeService.closePosition(
+          position.symbol,
+          position.side,
+          position.amount
+        );
 
-      if (closeRes?.skipped) {
-        logger.warn(`[CloseGuard] Exchange reported no position to close for ${position.symbol}; skipping DB close for ${position.id}`);
-        return position;
+        if (closeRes?.skipped) {
+          logger.warn(`[CloseGuard] Exchange reported no position to close for ${position.symbol}; will close in DB only`);
+          // Don't return - continue to close in DB
+        }
+      } else {
+        logger.info(`[CloseGuard] Skipping exchange close for position ${position.id} - no exposure (already closed on exchange)`);
       }
 
       // Prefer actual fill price if available and recompute PnL

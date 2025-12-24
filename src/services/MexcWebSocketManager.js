@@ -69,7 +69,7 @@ class MexcWebSocketManager {
 
   get endpoints() {
     // Build ordered endpoints list with domain preference and de-duplication
-    const primary = configService.getString('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.com/edge');
+    const primary = configService.getString('MEXC_FUTURES_WS_URL', 'wss://contract.mexc.co/edge');
     const primaryDomain = (primary || '').includes('mexc.co') ? 'co' : 'com';
 
     const uniq = (arr) => Array.from(new Set(arr));
@@ -86,8 +86,9 @@ class MexcWebSocketManager {
       'wss://wbs.mexc.co/ws'
     ]);
 
-    // Prefer .com if it is connecting; otherwise, fallback to .co
-    const preferCo = this._comFailures >= this._failoverThreshold;
+    // Prefer .co by default (better connectivity from some regions)
+    // Fallback to .com if .co fails
+    const preferCo = primaryDomain === 'co' || this._comFailures >= this._failoverThreshold;
     const ordered = preferCo ? [...coList, ...comList] : [...comList, ...coList];
     return ordered;
   }

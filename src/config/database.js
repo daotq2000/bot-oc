@@ -10,10 +10,11 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'bot_oc',
   waitForConnections: true,
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '15'), // Increased from 10 to 15 for higher frequency scans
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '30'), // Increased from 15 to 30 for high-frequency WebSocket processing
   queueLimit: 0,
   enableKeepAlive: true,
-  keepAliveInitialDelay: 0
+  keepAliveInitialDelay: 0,
+  connectTimeout: 10000 // 10 seconds connection timeout
 });
 
 /**

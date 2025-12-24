@@ -26,6 +26,10 @@ export class WebSocketOCConsumer {
     this.cleanupInterval = null;
     this.processedCount = 0;
     this.matchCount = 0;
+    
+    // Cache for open positions to avoid excessive DB queries
+    this.openPositionsCache = new Map(); // strategyId -> { hasOpenPosition: boolean, lastCheck: timestamp }
+    this.openPositionsCacheTTL = 5000; // 5 seconds TTL
   }
 
   /**
@@ -157,11 +161,24 @@ export class WebSocketOCConsumer {
 
       logger.info(`[WebSocketOCConsumer] 🎯 Found ${matches.length} match(es) for ${exchange} ${symbol}: ${matches.map(m => `strategy ${m.strategy.id} (OC=${m.oc.toFixed(2)}%)`).join(', ')}`);
 
-      // Process each match
-      for (const match of matches) {
-        logger.debug(`[WebSocketOCConsumer] 🎯 Processing match: strategy ${match.strategy.id}, bot_id=${match.strategy.bot_id}, symbol=${match.strategy.symbol}, OC=${match.oc.toFixed(2)}%`);
-        await this.processMatch(match).catch(error => {
-          logger.error(`[WebSocketOCConsumer] ❌ Error processing match for strategy ${match.strategy.id}:`, error?.message || error, error?.stack);
+      // Process matches in parallel (batch processing for better performance)
+      // Use Promise.allSettled to avoid one failure blocking others
+      const results = await Promise.allSettled(
+        matches.map(match => 
+          this.processMatch(match).catch(error => {
+            logger.error(`[WebSocketOCConsumer] ❌ Error processing match for strategy ${match.strategy.id}:`, error?.message || error);
+            throw error; // Re-throw to be caught by Promise.allSettled
+          })
+        )
+      );
+      
+      // Log results for debugging
+      const succeeded = results.filter(r => r.status === 'fulfilled').length;
+      const failed = results.filter(r => r.status === 'rejected').length;
+      if (failed > 0) {
+        logger.warn(`[WebSocketOCConsumer] Processed ${matches.length} matches: ${succeeded} succeeded, ${failed} failed`);
+        results.filter(r => r.status === 'rejected').forEach((r, i) => {
+          logger.error(`[WebSocketOCConsumer] Match ${i} failed:`, r.reason?.message || r.reason);
         });
       }
     } catch (error) {
@@ -178,7 +195,7 @@ export class WebSocketOCConsumer {
       const { strategy, oc, direction, currentPrice, interval } = match;
       const botId = strategy.bot_id;
 
-      logger.debug(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
+      logger.info(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
 
       // Get OrderService for this bot
       const orderService = this.orderServices.get(botId);
@@ -187,13 +204,14 @@ export class WebSocketOCConsumer {
         return;
       }
 
-      // Check if strategy already has open position
-      const { Position } = await import('../models/Position.js');
-      const openPositions = await Position.findOpen(strategy.id);
-      if (openPositions.length > 0) {
-        logger.debug(`[WebSocketOCConsumer] ⏭️ Strategy ${strategy.id} already has ${openPositions.length} open position(s), skipping`);
+      // Check if strategy already has open position (with cache to reduce DB queries)
+      const hasOpenPosition = await this.checkOpenPosition(strategy.id);
+      if (hasOpenPosition) {
+        logger.info(`[WebSocketOCConsumer] ⏭️ Strategy ${strategy.id} already has open position(s), skipping`);
         return;
       }
+      
+      logger.info(`[WebSocketOCConsumer] ✅ Strategy ${strategy.id} has no open position, proceeding...`);
 
       // Import calculator functions for TP/SL calculation
       const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
@@ -211,6 +229,9 @@ export class WebSocketOCConsumer {
         ? calculateLongEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0)
         : calculateShortEntryPrice(baseOpen, Math.abs(oc), strategy.extend || 0);
 
+      // Pre-calculate extend distance (full 100% extend move from baseOpen to entryPrice)
+      const totalExtendDistance = Math.abs(baseOpen - entryPrice);
+
       // Check extend condition: only trigger when price reaches the entry zone
       let extendOK = true;
       const extendVal = Number(strategy.extend || 0);
@@ -221,6 +242,8 @@ export class WebSocketOCConsumer {
           extendOK = currentPrice >= entryPrice && entryPrice > baseOpen;
         }
       }
+      
+      logger.info(`[WebSocketOCConsumer] Extend check for strategy ${strategy.id}: extendOK=${extendOK}, extendVal=${extendVal}, side=${side}, currentPrice=${currentPrice}, entryPrice=${entryPrice}, baseOpen=${baseOpen}, totalExtendDistance=${totalExtendDistance}`);
 
       // Calculate TP and SL (based on side)
       const tpPrice = calculateTakeProfit(entryPrice, Math.abs(oc), strategy.take_profit || 55, side);
@@ -243,14 +266,45 @@ export class WebSocketOCConsumer {
         amount: strategy.amount || 1000 // Default amount if not set
       };
 
-      // If extend condition not met, either place passive LIMIT (if enabled) or skip
+      // If extend condition not met, either place passive LIMIT (if enabled) or skip.
+      // New behaviour:
+      // - Không yêu cầu giá phải chạm 100% mức extend.
+      // - Cho phép đặt LIMIT nếu chênh lệch giữa currentPrice và entryPrice <= EXTEND_LIMIT_MAX_DIFF_RATIO * quãng đường extend.
       if (!extendOK) {
         const allowPassive = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
         if (allowPassive) {
-          signal.forcePassiveLimit = true; // OrderService will create a passive LIMIT at entryPrice
-          logger.debug(`[WebSocketOCConsumer] Extend not met; placing passive LIMIT (forcePassiveLimit) for strategy ${strategy.id} at ${entryPrice}`);
+          // Allow overriding max diff ratio via config (default 0.5 = 50%)
+          const maxDiffRatio = Number(configService.getNumber('EXTEND_LIMIT_MAX_DIFF_RATIO', 0.5)) || 0.5;
+          let priceDiffRatio = 0;
+          if (totalExtendDistance > 0) {
+            priceDiffRatio = Math.abs(currentPrice - entryPrice) / totalExtendDistance; // 0.0 → 1.0+
+          }
+
+          logger.info(
+            `[WebSocketOCConsumer] Extend miss for strategy ${strategy.id}: ` +
+            `allowPassive=${allowPassive}, priceDiffRatio=${priceDiffRatio.toFixed(4)}, maxDiffRatio=${maxDiffRatio}, ` +
+            `totalExtendDistance=${totalExtendDistance}, currentPrice=${currentPrice}, entryPrice=${entryPrice}`
+          );
+
+          // Chỉ đặt LIMIT nếu chênh lệch giá <= maxDiffRatio * quãng đường extend
+          if (totalExtendDistance === 0 || priceDiffRatio <= maxDiffRatio) {
+            signal.forcePassiveLimit = true; // OrderService sẽ tạo LIMIT thụ động tại entryPrice
+            logger.info(
+              `[WebSocketOCConsumer] ⚠️ Extend not fully met; placing passive LIMIT for strategy ${strategy.id} at ${entryPrice} (priceDiffRatio=${priceDiffRatio.toFixed(4)}, maxDiffRatio=${maxDiffRatio})`
+            );
+          } else {
+            logger.warn(
+              `[WebSocketOCConsumer] ❌ Extend not met and price difference too large; ` +
+              `SKIPPING order for strategy ${strategy.id}. ` +
+              `priceDiffRatio=${priceDiffRatio.toFixed(4)} > maxDiffRatio=${maxDiffRatio}, side=${side}, baseOpen=${baseOpen}, entry=${entryPrice}, current=${currentPrice}`
+            );
+            return;
+          }
         } else {
-          logger.debug(`[WebSocketOCConsumer] Extend not met; skipping order for strategy ${strategy.id}. side=${side} baseOpen=${baseOpen} entry=${entryPrice} current=${currentPrice}`);
+          logger.warn(
+            `[WebSocketOCConsumer] ❌ Extend not met; SKIPPING order for strategy ${strategy.id} because passive LIMIT is disabled. ` +
+            `side=${side} baseOpen=${baseOpen} entry=${entryPrice} current=${currentPrice}`
+          );
           return;
         }
       }
@@ -258,15 +312,57 @@ export class WebSocketOCConsumer {
       logger.info(`[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ${signal.side} @ ${currentPrice}, OC=${oc.toFixed(2)}%`);
 
       // Trigger order immediately
-      await orderService.executeSignal(signal).catch(error => {
+      const result = await orderService.executeSignal(signal).catch(error => {
         logger.error(`[WebSocketOCConsumer] ❌ Error executing signal for strategy ${strategy.id}:`, error?.message || error);
         throw error; // Re-throw to be caught by outer try-catch
       });
 
-      logger.debug(`[WebSocketOCConsumer] ✅ Order triggered successfully for strategy ${strategy.id}`);
+      // Clear cache after order is placed (position is now open)
+      if (result && result.id) {
+        this.clearPositionCache(strategy.id);
+        logger.debug(`[WebSocketOCConsumer] ✅ Order triggered successfully for strategy ${strategy.id}, position ${result.id} opened`);
+      } else {
+        logger.debug(`[WebSocketOCConsumer] ✅ Order triggered for strategy ${strategy.id}`);
+      }
     } catch (error) {
       logger.error(`[WebSocketOCConsumer] Error processing match:`, error?.message || error);
     }
+  }
+
+  /**
+   * Check if strategy has open position (with cache)
+   * @param {number} strategyId - Strategy ID
+   * @returns {Promise<boolean>} True if has open position
+   */
+  async checkOpenPosition(strategyId) {
+    const now = Date.now();
+    const cached = this.openPositionsCache.get(strategyId);
+    
+    // Return cached result if still valid
+    if (cached && (now - cached.lastCheck) < this.openPositionsCacheTTL) {
+      return cached.hasOpenPosition;
+    }
+    
+    // Query database
+    const { Position } = await import('../models/Position.js');
+    const openPositions = await Position.findOpen(strategyId);
+    const hasOpenPosition = openPositions.length > 0;
+    
+    // Update cache
+    this.openPositionsCache.set(strategyId, {
+      hasOpenPosition,
+      lastCheck: now
+    });
+    
+    return hasOpenPosition;
+  }
+
+  /**
+   * Clear open position cache for a strategy (call when position is opened/closed)
+   * @param {number} strategyId - Strategy ID
+   */
+  clearPositionCache(strategyId) {
+    this.openPositionsCache.delete(strategyId);
   }
 
   /**

@@ -16,8 +16,9 @@ export class TelegramService {
     this._processing = false;
     this._lastSendAt = 0; // global throttle
     this._perChatLastSend = new Map(); // chatId -> ts
-    this._minGapGlobalMs = 120; // ~8 msgs/sec globally
-    this._perChatMinGapMs = 250; // ~4 msgs/sec per chat
+    // Default throttles (Telegram 30 msg/sec global, 1 msg/sec per chat is safer)
+    this._minGapGlobalMs = 200;   // 5 msgs/sec global
+    this._perChatMinGapMs = 1000; // 1 msg/sec per chat to avoid 429
   }
 
   /**
@@ -112,12 +113,18 @@ export class TelegramService {
           this._perChatLastSend.set(chatId, this._lastSendAt);
           logger.debug(`[Telegram] ✅ Successfully sent message to ${chatId}`);
         } catch (error) {
-          logger.error(`[Telegram] Failed to send message to ${chatId}:`, error?.message || error);
-          // Simple backoff and requeue once for transient errors
-          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT/i.test(error?.message || '');
+          const msg = error?.message || '';
+          const retryAfter = Number(error?.response?.parameters?.retry_after || error?.parameters?.retry_after || NaN);
+          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT/i.test(msg);
+
           if (transient) {
-            this._queue.unshift({ chatId, message, options });
-            await new Promise(r => setTimeout(r, 500));
+            // Respect Telegram retry_after when present
+            const backoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000) : 1000;
+            logger.warn(`[Telegram] Throttled or transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, msg=${msg}`);
+            this._queue.unshift({ chatId, message, options }); // requeue
+            await new Promise(r => setTimeout(r, backoffMs));
+          } else {
+            logger.error(`[Telegram] Failed to send message to ${chatId}:`, msg);
           }
         }
       }
@@ -278,7 +285,12 @@ Amount: ${amountStr} (100%)`.trim();
 
       const pnlVal = Number(position.pnl || 0);
       const pnlPct = this.calculatePercent(position.entry_price, position.close_price, position.side);
-      const pnlLine = `${pnlVal >= 0 ? '' : ''}${pnlVal.toFixed(2)}$ ~ ${pnlPct >= 0 ? '' : ''}${pnlPct.toFixed(2)}%`;
+      
+      // Estimate trading fees (0.04% maker + 0.06% taker = ~0.1% total)
+      const estimatedFees = Number(position.amount) * 0.001; // 0.1%
+      const pnlAfterFees = pnlVal - estimatedFees;
+      
+      const pnlLine = `${pnlVal >= 0 ? '' : ''}${pnlVal.toFixed(2)}$ ~ ${pnlPct >= 0 ? '' : ''}${pnlPct.toFixed(2)}% (before fees)`;
 
       const msg = `
 ${title}
@@ -287,7 +299,8 @@ Bot: ${botName}
 Strategy: ${intervalLabel} | OC: ${ocStr}% | Extend: ${extendStr}% | TP: ${tpStr}%
 Close price: ${closePrice}$
 Amount: ${amountStr}
-💰 PNL: ${pnlLine}`.trim();
+💰 PNL: ${pnlLine}
+📊 Est. After Fees: ~${pnlAfterFees.toFixed(2)}$ (fees: ~${estimatedFees.toFixed(2)}$)`.trim();
 
       await this.sendMessage(channelId, msg);
     } catch (e) {

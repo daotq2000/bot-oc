@@ -21,12 +21,12 @@ export class RealtimeOCDetector {
     // Key: exchange|symbol|interval|bucketStart
     // Value: { open, bucketStart, lastUpdate }
     this.openPriceCache = new Map();
-    this.maxOpenPriceCacheSize = 2000; // Maximum number of entries to cache (reduced from 10000 to save memory)
+    this.maxOpenPriceCacheSize = 1000; // Reduced from 2000 to save memory
 
     // Cache fetched opens from REST to avoid repeated external calls
     // Key: exchange|symbol|interval|bucketStart -> open
     this.openFetchCache = new Map();
-    this.maxOpenFetchCacheSize = 500; // Maximum number of entries to cache (reduced from 5000 to save memory)
+    this.maxOpenFetchCacheSize = 200; // Reduced from 500 to save memory
 
     // Prime tolerance: if we are already inside the bucket more than this, try REST OHLCV open
     this.openPrimeToleranceMs = Number(configService.getNumber('OC_OPEN_PRIME_TOLERANCE_MS', 3000));
@@ -35,7 +35,7 @@ export class RealtimeOCDetector {
     // Key: exchange|symbol
     // Value: { price, timestamp }
     this.lastPriceCache = new Map();
-    this.maxLastPriceCacheSize = 1000; // Maximum number of symbols to track (reduced from 5000 to save memory)
+    this.maxLastPriceCacheSize = 600; // Reduced from 1000 to save memory (534 Binance + MEXC symbols)
     
     // Minimum price change threshold to trigger recalculation (0.01% default)
     this.priceChangeThreshold = 0.0001; // 0.01%
@@ -43,6 +43,49 @@ export class RealtimeOCDetector {
     // Public CCXT clients cache for REST OHLCV (no API keys)
     this._publicClients = new Map();
     this.maxPublicClients = 10; // Maximum number of exchange clients to cache
+    
+    // Start periodic cache cleanup to prevent memory leaks
+    this.startCacheCleanup();
+  }
+
+  /**
+   * Start periodic cache cleanup
+   */
+  startCacheCleanup() {
+    // Clean up old cache entries every 5 minutes
+    setInterval(() => {
+      this.cleanupOldCacheEntries();
+    }, 5 * 60 * 1000); // 5 minutes
+  }
+
+  /**
+   * Clean up old cache entries to prevent memory leaks
+   */
+  cleanupOldCacheEntries() {
+    const now = Date.now();
+    const maxAge = 15 * 60 * 1000; // 15 minutes
+    
+    let cleaned = 0;
+    
+    // Clean openPriceCache
+    for (const [key, value] of this.openPriceCache.entries()) {
+      if (now - value.lastUpdate > maxAge) {
+        this.openPriceCache.delete(key);
+        cleaned++;
+      }
+    }
+    
+    // Clean openFetchCache
+    for (const [key, value] of this.openFetchCache.entries()) {
+      if (now - value.timestamp > maxAge) {
+        this.openFetchCache.delete(key);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      logger.debug(`[RealtimeOCDetector] Cleaned ${cleaned} old cache entries. Cache sizes: openPrice=${this.openPriceCache.size}, openFetch=${this.openFetchCache.size}`);
+    }
   }
 
   /**
@@ -175,8 +218,13 @@ export class RealtimeOCDetector {
   }
 
   /**
-   * Get accurate OPEN for interval bucket. If already inside the bucket more than tolerance,
-   * attempt a synchronous REST OHLCV fetch to get the true candle open.
+   * Get accurate OPEN for interval bucket.
+   *
+   * IMPORTANT:
+   * - This function is now STRICT: it always tries to fetch the true candle OPEN
+   *   from REST OHLCV and will NOT fall back to currentPrice.
+   * - If REST data is not available or invalid, it returns null and callers
+   *   should skip OC detection for this tick.
    */
   async getAccurateOpen(exchange, symbol, interval, currentPrice, timestamp = Date.now()) {
     const ex = (exchange || '').toLowerCase();
@@ -190,24 +238,35 @@ export class RealtimeOCDetector {
       return cached.open;
     }
 
-    // Decide approach based on elapsed time inside bucket
-    const elapsed = Math.max(0, timestamp - bucketStart);
-    const useRestPrime = configService.getBoolean('OC_OPEN_PRIME_USE_REST', true);
-    const allowRest = useRestPrime && elapsed >= this.openPrimeToleranceMs;
-
-    let openPrice = currentPrice;
-
-    if (allowRest) {
-      // Try REST OHLCV open
-      const fetched = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
-      if (Number.isFinite(fetched) && fetched > 0) {
-        openPrice = fetched;
-        this.openFetchCache.set(key, fetched);
-        logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
-      } else {
-        logger.debug(`[RealtimeOCDetector] REST open not available, fallback to current price for ${sym} ${interval}`);
+    // 1) Try WebSocket kline OPEN cache first (no REST)
+    try {
+      if (ex === 'binance') {
+        const { webSocketManager } = await import('./WebSocketManager.js');
+        const wsOpen = webSocketManager.getKlineOpen(sym, interval, bucketStart);
+        if (Number.isFinite(wsOpen) && wsOpen > 0) {
+          logger.info(`[RealtimeOCDetector] Using WS kline open for ${sym} ${interval}: ${wsOpen}`);
+          // Store in cache
+          this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp });
+          return wsOpen;
+        }
       }
+    } catch (wsErr) {
+      logger.debug(`[RealtimeOCDetector] getKlineOpen failed for ${sym} ${interval}: ${wsErr?.message || wsErr}`);
     }
+
+    // 2) Fallback: REST OHLCV open
+    const fetched = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
+    if (!Number.isFinite(fetched) || fetched <= 0) {
+      logger.warn(
+        `[RealtimeOCDetector] ❌ Unable to fetch REST OPEN for ${sym} ${interval} (bucketStart=${bucketStart}). ` +
+        `Skipping OC calculation for this tick.`
+      );
+      return null;
+    }
+
+    const openPrice = fetched;
+    this.openFetchCache.set(key, fetched);
+    logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
 
     // Enforce max cache size (LRU eviction)
     if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(key)) {
@@ -379,42 +438,35 @@ export class RealtimeOCDetector {
       const normalizedExchange = (exchange || '').toLowerCase();
       const normalizedSymbol = String(symbol || '').toUpperCase().replace(/[\/:_]/g, '');
 
-      // Log every detection call for debugging (first 50, then every 1000th)
+      // Log every detection call for debugging (first 10, then every 5000th to reduce logging)
       if (!this._detectCount) this._detectCount = 0;
       this._detectCount++;
-      if (this._detectCount <= 50 || this._detectCount % 1000 === 0) {
-        logger.info(`[RealtimeOCDetector] detectOC called by ${caller} for ${normalizedExchange} ${normalizedSymbol} @ ${currentPrice} (count: ${this._detectCount})`);
+      if (this._detectCount <= 10 || this._detectCount % 5000 === 0) {
+        logger.debug(`[RealtimeOCDetector] detectOC called by ${caller} for ${normalizedExchange} ${normalizedSymbol} @ ${currentPrice} (count: ${this._detectCount})`);
       }
 
       // Check if price changed significantly
       if (!this.hasPriceChanged(normalizedExchange, normalizedSymbol, currentPrice)) {
-        if (this._detectCount <= 50) {
-          logger.debug(`[RealtimeOCDetector] Price not changed significantly for ${normalizedExchange} ${normalizedSymbol}`);
-        }
+        // Skip logging - too frequent
         return []; // Skip if price hasn't changed significantly
       }
 
       // Get strategies for this symbol
       const strategies = strategyCache.getStrategies(normalizedExchange, normalizedSymbol);
       
-      // Log strategy lookup result
+      // Log strategy lookup result (reduced logging)
       if (strategies.length === 0) {
-        if (this._detectCount <= 50 || normalizedSymbol.includes('PIPPIN')) {
-          logger.warn(`[RealtimeOCDetector] ⚠️ No strategies found for ${normalizedExchange} ${normalizedSymbol} (cache size: ${strategyCache.size()})`);
-          // Log all cached symbols for debugging
-          if (normalizedSymbol.includes('PIPPIN')) {
-            const allSymbols = new Set();
-            for (const [key] of strategyCache.cache.entries()) {
-              const [, sym] = key.split('|');
-              allSymbols.add(sym);
-            }
-            logger.warn(`[RealtimeOCDetector] Available symbols in cache: ${Array.from(allSymbols).slice(0, 20).join(', ')}${allSymbols.size > 20 ? '...' : ''}`);
-          }
+        // Only log for specific symbols or first few times
+        if (normalizedSymbol.includes('PIPPIN') && this._detectCount % 100 === 0) {
+          logger.debug(`[RealtimeOCDetector] No strategies found for ${normalizedExchange} ${normalizedSymbol}`);
         }
         return []; // No strategies for this symbol
       }
 
-      logger.info(`[RealtimeOCDetector] 🔍 Checking ${strategies.length} strategies for ${normalizedExchange} ${normalizedSymbol} @ ${currentPrice}`);
+      // Only log when checking strategies (reduced frequency)
+      if (this._detectCount <= 10 || this._detectCount % 1000 === 0) {
+        logger.debug(`[RealtimeOCDetector] Checking ${strategies.length} strategies for ${normalizedExchange} ${normalizedSymbol}`);
+      }
 
       const matches = [];
 
@@ -435,9 +487,9 @@ export class RealtimeOCDetector {
         const absOC = Math.abs(oc);
         const direction = this.getDirection(openPrice, currentPrice);
 
-        // Log calculation details for debugging
-        if (normalizedSymbol.includes('PIPPIN') || absOC >= ocThreshold * 0.8) {
-          logger.info(`[RealtimeOCDetector] Strategy ${strategy.id}: ${normalizedSymbol} ${interval} open=${openPrice} current=${currentPrice} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction}`);
+        // Log calculation details for debugging (reduced frequency)
+        if ((normalizedSymbol.includes('PIPPIN') || absOC >= ocThreshold * 0.8) && this._detectCount % 100 === 0) {
+          logger.debug(`[RealtimeOCDetector] Strategy ${strategy.id}: ${normalizedSymbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%)`);
         }
 
         // Check if OC meets threshold
@@ -454,11 +506,8 @@ export class RealtimeOCDetector {
           });
 
           logger.info(`[RealtimeOCDetector] ✅ MATCH FOUND: ${normalizedSymbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} strategy_id=${strategy.id} bot_id=${strategy.bot_id}`);
-        } else {
-          if (normalizedSymbol.includes('PIPPIN') || absOC >= ocThreshold * 0.8) {
-            logger.debug(`[RealtimeOCDetector] Strategy ${strategy.id}: OC ${absOC.toFixed(2)}% < threshold ${ocThreshold}%`);
-          }
         }
+        // Removed else logging - too frequent
       }
 
       if (matches.length > 0) {

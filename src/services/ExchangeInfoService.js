@@ -224,7 +224,7 @@ class ExchangeInfoService {
         };
       } catch (_) {}
       // Explicitly fetch swap markets from the correct public endpoint to avoid 404s
-      await mexc.fetchMarkets({ 'type': 'swap', 'method': 'publicGetContractDetail' });
+      await mexc.fetchMarkets({ 'type': 'swap' });
 
       const filtersToSave = [];
       const markets = mexc.markets || {};

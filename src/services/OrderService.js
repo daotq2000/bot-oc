@@ -1,7 +1,7 @@
 import { Position } from '../models/Position.js';
 import { EntryOrder } from '../models/EntryOrder.js';
 import { TelegramService } from './TelegramService.js';
-import { concurrencyManager } from './ConcurrencyManager.js';
+
 import logger from '../utils/logger.js';
 import { configService } from './ConfigService.js';
 
@@ -12,6 +12,66 @@ export class OrderService {
   constructor(exchangeService, telegramService) {
     this.exchangeService = exchangeService;
     this.telegramService = telegramService;
+    
+    // Cache for position counts to avoid excessive DB queries
+    this.positionCountCache = new Map(); // botId -> { count, timestamp }
+    this.positionCountCacheTTL = 5000; // 5 seconds
+    this.maxCacheSize = 100; // Maximum number of bot entries to cache
+    
+    // Start periodic cleanup to prevent memory leaks
+    this.startCacheCleanup();
+  }
+
+  /**
+   * Start periodic cache cleanup
+   */
+  startCacheCleanup() {
+    // Clean up old cache entries every 30 seconds
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = setInterval(() => {
+      this.cleanupCache();
+    }, 30000); // 30 seconds
+  }
+
+  /**
+   * Clean up old cache entries to prevent memory leaks
+   */
+  cleanupCache() {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    // Remove expired entries
+    for (const [botId, value] of this.positionCountCache.entries()) {
+      if (now - value.timestamp > this.positionCountCacheTTL * 2) {
+        this.positionCountCache.delete(botId);
+        cleaned++;
+      }
+    }
+    
+    // Enforce max size (LRU eviction)
+    if (this.positionCountCache.size > this.maxCacheSize) {
+      const entries = Array.from(this.positionCountCache.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp);
+      const toRemove = entries.slice(0, this.positionCountCache.size - this.maxCacheSize);
+      for (const [botId] of toRemove) {
+        this.positionCountCache.delete(botId);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      logger.debug(`[OrderService] Cleaned ${cleaned} cache entries. Current size: ${this.positionCountCache.size}`);
+    }
+  }
+
+  /**
+   * Stop cache cleanup timer
+   */
+  stopCacheCleanup() {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
   }
 
   // Send central log to fixed tracking channel
@@ -37,39 +97,75 @@ export class OrderService {
       // Central log: attempt
       await this.sendCentralLog(`Order Attempt | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} entry=${entryPrice} amt=${amount} tp=${tpPrice ?? 'n/a'} sl=${slPrice ?? 'n/a'} oc=${signal?.oc ?? 'n/a'}`);
 
-      // Acquire concurrency reservation (DB-backed advisory lock)
-      let reservationToken;
-      try {
-        reservationToken = await concurrencyManager.reserveSlot(strategy.bot_id);
-      } catch (e) {
-        if (e?.code === 'CONCURRENCY_LOCK_TIMEOUT') {
-          // Lock contention: skip silently without alert; not a real limit breach
-          logger.warn(`[OrderService] Concurrency lock timeout for bot ${strategy.bot_id}, skip placing order (no alert).`);
-          await this.sendCentralLog(`Order ConcurrencyLockTimeout | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol}`);
+      // Simple position limit check (with cache)
+      const maxPositions = strategy.bot?.max_concurrent_trades || 100;
+      
+      // Only check if limit is set and reasonable
+      if (maxPositions > 0 && maxPositions < 10000) {
+        const now = Date.now();
+        const cached = this.positionCountCache.get(strategy.bot_id);
+        
+        let currentCount;
+        if (cached && (now - cached.timestamp) < this.positionCountCacheTTL) {
+          currentCount = cached.count;
+        } else {
+          // Query database
+          const pool = (await import('../config/database.js')).default;
+          const [result] = await pool.execute(
+            'SELECT COUNT(*) as count FROM positions WHERE bot_id = ? AND status = ?',
+            [strategy.bot_id, 'open']
+          );
+          currentCount = result[0].count;
+          
+          // Update cache
+          this.positionCountCache.set(strategy.bot_id, {
+            count: currentCount,
+            timestamp: now
+          });
+        }
+        
+        if (currentCount >= maxPositions) {
+          logger.warn(`[OrderService] Max positions reached for bot ${strategy.bot_id}: ${currentCount}/${maxPositions}, skipping strategy ${strategy.id}`);
           return null;
         }
-        throw e;
       }
 
-      if (!reservationToken) {
-        // Real limit reached under lock
-        const status = await concurrencyManager.getStatus(strategy.bot_id);
-        const msg = `Max concurrent trades limit reached: ${status.currentCount}/${status.maxConcurrent}`;
-        logger.warn(`[OrderService] ${msg} for strategy ${strategy.id} (${strategy.symbol})`);
-        // Send Telegram alert about rejection
+      // Per-coin exposure limit (max_amount_per_coin, in USDT) - configurable per bot
+      const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
+      if (Number.isFinite(maxAmountPerCoin) && maxAmountPerCoin > 0) {
         try {
-          if (!strategy.bot && strategy.bot_id) {
-            const { Bot } = await import('../models/Bot.js');
-            strategy.bot = await Bot.findById(strategy.bot_id);
-          }
-          await this.telegramService?.sendConcurrencyLimitAlert?.(strategy, status);
-          await this.sendCentralLog(`Order Rejected MaxConcurrent | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(signal?.side || side).toUpperCase()} current=${status.currentCount}/${status.maxConcurrent}`);
-        } catch (e) {
-          logger.warn(`[OrderService] Failed to send concurrency alert: ${e?.message || e}`);
-        }
-        return null; // treat as soft skip
-      }
+          const pool = (await import('../config/database.js')).default;
+          // NOTE: amount is stored in USDT (strategy.amount), so we sum p.amount.
+          const [rows] = await pool.execute(
+            `SELECT COALESCE(SUM(p.amount), 0) AS total_amount
+             FROM positions p
+             JOIN strategies s ON p.strategy_id = s.id
+             WHERE s.bot_id = ? AND p.status = 'open' AND p.symbol = ?`,
+            [strategy.bot_id, strategy.symbol]
+          );
+          const currentAmount = Number(rows?.[0]?.total_amount || 0);
+          const projectedAmount = currentAmount + Number(amount || 0);
 
+          if (projectedAmount > maxAmountPerCoin) {
+            logger.warn(
+              `[OrderService] max_amount_per_coin exceeded for bot ${strategy.bot_id}, symbol=${strategy.symbol}. ` +
+              `current=${currentAmount}, new=${amount}, projected=${projectedAmount}, limit=${maxAmountPerCoin}. Skipping strategy ${strategy.id}`
+            );
+            await this.sendCentralLog(
+              `Order SkipMaxPerCoin | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
+              `${String(side).toUpperCase()} current=${currentAmount} new=${amount} limit=${maxAmountPerCoin}`
+            );
+            return null;
+          }
+        } catch (exposureErr) {
+          logger.warn(
+            `[OrderService] Failed to check max_amount_per_coin for bot ${strategy.bot_id}, symbol=${strategy.symbol}:`,
+            exposureErr?.message || exposureErr
+          );
+          // If exposure check fails, we proceed but log the issue.
+        }
+      }
+      
       let orderCreated = false;
 
       // Check if entry price is still valid
@@ -221,13 +317,11 @@ export class OrderService {
           });
           
           // CRITICAL: Finalize reservation immediately after Position is created
-          // This ensures reservation is released even if errors occur later
+          // Position created successfully
           orderCreated = true;
-          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'released');
-          logger.debug(`[OrderService] Position ${position.id} created and reservation finalized for bot ${strategy.bot_id}`);
+          logger.debug(`[OrderService] Position ${position.id} created for bot ${strategy.bot_id}`);
         } catch (posError) {
-          // If Position creation failed, cancel reservation
-          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'cancelled');
+          // If Position creation failed
           logger.error(`[OrderService] Failed to create Position: ${posError?.message || posError}`);
           throw posError;
         }
@@ -235,9 +329,8 @@ export class OrderService {
         // Pending LIMIT (no confirmed fill yet): track in entry_orders table
         // CRITICAL: Do NOT finalize reservation here - keep it active until Position is created
         // EntryOrderMonitor will finalize reservation when it creates Position
-        // Store reservation_token in entry_orders for EntryOrderMonitor to finalize later
+        // Store entry order for monitoring
         try {
-          // Try to store reservation_token if column exists, otherwise just create entry_order
           try {
             await EntryOrder.create({
               strategy_id: strategy.id,
@@ -247,12 +340,11 @@ export class OrderService {
               side,
               amount,
               entry_price: effectiveEntryPrice,
-              status: 'open',
-              reservation_token: reservationToken // Store reservation token for later finalization
+              status: 'open'
             });
           } catch (schemaError) {
-            // If reservation_token column doesn't exist, create without it
-            if (schemaError.message?.includes('reservation_token') || schemaError.code === 'ER_BAD_FIELD_ERROR') {
+            // Schema error - try without optional fields
+            if (schemaError.code === 'ER_BAD_FIELD_ERROR') {
               await EntryOrder.create({
                 strategy_id: strategy.id,
                 bot_id: strategy.bot_id,
@@ -263,16 +355,14 @@ export class OrderService {
                 entry_price: effectiveEntryPrice,
                 status: 'open'
               });
-              logger.debug(`[OrderService] entry_orders table doesn't have reservation_token column, created entry_order without it`);
+              logger.debug(`[OrderService] Created entry_order without optional fields`);
             } else {
               throw schemaError;
             }
           }
-          logger.debug(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table. Reservation ${reservationToken} kept active until Position is created.`);
+          logger.debug(`[OrderService] Tracked pending LIMIT entry order ${order.id} for strategy ${strategy.id} in entry_orders table.`);
         } catch (e) {
           logger.warn(`[OrderService] Failed to persist entry order ${order.id} into entry_orders: ${e?.message || e}`);
-          // If entry_order creation failed, cancel reservation
-          await concurrencyManager.finalizeReservation(strategy.bot_id, reservationToken, 'cancelled');
         }
       }
 
@@ -317,7 +407,7 @@ export class OrderService {
       } else {
         // Pending LIMIT only (no DB position yet)
         // Reservation is still active and will be finalized by EntryOrderMonitor when Position is created
-        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice} reservation=${reservationToken}`);
+        await this.sendCentralLog(`Order PendingLimit | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} type=${orderType} entry=${effectiveEntryPrice} tp=${tempTpPrice} sl=${tempSlPrice}`);
       }
 
       // For compatibility with callers (e.g. WebSocketOCConsumer), always return a truthy value on success:
@@ -365,11 +455,7 @@ export class OrderService {
       throw error;
     } finally {
       // If order was not created, cancel reservation (if any)
-      try {
-        if (typeof reservationToken !== 'undefined' && reservationToken && !orderCreated) {
-          await concurrencyManager.finalizeReservation(signal.strategy.bot_id, reservationToken, 'cancelled');
-        }
-      } catch (_) {}
+      // Cleanup logic removed (concurrency management disabled)
     }
   }
 

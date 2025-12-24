@@ -32,6 +32,106 @@ export class OcAlertScanner {
     this.configsCacheTime = 0;
     this.configsCacheTTL = 30_000; // 30s
     this.watchByExchange = new Map(); // exchange -> { symbols:Set, intervals:Set, threshold:number, chatId:string, cfgId:number }
+    
+    // Cache size limits to prevent memory leaks
+    this.maxStateCacheSize = 1000; // Maximum state entries
+    this.maxOpenCacheSize = 500; // Maximum open cache entries
+    this.maxLastSentSize = 500; // Maximum lastSent entries
+    
+    // Start periodic cleanup
+    this.startCacheCleanup();
+  }
+
+  /**
+   * Start periodic cache cleanup
+   */
+  startCacheCleanup() {
+    // Clean up old cache entries every 5 minutes
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = setInterval(() => {
+      this.cleanupCaches();
+    }, 5 * 60 * 1000); // 5 minutes
+  }
+
+  /**
+   * Clean up old cache entries to prevent memory leaks
+   */
+  cleanupCaches() {
+    const now = Date.now();
+    const maxAge = 30 * 60 * 1000; // 30 minutes
+    let cleaned = 0;
+    
+    // Clean state cache (by age and size)
+    for (const [key, value] of this.state.entries()) {
+      if (value.lastAlertTime && (now - value.lastAlertTime > maxAge * 2)) {
+        this.state.delete(key);
+        cleaned++;
+      }
+    }
+    if (this.state.size > this.maxStateCacheSize) {
+      const entries = Array.from(this.state.entries())
+        .sort((a, b) => (a[1].lastAlertTime || 0) - (b[1].lastAlertTime || 0));
+      const toRemove = entries.slice(0, this.state.size - this.maxStateCacheSize);
+      for (const [key] of toRemove) {
+        this.state.delete(key);
+        cleaned++;
+      }
+    }
+    
+    // Clean openCache (by age - bucketStart indicates age)
+    const currentTime = Date.now();
+    for (const [key, value] of this.openCache.entries()) {
+      // Extract bucketStart from key or use value if it's an object
+      const bucketStart = typeof value === 'object' && value.bucketStart 
+        ? value.bucketStart 
+        : this.getBucketStart('1m', currentTime) - (60 * 60 * 1000); // Assume 1h old if can't determine
+      if (currentTime - bucketStart > maxAge) {
+        this.openCache.delete(key);
+        cleaned++;
+      }
+    }
+    if (this.openCache.size > this.maxOpenCacheSize) {
+      const entries = Array.from(this.openCache.entries());
+      const toRemove = entries.slice(0, this.openCache.size - this.maxOpenCacheSize);
+      for (const [key] of toRemove) {
+        this.openCache.delete(key);
+        cleaned++;
+      }
+    }
+    
+    // Clean lastSent (by age)
+    for (const [key, timestamp] of this.lastSent.entries()) {
+      if (now - timestamp > maxAge) {
+        this.lastSent.delete(key);
+        cleaned++;
+      }
+    }
+    if (this.lastSent.size > this.maxLastSentSize) {
+      const entries = Array.from(this.lastSent.entries())
+        .sort((a, b) => a[1] - b[1]);
+      const toRemove = entries.slice(0, this.lastSent.size - this.maxLastSentSize);
+      for (const [key] of toRemove) {
+        this.lastSent.delete(key);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      logger.debug(`[OcAlertScanner] Cleaned ${cleaned} cache entries. Sizes: state=${this.state.size}, open=${this.openCache.size}, lastSent=${this.lastSent.size}`);
+    }
+  }
+
+  getBucketStart(interval, ts = Date.now()) {
+    const iv = this.getIntervalMs(interval);
+    return Math.floor(ts / iv) * iv;
+  }
+
+  getIntervalMs(interval) {
+    const m = interval.match(/^(\d+)m$/i);
+    if (m) return Number(m[1]) * 60_000;
+    const h = interval.match(/^(\d+)h$/i);
+    if (h) return Number(h[1]) * 3_600_000;
+    return 60_000;
   }
 
   async initialize(telegramService) {
@@ -45,8 +145,9 @@ export class OcAlertScanner {
         // Log first few calls to verify handler is invoked
         if (!this._mexcHandlerCount) this._mexcHandlerCount = 0;
         this._mexcHandlerCount++;
-        if (this._mexcHandlerCount <= 20 || this._mexcHandlerCount % 1000 === 0) {
-          logger.info(`[OcAlertScanner] MEXC price handler called: ${symbol} = ${price} (count: ${this._mexcHandlerCount})`);
+        // Reduced logging frequency
+        if (this._mexcHandlerCount <= 5 || this._mexcHandlerCount % 5000 === 0) {
+          logger.debug(`[OcAlertScanner] MEXC price handler called: ${symbol} = ${price} (count: ${this._mexcHandlerCount})`);
         }
         this.onTick('mexc', symbol, price, ts).catch(error => {
           logger.error(`[OcAlertScanner] Error in MEXC onTick:`, error?.message || error);
@@ -95,6 +196,8 @@ export class OcAlertScanner {
     this.timer = null;
     if (this.scanTimeout) clearTimeout(this.scanTimeout);
     this.scanTimeout = null;
+    if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+    this._cleanupTimer = null;
     this.isRunning = false;
     logger.info('[OcAlertScanner] Stopped');
   }
@@ -151,12 +254,12 @@ export class OcAlertScanner {
     return Math.floor(ts / iv) * iv;
   }
 
-  // Compute open price for arbitrary interval from 1m candles (current bucket)
-  async getOpenFromAggregated1m(exchange, symbol, interval, currentPrice = null) {
+  // Compute open price for arbitrary interval from realtime candles (current bucket)
+  // ts: exchange event timestamp (ms) to align exactly with kline open time
+  async getOpenFromAggregated1m(exchange, symbol, interval, currentPrice = null, ts = Date.now()) {
     const ex = (exchange || 'mexc').toLowerCase();
-    const now = Date.now();
     const ivMs = this.getIntervalMs(interval);
-    const bucketStart = Math.floor(now / ivMs) * ivMs;
+    const bucketStart = Math.floor(ts / ivMs) * ivMs;
     const cacheKey = `${ex}|${symbol}|${interval}|${bucketStart}`;
 
     // Check if we already have open price cached for this bucket
@@ -165,53 +268,30 @@ export class OcAlertScanner {
       return cached;
     }
 
-    // For real-time OC detection without database:
-    // Use current price as open for new bucket, or fetch from REST API as fallback
-    if (currentPrice && Number.isFinite(currentPrice) && currentPrice > 0) {
-      // Use current price as open for new bucket (similar to RealtimeOCDetector)
-      this.openCache.set(cacheKey, currentPrice);
-      logger.debug(`[OcAlertScanner] Using current price as open for ${symbol} ${interval}: ${currentPrice} (new bucket)`);
-      return currentPrice;
-    }
-    
-    // Fallback: Try to get current price from WebSocket cache or REST API
     try {
-      let price = null;
-      
-      // Try WebSocket price cache first
-      if (ex === 'mexc') {
-        const { mexcPriceWs } = await import('../services/MexcWebSocketManager.js');
-        price = mexcPriceWs.priceCache.get(symbol.toUpperCase().replace(/[\/:_]/g, ''));
-      } else if (ex === 'binance') {
-        const { webSocketManager } = await import('../services/WebSocketManager.js');
-        price = webSocketManager.getPrice(symbol);
+      // Reuse RealtimeOCDetector's strict REST-based OPEN logic to ensure
+      // OC Alert and Strategy detection share the exact same candle open.
+      const { realtimeOCDetector } = await import('../services/RealtimeOCDetector.js');
+      const open = await realtimeOCDetector.getAccurateOpen(ex, symbol, interval, currentPrice, ts);
+
+      if (!Number.isFinite(open) || open <= 0) {
+        logger.warn(
+          `[OcAlertScanner] ❌ Unable to fetch REST OPEN for ${ex.toUpperCase()} ${symbol} ${interval} ` +
+          `(bucketStart=${bucketStart}). Skipping OC alert for this symbol/interval.`
+        );
+        return null;
       }
 
-      if (price && Number.isFinite(price) && price > 0) {
-        this.openCache.set(cacheKey, price);
-        logger.debug(`[OcAlertScanner] Using WS price as open for ${symbol} ${interval}: ${price}`);
-        return price;
-    }
-
-      // Final fallback: Use REST API to get current price
-      logger.debug(`[OcAlertScanner] Fetching current price from REST API for ${symbol} on ${ex}...`);
-      const { ExchangeService } = await import('../services/ExchangeService.js');
-      const dummyBot = { id: `alert_${ex}`, exchange: ex };
-      const exchangeService = new ExchangeService(dummyBot);
-      await exchangeService.initialize();
-      price = await exchangeService.getTickerPrice(symbol);
-      
-      if (price && Number.isFinite(price) && price > 0) {
-        this.openCache.set(cacheKey, price);
-        logger.debug(`[OcAlertScanner] Using REST price as open for ${symbol} ${interval}: ${price}`);
-        return price;
-    }
+      this.openCache.set(cacheKey, open);
+      logger.debug(`[OcAlertScanner] Using REST open for ${ex.toUpperCase()} ${symbol} ${interval}: ${open}`);
+      return open;
     } catch (error) {
-      logger.warn(`[OcAlertScanner] Failed to get open price for ${symbol} on ${ex}:`, error?.message || error);
+      logger.warn(
+        `[OcAlertScanner] Failed to get accurate OPEN for ${ex.toUpperCase()} ${symbol} ${interval}:`,
+        error?.message || error
+      );
+      return null;
     }
-
-    logger.debug(`[OcAlertScanner] No open price available for ${symbol} ${interval} on ${ex}`);
-    return null;
   }
 
   // Build/refresh watch list from active configs and subscribe WS
@@ -270,7 +350,7 @@ export class OcAlertScanner {
       const cached = this.openCache.get(key);
       if (Number.isFinite(cached) && cached > 0) return cached;
     }
-    const open = await this.getOpenFromAggregated1m(exchange, symbol, interval, currentPrice);
+    const open = await this.getOpenFromAggregated1m(exchange, symbol, interval, currentPrice, ts);
     if (Number.isFinite(open) && open > 0) this.openCache.set(key, open);
     return open;
   }
@@ -296,14 +376,15 @@ export class OcAlertScanner {
         return;
       }
       
-      // Log first few ticks to verify handler is called
+      // Log first few ticks to verify handler is called (reduced frequency)
       if (this._onTickCount === undefined) this._onTickCount = new Map();
       const exchangeKey = exchange.toLowerCase();
       const count = (this._onTickCount.get(exchangeKey) || 0) + 1;
       this._onTickCount.set(exchangeKey, count);
       
-      if (count <= 20 || count % 1000 === 0) {
-        logger.info(`[OcTick] Received tick: ${exchange.toUpperCase()} ${sym} = ${p} (count: ${count})`);
+      // Reduced logging frequency to save CPU
+      if (count <= 5 || count % 5000 === 0) {
+        logger.debug(`[OcTick] Received tick: ${exchange.toUpperCase()} ${sym} = ${p} (count: ${count})`);
       }
 
       for (const w of this.watchers) {
@@ -331,13 +412,12 @@ export class OcAlertScanner {
 
           const oc = ((p - open) / open) * 100;
           
-          // Log first few ticks for debugging
+          // Reduced logging frequency to save CPU
           if (this._tickCount === undefined) this._tickCount = 0;
           this._tickCount++;
-          if (this._tickCount <= 20 || this._tickCount % 100 === 0) {
-            logger.info(`[OcTick] ${exchange.toUpperCase()} ${sym} ${interval}: open=${open} price=${p} oc=${oc.toFixed(2)}% (tick #${this._tickCount})`);
-          } else {
-          logger.debug(`[OcTick] ${exchange.toUpperCase()} ${sym} ${interval}: open=${open} price=${p} oc=${oc.toFixed(2)}%`);
+          // Only log when OC is significant or very infrequently
+          if (Math.abs(oc) >= 1.0 && (this._tickCount <= 10 || this._tickCount % 1000 === 0)) {
+            logger.debug(`[OcTick] ${exchange.toUpperCase()} ${sym} ${interval}: oc=${oc.toFixed(2)}%`);
           }
           const now = Date.now();
           const stateKey = `${w.cfgId}|${exchange}|${sym}|${interval}`;
@@ -349,13 +429,31 @@ export class OcAlertScanner {
           state.lastPrice = p;
           state.lastOc = oc;
 
-          const minIntervalMs = Number(configService.getNumber('OC_ALERT_TICK_MIN_INTERVAL_MS', configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000)));
+          const minIntervalMs = Number(configService.getNumber(
+            'OC_ALERT_TICK_MIN_INTERVAL_MS',
+            configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000)
+          ));
           const rearmRatio = Number(configService.getNumber('OC_ALERT_REARM_RATIO', 0.6));
+          // Step tracking: cho phép tiếp tục gửi alert khi OC tăng thêm từng nấc,
+          // thay vì chỉ bắn một lần ở điểm chạm threshold đầu tiên.
+          // Nếu không cấu hình riêng, mặc định step = threshold (tức 1x, 2x, 3x ngưỡng).
+          const stepPercentCfg = Number(configService.getNumber('OC_ALERT_STEP_PERCENT', NaN));
           const absOc = Math.abs(oc);
           const absThreshold = Math.abs(Number(w.threshold || 0));
           if (absThreshold <= 0) continue;
 
-          if (absOc >= absThreshold && state.armed) {
+          // Giá trị OC của lần alert trước (tính theo trị tuyệt đối)
+          const lastAlertOcAbs = Number.isFinite(state.lastAlertOcAbs) ? state.lastAlertOcAbs : 0;
+          const stepPercent = Number.isFinite(stepPercentCfg) ? Math.abs(stepPercentCfg) : absThreshold;
+
+          // Điều kiện để bắn alert mới:
+          // 1) OC hiện tại vượt ngưỡng tối thiểu (absThreshold)
+          // 2) OC đã đi thêm ít nhất "stepPercent" so với lần alert trước
+          // 3) Thỏa rate-limit theo thời gian (minIntervalMs)
+          const ocDeltaFromLastAlert = absOc - lastAlertOcAbs;
+          const shouldFireByStep = absOc >= absThreshold && ocDeltaFromLastAlert >= stepPercent;
+
+          if (shouldFireByStep && state.armed) {
             const elapsed = now - (state.lastAlertTime || 0);
             if (elapsed >= minIntervalMs) {
               // Use config's telegram_chat_id, don't fallback to default
@@ -364,7 +462,11 @@ export class OcAlertScanner {
                 logger.warn(`[OcTick] No telegram_chat_id for config ${w.cfgId} (${exchange}), skipping alert for ${sym}`);
                 continue;
               }
-              logger.info(`[OcTick] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% (thr=${absThreshold}%) to chat_id=${chatId} (config_id=${w.cfgId})`);
+              logger.info(
+                `[OcTick] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} ` +
+                `oc=${oc.toFixed(2)}% (thr=${absThreshold}%, step=${stepPercent}%, ` +
+                `lastAlertOcAbs=${lastAlertOcAbs.toFixed(2)}%) to chat_id=${chatId} (config_id=${w.cfgId})`
+              );
               this.telegramService.sendVolatilityAlert(chatId, {
                 symbol: sym,
                 interval,
@@ -376,6 +478,7 @@ export class OcAlertScanner {
                 logger.error(`[OcTick] Failed to send alert to chat_id=${chatId}:`, error?.message || error);
               });
               state.lastAlertTime = now;
+              state.lastAlertOcAbs = absOc;
               state.armed = false;
               logger.info(`[OcTick] ✅ Alert sent: ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% to chat_id=${chatId}`);
 
@@ -398,14 +501,8 @@ export class OcAlertScanner {
                       const mCur = Number(match.currentPrice || p);
                       const mInt = match.interval || interval;
                       const mDir = match.direction || (mCur >= mOpen ? 'bullish' : 'bearish');
-                      await this.telegramService.sendVolatilityAlert(matchChatId, {
-                        symbol: sym,
-                        interval: mInt,
-                        oc: mOC,
-                        open: mOpen,
-                        currentPrice: mCur,
-                        direction: mDir
-                      }).catch(() => {});
+                      // Skip sending duplicate alert for each match (already sent above)
+                      // await this.telegramService.sendVolatilityAlert(matchChatId, ...).catch(() => {});
 
                       // Continue to execute order immediately
                       await webSocketOCConsumer.processMatch(match);
@@ -421,7 +518,10 @@ export class OcAlertScanner {
               }
             }
           } else if (absOc < absThreshold * rearmRatio) {
+            // Khi OC giảm về dưới rearmRatio * threshold, reset để chuẩn bị cho
+            // một chu kỳ biến động mới (và reset lastAlertOcAbs để bậc thang tính lại từ đầu).
             state.armed = true;
+            state.lastAlertOcAbs = 0;
           }
         }
       }
@@ -504,6 +604,7 @@ export class OcAlertScanner {
       const thresholdByConfig = (cfg) => Number(cfg.threshold || 0);
       const minIntervalMs = Number(configService.getNumber('PRICE_ALERT_MIN_INTERVAL_MS', 60000));
       const rearmRatio = Number(configService.getNumber('OC_ALERT_REARM_RATIO', 0.6)); // re-arm when oc falls below ratio*threshold
+      const stepPercentCfg = Number(configService.getNumber('OC_ALERT_STEP_PERCENT', NaN));
       const now = Date.now();
 
       for (const cfg of configs) {
@@ -559,7 +660,7 @@ export class OcAlertScanner {
             
             let state = this.state.get(stateKey);
             if (!state) {
-              state = { lastAlertTime: 0, armed: true, lastOc: oc, lastPrice: Number(currentPrice) };
+              state = { lastAlertTime: 0, armed: true, lastOc: oc, lastPrice: Number(currentPrice), lastAlertOcAbs: 0 };
               this.state.set(stateKey, state);
               logger.debug(`[OcAlertScanner] New state for ${sym} ${interval}: oc=${oc.toFixed(2)}%, armed=true`);
             }
@@ -571,15 +672,21 @@ export class OcAlertScanner {
             // Check if we should send an alert
             const absOc = Math.abs(oc);
             const absThreshold = Math.abs(threshold);
+            const lastAlertOcAbs = Number.isFinite(state.lastAlertOcAbs) ? state.lastAlertOcAbs : 0;
+            const stepPercent = Number.isFinite(stepPercentCfg) ? Math.abs(stepPercentCfg) : absThreshold;
+            const ocDeltaFromLastAlert = absOc - lastAlertOcAbs;
             
-            // Log at info level when OC is close to threshold to help debug
+            // Log at info level khi OC tiến gần threshold để debug
             if (absOc >= absThreshold * 0.7) {
               logger.info(`[OcAlertScanner] ${sym} ${interval}: oc=${oc.toFixed(2)}% vs threshold=${absThreshold}%, armed=${state.armed}`);
             } else {
             logger.debug(`[OcAlertScanner] ${sym} ${interval}: oc=${oc.toFixed(2)}% vs threshold=${absThreshold}%, armed=${state.armed}`);
             }
             
-            if (absOc >= absThreshold && state.armed) {
+            // Điều kiện bắn alert: vượt ngưỡng tối thiểu + đi thêm ít nhất step kể từ lần alert trước
+            const shouldFireByStep = absOc >= absThreshold && ocDeltaFromLastAlert >= stepPercent;
+
+            if (shouldFireByStep && state.armed) {
               const last = state.lastAlertTime || 0;
               const timeSinceLastAlert = now - last;
               logger.info(`[OcAlertScanner] ${sym} ${interval}: Alert condition met! oc=${oc.toFixed(2)}% >= ${absThreshold}%, timeSinceLastAlert=${timeSinceLastAlert}ms, minInterval=${minIntervalMs}ms`);
@@ -591,7 +698,11 @@ export class OcAlertScanner {
                   logger.warn(`[OcAlertScanner] No telegram_chat_id for config ${cfg.id} (${exchange}), skipping alert for ${sym}`);
                   continue;
                 }
-                logger.info(`[OcAlertScanner] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% to chat_id=${chatId} (config_id=${cfg.id})`);
+                logger.info(
+                  `[OcAlertScanner] Sending alert for ${exchange.toUpperCase()} ${sym} ${interval} ` +
+                  `oc=${oc.toFixed(2)}% (thr=${absThreshold}%, step=${stepPercent}%, ` +
+                  `lastAlertOcAbs=${lastAlertOcAbs.toFixed(2)}%) to chat_id=${chatId} (config_id=${cfg.id})`
+                );
                 await this.telegramService.sendVolatilityAlert(chatId, {
                   symbol: sym,
                   interval,
@@ -603,6 +714,7 @@ export class OcAlertScanner {
                   logger.error(`[OcAlertScanner] Failed to send alert to chat_id=${chatId}:`, error?.message || error);
                 });
                 state.lastAlertTime = now;
+                state.lastAlertOcAbs = absOc;
                 state.armed = false; // Disarm after alert
                 logger.info(`[OcAlertScanner] ✅ Alert sent: ${exchange.toUpperCase()} ${sym} ${interval} oc=${oc.toFixed(2)}% >= ${absThreshold}% to chat_id=${chatId}`);
               } else {
@@ -613,6 +725,7 @@ export class OcAlertScanner {
               if (!state.armed) {
                 logger.debug(`[OcAlertScanner] Re-arming ${sym} ${interval} (oc=${oc.toFixed(2)}% < ${(absThreshold * rearmRatio).toFixed(2)}%)`);
                 state.armed = true;
+                state.lastAlertOcAbs = 0;
               }
             }
           }

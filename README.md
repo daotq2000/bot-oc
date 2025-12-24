@@ -196,6 +196,25 @@ Nếu đã cấu hình Telegram bot, bạn có thể sử dụng các lệnh sau
 4. **Dynamic Stop Loss**:
    - `current_sl = tp_price + ((reduce + minutes * up_reduce) * oc / 100)`
 
+## Cấu Hình Extend & LIMIT (Quan Trọng)
+
+- **`EXTEND_LIMIT_MAX_DIFF_RATIO`**  
+  - Được seed trong `src/app.js` và có thể chỉnh trong bảng `app_configs`.  
+  - Ý nghĩa: **tỉ lệ chênh lệch tối đa** giữa `currentPrice` và `entryPrice` **so với toàn bộ quãng đường extend** (từ `open` đến `entry`) để bot vẫn cho phép đặt lệnh LIMIT khi *extend chưa chạm đủ 100%*.  
+  - Giá trị:
+    - `0.5` (mặc định) = cho phép đặt LIMIT nếu giá hiện tại còn cách entry **≤ 50%** quãng đường extend.
+    - `0.3` = chặt hơn, yêu cầu giá phải gần entry hơn (≤ 30% quãng đường).
+    - `0.8` = thoáng hơn, cho phép đặt LIMIT dù giá còn khá xa entry (≤ 80% quãng đường).
+  - Được sử dụng trong `WebSocketOCConsumer` khi `ENABLE_LIMIT_ON_EXTEND_MISS = true`.
+
+- **`EXTEND_LIMIT_AUTO_CANCEL_MINUTES`**  
+  - Được seed trong `src/app.js` và có thể chỉnh trong `app_configs`.  
+  - Ý nghĩa: **số phút tối đa** mà một **lệnh entry LIMIT (bao gồm lệnh đặt ra từ extend-miss)** được phép treo mà **không được khớp**, sau đó sẽ:
+    1. Bot gọi `cancelOrder` trên sàn.
+    2. Đánh dấu `entry_orders` tương ứng là `canceled` với lý do `expired_ttl`.
+  - Mặc định: `10` phút.  
+  - Logic auto-cancel được triển khai trong `EntryOrderMonitor.pollOpenEntryOrders`, sử dụng `EXTEND_LIMIT_AUTO_CANCEL_MINUTES` để tính TTL.
+
 ## Cấu Hình Test
 
 Để test bot, sử dụng config sau:
