@@ -140,11 +140,11 @@ export class SymbolsUpdater {
           exchangeInfoService.updateFiltersFromExchange()
             .then(() => {
               this._recordExchangeSuccess('binance');
-              logger.info('[SymbolsUpdater] Binance symbol filters updated');
+        logger.info('[SymbolsUpdater] Binance symbol filters updated');
             })
             .catch((e) => {
               this._recordExchangeFailure('binance');
-              logger.error('[SymbolsUpdater] Binance update failed:', e?.message || e);
+        logger.error('[SymbolsUpdater] Binance update failed:', e?.message || e);
             })
         );
       }
@@ -154,11 +154,11 @@ export class SymbolsUpdater {
           exchangeInfoService.updateMexcFiltersFromExchange()
             .then(() => {
               this._recordExchangeSuccess('mexc');
-              logger.info('[SymbolsUpdater] MEXC symbol filters updated');
+        logger.info('[SymbolsUpdater] MEXC symbol filters updated');
             })
             .catch((e) => {
               this._recordExchangeFailure('mexc');
-              logger.error('[SymbolsUpdater] MEXC update failed:', e?.message || e);
+        logger.error('[SymbolsUpdater] MEXC update failed:', e?.message || e);
             })
         );
       }

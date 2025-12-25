@@ -272,13 +272,18 @@ Amount: ${amountStr} (100%)`.trim();
       
       if (!channelId) {
         logger.warn(`[CloseSummaryAlert] No channel ID available for position ${position.id}, skipping notification`);
+        logger.warn(`[CloseSummaryAlert] position.telegram_alert_channel_id: ${position?.telegram_alert_channel_id || 'NULL'}`);
+        logger.warn(`[CloseSummaryAlert] position.telegram_chat_id: ${position?.telegram_chat_id || 'NULL'}`);
+        logger.warn(`[CloseSummaryAlert] this.alertChannelId: ${this.alertChannelId || 'NULL'}`);
         return;
       }
+
+      logger.info(`[CloseSummaryAlert] Sending alert for position ${position.id} to channel ${channelId}`);
 
       const symbol = this.formatSymbolUnderscore(position.symbol);
       const isWin = (position.close_reason === 'tp_hit');
       const sideTitle = position.side === 'long' ? 'Long' : 'Short';
-      const title = isWin ? `🏆 ${symbol} | ${sideTitle} WIN` : `😡 ${symbol} | ${sideTitle} LOSE`;
+      const title = `🏆 ${symbol} | ${sideTitle} ${isWin ? 'WIN' : 'LOSE'}`;
 
       const wins = Number(stats?.wins || 0);
       const loses = Number(stats?.loses || 0);
@@ -289,6 +294,8 @@ Amount: ${amountStr} (100%)`.trim();
       const ocStr = Number(position.oc || 0).toFixed(2);
       const extendStr = Number(position.extend || 0).toFixed(0);
       const tpStr = Number(position.take_profit || 0).toFixed(0);
+      const reduceStr = Number(position.reduce || 0).toFixed(0);
+      const upReduceStr = Number(position.up_reduce || 0).toFixed(0);
 
       const closePrice = this.formatPriceAdaptive(position.close_price);
       const amountStr = Number(position.amount).toFixed(2);
@@ -296,25 +303,21 @@ Amount: ${amountStr} (100%)`.trim();
       const pnlVal = Number(position.pnl || 0);
       const pnlPct = this.calculatePercent(position.entry_price, position.close_price, position.side);
       
-      // Estimate trading fees (0.04% maker + 0.06% taker = ~0.1% total)
-      const estimatedFees = Number(position.amount) * 0.001; // 0.1%
-      const pnlAfterFees = pnlVal - estimatedFees;
-      
       const pnlLine = `${pnlVal >= 0 ? '' : ''}${pnlVal.toFixed(2)}$ ~ ${pnlPct >= 0 ? '' : ''}${pnlPct.toFixed(2)}% (before fees)`;
 
       const msg = `
 ${title}
 ${wins} WIN, ${loses} LOSE | Total PNL: ${totalPnl.toFixed(2)}$
 Bot: ${botName}
-Strategy: ${intervalLabel} | OC: ${ocStr}% | Extend: ${extendStr}% | TP: ${tpStr}%
+Strategy: ${intervalLabel} | OC: ${ocStr}% | Extend: ${extendStr}% | TP: ${tpStr}% | Reduce: ${reduceStr}% | Up Reduce: ${upReduceStr}%
 Close price: ${closePrice}$
 Amount: ${amountStr}
-💰 PNL: ${pnlLine}
-📊 Est. After Fees: ~${pnlAfterFees.toFixed(2)}$ (fees: ~${estimatedFees.toFixed(2)}$)`.trim();
+💰 PNL: ${pnlLine}`.trim();
 
       await this.sendMessage(channelId, msg);
+      logger.info(`[CloseSummaryAlert] ✅ Successfully sent alert for position ${position.id}`);
     } catch (e) {
-      logger.error('Failed to send close summary alert:', e);
+      logger.error(`[CloseSummaryAlert] ❌ Failed to send close summary alert for position ${position?.id || 'unknown'}:`, e?.message || e, e?.stack);
     }
   }
 

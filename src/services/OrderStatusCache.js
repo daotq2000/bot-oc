@@ -89,7 +89,12 @@ class OrderStatusCache {
       updatedAt: Date.now()
     });
 
-    logger.debug(`[OrderStatusCache] Updated order ${orderId} (${exchange}): status=${normalizedStatus}, filled=${filled}, avgPrice=${avgPrice}`);
+    // Log important status changes (FILLED orders) at info level for debugging
+    if (normalizedStatus === 'closed') {
+      logger.info(`[OrderStatusCache] ✅ Order ${orderId} (${exchange}) FILLED: filled=${filled}, avgPrice=${avgPrice || 'N/A'}, symbol=${symbol || 'N/A'}`);
+    } else {
+      logger.debug(`[OrderStatusCache] Updated order ${orderId} (${exchange}): status=${normalizedStatus}, filled=${filled}, avgPrice=${avgPrice}`);
+    }
   }
 
   /**

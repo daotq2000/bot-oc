@@ -84,6 +84,8 @@ export const mockExchangeService = {
   fetchOHLCV: jest.fn().mockResolvedValue([mockCandle]),
   getTickerPrice: jest.fn().mockResolvedValue(50000.00),
   cancelOrder: jest.fn().mockResolvedValue({ id: 'cancel_123' }),
+  getOrderStatus: jest.fn().mockResolvedValue({ status: 'open', filled: 0 }),
+  getOrderAverageFillPrice: jest.fn().mockResolvedValue(50000.00),
 };
 
 export const mockTelegramService = {

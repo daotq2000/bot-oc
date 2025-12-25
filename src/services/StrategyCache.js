@@ -131,26 +131,26 @@ export class StrategyCache {
 
     // Create refresh promise to prevent concurrent refreshes
     this._refreshPromise = (async () => {
-      try {
-        logger.info('[StrategyCache] Refreshing strategy cache from database...');
-        
-        // Get all active strategies
-        const strategies = await Strategy.findAll(null, true);
-        
+    try {
+      logger.info('[StrategyCache] Refreshing strategy cache from database...');
+      
+      // Get all active strategies
+      const strategies = await Strategy.findAll(null, true);
+      
         // Build new cache and index
-        for (const strategy of strategies) {
-          const exchange = (strategy.exchange || '').toLowerCase();
-          const symbol = String(strategy.symbol || '').toUpperCase().replace(/[\/:_]/g, '');
-          const oc = Number(strategy.oc || 0);
-          const botId = Number(strategy.bot_id || 0);
+      for (const strategy of strategies) {
+        const exchange = (strategy.exchange || '').toLowerCase();
+        const symbol = String(strategy.symbol || '').toUpperCase().replace(/[\/:_]/g, '');
+        const oc = Number(strategy.oc || 0);
+        const botId = Number(strategy.bot_id || 0);
 
           // CRITICAL FIX: Allow oc === 0 (use Number.isNaN instead of !oc)
           if (!exchange || !symbol || Number.isNaN(oc) || !botId) {
-            logger.warn(`[StrategyCache] Skipping invalid strategy ${strategy.id}: exchange=${exchange}, symbol=${symbol}, oc=${oc}, botId=${botId}`);
-            continue;
-          }
+          logger.warn(`[StrategyCache] Skipping invalid strategy ${strategy.id}: exchange=${exchange}, symbol=${symbol}, oc=${oc}, botId=${botId}`);
+          continue;
+        }
 
-          const key = this.generateKey(exchange, symbol, oc, botId);
+        const key = this.generateKey(exchange, symbol, oc, botId);
           newCache.set(key, strategy);
           
           // Build secondary index
@@ -164,20 +164,20 @@ export class StrategyCache {
         // Atomic swap: only replace if build succeeded
         this.cache = newCache;
         this.indexBySymbol = newIndexBySymbol;
-        this.lastRefreshTime = Date.now();
-        const duration = Date.now() - startTime;
+      this.lastRefreshTime = Date.now();
+      const duration = Date.now() - startTime;
 
-        logger.info(`[StrategyCache] Cache refreshed: ${this.cache.size} strategies in ${duration}ms`);
+      logger.info(`[StrategyCache] Cache refreshed: ${this.cache.size} strategies in ${duration}ms`);
 
-        return this.cache;
-      } catch (error) {
-        logger.error('[StrategyCache] Failed to refresh cache:', error?.message || error);
+      return this.cache;
+    } catch (error) {
+      logger.error('[StrategyCache] Failed to refresh cache:', error?.message || error);
         // Return existing cache on error (cache is not cleared)
-        return this.cache;
-      } finally {
-        this.isRefreshing = false;
+      return this.cache;
+    } finally {
+      this.isRefreshing = false;
         this._refreshPromise = null;
-      }
+    }
     })();
 
     return this._refreshPromise;

@@ -809,13 +809,13 @@ export class BinanceDirectClient {
       const restPrice = parseFloat(ticker?.price);
       if (Number.isFinite(restPrice) && restPrice > 0) {
     // CRITICAL FIX: O(1) LRU eviction using Map insertion order
-    if (this.restPriceFallbackCache.size >= this.maxPriceCacheSize && !this.restPriceFallbackCache.has(normalizedSymbol)) {
+        if (this.restPriceFallbackCache.size >= this.maxPriceCacheSize && !this.restPriceFallbackCache.has(normalizedSymbol)) {
       // Remove oldest entry (first in Map)
       const oldestKey = this.restPriceFallbackCache.keys().next().value;
       if (oldestKey) {
         this.restPriceFallbackCache.delete(oldestKey);
       }
-    }
+        }
         this.restPriceFallbackCache.set(normalizedSymbol, { price: restPrice, timestamp: now });
         logger.info(`Price for ${normalizedSymbol} not in WebSocket cache. Using REST fallback price ${restPrice}.`);
         return restPrice;

@@ -137,8 +137,10 @@ export class PositionMonitor {
 
     // Check if TP/SL orders still exist on exchange
     // If tp_order_id exists in DB but order is not on exchange (filled/canceled), we should recreate it
-    let needsTp = !position.tp_order_id;
-    let needsSl = !position.sl_order_id;
+    // CRITICAL FIX: Also check tp_sl_pending flag - if true, we need to place TP/SL even if tp_order_id exists
+    const isTPSLPending = position.tp_sl_pending === true || position.tp_sl_pending === 1;
+    let needsTp = !position.tp_order_id || isTPSLPending;
+    let needsSl = !position.sl_order_id || isTPSLPending;
 
     // If tp_order_id exists, verify it's still active on exchange
     if (position.tp_order_id) {
@@ -190,9 +192,18 @@ export class PositionMonitor {
       }
     }
 
-    // Skip if both TP and SL already exist and are active
-    if (!needsTp && !needsSl) {
+    // Skip if both TP and SL already exist and are active, AND tp_sl_pending is false
+    if (!needsTp && !needsSl && !isTPSLPending) {
       // Release lock before returning
+      await this._releasePositionLock(position.id);
+      return;
+    }
+    
+    // If tp_sl_pending is true but we have both orders, clear the flag
+    if (isTPSLPending && position.tp_order_id && (!needsSl || position.sl_order_id)) {
+      // Both orders exist, clear pending flag
+      await Position.update(position.id, { tp_sl_pending: false });
+      logger.debug(`[Place TP/SL] Cleared tp_sl_pending flag for position ${position.id} (both TP and SL exist)`);
       await this._releasePositionLock(position.id);
       return;
     }
@@ -298,7 +309,8 @@ export class PositionMonitor {
             // Store initial TP price for trailing calculation (only if not already set)
             const updateData = { 
               tp_order_id: tpOrderId, 
-              take_profit_price: tpPrice
+              take_profit_price: tpPrice,
+              tp_sl_pending: false // Clear pending flag after successful TP placement
             };
             if (!shouldPreserveInitialTP) {
               updateData.initial_tp_price = tpPrice; // Only set if not already set
@@ -386,7 +398,18 @@ export class PositionMonitor {
           const slRes = await exchangeService.createStopLossLimit(position.symbol, position.side, slPrice, quantity);
           const slOrderId = slRes?.orderId ? String(slRes.orderId) : null;
           if (slOrderId) {
-            await Position.update(position.id, { sl_order_id: slOrderId, stop_loss_price: slPrice });
+            // Clear tp_sl_pending flag if both TP and SL are now placed
+            const currentPosition = await Position.findById(position.id);
+            const hasTP = currentPosition?.tp_order_id && currentPosition.tp_order_id.trim() !== '';
+            const updateData = { 
+              sl_order_id: slOrderId, 
+              stop_loss_price: slPrice 
+            };
+            // Clear pending flag if both TP and SL are placed
+            if (hasTP) {
+              updateData.tp_sl_pending = false;
+            }
+            await Position.update(position.id, updateData);
             logger.debug(`[Place TP/SL] ✅ Placed SL order ${slOrderId} for position ${position.id} @ ${slPrice}`);
           }
         } catch (e) {

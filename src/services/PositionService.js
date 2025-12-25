@@ -39,8 +39,14 @@ export class PositionService {
       // This detects when TP/SL orders are filled via WebSocket ORDER_TRADE_UPDATE events
       if (position.tp_order_id) {
         // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
-        const exchange = this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance';
+        // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
+        const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
         const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id, exchange);
+        
+        // Debug logging for cache miss
+        if (!cachedTpStatus) {
+          logger.debug(`[TP/SL Check] TP order ${position.tp_order_id} for position ${position.id} not found in cache (exchange: ${exchange})`);
+        }
         // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
         if (cachedTpStatus && cachedTpStatus.status === 'closed') {
           // TP order has been filled - position is already closed on exchange
@@ -64,8 +70,14 @@ export class PositionService {
 
       if (position.sl_order_id) {
         // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
-        const exchange = this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance';
+        // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
+        const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
         const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
+        
+        // Debug logging for cache miss
+        if (!cachedSlStatus) {
+          logger.debug(`[TP/SL Check] SL order ${position.sl_order_id} for position ${position.id} not found in cache (exchange: ${exchange})`);
+        }
         // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
         if (cachedSlStatus && cachedSlStatus.status === 'closed') {
           // SL order has been filled - position is already closed on exchange
@@ -98,7 +110,8 @@ export class PositionService {
           let closeReason = 'closed_on_exchange';
           
           // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
-          const exchange = this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance';
+          // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
+          const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
           
           if (position.tp_order_id) {
             const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id, exchange);
@@ -432,24 +445,24 @@ export class PositionService {
       }
       
       try {
-        const updatePayload = {
-          pnl: pnl,
-          current_reduce: clampedReduce,
+      const updatePayload = {
+        pnl: pnl,
+        current_reduce: clampedReduce,
           minutes_elapsed: actualMinutesElapsed // Update minutes_elapsed here (only once)
           // Note: is_processing lock is released in finally block, not here
-        };
-        
-        // Only update stop_loss_price if SL was calculated (initial SL setup)
-        if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0) {
-          const prevSL = Number(position.stop_loss_price || 0);
-          // Only update if SL changed (initial setup) or doesn't exist
-          if (prevSL <= 0 || Math.abs(updatedSL - prevSL) > 0.0001) {
-            updatePayload.stop_loss_price = updatedSL;
-          }
+      };
+      
+      // Only update stop_loss_price if SL was calculated (initial SL setup)
+      if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0) {
+        const prevSL = Number(position.stop_loss_price || 0);
+        // Only update if SL changed (initial setup) or doesn't exist
+        if (prevSL <= 0 || Math.abs(updatedSL - prevSL) > 0.0001) {
+          updatePayload.stop_loss_price = updatedSL;
         }
+      }
         
-        const updated = await Position.update(position.id, updatePayload);
-        return updated;
+      const updated = await Position.update(position.id, updatePayload);
+      return updated;
       } finally {
         // Always release lock if acquired
         if (lockAcquired) {
@@ -693,24 +706,36 @@ export class PositionService {
     try {
       if (!this.telegramService?.sendCloseSummaryAlert) {
         logger.warn(`[Notification] TelegramService not available, skipping close summary alert for position ${closedPosition.id}`);
+        logger.warn(`[Notification] telegramService: ${!!this.telegramService}, sendCloseSummaryAlert: ${!!this.telegramService?.sendCloseSummaryAlert}`);
         return;
       }
-      logger.info(`[Notification] Preparing to send close summary for position ${closedPosition.id}`);
+      logger.info(`[Notification] Preparing to send close summary for position ${closedPosition.id} (reason: ${closedPosition.close_reason})`);
       
-      // Ensure position has all required fields (telegram_alert_channel_id, bot_name, etc.)
-      // Position.close() returns position from findById which includes bot info, but let's verify
-      let positionWithBotInfo = closedPosition;
-      if (!closedPosition.telegram_alert_channel_id && !closedPosition.telegram_chat_id) {
-        // Re-fetch position with bot info if missing
-        positionWithBotInfo = await Position.findById(closedPosition.id);
-        if (!positionWithBotInfo) {
-          logger.warn(`[Notification] Could not find position ${closedPosition.id} to send notification`);
-          return;
+      // CRITICAL FIX: Always re-fetch position with bot info to ensure we have all required fields
+      // Position.close() may not return all fields from JOIN, so we re-fetch to be safe
+      let positionWithBotInfo = await Position.findById(closedPosition.id);
+      if (!positionWithBotInfo) {
+        logger.warn(`[Notification] Could not find position ${closedPosition.id} to send notification`);
+        return;
+      }
+
+      // Verify required fields and try to get from bot if missing
+      if (!positionWithBotInfo.bot_name || !positionWithBotInfo.telegram_alert_channel_id && !positionWithBotInfo.telegram_chat_id) {
+        logger.warn(`[Notification] Position ${closedPosition.id} missing bot info, trying to get from bot`);
+        if (positionWithBotInfo.bot_id) {
+          const { Bot } = await import('../models/Bot.js');
+          const bot = await Bot.findById(positionWithBotInfo.bot_id);
+          if (bot) {
+            positionWithBotInfo.bot_name = bot.bot_name || positionWithBotInfo.bot_name;
+            positionWithBotInfo.telegram_chat_id = bot.telegram_chat_id || positionWithBotInfo.telegram_chat_id;
+            positionWithBotInfo.telegram_alert_channel_id = bot.telegram_alert_channel_id || positionWithBotInfo.telegram_alert_channel_id;
+            logger.debug(`[Notification] Updated position ${closedPosition.id} with bot info: bot_name=${positionWithBotInfo.bot_name}, telegram_chat_id=${positionWithBotInfo.telegram_chat_id}, telegram_alert_channel_id=${positionWithBotInfo.telegram_alert_channel_id}`);
+          }
         }
       }
       
       const stats = await Position.getBotStats(positionWithBotInfo.bot_id);
-      logger.debug(`[Notification] Fetched bot stats for bot ${positionWithBotInfo.bot_id}:`, stats);
+      logger.debug(`[Notification] Fetched bot stats for bot ${positionWithBotInfo.bot_id}: wins=${stats?.wins || 0}, loses=${stats?.loses || 0}, total_pnl=${stats?.total_pnl || 0}`);
       await this.telegramService.sendCloseSummaryAlert(positionWithBotInfo, stats);
       logger.info(`[Notification] ✅ Successfully sent close summary alert for position ${closedPosition.id}`);
     } catch (inner) {

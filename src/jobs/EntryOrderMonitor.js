@@ -141,9 +141,14 @@ export class EntryOrderMonitor {
         return; // Entry order handled
       }
 
-      // TP/SL orders: No need to query DB here - orderStatusCache is already updated
+      // TP/SL orders: Update cache and log for debugging
       // PositionService.updatePosition will detect TP/SL fills via cache on next monitor cycle
       // This avoids O(N) DB scan on every TP/SL fill event
+      if (isFilled) {
+        logger.info(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) FILLED via WebSocket. Cache updated. PositionService will detect on next cycle.`);
+      } else if (isCanceled) {
+        logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) ${status} via WebSocket. Cache updated.`);
+      }
     } catch (error) {
       logger.error('[EntryOrderMonitor] Error in _handleBinanceOrderTradeUpdate:', error?.message || error);
     }
@@ -315,6 +320,7 @@ export class EntryOrderMonitor {
         // CRITICAL FIX: Store reduce and up_reduce from strategy for trailing TP calculation
         // Note: positions table may not have reduce/up_reduce columns, so we store in current_reduce
         // PositionService will read reduce/up_reduce from strategy JOIN when needed
+        // CRITICAL FIX: Set tp_sl_pending flag to ensure PositionMonitor places TP/SL orders
         position = await Position.create({
         strategy_id: entry.strategy_id,
         bot_id: botId,
@@ -325,7 +331,8 @@ export class EntryOrderMonitor {
         amount: entry.amount,
         take_profit_price: tpPrice,
         stop_loss_price: slPrice,
-        current_reduce: strategy.reduce
+        current_reduce: strategy.reduce,
+        tp_sl_pending: true // Flag: TP/SL orders will be placed by PositionMonitor
       });
 
       await EntryOrder.markFilled(entry.id);

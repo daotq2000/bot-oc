@@ -58,11 +58,11 @@ export class PositionWebSocketClient extends EventEmitter {
    */
   async createListenKey() {
     try {
-      const res = await this.makeRequest('/fapi/v1/listenKey', 'POST', {}, true);
+    const res = await this.makeRequest('/fapi/v1/listenKey', 'POST', {}, true);
       if (!res?.listenKey) {
         throw new Error('No listenKey returned from Binance API');
       }
-      this.listenKey = res.listenKey;
+    this.listenKey = res.listenKey;
       logger.debug('[WS] Created listenKey');
       return this.listenKey;
     } catch (e) {
@@ -120,7 +120,7 @@ export class PositionWebSocketClient extends EventEmitter {
     // Create listenKey if needed
     if (!this.listenKey) {
       try {
-        await this.createListenKey();
+      await this.createListenKey();
       } catch (e) {
         logger.error('[WS] Failed to create listenKey, will retry:', e?.message || e);
         this.state = 'idle';
@@ -162,7 +162,7 @@ export class PositionWebSocketClient extends EventEmitter {
             this.reconnect(true);
           }).catch((err) => {
             logger.error('[WS] Error expiring listenKey:', err?.message || err);
-            this.reconnect(true);
+          this.reconnect(true);
           });
         }
       } catch (err) {
@@ -182,7 +182,7 @@ export class PositionWebSocketClient extends EventEmitter {
       this.clearTimers();
       // Only reconnect if not stopped and not already reconnecting
       if (!this._isStopped && !this._isReconnecting) {
-        this.reconnect();
+      this.reconnect();
       }
     });
 
@@ -191,7 +191,7 @@ export class PositionWebSocketClient extends EventEmitter {
       this.emit('error', err);
       // Only reconnect if not stopped and not already reconnecting
       if (!this._isStopped && !this._isReconnecting) {
-        this.reconnect();
+      this.reconnect();
       }
     });
   }
@@ -256,7 +256,7 @@ export class PositionWebSocketClient extends EventEmitter {
       // Clean up existing connection
       if (this.ws) {
         try {
-          this.ws.terminate();
+        this.ws.terminate();
         } catch (_) {}
         this.ws = null;
       }

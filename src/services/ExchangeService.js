@@ -391,16 +391,33 @@ export class ExchangeService {
           }
 
           // Use bot's default_leverage if set, otherwise use max leverage from symbol_filters cache
-          // This avoids getLeverageBrackets API call which causes rate limits
+          // If cache miss, try API call before falling back to default config
           let desiredLev;
           if (this.bot.default_leverage != null && Number.isFinite(Number(this.bot.default_leverage))) {
             // Use bot's configured default leverage
             desiredLev = parseInt(this.bot.default_leverage);
           } else {
-            // Fall back to max leverage from cache or default config
-            const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
-            const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
-            desiredLev = maxLeverageFromCache || defaultLeverage;
+            // Try cache first
+            let maxLeverageFromCache = exchangeInfoService.getMaxLeverage(normalizedSymbol);
+            
+            // If cache miss, try API call (for Binance)
+            if (maxLeverageFromCache == null && this.binanceDirectClient) {
+              try {
+                maxLeverageFromCache = await this.binanceDirectClient.getMaxLeverage(normalizedSymbol);
+                logger.debug(`[Binance] Fetched max leverage from API for ${normalizedSymbol}: ${maxLeverageFromCache}`);
+              } catch (apiErr) {
+                logger.warn(`[Binance] Failed to fetch max leverage from API for ${normalizedSymbol}: ${apiErr?.message || apiErr}`);
+              }
+            }
+            
+            // Only fallback to default config if both cache and API failed
+            if (maxLeverageFromCache != null && Number.isFinite(Number(maxLeverageFromCache))) {
+              desiredLev = parseInt(maxLeverageFromCache);
+            } else {
+              const defaultLeverage = parseInt(configService.getNumber('BINANCE_DEFAULT_LEVERAGE', 5));
+              desiredLev = defaultLeverage;
+              logger.warn(`[Binance] Using default leverage ${defaultLeverage} for ${normalizedSymbol} (cache and API both failed)`);
+            }
           }
 
           // Cache last applied leverage to avoid redundant calls
@@ -533,8 +550,16 @@ export class ExchangeService {
             // Use bot's configured default leverage
             maxLev = Number(this.bot.default_leverage);
           } else {
-            // Fall back to max leverage from cache or default config
-            maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+            // Try cache first
+            const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(symbol);
+            
+            // Only fallback to default config if cache is null/undefined
+            if (maxLeverageFromCache != null && Number.isFinite(Number(maxLeverageFromCache))) {
+              maxLev = Number(maxLeverageFromCache);
+            } else {
+              maxLev = Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+              logger.warn(`[MEXC] Using default leverage ${maxLev} for ${symbol} (cache miss)`);
+            }
           }
           if (Number.isFinite(maxLev) && maxLev > 0) {
             try {
@@ -594,8 +619,16 @@ export class ExchangeService {
             // Use bot's configured default leverage
             maxLev = Number(this.bot.default_leverage);
           } else {
-            // Fall back to max leverage from cache or default config
-            maxLev = Number(exchangeInfoService.getMaxLeverage(symbol)) || Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+            // Try cache first
+            const maxLeverageFromCache = exchangeInfoService.getMaxLeverage(symbol);
+            
+            // Only fallback to default config if cache is null/undefined
+            if (maxLeverageFromCache != null && Number.isFinite(Number(maxLeverageFromCache))) {
+              maxLev = Number(maxLeverageFromCache);
+            } else {
+              maxLev = Number(configService.getNumber('MEXC_DEFAULT_LEVERAGE', 5));
+              logger.warn(`[MEXC] Using default leverage ${maxLev} for ${symbol} (cache miss) in margin calculation`);
+            }
           }
           const feeBuffer = Number(configService.getNumber('MEXC_MARGIN_FEE_BUFFER', 0.002)); // 0.2% buffer
           const marginNeeded = (notional / Math.max(maxLev, 1)) * (1 + Math.max(0, feeBuffer));

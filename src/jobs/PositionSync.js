@@ -242,7 +242,7 @@ export class PositionSync {
             // Match all positions with same symbol+side (there can be multiple positions)
             for (const dbPos of dbPosArray) {
               matchedDbPositionIds.add(dbPos.id); // Mark as matched
-              await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
+            await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
             }
           }
           processedCount++;
@@ -431,24 +431,24 @@ export class PositionSync {
           const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
           
           // Use normalized symbol for consistency
-          const position = await Position.create({
-            strategy_id: entry.strategy_id,
-            bot_id: botId,
-            order_id: entry.order_id,
+            const position = await Position.create({
+              strategy_id: entry.strategy_id,
+              bot_id: botId,
+              order_id: entry.order_id,
             symbol: normalizedSymbol, // Use normalized symbol
-            side: side,
-            entry_price: entryPrice,
-            amount: entry.amount,
-            take_profit_price: tpPrice,
-            stop_loss_price: slPrice,
-            current_reduce: strategy.reduce
-          });
-          
-          await EntryOrder.markFilled(entry.id);
+              side: side,
+              entry_price: entryPrice,
+              amount: entry.amount,
+              take_profit_price: tpPrice,
+              stop_loss_price: slPrice,
+              current_reduce: strategy.reduce
+            });
+            
+            await EntryOrder.markFilled(entry.id);
           await connection.commit();
-          
+            
           logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${normalizedSymbol} ${side}`);
-          return true;
+            return true;
         } catch (error) {
           await connection.rollback();
           logger.error(`[PositionSync] Error creating Position from entry_order ${entry.id}:`, error?.message || error);
@@ -505,22 +505,22 @@ export class PositionSync {
 
       // Create Position record with normalized symbol
       // Use timestamp + symbol + side for order_id to make it traceable
-      const position = await Position.create({
-        strategy_id: strategy.id,
-        bot_id: botId,
+        const position = await Position.create({
+          strategy_id: strategy.id,
+          bot_id: botId,
         order_id: `sync_${normalizedSymbol}_${side}_${Date.now()}`, // Traceable order_id
         symbol: normalizedSymbol, // Use normalized symbol for consistency
-        side: side,
-        entry_price: entryPrice || markPrice,
-        amount: amount,
-        take_profit_price: tpPrice,
-        stop_loss_price: slPrice,
-        current_reduce: strategy.reduce
-      });
+          side: side,
+          entry_price: entryPrice || markPrice,
+          amount: amount,
+          take_profit_price: tpPrice,
+          stop_loss_price: slPrice,
+          current_reduce: strategy.reduce
+        });
 
       await connection.commit();
       logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} (synced from exchange)`);
-      return true;
+        return true;
     } catch (error) {
       await connection.rollback();
       logger.error(`[PositionSync] Error creating missing position for ${symbol} ${side}:`, error?.message || error);
@@ -561,12 +561,12 @@ export class PositionSync {
           if (lockResult.affectedRows > 0) {
             // Lock acquired, proceed with update
             try {
-              logger.warn(`[PositionSync] Position ${dbPos.id} is open in DB but closed on exchange, marking as closed`);
-              await Position.update(dbPos.id, {
-                status: 'closed',
-                close_reason: 'sync_exchange_closed',
-                closed_at: new Date()
-              });
+        logger.warn(`[PositionSync] Position ${dbPos.id} is open in DB but closed on exchange, marking as closed`);
+        await Position.update(dbPos.id, {
+          status: 'closed',
+          close_reason: 'sync_exchange_closed',
+          closed_at: new Date()
+        });
             } finally {
               // Always release lock in finally block
               try {
