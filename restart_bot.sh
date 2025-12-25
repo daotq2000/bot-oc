@@ -94,10 +94,12 @@ echo "\n📌 Step 3: Clearing logs..."
 mkdir -p "${LOG_DIR}"
 : > "${LOG_DIR}/combined.log" || true
 : > "${LOG_DIR}/error.log" || true
+: > "${LOG_DIR}/orders.log" || true
+: > "${LOG_DIR}/orders-error.log" || true
 if has_cmd pm2; then
   pm2 flush "${BOT_NAME}" 2>/dev/null || true
 fi
-echo "✅ Logs ready at ${LOG_DIR}"
+echo "✅ Logs cleared: combined.log, error.log, orders.log, orders-error.log"
 
 # Step 4: Start bot
 echo "\n📌 Step 4: Starting bot..."
@@ -149,4 +151,6 @@ echo "Useful commands:"
 echo "  ./restart_bot.sh                    - Restart"
 echo "  tail -f ${LOG_DIR}/combined.log      - Follow stdout logs"
 echo "  tail -f ${LOG_DIR}/error.log         - Follow error logs"
+echo "  tail -f ${LOG_DIR}/orders.log        - Follow order logs"
+echo "  tail -f ${LOG_DIR}/orders-error.log  - Follow order error logs"
 echo "  pm2 status (if installed)            - PM2 status"

@@ -43,10 +43,308 @@ export class BinanceDirectClient {
     this._dualSidePosition = null; // boolean
     this._positionModeCheckedAt = 0;
     this._positionModeTTL = Number(configService.getNumber('BINANCE_POSITION_MODE_TTL_MS', 60000)); // 1 minute default
+
+    // CRITICAL FIX: Request queue for rate limiting (prevents IP ban)
+    // Binance Futures: 1200 requests per minute (20 req/sec), but we use conservative 8 req/sec
+    this._requestQueue = [];
+    this._isProcessingQueue = false;
+    this._requestInterval = Number(configService.getNumber('BINANCE_REQUEST_INTERVAL_MS', 125)); // 8 req/sec default
+    this._lastSignedRequestTime = 0; // Track signed requests separately (more strict)
+    this._signedRequestInterval = Number(configService.getNumber('BINANCE_SIGNED_REQUEST_INTERVAL_MS', 150)); // ~6.6 req/sec for signed
+
+    // CRITICAL FIX: Circuit breaker to prevent spam when Binance is down
+    this._circuitBreakerState = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+    this._circuitBreakerFailures = 0;
+    this._circuitBreakerLastFailure = 0;
+    this._circuitBreakerThreshold = Number(configService.getNumber('BINANCE_CIRCUIT_BREAKER_THRESHOLD', 5)); // Failures before opening
+    this._circuitBreakerTimeout = Number(configService.getNumber('BINANCE_CIRCUIT_BREAKER_TIMEOUT_MS', 60000)); // 1 minute cooldown
+    this._circuitBreakerSuccessThreshold = Number(configService.getNumber('BINANCE_CIRCUIT_BREAKER_SUCCESS_THRESHOLD', 2)); // Successes to close
+
+    // CRITICAL FIX: Error classification for retry logic
+    this._nonRetryableErrors = new Set([
+      -2019, // Insufficient margin
+      -2010, // NEW_ORDER_REJECTED
+      -2021, // Order would immediately trigger
+      -1111, // Precision error
+      -1121, // Invalid symbol
+      -1122, // Invalid symbol status
+      -4061, // Position side mismatch
+      -4131, // Invalid quantity
+      -4140, // No need to change margin type
+      -4141, // No need to change position side
+    ]);
+  }
+
+  /**
+   * CRITICAL FIX: Check circuit breaker state
+   * @returns {boolean} True if requests should be allowed
+   */
+  _checkCircuitBreaker() {
+    const now = Date.now();
+    
+    if (this._circuitBreakerState === 'OPEN') {
+      // Check if timeout has passed, move to HALF_OPEN
+      if (now - this._circuitBreakerLastFailure >= this._circuitBreakerTimeout) {
+        logger.warn('[Binance] Circuit breaker: Moving to HALF_OPEN state');
+        this._circuitBreakerState = 'HALF_OPEN';
+        this._circuitBreakerFailures = 0;
+        return true;
+      }
+      // Still in cooldown
+      return false;
+    }
+    
+    return true; // CLOSED or HALF_OPEN
+  }
+
+  /**
+   * CRITICAL FIX: Record circuit breaker success
+   */
+  _recordCircuitBreakerSuccess() {
+    if (this._circuitBreakerState === 'HALF_OPEN') {
+      this._circuitBreakerFailures++;
+      if (this._circuitBreakerFailures >= this._circuitBreakerSuccessThreshold) {
+        logger.info('[Binance] Circuit breaker: Moving to CLOSED state (recovered)');
+        this._circuitBreakerState = 'CLOSED';
+        this._circuitBreakerFailures = 0;
+      }
+    } else if (this._circuitBreakerState === 'CLOSED') {
+      // Reset failure count on success
+      this._circuitBreakerFailures = 0;
+    }
+  }
+
+  /**
+   * CRITICAL FIX: Record circuit breaker failure
+   */
+  _recordCircuitBreakerFailure() {
+    this._circuitBreakerFailures++;
+    this._circuitBreakerLastFailure = Date.now();
+    
+    if (this._circuitBreakerState === 'HALF_OPEN') {
+      // Failed in half-open, go back to open
+      logger.warn('[Binance] Circuit breaker: Moving back to OPEN state');
+      this._circuitBreakerState = 'OPEN';
+      this._circuitBreakerFailures = 0;
+    } else if (this._circuitBreakerState === 'CLOSED' && this._circuitBreakerFailures >= this._circuitBreakerThreshold) {
+      // Too many failures, open circuit
+      logger.error(`[Binance] Circuit breaker: Opening circuit after ${this._circuitBreakerFailures} failures`);
+      this._circuitBreakerState = 'OPEN';
+    }
+  }
+
+  /**
+   * CRITICAL FIX: Classify error for retry decision
+   * @param {Error} error - Error object
+   * @returns {Object} { retryable: boolean, reason: string, code?: number }
+   */
+  _classifyError(error) {
+    const msg = error?.message || String(error);
+    const code = error?.code || (msg.match(/-?\d+/)?.[0] ? parseInt(msg.match(/-?\d+/)[0]) : null);
+    
+    // Network/timeout errors - always retryable
+    if (/timeout|ECONNRESET|ENOTFOUND|ECONNREFUSED|network|fetch|aborted/i.test(msg)) {
+      return { retryable: true, reason: 'network_error', code };
+    }
+    
+    // 5xx server errors - retryable
+    if (/HTTP 5\d{2}/.test(msg) || error?.status >= 500) {
+      return { retryable: true, reason: 'server_error', code, status: error?.status };
+    }
+    
+    // Rate limit (429) - retryable with backoff
+    if (error?.status === 429 || /429|Too Many Requests|rate limit/i.test(msg)) {
+      return { retryable: true, reason: 'rate_limit', code };
+    }
+    
+    // Timestamp errors - retryable after sync
+    if (code === -1021 || code === -1022 || /timestamp|recvWindow/i.test(msg)) {
+      return { retryable: true, reason: 'timestamp_error', code };
+    }
+    
+    // Non-retryable logic errors
+    if (code && this._nonRetryableErrors.has(code)) {
+      return { retryable: false, reason: 'logic_error', code };
+    }
+    
+    // Other 4xx errors - generally not retryable
+    if (error?.status >= 400 && error?.status < 500) {
+      return { retryable: false, reason: 'client_error', code, status: error?.status };
+    }
+    
+    // Unknown errors - conservative: don't retry
+    return { retryable: false, reason: 'unknown_error', code };
+  }
+
+  /**
+   * CRITICAL FIX: Queue request for rate limiting
+   * @param {Function} requestFn - Async function to execute
+   * @param {boolean} isSigned - Whether this is a signed request (stricter rate limit)
+   * @returns {Promise} Request result
+   */
+  async _queueRequest(requestFn, isSigned = false) {
+    return new Promise((resolve, reject) => {
+      this._requestQueue.push({ requestFn, isSigned, resolve, reject });
+      this._processRequestQueue().catch(() => {});
+    });
+  }
+
+  /**
+   * CRITICAL FIX: Process request queue with rate limiting
+   */
+  async _processRequestQueue() {
+    if (this._isProcessingQueue) return;
+    this._isProcessingQueue = true;
+
+    while (this._requestQueue.length > 0) {
+      const { requestFn, isSigned, resolve, reject } = this._requestQueue.shift();
+      
+      // Check circuit breaker
+      if (!this._checkCircuitBreaker()) {
+        const error = new Error('Circuit breaker is OPEN - Binance API is unavailable');
+        error.code = 'CIRCUIT_BREAKER_OPEN';
+        reject(error);
+        continue;
+      }
+
+      // Rate limiting: use stricter interval for signed requests
+      const interval = isSigned ? this._signedRequestInterval : this._requestInterval;
+      const lastRequestTime = isSigned ? this._lastSignedRequestTime : this.lastRequestTime;
+      const now = Date.now();
+      const timeSinceLastRequest = now - lastRequestTime;
+      
+      if (timeSinceLastRequest < interval) {
+        await new Promise(resolve => setTimeout(resolve, interval - timeSinceLastRequest));
+      }
+      
+      // Update last request time
+      if (isSigned) {
+        this._lastSignedRequestTime = Date.now();
+      } else {
+        this.lastRequestTime = Date.now();
+      }
+
+      // Execute request
+      try {
+        const result = await requestFn();
+        this._recordCircuitBreakerSuccess();
+        resolve(result);
+      } catch (error) {
+        const classification = this._classifyError(error);
+        
+        // Record failure for circuit breaker (only for network/server errors)
+        if (classification.retryable && (classification.reason === 'network_error' || classification.reason === 'server_error')) {
+          this._recordCircuitBreakerFailure();
+        }
+        
+        reject(error);
+      }
+    }
+
+    this._isProcessingQueue = false;
+  }
+
+  /**
+   * CRITICAL FIX: Validate order parameters before submission
+   * @param {string} symbol - Trading symbol
+   * @param {string} side - Order side (BUY/SELL)
+   * @param {string} type - Order type (MARKET/LIMIT/STOP/etc)
+   * @param {number} quantity - Order quantity
+   * @param {number} price - Order price (optional)
+   * @returns {Promise<Object>} { valid: boolean, errors: string[] }
+   */
+  async validateOrderParams(symbol, side, type, quantity, price = null) {
+    const errors = [];
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+
+    try {
+      // Get filters from cache or API
+      let filters = null;
+      if (this.exchangeInfoService) {
+        filters = this.exchangeInfoService.getFilters(normalizedSymbol);
+      }
+      
+      if (!filters) {
+        // Fallback: fetch from API
+        const exchangeInfo = await this.getTradingExchangeSymbol(normalizedSymbol);
+        if (exchangeInfo?.filters) {
+          filters = {
+            tickSize: exchangeInfo.filters.find(f => f.filterType === 'PRICE_FILTER')?.tickSize,
+            stepSize: exchangeInfo.filters.find(f => f.filterType === 'LOT_SIZE')?.stepSize,
+            minQty: exchangeInfo.filters.find(f => f.filterType === 'LOT_SIZE')?.minQty,
+            maxQty: exchangeInfo.filters.find(f => f.filterType === 'LOT_SIZE')?.maxQty,
+            minNotional: exchangeInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL')?.notional || 
+                        exchangeInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL')?.minNotional
+          };
+        }
+      }
+
+      if (filters) {
+        // Validate quantity
+        const qty = parseFloat(quantity);
+        const stepSize = parseFloat(filters.stepSize || '0.001');
+        const minQty = parseFloat(filters.minQty || '0');
+        const maxQty = parseFloat(filters.maxQty || '999999999');
+
+        if (qty < minQty) {
+          errors.push(`Quantity ${qty} is below minimum ${minQty}`);
+        }
+        if (qty > maxQty) {
+          errors.push(`Quantity ${qty} exceeds maximum ${maxQty}`);
+        }
+        // Check if quantity is multiple of stepSize
+        const remainder = (qty % stepSize);
+        if (remainder > 0.00000001) { // Floating point tolerance
+          errors.push(`Quantity ${qty} is not a multiple of stepSize ${stepSize}`);
+        }
+
+        // Validate price (for LIMIT orders)
+        if (price !== null && type !== 'MARKET') {
+          const priceNum = parseFloat(price);
+          const tickSize = parseFloat(filters.tickSize || '0.01');
+          const minPrice = parseFloat(filters.minPrice || '0');
+
+          if (priceNum < minPrice) {
+            errors.push(`Price ${priceNum} is below minimum ${minPrice}`);
+          }
+          // Check if price is multiple of tickSize
+          const priceRemainder = (priceNum % tickSize);
+          if (priceRemainder > 0.00000001) {
+            errors.push(`Price ${priceNum} is not a multiple of tickSize ${tickSize}`);
+          }
+
+          // Validate notional
+          const minNotional = parseFloat(filters.minNotional || '5');
+          const notional = qty * priceNum;
+          if (notional < minNotional) {
+            errors.push(`Notional value ${notional.toFixed(2)} is below minimum ${minNotional}`);
+          }
+        } else if (type === 'MARKET' && filters.minNotional) {
+          // For MARKET orders, estimate notional from current price
+          const currentPrice = await this.getPrice(normalizedSymbol);
+          if (currentPrice) {
+            const notional = qty * currentPrice;
+            const minNotional = parseFloat(filters.minNotional || '5');
+            if (notional < minNotional) {
+              errors.push(`Estimated notional value ${notional.toFixed(2)} is below minimum ${minNotional}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Validation errors are non-fatal, just log
+      logger.debug(`[Binance] Order validation error: ${e?.message || e}`);
+    }
+
+    return {
+      valid: errors.length === 0,
+      errors
+    };
   }
 
   /**
    * Ensure local time is synced with Binance server time within TTL
+   * CRITICAL FIX: Enhanced with auto-recovery on timestamp errors
    */
   async ensureTimeSync() {
     const now = Date.now();
@@ -245,6 +543,7 @@ export class BinanceDirectClient {
 
   /**
    * Make request for TRADING operations (uses testnet or production based on config)
+   * CRITICAL FIX: Enhanced with request queue, error classification, and circuit breaker
    */
   async makeRequest(endpoint, method = 'GET', params = {}, requiresAuth = false, retries = 3) {
     // Disable retry for order operations to avoid duplicate orders
@@ -252,13 +551,17 @@ export class BinanceDirectClient {
     if (isOrderEndpoint) {
       retries = 1; // Single attempt only for order operations
     }
-    // Rate limiting
-    const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    if (timeSinceLastRequest < this.minRequestInterval) {
-      await new Promise(resolve => setTimeout(resolve, this.minRequestInterval - timeSinceLastRequest));
-    }
-    this.lastRequestTime = Date.now();
+
+    // CRITICAL FIX: Use request queue for rate limiting
+    return this._queueRequest(async () => {
+      return await this._makeRequestInternal(endpoint, method, params, requiresAuth, retries);
+    }, requiresAuth);
+  }
+
+  /**
+   * Internal request method (called from queue)
+   */
+  async _makeRequestInternal(endpoint, method = 'GET', params = {}, requiresAuth = false, retries = 3) {
 
     const url = `${this.baseURL}${endpoint}`;
 
@@ -271,7 +574,7 @@ export class BinanceDirectClient {
       await this.ensureTimeSync();
     }
 
-    // Make request with retries
+    // CRITICAL FIX: Make request with retries and error classification
     let useDirectServerTime = false;
     for (let i = 0; i < retries; i++) {
       let queryString = '';
@@ -328,7 +631,7 @@ export class BinanceDirectClient {
         const data = await response.json();
         if (!response.ok) {
           if (data.code && data.msg) {
-            // Special handling for timestamp skew
+            // CRITICAL FIX: Enhanced timestamp error handling with auto-recovery
             if (data.code === -1021) {
               logger.warn('Binance -1021 timestamp outside recvWindow. Syncing time and retrying...');
               await this.syncServerTime(true);
@@ -352,14 +655,47 @@ export class BinanceDirectClient {
             if (data.code === -1111) {
               logger.error('Binance precision rejection', { endpoint, params: this.sanitizeParams(params), response: data });
             }
-            throw new Error(`Binance API Error ${data.code}: ${data.msg}`);
+            
+            // CRITICAL FIX: Create error with code for classification
+            const error = new Error(`Binance API Error ${data.code}: ${data.msg}`);
+            error.code = data.code;
+            throw error;
           }
-          throw new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
+          const error = new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
+          error.status = response.status;
+          throw error;
         }
         return data;
       } catch (error) {
-        if (i === retries - 1) throw error;
-        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
+        // CRITICAL FIX: Classify error and decide if retry is appropriate
+        const classification = this._classifyError(error);
+        
+        // Don't retry non-retryable errors
+        if (!classification.retryable) {
+          logger.debug(`[Binance] Non-retryable error: ${classification.reason} (code: ${classification.code})`);
+          throw error;
+        }
+        
+        // Last attempt - throw error
+        if (i === retries - 1) {
+          throw error;
+        }
+        
+        // Calculate backoff based on error type
+        let backoff;
+        if (classification.reason === 'rate_limit') {
+          // Rate limit: longer backoff with jitter
+          backoff = Math.min(1000 * Math.pow(2, i), 10000) + Math.random() * 1000;
+          logger.warn(`[Binance] Rate limit hit, backing off ${Math.round(backoff)}ms before retry ${i + 1}/${retries}`);
+        } else if (classification.reason === 'timestamp_error') {
+          // Timestamp error: short backoff, time already synced
+          backoff = 50;
+        } else {
+          // Network/server error: exponential backoff
+          backoff = 1000 * (i + 1);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, backoff));
       }
     }
   }
@@ -472,12 +808,14 @@ export class BinanceDirectClient {
       const ticker = await this.makeMarketDataRequest('/fapi/v1/ticker/price', 'GET', { symbol: normalizedSymbol });
       const restPrice = parseFloat(ticker?.price);
       if (Number.isFinite(restPrice) && restPrice > 0) {
-        // Enforce max cache size (LRU eviction)
-        if (this.restPriceFallbackCache.size >= this.maxPriceCacheSize && !this.restPriceFallbackCache.has(normalizedSymbol)) {
-          const oldest = Array.from(this.restPriceFallbackCache.entries())
-            .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
-          if (oldest) this.restPriceFallbackCache.delete(oldest[0]);
-        }
+    // CRITICAL FIX: O(1) LRU eviction using Map insertion order
+    if (this.restPriceFallbackCache.size >= this.maxPriceCacheSize && !this.restPriceFallbackCache.has(normalizedSymbol)) {
+      // Remove oldest entry (first in Map)
+      const oldestKey = this.restPriceFallbackCache.keys().next().value;
+      if (oldestKey) {
+        this.restPriceFallbackCache.delete(oldestKey);
+      }
+    }
         this.restPriceFallbackCache.set(normalizedSymbol, { price: restPrice, timestamp: now });
         logger.info(`Price for ${normalizedSymbol} not in WebSocket cache. Using REST fallback price ${restPrice}.`);
         return restPrice;
@@ -936,6 +1274,7 @@ export class BinanceDirectClient {
 
   /**
    * Place market order
+   * CRITICAL FIX: Added parameter validation before submission
    */
   async placeMarketOrder(symbol, side, quantity, positionSide = 'BOTH', reduceOnly = false) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
@@ -953,6 +1292,14 @@ export class BinanceDirectClient {
     const formattedQuantity = this.formatQuantity(quantity, stepSize);
     if (parseFloat(formattedQuantity) <= 0) {
       throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
+    }
+
+    // CRITICAL FIX: Validate order parameters before submission
+    const validation = await this.validateOrderParams(normalizedSymbol, side, 'MARKET', parseFloat(formattedQuantity), currentPrice);
+    if (!validation.valid) {
+      const error = new Error(`Order validation failed: ${validation.errors.join(', ')}`);
+      error.validationErrors = validation.errors;
+      throw error;
     }
 
     logger.debug(`Market order: quantity=${formattedQuantity}, price=${currentPrice}`);
@@ -986,6 +1333,7 @@ export class BinanceDirectClient {
 
   /**
    * Place limit order
+   * CRITICAL FIX: Added parameter validation before submission
    */
   async placeLimitOrder(symbol, side, quantity, price, positionSide = 'BOTH', timeInForce = 'GTC') {
     const normalizedSymbol = this.normalizeSymbol(symbol);
@@ -1006,6 +1354,14 @@ export class BinanceDirectClient {
 
     if (roundedPrice <= 0) {
       throw new Error(`Invalid price after rounding: ${roundedPrice} (original: ${price}, tickSize: ${tickSize})`);
+    }
+
+    // CRITICAL FIX: Validate order parameters before submission
+    const validation = await this.validateOrderParams(normalizedSymbol, side, 'LIMIT', parseFloat(formattedQuantity), roundedPrice);
+    if (!validation.valid) {
+      const error = new Error(`Order validation failed: ${validation.errors.join(', ')}`);
+      error.validationErrors = validation.errors;
+      throw error;
     }
 
     const params = {
@@ -1191,6 +1547,8 @@ export class BinanceDirectClient {
     const limitPriceStr = limitNum.toFixed(pricePrecision);
 
     // Safety check to prevent -2021 "Order would immediately trigger"
+    // NOTE: For SHORT positions, we allow TP to cross entry (stopNum >= currentPrice) for early loss-cutting
+    // This is intentional behavior - trailing TP can move above entry to cut losses early
     const currentPrice = await this.getPrice(normalizedSymbol);
     if (currentPrice) {
       const stopNum = parseFloat(stopPriceStr);
@@ -1198,16 +1556,21 @@ export class BinanceDirectClient {
         logger.warn(`[TP-SKIP] TP price ${stopNum} for LONG is at or below current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
         return null;
       }
-      if (side === 'short' && stopNum >= currentPrice) {
-        logger.warn(`[TP-SKIP] TP price ${stopNum} for SHORT is at or above current price ${currentPrice}. Skipping order to prevent immediate trigger.`);
-        return null;
-      }
+      // REMOVED: Safety check for SHORT positions
+      // We allow TP to be >= currentPrice for SHORT positions to enable early loss-cutting
+      // The trailing TP logic intentionally allows TP to cross entry price for SHORT positions
     }
 
     // Determine position side
     const positionSide = side === 'long' ? 'LONG' : 'SHORT';
     // For TP: long position closes with SELL, short position closes with BUY
     const orderSide = side === 'long' ? 'SELL' : 'BUY';
+    
+    // Debug logging to verify side is correct
+    if (side !== 'long' && side !== 'short') {
+      logger.error(`[TP-ERROR] Invalid side value: ${side} (expected 'long' or 'short')`);
+    }
+    logger.debug(`[TP] Creating TP order: symbol=${normalizedSymbol}, side=${side}, positionSide=${positionSide}, orderSide=${orderSide}, stopPrice=${stopPriceStr}, limitPrice=${limitPriceStr}`);
 
     const params = {
       symbol: normalizedSymbol,

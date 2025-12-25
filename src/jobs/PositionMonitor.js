@@ -104,11 +104,96 @@ export class PositionMonitor {
 
   /**
    * Place TP/SL orders for new positions that don't have them yet.
+   * Uses soft lock to prevent race conditions when multiple instances run concurrently.
    * @param {Object} position - Position object
    */
   async placeTpSlOrders(position) {
-    // Skip if position already has TP/SL orders or is not open
-    if (position.status !== 'open' || (position.tp_order_id && position.sl_order_id)) {
+    // Skip if position is not open
+    if (position.status !== 'open') {
+      return;
+    }
+
+    // RACE CONDITION FIX: Use soft lock to prevent concurrent TP/SL placement
+    // Try to acquire lock by setting is_processing flag
+    try {
+      const { pool } = await import('../config/database.js');
+      const [result] = await pool.execute(
+        `UPDATE positions 
+         SET is_processing = 1 
+         WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
+         LIMIT 1`,
+        [position.id]
+      );
+      
+      // If no rows updated, another process is already handling this position
+      if (result.affectedRows === 0) {
+        logger.debug(`[Place TP/SL] Position ${position.id} is already being processed by another instance, skipping...`);
+        return;
+      }
+    } catch (lockError) {
+      // If is_processing column doesn't exist, continue without lock (backward compatibility)
+      logger.debug(`[Place TP/SL] Could not acquire lock for position ${position.id} (column may not exist): ${lockError?.message || lockError}`);
+    }
+
+    // Check if TP/SL orders still exist on exchange
+    // If tp_order_id exists in DB but order is not on exchange (filled/canceled), we should recreate it
+    let needsTp = !position.tp_order_id;
+    let needsSl = !position.sl_order_id;
+
+    // If tp_order_id exists, verify it's still active on exchange
+    if (position.tp_order_id) {
+      try {
+        const exchangeService = this.exchangeServices.get(position.bot_id);
+        if (exchangeService) {
+          const orderStatus = await exchangeService.getOrderStatus(position.symbol, position.tp_order_id);
+          const status = (orderStatus?.status || '').toLowerCase();
+          // If order is filled, canceled, or expired, we need to recreate it
+          if (status === 'filled' || status === 'canceled' || status === 'cancelled' || status === 'expired') {
+            logger.warn(`[Place TP/SL] TP order ${position.tp_order_id} for position ${position.id} is ${status} on exchange, will recreate`);
+            needsTp = true;
+            // Clear tp_order_id in DB so we can recreate
+            await Position.update(position.id, { tp_order_id: null });
+            position.tp_order_id = null;
+          }
+        }
+      } catch (e) {
+        // If we can't check order status, assume it might be missing and try to recreate
+        logger.warn(`[Place TP/SL] Could not verify TP order ${position.tp_order_id} for position ${position.id}: ${e?.message || e}. Will try to recreate.`);
+        needsTp = true;
+        await Position.update(position.id, { tp_order_id: null });
+        position.tp_order_id = null;
+      }
+    }
+
+    // If sl_order_id exists, verify it's still active on exchange
+    if (position.sl_order_id) {
+      try {
+        const exchangeService = this.exchangeServices.get(position.bot_id);
+        if (exchangeService) {
+          const orderStatus = await exchangeService.getOrderStatus(position.symbol, position.sl_order_id);
+          const status = (orderStatus?.status || '').toLowerCase();
+          // If order is filled, canceled, or expired, we need to recreate it
+          if (status === 'filled' || status === 'canceled' || status === 'cancelled' || status === 'expired') {
+            logger.warn(`[Place TP/SL] SL order ${position.sl_order_id} for position ${position.id} is ${status} on exchange, will recreate`);
+            needsSl = true;
+            // Clear sl_order_id in DB so we can recreate
+            await Position.update(position.id, { sl_order_id: null });
+            position.sl_order_id = null;
+          }
+        }
+      } catch (e) {
+        // If we can't check order status, assume it might be missing and try to recreate
+        logger.warn(`[Place TP/SL] Could not verify SL order ${position.sl_order_id} for position ${position.id}: ${e?.message || e}. Will try to recreate.`);
+        needsSl = true;
+        await Position.update(position.id, { sl_order_id: null });
+        position.sl_order_id = null;
+      }
+    }
+
+    // Skip if both TP and SL already exist and are active
+    if (!needsTp && !needsSl) {
+      // Release lock before returning
+      await this._releasePositionLock(position.id);
       return;
     }
 
@@ -116,26 +201,63 @@ export class PositionMonitor {
       const exchangeService = this.exchangeServices.get(position.bot_id);
       if (!exchangeService) {
         logger.warn(`[Place TP/SL] ExchangeService not found for bot ${position.bot_id}`);
+        // Release lock before returning
+        await this._releasePositionLock(position.id);
         return;
       }
 
-      // Get the actual fill price from the exchange
-      const fillPrice = await exchangeService.binanceDirectClient.getOrderAverageFillPrice(position.symbol, position.order_id);
+      // Get the actual fill price from the exchange (abstract method, not exchange-specific)
+      let fillPrice = await exchangeService.getOrderAverageFillPrice(position.symbol, position.order_id);
       if (!fillPrice || !Number.isFinite(fillPrice) || fillPrice <= 0) {
-        logger.debug(`[Place TP/SL] Could not get fill price for position ${position.id}, will retry.`);
-        return;
+        // Fallback to position.entry_price if available
+        if (position.entry_price && Number.isFinite(Number(position.entry_price)) && Number(position.entry_price) > 0) {
+          fillPrice = Number(position.entry_price);
+          logger.info(`[Place TP/SL] Could not get fill price from exchange for position ${position.id}, using entry_price from DB: ${fillPrice}`);
+        } else {
+          logger.warn(`[Place TP/SL] Could not get fill price for position ${position.id} (order_id=${position.order_id}), will retry.`);
+          // Release lock before returning
+          await this._releasePositionLock(position.id);
+          return;
+        }
+      } else {
+        // Update position with the real entry price
+        await Position.update(position.id, { entry_price: fillPrice });
+        position.entry_price = fillPrice;
+        logger.info(`[Place TP/SL] Updated position ${position.id} with actual fill price: ${fillPrice}`);
       }
 
-      // Update position with the real entry price
-      await Position.update(position.id, { entry_price: fillPrice });
-      position.entry_price = fillPrice;
-      logger.info(`[Place TP/SL] Updated position ${position.id} with actual fill price: ${fillPrice}`);
+      // Get strategy to access oc, take_profit, stoploss
+      const strategy = await Strategy.findById(position.strategy_id);
+      if (!strategy) {
+        logger.warn(`[Place TP/SL] Strategy ${position.strategy_id} not found for position ${position.id}`);
+        return;
+      }
 
       // Recalculate TP/SL based on the real entry price
       const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
-      const tpPrice = calculateTakeProfit(fillPrice, position.oc, position.take_profit, position.side);
+      const oc = strategy.oc || position.oc || 1; // Fallback to position.oc if available, then default to 1
+      
+      // CRITICAL FIX: Don't fallback to 50 if strategy.take_profit is explicitly 0 (disabled)
+      // Only use fallback if take_profit is undefined/null, not if it's 0
+      let takeProfit;
+      if (strategy.take_profit !== undefined && strategy.take_profit !== null) {
+        takeProfit = Number(strategy.take_profit);
+      } else if (position.take_profit !== undefined && position.take_profit !== null) {
+        takeProfit = Number(position.take_profit);
+      } else {
+        takeProfit = 50; // Default only if both are undefined/null
+      }
+      
+      // If take_profit is 0 or invalid, skip TP calculation
+      if (!Number.isFinite(takeProfit) || takeProfit <= 0) {
+        logger.warn(`[Place TP/SL] Invalid take_profit (${takeProfit}) for position ${position.id}, skipping TP order placement`);
+        takeProfit = null;
+      }
+      
+      const tpPrice = takeProfit ? calculateTakeProfit(fillPrice, takeProfit, position.side) : null;
+      
       // Only set SL if strategy.stoploss > 0. No fallback to reduce/up_reduce
-      const rawStoploss = position.stoploss !== undefined ? Number(position.stoploss) : NaN;
+      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : (position.stoploss !== undefined ? Number(position.stoploss) : NaN);
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
       const slPrice = isStoplossValid ? calculateInitialStopLoss(fillPrice, rawStoploss, position.side) : null;
 
@@ -143,29 +265,54 @@ export class PositionMonitor {
       const quantity = await exchangeService.getClosableQuantity(position.symbol, position.side);
       if (!quantity || quantity <= 0) {
         logger.warn(`[Place TP/SL] No closable quantity found for position ${position.id}, cannot place TP/SL.`);
+        // Release lock before returning
+        await this._releasePositionLock(position.id);
         return;
       }
 
-      // Place TP order
-      if (!position.tp_order_id) {
+      // Check quantity mismatch with DB amount (warn if significant difference)
+      const dbAmount = parseFloat(position.amount || 0);
+      const markPrice = parseFloat(position.entry_price || fillPrice || 0);
+      const estimatedQuantity = markPrice > 0 ? dbAmount / markPrice : 0;
+      const quantityDiffPercent = estimatedQuantity > 0 ? Math.abs((quantity - estimatedQuantity) / estimatedQuantity) * 100 : 0;
+      
+      if (quantityDiffPercent > 10) { // More than 10% difference
+        logger.warn(
+          `[Place TP/SL] Quantity mismatch for position ${position.id}: ` +
+          `DB estimated=${estimatedQuantity.toFixed(4)}, Exchange=${quantity.toFixed(4)}, diff=${quantityDiffPercent.toFixed(2)}%`
+        );
+      }
+
+      // Place TP order if needed and tpPrice is valid
+      if (needsTp && tpPrice && Number.isFinite(tpPrice) && tpPrice > 0) {
         try {
+          // CRITICAL: Only update initial_tp_price if it's not already set (preserve original initial TP)
+          const currentPosition = await Position.findById(position.id);
+          const shouldPreserveInitialTP = currentPosition?.initial_tp_price && 
+                                          Number.isFinite(Number(currentPosition.initial_tp_price)) && 
+                                          Number(currentPosition.initial_tp_price) > 0;
+          
           const tpRes = await exchangeService.createTakeProfitLimit(position.symbol, position.side, tpPrice, quantity);
           const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
           if (tpOrderId) {
-            // Store initial TP price for trailing calculation
-            await Position.update(position.id, { 
+            // Store initial TP price for trailing calculation (only if not already set)
+            const updateData = { 
               tp_order_id: tpOrderId, 
-              take_profit_price: tpPrice,
-              initial_tp_price: tpPrice  // Save initial TP for trailing calculation
-            });
-            logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice} (initial TP)`);
+              take_profit_price: tpPrice
+            };
+            if (!shouldPreserveInitialTP) {
+              updateData.initial_tp_price = tpPrice; // Only set if not already set
+            }
+            await Position.update(position.id, updateData);
+            logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice} ${shouldPreserveInitialTP ? '(preserved initial TP)' : '(initial TP)'}`);
           } else {
             // Order creation returned null (e.g., price too close to market)
             logger.warn(`[Place TP/SL] ⚠️ TP order creation returned null for position ${position.id} @ ${tpPrice}. Updating TP price in DB only.`);
-            await Position.update(position.id, { 
-              take_profit_price: tpPrice,
-              initial_tp_price: tpPrice  // Save initial TP for trailing calculation
-            });
+            const updateData = { take_profit_price: tpPrice };
+            if (!shouldPreserveInitialTP) {
+              updateData.initial_tp_price = tpPrice; // Only set if not already set
+            }
+            await Position.update(position.id, updateData);
           }
         } catch (e) {
           // If TP order creation fails, still update take_profit_price in DB
@@ -173,14 +320,21 @@ export class PositionMonitor {
           logger.error(`[Place TP/SL] ❌ Failed to create TP order for position ${position.id}:`, e?.message || e);
           logger.warn(`[Place TP/SL] Updating TP price in DB to ${tpPrice} for position ${position.id} (order not placed, trailing TP will still work)`);
           try {
-            await Position.update(position.id, { 
-              take_profit_price: tpPrice,
-              initial_tp_price: tpPrice  // Save initial TP for trailing calculation
-            });
+            const currentPosition = await Position.findById(position.id);
+            const shouldPreserveInitialTP = currentPosition?.initial_tp_price && 
+                                            Number.isFinite(Number(currentPosition.initial_tp_price)) && 
+                                            Number(currentPosition.initial_tp_price) > 0;
+            const updateData = { take_profit_price: tpPrice };
+            if (!shouldPreserveInitialTP) {
+              updateData.initial_tp_price = tpPrice; // Only set if not already set
+            }
+            await Position.update(position.id, updateData);
           } catch (updateError) {
             logger.error(`[Place TP/SL] Failed to update TP price in DB:`, updateError?.message || updateError);
           }
         }
+      } else if (needsTp && (!tpPrice || !Number.isFinite(tpPrice) || tpPrice <= 0)) {
+        logger.warn(`[Place TP/SL] Cannot place TP order for position ${position.id}: invalid tpPrice (${tpPrice})`);
       }
 
       // Delay before placing SL order to avoid rate limits
@@ -191,7 +345,7 @@ export class PositionMonitor {
       }
 
       // Place SL order (only if slPrice is valid, i.e., stoploss > 0)
-      if (!position.sl_order_id && slPrice !== null && Number.isFinite(slPrice) && slPrice > 0) {
+      if (needsSl && slPrice !== null && Number.isFinite(slPrice) && slPrice > 0) {
         // Safety check: If SL is invalid (SL <= entry for SHORT or SL >= entry for LONG), force close position immediately
         const entryPrice = Number(fillPrice);
         const slPriceNum = Number(slPrice);
@@ -213,11 +367,17 @@ export class PositionMonitor {
             }
             
             // Force close position immediately with market order
-            const { PositionService } = await import('../services/PositionService.js');
-            const positionService = new PositionService(exchangeService);
+            // REUSE existing PositionService instance instead of creating new one
+            const positionService = this.positionServices.get(position.bot_id);
+            if (!positionService) {
+              logger.error(`[Place TP/SL] PositionService not found for bot ${position.bot_id}, cannot force close position ${position.id}`);
+              await this._releasePositionLock(position.id);
+              return;
+            }
             const currentPrice = await exchangeService.getTickerPrice(position.symbol);
             const pnl = positionService.calculatePnL(position, currentPrice);
             await positionService.closePosition(position, currentPrice, pnl, 'sl_invalid');
+            await this._releasePositionLock(position.id);
             return; // Exit early, position is closed
           }
         }
@@ -237,6 +397,26 @@ export class PositionMonitor {
       }
     } catch (error) {
       logger.error(`[Place TP/SL] Error processing TP/SL for position ${position.id}:`, error?.message || error, error?.stack);
+    } finally {
+      // Always release lock in finally block
+      await this._releasePositionLock(position.id);
+    }
+  }
+
+  /**
+   * Release soft lock for position
+   * @param {number} positionId - Position ID
+   */
+  async _releasePositionLock(positionId) {
+    try {
+      const { pool } = await import('../config/database.js');
+      await pool.execute(
+        `UPDATE positions SET is_processing = 0 WHERE id = ?`,
+        [positionId]
+      );
+    } catch (e) {
+      // Ignore errors (column may not exist for backward compatibility)
+      logger.debug(`[Place TP/SL] Could not release lock for position ${positionId}: ${e?.message || e}`);
     }
   }
 
@@ -253,19 +433,25 @@ export class PositionMonitor {
       const orderService = this.orderServices.get(strategy.bot_id);
       if (!exchangeService || !orderService) return;
 
-      // TTL-based cancellation: if order not filled after N minutes, cancel
-      
-      const ttlMinutes = Number(configService.getNumber('ENTRY_ORDER_TTL_MINUTES', 10));
+      // TTL-based cancellation for ENTRY orders only (not TP/SL orders)
+      // IMPORTANT: This only cancels position.order_id (entry order), NOT tp_order_id or sl_order_id
+      // EntryOrderMonitor handles entry orders from entry_orders table, but this is a fallback
+      // for positions that may still have an unfilled entry order_id
+      // TP/SL orders (tp_order_id, sl_order_id) are NEVER cancelled by this TTL
+      const ttlMinutes = Number(configService.getNumber('ENTRY_ORDER_TTL_MINUTES', 30));
       const ttlMs = Math.max(1, ttlMinutes) * 60 * 1000;
       const openedAtMs = new Date(position.opened_at).getTime();
       const now = Date.now();
 
-      if (position.status === 'open' && now - openedAtMs >= ttlMs) {
+      // Only check position.order_id (entry order), NOT tp_order_id or sl_order_id
+      if (position.status === 'open' && position.order_id && now - openedAtMs >= ttlMs) {
         // Check actual order status on exchange to avoid cancelling filled orders
+        // This is the ENTRY order, not TP/SL orders
         const st = await exchangeService.getOrderStatus(position.symbol, position.order_id);
         if (st.status === 'open' && (st.filled || 0) === 0) {
+          // Only cancel entry order, never cancel TP/SL orders here
           await orderService.cancelOrder(position, 'ttl_expired');
-          logger.debug(`Cancelled unfilled entry (TTL ${ttlMinutes}m) for position ${position.id}`);
+          logger.debug(`[PositionMonitor] Cancelled unfilled ENTRY order (order_id=${position.order_id}, TTL ${ttlMinutes}m) for position ${position.id}. TP/SL orders are NOT affected.`);
           return; // done for this position
         }
       }

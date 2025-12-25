@@ -207,13 +207,13 @@ Nếu đã cấu hình Telegram bot, bạn có thể sử dụng các lệnh sau
     - `0.8` = thoáng hơn, cho phép đặt LIMIT dù giá còn khá xa entry (≤ 80% quãng đường).
   - Được sử dụng trong `WebSocketOCConsumer` khi `ENABLE_LIMIT_ON_EXTEND_MISS = true`.
 
-- **`EXTEND_LIMIT_AUTO_CANCEL_MINUTES`**  
+- **`ENTRY_ORDER_TTL_MINUTES`**  
   - Được seed trong `src/app.js` và có thể chỉnh trong `app_configs`.  
-  - Ý nghĩa: **số phút tối đa** mà một **lệnh entry LIMIT (bao gồm lệnh đặt ra từ extend-miss)** được phép treo mà **không được khớp**, sau đó sẽ:
+  - Ý nghĩa: **số phút tối đa** mà một **lệnh entry LIMIT** (bao gồm cả lệnh đặt ra từ extend-miss) được phép treo mà **không được khớp**, sau đó sẽ:
     1. Bot gọi `cancelOrder` trên sàn.
     2. Đánh dấu `entry_orders` tương ứng là `canceled` với lý do `expired_ttl`.
-  - Mặc định: `10` phút.  
-  - Logic auto-cancel được triển khai trong `EntryOrderMonitor.pollOpenEntryOrders`, sử dụng `EXTEND_LIMIT_AUTO_CANCEL_MINUTES` để tính TTL.
+  - Mặc định: `30` phút.  
+  - Logic auto-cancel được triển khai trong `EntryOrderMonitor.pollOpenEntryOrders`, sử dụng `ENTRY_ORDER_TTL_MINUTES` để tính TTL.
 
 ## Cấu Hình Test
 

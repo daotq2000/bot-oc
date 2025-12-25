@@ -264,21 +264,21 @@ async function createMissingPosition(botId, missing, exchangeService) {
       
       const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
       const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || entry.entry_price || 0);
-      const tpPrice = calculateTakeProfit(entryPrice, strategy.oc, strategy.take_profit, side);
+      const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit, side);
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
       const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
       
-      const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
-      const reservationToken = entry.reservation_token 
-        ? entry.reservation_token 
-        : await concurrencyManager.reserveSlot(botId);
+      // ConcurrencyManager removed - reservation logic disabled
+      // const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
+      const reservationToken = entry.reservation_token || null; // Reservation disabled
       
-      if (!reservationToken) {
-        const status = await concurrencyManager.getStatus(botId);
-        console.log(`    Concurrency limit reached: ${status.currentCount}/${status.maxConcurrent}`);
-        return false;
-      }
+      // Skip reservation check (ConcurrencyManager removed)
+      // if (!reservationToken) {
+      //   const status = await concurrencyManager.getStatus(botId);
+      //   console.log(`    Concurrency limit reached: ${status.currentCount}/${status.maxConcurrent}`);
+      //   return false;
+      // }
       
       try {
         const position = await Position.create({
@@ -295,12 +295,14 @@ async function createMissingPosition(botId, missing, exchangeService) {
         });
         
         await EntryOrder.markFilled(entry.id);
-        await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
+        // ConcurrencyManager removed - reservation disabled
+        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
         
         console.log(`    ✅ Created Position ${position.id} from entry_order ${entry.id}`);
         return true;
       } catch (posError) {
-        await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+        // ConcurrencyManager removed - reservation disabled
+        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
         throw posError;
       }
     }
@@ -327,25 +329,26 @@ async function createMissingPosition(botId, missing, exchangeService) {
     const amount = Math.abs(contracts * markPrice);
 
     const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
-    const tpPrice = calculateTakeProfit(entryPrice || markPrice, strategy.oc, strategy.take_profit, side);
+    const tpPrice = calculateTakeProfit(entryPrice || markPrice, strategy.take_profit, side);
     const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
     const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
     const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice || markPrice, rawStoploss, side) : null;
 
-    const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
-    const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
-    if (!canAccept) {
-      const status = await concurrencyManager.getStatus(botId);
-      console.log(`    Concurrency limit reached: ${status.currentCount}/${status.maxConcurrent}`);
-      return false;
-    }
-
-    const reservationToken = await concurrencyManager.reserveSlot(botId);
-    if (!reservationToken) {
-      const status = await concurrencyManager.getStatus(botId);
-      console.log(`    Failed to reserve slot: ${status.currentCount}/${status.maxConcurrent}`);
-      return false;
-    }
+    // ConcurrencyManager removed - reservation logic disabled
+    // const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
+    // const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
+    // if (!canAccept) {
+    //   const status = await concurrencyManager.getStatus(botId);
+    //   console.log(`    Concurrency limit reached: ${status.currentCount}/${status.maxConcurrent}`);
+    //   return false;
+    // }
+    // const reservationToken = await concurrencyManager.reserveSlot(botId);
+    // if (!reservationToken) {
+    //   const status = await concurrencyManager.getStatus(botId);
+    //   console.log(`    Failed to reserve slot: ${status.currentCount}/${status.maxConcurrent}`);
+    //   return false;
+    // }
+    const reservationToken = null; // Reservation disabled
 
     try {
       const position = await Position.create({
@@ -361,11 +364,13 @@ async function createMissingPosition(botId, missing, exchangeService) {
         current_reduce: strategy.reduce
       });
 
-      await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
+      // ConcurrencyManager removed - reservation disabled
+      // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
       console.log(`    ✅ Created Position ${position.id} from strategy ${strategy.id}`);
       return true;
     } catch (error) {
-      await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
+      // ConcurrencyManager removed - reservation disabled
+      // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
       throw error;
     }
   } catch (error) {

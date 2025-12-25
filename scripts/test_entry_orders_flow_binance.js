@@ -105,16 +105,16 @@ async function queryEntryOrdersAndPositions(botId, symbol) {
   return { entryRows, posRows };
 }
 
-async function createTempStrategy(botId, symbol, amount) {
+async function createTempStrategy(botId, symbol, amount, reduce = 10, upReduce = 0) {
   const [result] = await pool.execute(
     `INSERT INTO strategies (bot_id, symbol, \`interval\`, amount, oc, take_profit, reduce, extend, up_reduce, \`ignore\`, is_active, created_at, updated_at)
-     VALUES (?, ?, '15m', ?, 1, 50, 10, 0, 0, 0, 0, NOW(), NOW())`, // Provide defaults for all non-nullable fields
-    [botId, symbol, amount]
+     VALUES (?, ?, '15m', ?, 1, 50, ?, 0, ?, 0, 0, NOW(), NOW())`, // Use provided reduce and up_reduce values
+    [botId, symbol, amount, reduce, upReduce]
   );
   if (!result.insertId) {
     throw new Error('Failed to create temporary strategy');
   }
-  console.log(`[INFO] Created temporary strategy with id=${result.insertId}`);
+  console.log(`[INFO] Created temporary strategy with id=${result.insertId} (reduce=${reduce}, up_reduce=${upReduce})`);
   return result.insertId;
 }
 
@@ -138,6 +138,8 @@ async function main() {
   const side = String(args.side || '').toLowerCase();
   const amount = Number(args.amount || 50);
   const offsetPct = Number(args.offset_pct || 0.5);
+  const reduce = Number(args.reduce || 10);
+  const upReduce = Number(args.up_reduce || 0);
   const confirm = !!args.confirm;
 
   if (!['long', 'short'].includes(side)) usage('Missing/invalid --side');
@@ -148,7 +150,7 @@ async function main() {
     const bot = await getBot3();
     console.log(`[INFO] Using bot id=3: name=${bot.bot_name || 'N/A'}, exchange=${bot.exchange}, testnet=${bot.binance_testnet}`);
 
-    tempStrategyId = await createTempStrategy(bot.id, symbol, amount);
+    tempStrategyId = await createTempStrategy(bot.id, symbol, amount, reduce, upReduce);
 
     const exSvc = new ExchangeService(bot);
     await exSvc.initialize();
@@ -173,21 +175,23 @@ async function main() {
     }
     limitPrice = Number(limitPrice.toFixed(4));
 
-    const realStrategy = {
-      id: tempStrategyId,
-      bot_id: bot.id,
-      symbol: symbol,
-      amount: amount,
-      oc: 1, // Mock value
-      take_profit: 50, // Mock value
-      reduce: 10, // Mock value
-      bot: bot
-    };
+    // Fetch actual strategy from DB to get all fields
+    const [strategyRows] = await pool.execute(
+      `SELECT * FROM strategies WHERE id = ?`,
+      [tempStrategyId]
+    );
+    const realStrategy = strategyRows[0];
+    if (!realStrategy) {
+      throw new Error(`Strategy ${tempStrategyId} not found after creation`);
+    }
+    realStrategy.bot = bot;
 
     console.log('\n=== Test Plan (Binance testnet entry_orders flow) ===');
     console.log(`Symbol       : ${symbol}`);
     console.log(`Side         : ${side.toUpperCase()}`);
     console.log(`Amount (USDT): ${amount}`);
+    console.log(`Reduce       : ${reduce}`);
+    console.log(`Up Reduce    : ${upReduce}`);
     console.log(`Current      : ${current}`);
     console.log(`Limit Price  : ${limitPrice} (offset ${offsetPct}% from market)`);
     console.log(`Mode         : ${confirm ? 'CONFIRMED - WILL PLACE REAL LIMIT ORDER' : 'DRY-RUN'}`);

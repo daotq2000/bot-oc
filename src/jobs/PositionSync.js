@@ -112,9 +112,54 @@ export class PositionSync {
         return;
       }
       
-      if (!Array.isArray(exchangePositions) || exchangePositions.length === 0) {
-        logger.debug(`[PositionSync] No positions on exchange for bot ${botId}`);
-        return; // No positions on exchange
+      if (!Array.isArray(exchangePositions)) {
+        logger.error(`[PositionSync] Invalid exchange positions data for bot ${botId}`);
+        return;
+      }
+      
+      // If no positions on exchange, all DB positions should be closed
+      if (exchangePositions.length === 0) {
+        logger.info(`[PositionSync] No positions on exchange for bot ${botId}, closing all open positions in DB`);
+        let closedCount = 0;
+        for (const dbPos of dbPositions) {
+          try {
+            const { pool } = await import('../config/database.js');
+            const [lockResult] = await pool.execute(
+              `UPDATE positions 
+               SET is_processing = 1 
+               WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
+               LIMIT 1`,
+              [dbPos.id]
+            );
+            
+            if (lockResult.affectedRows > 0) {
+              try {
+                logger.warn(
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but exchange has no positions, marking as closed`
+                );
+                await Position.update(dbPos.id, {
+                  status: 'closed',
+                  close_reason: 'sync_exchange_empty',
+                  closed_at: new Date()
+                });
+                closedCount++;
+              } finally {
+                try {
+                  await pool.execute(
+                    `UPDATE positions SET is_processing = 0 WHERE id = ?`,
+                    [dbPos.id]
+                  );
+                } catch (releaseError) {
+                  logger.debug(`[PositionSync] Could not release lock for position ${dbPos.id}: ${releaseError?.message || releaseError}`);
+                }
+              }
+            }
+          } catch (error) {
+            logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, error?.message || error);
+          }
+        }
+        logger.info(`[PositionSync] Closed ${closedCount} positions for bot ${botId} (exchange has no positions)`);
+        return;
       }
 
       // Get open positions from database for this bot
@@ -127,40 +172,47 @@ export class PositionSync {
       );
 
       // Helper to normalize symbol exactly like we do for exchange positions
-      const normalizeSymbol = (symbol) => {
-        if (!symbol) return symbol;
-        let normalizedSymbol = symbol;
-        normalizedSymbol = normalizedSymbol.replace(/\/USDT:USDT$/, 'USDT'); // MEXC format
-        normalizedSymbol = normalizedSymbol.replace(/\/USDT$/, 'USDT'); // Standard format with slash
-        normalizedSymbol = normalizedSymbol.replace(/_USDT$/, 'USDT'); // Gate format
-        normalizedSymbol = normalizedSymbol.replace(/\//g, ''); // Remove any remaining slashes
-        return normalizedSymbol;
-      };
+      const normalizeSymbol = (symbol) => this.normalizeSymbol(symbol);
 
       // Create a map of DB positions by *normalized* symbol+side
       // This prevents duplicates like "H/USDT" vs "HUSDT" for the same underlying coin.
+      // Use array to store multiple positions with same symbol+side
       const dbPositionsMap = new Map();
       for (const pos of dbPositions) {
         const rawSym = pos.symbol;
         const normSym = normalizeSymbol(rawSym);
         const keyRaw = `${rawSym}_${pos.side}`;
         const keyNorm = `${normSym}_${pos.side}`;
-        dbPositionsMap.set(keyRaw, pos);
-        dbPositionsMap.set(keyNorm, pos);
+        
+        // Store as array to handle multiple positions with same symbol+side
+        if (!dbPositionsMap.has(keyRaw)) {
+          dbPositionsMap.set(keyRaw, []);
+        }
+        if (!dbPositionsMap.has(keyNorm)) {
+          dbPositionsMap.set(keyNorm, []);
+        }
+        dbPositionsMap.get(keyRaw).push(pos);
+        if (keyRaw !== keyNorm) {
+          dbPositionsMap.get(keyNorm).push(pos);
+        }
       }
 
       // Process exchange positions
       let processedCount = 0;
       let createdCount = 0;
+      const matchedDbPositionIds = new Set(); // Track which DB positions were matched
+      
       for (const exPos of exchangePositions) {
         try {
           // Normalize position data
+          // CRITICAL FIX: Parse raw amount FIRST, then determine side, then get absolute value
           const symbol = exPos.symbol || exPos.info?.symbol || exPos.market;
-          const contracts = exPos.contracts ?? Math.abs(parseFloat(exPos.positionAmt || exPos.size || 0));
-          const side = contracts > 0 ? 'long' : (contracts < 0 ? 'short' : null);
+          const rawAmt = parseFloat(exPos.positionAmt ?? exPos.contracts ?? exPos.size ?? 0);
+          const side = rawAmt > 0 ? 'long' : rawAmt < 0 ? 'short' : null;
+          const contracts = Math.abs(rawAmt); // Absolute value AFTER determining side
           
-          if (!symbol || !side || Math.abs(contracts) <= 0) {
-            logger.debug(`[PositionSync] Skipping invalid position: symbol=${symbol}, side=${side}, contracts=${contracts}`);
+          if (!symbol || !side || contracts <= 0) {
+            logger.debug(`[PositionSync] Skipping invalid position: symbol=${symbol}, side=${side}, rawAmt=${rawAmt}, contracts=${contracts}`);
             continue; // Skip invalid positions
           }
 
@@ -174,9 +226,9 @@ export class PositionSync {
           // Try multiple key formats for matching
           const key1 = `${normalizedSymbol}_${side}`;
           const key2 = `${symbol}_${side}`;
-          const dbPos = dbPositionsMap.get(key1) || dbPositionsMap.get(key2);
+          const dbPosArray = dbPositionsMap.get(key1) || dbPositionsMap.get(key2) || [];
 
-          if (!dbPos) {
+          if (dbPosArray.length === 0) {
             // Position exists on exchange but not in database - try to find matching entry_order or strategy
             logger.info(`[PositionSync] Position ${normalizedSymbol} ${side} exists on exchange but not in database, attempting to create...`);
             try {
@@ -186,8 +238,12 @@ export class PositionSync {
               logger.error(`[PositionSync] Failed to create position ${normalizedSymbol} ${side}:`, createError?.message || createError);
             }
           } else {
-            // Position exists in both - verify consistency
-            await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
+            // Position exists in both - verify consistency for all matching positions
+            // Match all positions with same symbol+side (there can be multiple positions)
+            for (const dbPos of dbPosArray) {
+              matchedDbPositionIds.add(dbPos.id); // Mark as matched
+              await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
+            }
           }
           processedCount++;
         } catch (error) {
@@ -195,7 +251,73 @@ export class PositionSync {
         }
       }
       
-      logger.info(`[PositionSync] Processed ${processedCount} exchange positions for bot ${botId}, created ${createdCount} missing positions`);
+      // CRITICAL: Close positions that exist in DB but not on exchange
+      let closedCount = 0;
+      for (const dbPos of dbPositions) {
+        if (!matchedDbPositionIds.has(dbPos.id) && dbPos.status === 'open') {
+          // This position exists in DB but not on exchange - close it
+          try {
+            const { pool } = await import('../config/database.js');
+            // Try to acquire lock before updating
+            const [lockResult] = await pool.execute(
+              `UPDATE positions 
+               SET is_processing = 1 
+               WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
+               LIMIT 1`,
+              [dbPos.id]
+            );
+            
+            if (lockResult.affectedRows > 0) {
+              // Lock acquired, proceed with update
+              try {
+                logger.warn(
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, marking as closed`
+                );
+                await Position.update(dbPos.id, {
+                  status: 'closed',
+                  close_reason: 'sync_not_on_exchange',
+                  closed_at: new Date()
+                });
+                closedCount++;
+              } finally {
+                // Always release lock in finally block
+                try {
+                  await pool.execute(
+                    `UPDATE positions SET is_processing = 0 WHERE id = ?`,
+                    [dbPos.id]
+                  );
+                } catch (releaseError) {
+                  logger.debug(`[PositionSync] Could not release lock for position ${dbPos.id}: ${releaseError?.message || releaseError}`);
+                }
+              }
+            } else {
+              // Another process is handling this position, skip update
+              logger.debug(`[PositionSync] Position ${dbPos.id} is being processed by another instance, skipping close update`);
+            }
+          } catch (lockError) {
+            // If is_processing column doesn't exist, proceed without lock (backward compatibility)
+            logger.debug(`[PositionSync] Could not acquire lock for position ${dbPos.id}: ${lockError?.message || lockError}`);
+            try {
+              logger.warn(
+                `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, marking as closed`
+              );
+              await Position.update(dbPos.id, {
+                status: 'closed',
+                close_reason: 'sync_not_on_exchange',
+                closed_at: new Date()
+              });
+              closedCount++;
+            } catch (updateError) {
+              logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, updateError?.message || updateError);
+            }
+          }
+        }
+      }
+      
+      logger.info(
+        `[PositionSync] Processed ${processedCount} exchange positions for bot ${botId}, ` +
+        `created ${createdCount} missing positions, closed ${closedCount} orphan positions`
+      );
     } catch (error) {
       logger.error(`[PositionSync] Error syncing bot ${botId}:`, error?.message || error);
       throw error;
@@ -203,7 +325,23 @@ export class PositionSync {
   }
 
   /**
+   * Normalize symbol to consistent format (BTCUSDT everywhere)
+   * @param {string} symbol - Raw symbol
+   * @returns {string} Normalized symbol
+   */
+  normalizeSymbol(symbol) {
+    if (!symbol) return symbol;
+    let normalizedSymbol = String(symbol);
+    normalizedSymbol = normalizedSymbol.replace(/\/USDT:USDT$/, 'USDT'); // MEXC format
+    normalizedSymbol = normalizedSymbol.replace(/\/USDT$/, 'USDT'); // Standard format with slash
+    normalizedSymbol = normalizedSymbol.replace(/_USDT$/, 'USDT'); // Gate format
+    normalizedSymbol = normalizedSymbol.replace(/\//g, ''); // Remove any remaining slashes
+    return normalizedSymbol;
+  }
+
+  /**
    * Create Position record for position that exists on exchange but not in database
+   * Uses transaction with SELECT FOR UPDATE to prevent race conditions
    * @param {number} botId - Bot ID
    * @param {string} symbol - Symbol (normalized)
    * @param {string} side - 'long' or 'short'
@@ -211,23 +349,25 @@ export class PositionSync {
    * @param {ExchangeService} exchangeService - Exchange service instance
    */
   async createMissingPosition(botId, symbol, side, exPos, exchangeService) {
+    const connection = await pool.getConnection();
     try {
-      // SAFEGUARD: ensure we never create more than one open Position
-      // per (botId, normalized symbol, side). This prevents cases where
-      // the same net position on exchange is represented by many DB rows.
-      const normalizeSymbol = (sym) => {
-        if (!sym) return sym;
-        let normalizedSymbol = sym;
-        normalizedSymbol = normalizedSymbol.replace(/\/USDT:USDT$/, 'USDT');
-        normalizedSymbol = normalizedSymbol.replace(/\/USDT$/, 'USDT');
-        normalizedSymbol = normalizedSymbol.replace(/_USDT$/, 'USDT');
-        normalizedSymbol = normalizedSymbol.replace(/\//g, '');
-        return normalizedSymbol;
-      };
+      await connection.beginTransaction();
 
-      const normalizedSymbol = normalizeSymbol(symbol);
+      // CRITICAL: Normalize side parameter to ensure consistency (lowercase 'long' or 'short')
+      let normalizedSide = String(side || '').toLowerCase();
+      if (normalizedSide !== 'long' && normalizedSide !== 'short') {
+        logger.error(`[PositionSync] Invalid side parameter: ${JSON.stringify(side)}, must be 'long' or 'short'`);
+        await connection.rollback();
+        return false;
+      }
+      side = normalizedSide; // Use normalized side
 
-      const [existing] = await pool.execute(
+      // Normalize symbol to ensure consistency
+      const normalizedSymbol = this.normalizeSymbol(symbol);
+
+      // SAFEGUARD: Check for existing position with SELECT FOR UPDATE to prevent race conditions
+      // This locks the rows and prevents concurrent creation
+      const [existing] = await connection.execute(
         `SELECT p.id, p.symbol, p.side
          FROM positions p
          JOIN strategies s ON p.strategy_id = s.id
@@ -240,7 +380,8 @@ export class PositionSync {
              s.symbol = ? OR 
              s.symbol = ?
            )
-         LIMIT 1`,
+         LIMIT 1
+         FOR UPDATE`,
         [
           botId,
           side,
@@ -252,6 +393,7 @@ export class PositionSync {
       );
 
       if (existing.length > 0) {
+        await connection.rollback();
         logger.info(
           `[PositionSync] Skip creating duplicate Position for ${normalizedSymbol} ${side} on bot ${botId} ` +
           `(found existing position id=${existing[0].id}, symbol=${existing[0].symbol})`
@@ -259,12 +401,13 @@ export class PositionSync {
         return false;
       }
 
-      // Try to find matching entry_order first
-      const [entryOrders] = await pool.execute(
+      // Try to find matching entry_order first (use normalized symbol for consistency)
+      const [entryOrders] = await connection.execute(
         `SELECT * FROM entry_orders 
-         WHERE bot_id = ? AND symbol = ? AND side = ? AND status = 'open'
+         WHERE bot_id = ? AND side = ? AND status = 'open'
+           AND (symbol = ? OR symbol = ? OR symbol = ?)
          ORDER BY created_at DESC LIMIT 1`,
-        [botId, symbol, side]
+        [botId, side, normalizedSymbol, `${normalizedSymbol}/USDT`, symbol]
       );
 
       if (entryOrders.length > 0) {
@@ -282,58 +425,44 @@ export class PositionSync {
           // Use entry_order data to create Position
           const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
           const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || entry.entry_price || 0);
-          const tpPrice = calculateTakeProfit(entryPrice, strategy.oc, strategy.take_profit, side);
+          const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit, side);
           const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
           const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
           const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
           
-          // Check concurrency
-          // Concurrency management removed
-          const reservationToken = entry.reservation_token 
-            ? entry.reservation_token 
-            : 'disabled'; // Concurrency disabled
+          // Use normalized symbol for consistency
+          const position = await Position.create({
+            strategy_id: entry.strategy_id,
+            bot_id: botId,
+            order_id: entry.order_id,
+            symbol: normalizedSymbol, // Use normalized symbol
+            side: side,
+            entry_price: entryPrice,
+            amount: entry.amount,
+            take_profit_price: tpPrice,
+            stop_loss_price: slPrice,
+            current_reduce: strategy.reduce
+          });
           
-          if (!reservationToken) {
-            const status = await concurrencyManager.getStatus(botId);
-            logger.warn(`[PositionSync] Cannot create Position from entry_order ${entry.id}: limit reached (${status.currentCount}/${status.maxConcurrent})`);
-            return false;
-          }
+          await EntryOrder.markFilled(entry.id);
+          await connection.commit();
           
-          try {
-            const position = await Position.create({
-              strategy_id: entry.strategy_id,
-              bot_id: botId,
-              order_id: entry.order_id,
-              symbol: entry.symbol,
-              side: side,
-              entry_price: entryPrice,
-              amount: entry.amount,
-              take_profit_price: tpPrice,
-              stop_loss_price: slPrice,
-              current_reduce: strategy.reduce
-            });
-            
-            await EntryOrder.markFilled(entry.id);
-            // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
-            
-            logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${symbol} ${side}`);
-            return true;
-          } catch (posError) {
-            // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
-            throw posError;
-          }
+          logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${normalizedSymbol} ${side}`);
+          return true;
         } catch (error) {
+          await connection.rollback();
           logger.error(`[PositionSync] Error creating Position from entry_order ${entry.id}:`, error?.message || error);
           return false;
         }
       }
 
-      // Try to find matching strategy
-      const [strategies] = await pool.execute(
+      // Try to find matching strategy (use normalized symbol for consistency)
+      const [strategies] = await connection.execute(
         `SELECT * FROM strategies 
-         WHERE bot_id = ? AND symbol = ? AND is_active = TRUE
+         WHERE bot_id = ? AND is_active = TRUE
+           AND (symbol = ? OR symbol = ? OR symbol = ?)
          ORDER BY created_at DESC LIMIT 1`,
-        [botId, symbol]
+        [botId, normalizedSymbol, `${normalizedSymbol}/USDT`, symbol]
       );
 
       if (strategies.length === 0) {
@@ -344,89 +473,162 @@ export class PositionSync {
       const strategy = strategies[0];
 
       // Get position details from exchange
+      // CRITICAL: Parse raw amount first to determine side correctly
+      const rawAmt = parseFloat(exPos.positionAmt ?? exPos.contracts ?? 0);
+      const contracts = Math.abs(rawAmt);
+      
+      // CRITICAL FIX: Verify side matches rawAmt to prevent side mismatch bugs
+      const verifiedSide = rawAmt > 0 ? 'long' : rawAmt < 0 ? 'short' : null;
+      if (verifiedSide && verifiedSide !== side) {
+        logger.error(
+          `[PositionSync] ⚠️ SIDE MISMATCH when creating position for ${symbol}: ` +
+          `Parameter side=${side}, but rawAmt=${rawAmt} indicates side=${verifiedSide}. ` +
+          `Using verified side from rawAmt to prevent incorrect position creation.`
+        );
+        // Use verified side from rawAmt instead of parameter
+        // This prevents creating position with wrong side if parameter was incorrect
+        side = verifiedSide;
+      }
+      
       const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || 0);
-      const contracts = exPos.contracts ?? Math.abs(parseFloat(exPos.positionAmt || 0));
       const markPrice = parseFloat(exPos.markPrice || exPos.info?.markPrice || entryPrice || 0);
       
       // Calculate amount in USDT (approximate)
-      const amount = Math.abs(contracts * markPrice);
+      const amount = contracts * markPrice;
 
       // Calculate TP/SL
       const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
-      const tpPrice = calculateTakeProfit(entryPrice || markPrice, strategy.oc, strategy.take_profit, side);
+      const tpPrice = calculateTakeProfit(entryPrice || markPrice, strategy.take_profit, side);
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
       const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice || markPrice, rawStoploss, side) : null;
 
-      // Check concurrency limit before creating
-      const { concurrencyManager } = await import('../services/ConcurrencyManager.js');
-      // const canAccept = await concurrencyManager.canAcceptNewPosition(botId);
-      const canAccept = true; // Concurrency disabled
-      if (!canAccept) {
-        const status = await concurrencyManager.getStatus(botId);
-        logger.warn(`[PositionSync] Cannot create Position for ${symbol} ${side}: max concurrent limit reached (${status.currentCount}/${status.maxConcurrent})`);
-        return false;
-      }
+      // Create Position record with normalized symbol
+      // Use timestamp + symbol + side for order_id to make it traceable
+      const position = await Position.create({
+        strategy_id: strategy.id,
+        bot_id: botId,
+        order_id: `sync_${normalizedSymbol}_${side}_${Date.now()}`, // Traceable order_id
+        symbol: normalizedSymbol, // Use normalized symbol for consistency
+        side: side,
+        entry_price: entryPrice || markPrice,
+        amount: amount,
+        take_profit_price: tpPrice,
+        stop_loss_price: slPrice,
+        current_reduce: strategy.reduce
+      });
 
-      // Reserve slot
-      // const reservationToken = await concurrencyManager.reserveSlot(botId);
-      const reservationToken = 'disabled'; // Concurrency disabled
-      if (!reservationToken) {
-        const status = await concurrencyManager.getStatus(botId);
-        logger.warn(`[PositionSync] Failed to reserve slot for ${symbol} ${side}: limit reached (${status.currentCount}/${status.maxConcurrent})`);
-        return false;
-      }
-
-      try {
-        // Create Position record
-        const position = await Position.create({
-          strategy_id: strategy.id,
-          bot_id: botId,
-          order_id: `sync_${Date.now()}`, // Placeholder order_id
-          symbol: symbol,
-          side: side,
-          entry_price: entryPrice || markPrice,
-          amount: amount,
-          take_profit_price: tpPrice,
-          stop_loss_price: slPrice,
-          current_reduce: strategy.reduce
-        });
-
-        // Finalize reservation
-        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'released');
-
-        logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${symbol} ${side} on bot ${botId} (synced from exchange)`);
-        return true;
-      } catch (error) {
-        // Cancel reservation if Position creation failed
-        // await concurrencyManager.finalizeReservation(botId, reservationToken, 'cancelled');
-        logger.error(`[PositionSync] Failed to create Position for ${symbol} ${side}:`, error?.message || error);
-        throw error;
-      }
+      await connection.commit();
+      logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} (synced from exchange)`);
+      return true;
     } catch (error) {
+      await connection.rollback();
       logger.error(`[PositionSync] Error creating missing position for ${symbol} ${side}:`, error?.message || error);
       return false;
+    } finally {
+      connection.release();
     }
   }
 
   /**
    * Verify consistency between database and exchange position
+   * Checks: contracts (closed), size mismatch, side mismatch, entry price mismatch
    * @param {Object} dbPos - Database position
    * @param {Object} exPos - Exchange position
    * @param {ExchangeService} exchangeService - Exchange service instance
    */
   async verifyPositionConsistency(dbPos, exPos, exchangeService) {
     try {
-      const contracts = exPos.contracts ?? Math.abs(parseFloat(exPos.positionAmt || 0));
+      // Parse raw amount first to determine side correctly
+      const rawAmt = parseFloat(exPos.positionAmt ?? exPos.contracts ?? 0);
+      const contracts = Math.abs(rawAmt);
+      const exSide = rawAmt > 0 ? 'long' : rawAmt < 0 ? 'short' : null;
       
-      // If exchange position is closed (contracts = 0) but DB position is open, mark as closed
-      if (Math.abs(contracts) <= 0 && dbPos.status === 'open') {
-        logger.warn(`[PositionSync] Position ${dbPos.id} is open in DB but closed on exchange, marking as closed`);
-        await Position.update(dbPos.id, {
-          status: 'closed',
-          close_reason: 'sync_exchange_closed',
-          closed_at: new Date()
-        });
+      // 1. Check if exchange position is closed (contracts = 0) but DB position is open
+      // CRITICAL FIX: Use soft lock to prevent race condition with PositionMonitor
+      if (contracts <= 0 && dbPos.status === 'open') {
+        try {
+          const { pool } = await import('../config/database.js');
+          // Try to acquire lock before updating
+          const [lockResult] = await pool.execute(
+            `UPDATE positions 
+             SET is_processing = 1 
+             WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
+             LIMIT 1`,
+            [dbPos.id]
+          );
+          
+          if (lockResult.affectedRows > 0) {
+            // Lock acquired, proceed with update
+            try {
+              logger.warn(`[PositionSync] Position ${dbPos.id} is open in DB but closed on exchange, marking as closed`);
+              await Position.update(dbPos.id, {
+                status: 'closed',
+                close_reason: 'sync_exchange_closed',
+                closed_at: new Date()
+              });
+            } finally {
+              // Always release lock in finally block
+              try {
+                await pool.execute(
+                  `UPDATE positions SET is_processing = 0 WHERE id = ?`,
+                  [dbPos.id]
+                );
+              } catch (releaseError) {
+                logger.debug(`[PositionSync] Could not release lock for position ${dbPos.id}: ${releaseError?.message || releaseError}`);
+              }
+            }
+          } else {
+            // Another process is handling this position, skip update
+            logger.debug(`[PositionSync] Position ${dbPos.id} is being processed by another instance, skipping close update`);
+          }
+        } catch (lockError) {
+          // If is_processing column doesn't exist, proceed without lock (backward compatibility)
+          logger.debug(`[PositionSync] Could not acquire lock for position ${dbPos.id}: ${lockError?.message || lockError}`);
+          await Position.update(dbPos.id, {
+            status: 'closed',
+            close_reason: 'sync_exchange_closed',
+            closed_at: new Date()
+          });
+        }
+        return;
+      }
+
+      // 2. Check side mismatch (CRITICAL)
+      if (exSide && exSide !== dbPos.side) {
+        logger.error(
+          `[PositionSync] ⚠️ SIDE MISMATCH for position ${dbPos.id}: ` +
+          `DB=${dbPos.side}, Exchange=${exSide}, symbol=${dbPos.symbol}. ` +
+          `This is a critical error - position side is incorrect!`
+        );
+        // Don't auto-fix side mismatch - requires manual intervention
+        return;
+      }
+
+      // 3. Check size mismatch (warn if significant difference)
+      const dbAmount = parseFloat(dbPos.amount || 0);
+      const exAmount = contracts * parseFloat(exPos.markPrice || exPos.info?.markPrice || dbPos.entry_price || 0);
+      const sizeDiffPercent = dbAmount > 0 ? Math.abs((exAmount - dbAmount) / dbAmount) * 100 : 0;
+      
+      if (sizeDiffPercent > 10) { // More than 10% difference
+        logger.warn(
+          `[PositionSync] Size mismatch for position ${dbPos.id}: ` +
+          `DB=${dbAmount.toFixed(2)}, Exchange=${exAmount.toFixed(2)}, diff=${sizeDiffPercent.toFixed(2)}%`
+        );
+      }
+
+      // 4. Check entry price mismatch (warn if significant difference)
+      const exEntryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || 0);
+      const dbEntryPrice = parseFloat(dbPos.entry_price || 0);
+      
+      if (exEntryPrice > 0 && dbEntryPrice > 0) {
+        const priceDiffPercent = Math.abs((exEntryPrice - dbEntryPrice) / dbEntryPrice) * 100;
+        if (priceDiffPercent > 5) { // More than 5% difference
+          logger.warn(
+            `[PositionSync] Entry price mismatch for position ${dbPos.id}: ` +
+            `DB=${dbEntryPrice}, Exchange=${exEntryPrice}, diff=${priceDiffPercent.toFixed(2)}%`
+          );
+        }
       }
     } catch (error) {
       logger.warn(`[PositionSync] Error verifying position ${dbPos.id}:`, error?.message || error);

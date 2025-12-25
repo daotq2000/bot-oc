@@ -309,34 +309,71 @@ export class PriceAlertScanner {
 
   /**
    * Get price for a symbol (with caching)
+   * Priority: WebSocket > ExchangeService > null
    */
   async getPrice(exchange, symbol) {
     try {
       const cacheKey = `${exchange}_${symbol}`;
       const now = Date.now();
       const cacheTime = this.priceCacheTime.get(cacheKey) || 0;
-      const cacheDuration = 2000; // 2 seconds cache
+      const cacheDuration = 500; // Reduced from 2000ms to 500ms for better realtime tracking
 
       // Return cached price if still valid
       if (now - cacheTime < cacheDuration) {
         return this.priceCache.get(cacheKey);
       }
 
-      // Fetch fresh price
-      const exchangeService = this.exchangeServices.get(exchange);
-      if (!exchangeService) {
-        return null;
+      let price = null;
+
+      // Priority 1: Try WebSocket first (realtime, no API calls)
+      if (exchange === 'binance') {
+        const { webSocketManager } = await import('../services/WebSocketManager.js');
+        const wsPrice = webSocketManager.getPrice(symbol);
+        if (Number.isFinite(Number(wsPrice)) && wsPrice > 0) {
+          price = Number(wsPrice);
+        }
+      } else if (exchange === 'mexc') {
+        const { mexcPriceWs } = await import('../services/MexcWebSocketManager.js');
+        const wsPrice = mexcPriceWs.getPrice(symbol);
+        if (Number.isFinite(Number(wsPrice)) && wsPrice > 0) {
+          price = Number(wsPrice);
+        }
       }
 
-      const price = await exchangeService.getTickerPrice(symbol);
-      
-      // Cache the price
+      // Priority 2: Fallback to ExchangeService (REST API) if WebSocket has no price
+      if (!price || !Number.isFinite(price)) {
+      const exchangeService = this.exchangeServices.get(exchange);
+        if (exchangeService) {
+          try {
+            price = await exchangeService.getTickerPrice(symbol);
+          } catch (e) {
+            logger.debug(`[PriceAlertScanner] ExchangeService.getTickerPrice failed for ${exchange} ${symbol}: ${e?.message || e}`);
+          }
+        }
+      }
+
+      // Cache the price (even if null, to avoid excessive calls)
+      if (Number.isFinite(Number(price)) && price > 0) {
       this.priceCache.set(cacheKey, price);
       this.priceCacheTime.set(cacheKey, now);
-
       return price;
+      }
+
+      // Return cached price if available (even if expired, better than null)
+      const cachedPrice = this.priceCache.get(cacheKey);
+      if (Number.isFinite(Number(cachedPrice)) && cachedPrice > 0) {
+        return cachedPrice;
+      }
+
+      return null;
     } catch (error) {
-      logger.warn(`Failed to get price for ${symbol} on ${exchange}:`, error.message);
+      logger.warn(`[PriceAlertScanner] Failed to get price for ${symbol} on ${exchange}:`, error.message);
+      // Return cached price as fallback
+      const cacheKey = `${exchange}_${symbol}`;
+      const cachedPrice = this.priceCache.get(cacheKey);
+      if (Number.isFinite(Number(cachedPrice)) && cachedPrice > 0) {
+        return cachedPrice;
+      }
       return null;
     }
   }
@@ -363,18 +400,21 @@ export class PriceAlertScanner {
       // Use compact line format via TelegramService
       const ocAbs = Math.abs(ocPercent);
       logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
-      await this.telegramService.sendVolatilityAlert(telegramChatId, {
-        symbol,
-        interval: interval || '1m',
-        oc: ocPercent,
-        open: openPrice,
-        currentPrice,
-        direction
-      }).catch((error) => {
-        logger.error(`[PriceAlertScanner] Failed to send alert to chat_id=${telegramChatId}:`, error?.message || error);
-      });
-
-      logger.info(`[PriceAlertScanner] ✅ Alert sent: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
+      
+      try {
+        await this.telegramService.sendVolatilityAlert(telegramChatId, {
+          symbol,
+          interval: interval || '1m',
+          oc: ocPercent,
+          open: openPrice,
+          currentPrice,
+          direction
+        });
+        // Note: Actual send happens asynchronously in queue, check logs for "Successfully sent message"
+        logger.info(`[PriceAlertScanner] ✅ Alert queued: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
+      } catch (error) {
+        logger.error(`[PriceAlertScanner] ❌ Failed to send alert to chat_id=${telegramChatId}:`, error?.message || error);
+      }
     } catch (error) {
       logger.error(`Failed to send price alert for ${symbol}:`, error);
     }

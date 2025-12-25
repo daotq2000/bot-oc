@@ -20,12 +20,29 @@ export class PositionService {
    * @returns {Promise<Object>} Updated position with close info if triggered
    */
   async updatePosition(position) {
+    // Cache closable quantity for this update cycle to avoid multiple API calls
+    let cachedClosableQty = null;
+    const getCachedClosableQty = async () => {
+      if (cachedClosableQty === null) {
+        try {
+          cachedClosableQty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+        } catch (e) {
+          logger.debug(`[PositionService] Failed to get closable quantity: ${e?.message || e}`);
+          cachedClosableQty = 0;
+        }
+      }
+      return cachedClosableQty;
+    };
+
     try {
       // PRIORITY CHECK 1: Check order status from WebSocket cache (no REST API call)
       // This detects when TP/SL orders are filled via WebSocket ORDER_TRADE_UPDATE events
       if (position.tp_order_id) {
-        const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id);
-        if (cachedTpStatus && (cachedTpStatus.status === 'closed' || cachedTpStatus.status === 'FILLED')) {
+        // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
+        const exchange = this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance';
+        const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id, exchange);
+        // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
+        if (cachedTpStatus && cachedTpStatus.status === 'closed') {
           // TP order has been filled - position is already closed on exchange
           logger.info(`[TP/SL Check] TP order ${position.tp_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
           
@@ -46,8 +63,11 @@ export class PositionService {
       }
 
       if (position.sl_order_id) {
-        const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id);
-        if (cachedSlStatus && (cachedSlStatus.status === 'closed' || cachedSlStatus.status === 'FILLED')) {
+        // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
+        const exchange = this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance';
+        const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
+        // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
+        if (cachedSlStatus && cachedSlStatus.status === 'closed') {
           // SL order has been filled - position is already closed on exchange
           logger.info(`[TP/SL Check] SL order ${position.sl_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
           
@@ -77,9 +97,13 @@ export class PositionService {
           // Check cache first, then fallback to REST API only if cache miss
           let closeReason = 'closed_on_exchange';
           
+          // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
+          const exchange = this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance';
+          
           if (position.tp_order_id) {
-            const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id);
-            if (cachedTpStatus?.status === 'closed' || cachedTpStatus?.status === 'FILLED') {
+            const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id, exchange);
+            // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
+            if (cachedTpStatus?.status === 'closed') {
               closeReason = 'tp_hit';
             } else {
               // Fallback to REST API only if cache miss
@@ -93,7 +117,7 @@ export class PositionService {
                     filled: tpOrderStatus.filled || 0,
                     avgPrice: tpOrderStatus.raw?.avgPrice || null,
                     symbol: position.symbol
-                  });
+                  }, exchange);
                 }
               } catch (e) {
                 logger.debug(`[TP/SL Check] Failed to check TP order via REST API: ${e?.message || e}`);
@@ -102,8 +126,9 @@ export class PositionService {
           }
           
           if (position.sl_order_id && closeReason !== 'tp_hit') {
-            const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id);
-            if (cachedSlStatus?.status === 'closed' || cachedSlStatus?.status === 'FILLED') {
+            const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
+            // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
+            if (cachedSlStatus?.status === 'closed') {
               closeReason = 'sl_hit';
             } else {
               // Fallback to REST API only if cache miss
@@ -117,7 +142,7 @@ export class PositionService {
                     filled: slOrderStatus.filled || 0,
                     avgPrice: slOrderStatus.raw?.avgPrice || null,
                     symbol: position.symbol
-                  });
+                  }, exchange);
                 }
               } catch (e) {
                 logger.debug(`[TP/SL Check] Failed to check SL order via REST API: ${e?.message || e}`);
@@ -230,6 +255,16 @@ export class PositionService {
         const minutesToProcess = Math.min(actualMinutesElapsed - prevMinutes, 1); // Only process 1 minute at a time
         actualMinutesElapsed = prevMinutes + minutesToProcess; // Use incremental value
         
+        // WARN if downtime detected (more than 5 minutes skipped)
+        if (actualMinutesElapsed - prevMinutes > 5) {
+          logger.warn(
+            `[TP Trail] ⚠️ Downtime detected for position ${position.id}: ` +
+            `prevMinutes=${prevMinutes}, actualMinutes=${Math.floor((now - openedAt) / (60 * 1000))}, ` +
+            `skipped=${Math.floor((now - openedAt) / (60 * 1000)) - prevMinutes} minutes. ` +
+            `Processing only 1 minute to prevent large TP jumps.`
+          );
+        }
+        
         logger.debug(`[TP Trail] pos=${position.id} Proceeding with TP trail: actualMinutes=${Math.floor((now - openedAt) / (60 * 1000))} > prevMinutes=${prevMinutes}, processing ${minutesToProcess} minute(s), targetMinutes=${actualMinutesElapsed}`);
       } else {
         // Fallback: increment-based calculation
@@ -241,7 +276,7 @@ export class PositionService {
       const prevSL = Number(position.stop_loss_price || 0);
       let updatedSL = null;
       if (prevSL <= 0) {
-        updatedSL = this.calculateUpdatedStopLoss(position);
+        updatedSL = await this.calculateUpdatedStopLoss(position);
         if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0) {
           await Position.update(position.id, { stop_loss_price: updatedSL });
           logger.debug(`[TP Trail] Set initial SL for position ${position.id}: ${updatedSL}`);
@@ -280,7 +315,7 @@ export class PositionService {
               
               if (entryPriceForTP > 0 && takeProfit > 0) {
                 // Calculate initial TP from strategy (same calculation as placeTpSlOrders)
-                initialTP = calculateTakeProfit(entryPriceForTP, oc, takeProfit, position.side);
+                initialTP = calculateTakeProfit(entryPriceForTP, takeProfit, position.side);
                 // Save it to DB for future use
                 await Position.update(position.id, { initial_tp_price: initialTP });
                 logger.debug(`[TP Trail] Calculated and saved initial TP: ${initialTP.toFixed(2)} (entry=${entryPriceForTP}, take_profit=${takeProfit})`);
@@ -297,7 +332,8 @@ export class PositionService {
             const trailingPercent = position.side === 'long' ? upReduce : reduce;
             
             // Calculate next TP: trails from initial TP towards entry
-            const newTP = calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, trailingPercent, position.side);
+            // Trailing is TIME-BASED ONLY (not price-based) for predictable behavior
+            const newTP = calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, trailingPercent, position.side, minutesElapsed);
             
             logger.debug(
               `[TP Trail] pos=${position.id} ${position.symbol} side=${position.side} ` +
@@ -316,16 +352,16 @@ export class PositionService {
               
               logger.debug(`[TP Trail] TP ${newTP.toFixed(2)} crossed entry ${entryPrice.toFixed(2)} for ${position.side} position ${position.id}. Distance from market: ${distancePercent.toFixed(3)}%`);
               
-              if (distancePercent <= 0.5) {
+              // Configurable threshold for market close (default 0.5%)
+              const marketCloseThreshold = Number(configService.getNumber('TRAILING_MARKET_CLOSE_THRESHOLD', 0.5));
+              
+              if (distancePercent <= marketCloseThreshold) {
                 // Too close to market - close position immediately
-                logger.warn(`[TP Trail] TP too close to market (${distancePercent.toFixed(3)}% <= 0.5%). Closing position ${position.id} by MARKET order.`);
+                logger.warn(`[TP Trail] TP too close to market (${distancePercent.toFixed(3)}% <= ${marketCloseThreshold}%). Closing position ${position.id} by MARKET order.`);
                 try {
-                  const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+                  const qty = await getCachedClosableQty();
                   if (qty > 0) {
-                    const qtyToClose = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
-                    if (qtyToClose > 0) {
-                      await this.exchangeService.closePosition(position.symbol, position.side, qtyToClose);
-                    }
+                    await this.exchangeService.closePosition(position.symbol, position.side, qty);
                     await this.closePosition(position, marketPrice, pnl, 'trailing_exit');
                     logger.debug(`[TP Trail] Closed position ${position.id} by MARKET order (TP too close to market)`);
                     return await Position.findById(position.id);
@@ -341,52 +377,93 @@ export class PositionService {
               // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
               // Try to replace TP order, but continue even if it fails
               try {
-                await this._maybeReplaceTpOrder(position, prevTP, newTP);
+                await this._maybeReplaceTpOrder(position, prevTP, newTP, getCachedClosableQty);
               } catch (replaceError) {
                 logger.warn(`[TP Trail] Failed to replace TP order for position ${position.id}: ${replaceError?.message || replaceError}. Continuing with TP price update.`);
               }
               
-              // Always update take_profit_price and minutes_elapsed in DB
+              // Always update take_profit_price in DB (minutes_elapsed will be updated at the end)
               // This ensures trailing TP works even if order replacement fails
               await Position.update(position.id, { 
-                take_profit_price: newTP,
-                minutes_elapsed: actualMinutesElapsed
+                take_profit_price: newTP
+                // NOTE: minutes_elapsed will be updated in final updatePayload below to avoid double update
               });
-              logger.debug(`[TP Trail] ✅ Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)} (prev=${prevTP.toFixed(2)}), minutes_elapsed=${actualMinutesElapsed}`);
+              logger.debug(`[TP Trail] ✅ Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)} (prev=${prevTP.toFixed(2)})`);
             }
           }
         } catch (e) {
           logger.warn(`[TP Trail] Error processing TP trail: ${e?.message || e}`);
         }
         
-        // Update minutes_elapsed even if TP trail was skipped
-        await Position.update(position.id, { minutes_elapsed: actualMinutesElapsed });
+        // NOTE: minutes_elapsed is updated in final updatePayload below (not here) to avoid double update
 
       // Calculate current_reduce and clamp to prevent overflow (computed above)
       // Re-use clampedReduce computed from reduce + actualMinutesElapsed * up_reduce
 
       // Update position
-      // Calculate current_reduce for tracking (not used for trailing anymore, but kept for compatibility)
+      // Calculate current_reduce for tracking (deprecated: kept for backward compatibility only, not used for trailing)
       const currentReduce = Number(position.reduce || 0) + (actualMinutesElapsed * Number(position.up_reduce || 0));
       const clampedReduce = Math.min(Math.max(currentReduce, 0), 999999.99);
       
-      const updatePayload = {
-        pnl: pnl,
-        current_reduce: clampedReduce,
-        minutes_elapsed: actualMinutesElapsed
-      };
+      // SINGLE UPDATE: Consolidate all updates into one payload to avoid race conditions and double writes
+      // CRITICAL FIX: Use soft lock to prevent race condition with PositionSync
+      let lockAcquired = false;
+      try {
+        const { pool } = await import('../config/database.js');
+        // Try to acquire lock before updating
+        const [lockResult] = await pool.execute(
+          `UPDATE positions 
+           SET is_processing = 1 
+           WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
+           LIMIT 1`,
+          [position.id]
+        );
+        lockAcquired = lockResult.affectedRows > 0;
+        
+        if (!lockAcquired) {
+          // Another process is handling this position, skip update
+          logger.debug(`[PositionService] Position ${position.id} is being processed by another instance, skipping update`);
+          return position; // Return original position without changes
+        }
+      } catch (lockError) {
+        // If is_processing column doesn't exist, proceed without lock (backward compatibility)
+        logger.debug(`[PositionService] Could not acquire lock for position ${position.id}: ${lockError?.message || lockError}`);
+        lockAcquired = true; // Proceed with update
+      }
       
-      // Only update stop_loss_price if SL was calculated (initial SL setup)
-      if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0) {
-        const prevSL = Number(position.stop_loss_price || 0);
-        // Only update if SL changed (initial setup) or doesn't exist
-        if (prevSL <= 0 || Math.abs(updatedSL - prevSL) > 0.0001) {
-          updatePayload.stop_loss_price = updatedSL;
+      try {
+        const updatePayload = {
+          pnl: pnl,
+          current_reduce: clampedReduce,
+          minutes_elapsed: actualMinutesElapsed // Update minutes_elapsed here (only once)
+          // Note: is_processing lock is released in finally block, not here
+        };
+        
+        // Only update stop_loss_price if SL was calculated (initial SL setup)
+        if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0) {
+          const prevSL = Number(position.stop_loss_price || 0);
+          // Only update if SL changed (initial setup) or doesn't exist
+          if (prevSL <= 0 || Math.abs(updatedSL - prevSL) > 0.0001) {
+            updatePayload.stop_loss_price = updatedSL;
+          }
+        }
+        
+        const updated = await Position.update(position.id, updatePayload);
+        return updated;
+      } finally {
+        // Always release lock if acquired
+        if (lockAcquired) {
+          try {
+            const { pool } = await import('../config/database.js');
+            await pool.execute(
+              `UPDATE positions SET is_processing = 0 WHERE id = ?`,
+              [position.id]
+            );
+          } catch (releaseError) {
+            logger.debug(`[PositionService] Could not release lock for position ${position.id}: ${releaseError?.message || releaseError}`);
+          }
         }
       }
-      const updated = await Position.update(position.id, updatePayload);
-
-      return updated;
     } catch (error) {
       logger.error(`Failed to update position ${position.id}:`, error);
       throw error;
@@ -440,31 +517,54 @@ export class PositionService {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
               }
               
-              const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+              const qty = getCachedClosableQty ? await getCachedClosableQty() : await this.exchangeService.getClosableQuantity(position.symbol, position.side);
               if (qty > 0) {
-                // Only create TP order if TP is on the correct side of Entry
+                // CRITICAL FIX: Allow TP to cross entry for SHORT positions (early loss-cutting)
+                // For SHORT: TP can be above entry (loss zone) to enable early exit when price moves against position
+                // For LONG: TP should be above entry (profit zone) - no change
                 const entryPrice = Number(position.entry_price || 0);
-                const isValidTP = Number.isFinite(entryPrice) && entryPrice > 0 &&
-                  ((position.side === 'short' && newTP <= entryPrice) || 
-                   (position.side === 'long' && newTP >= entryPrice));
+                let isValidTP = true;
+                
+                if (Number.isFinite(entryPrice) && entryPrice > 0) {
+                  if (position.side === 'long') {
+                    // LONG: TP must be >= entry (profit zone)
+                    isValidTP = newTP >= entryPrice;
+                  } else {
+                    // SHORT: TP can be <= entry (profit zone) OR > entry (loss zone for early exit)
+                    // No validation needed - allow TP to trail above entry for early loss-cutting
+                    isValidTP = true;
+                  }
+                }
                 
                 if (isValidTP) {
                   try {
+                    // Debug logging to verify position.side is correct
+                    logger.debug(`[TP Replace] Creating TP order: position.id=${position.id}, position.side=${position.side}, symbol=${position.symbol}, newTP=${newTP.toFixed(8)}, entryPrice=${entryPrice.toFixed(8)}`);
+                    if (position.side !== 'long' && position.side !== 'short') {
+                      logger.error(`[TP Replace] ⚠️ Invalid position.side value: ${position.side} for position ${position.id}. Expected 'long' or 'short'.`);
+                    }
                     const tpRes = await this.exchangeService.createTakeProfitLimit(position.symbol, position.side, newTP, qty);
                     const newTpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
-                    const updatePayload = { take_profit_price: newTP };
+                    const updatePayload = { 
+                      take_profit_price: newTP,
+                      tp_synced: newTpOrderId ? true : false // Track if TP order was successfully placed
+                    };
                     if (newTpOrderId) updatePayload.tp_order_id = newTpOrderId;
                     await Position.update(position.id, updatePayload);
-                    logger.debug(`[TP Replace] ✅ Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id}`);
+                    logger.debug(`[TP Replace] ✅ Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id} (tp_synced=${updatePayload.tp_synced})`);
                   } catch (tpError) {
                     // If TP order creation fails, still update take_profit_price in DB
                     // This allows trailing TP to continue working even if orders can't be placed
-                    logger.warn(`[TP Replace] ⚠️ Failed to place TP order @ ${newTP} for position ${position.id}: ${tpError?.message || tpError}. Updating TP price in DB only.`);
-                    await Position.update(position.id, { take_profit_price: newTP });
-                    logger.debug(`[TP Replace] Updated TP price in DB to ${newTP} for position ${position.id} (order not placed)`);
+                    // Mark as not synced so PositionMonitor can retry later
+                    logger.warn(`[TP Replace] ⚠️ Failed to place TP order @ ${newTP} for position ${position.id}: ${tpError?.message || tpError}. Updating TP price in DB only (tp_synced=false).`);
+                    await Position.update(position.id, { 
+                      take_profit_price: newTP,
+                      tp_synced: false // Mark as not synced for retry
+                    });
+                    logger.debug(`[TP Replace] Updated TP price in DB to ${newTP} for position ${position.id} (order not placed, will retry)`);
                   }
                 } else {
-                  logger.debug(`[TP Replace] TP ${newTP} is on wrong side of Entry ${entryPrice}, skipping TP order creation (will be handled by SL conversion)`);
+                  logger.debug(`[TP Replace] TP ${newTP} is invalid for LONG position (must be >= entry ${entryPrice}), skipping TP order creation (will be handled by SL conversion)`);
                 }
               } else {
                 logger.warn(`[TP Replace] Skip placing new TP, qty=${qty}`);
@@ -517,7 +617,7 @@ export class PositionService {
    * @param {Object} position - Position object
    * @returns {number} Updated stop loss price
    */
-  calculateUpdatedStopLoss(position) {
+  async calculateUpdatedStopLoss(position) {
     const prevSL = Number(position.stop_loss_price || 0);
     const entry = Number(position.entry_price || 0);
     
@@ -526,8 +626,29 @@ export class PositionService {
     // NEW LOGIC: SL should NOT be moved after initial setup
     // Only calculate initial SL if it doesn't exist yet
     if (!Number.isFinite(prevSL) || prevSL <= 0) {
-      // Get stoploss from strategy (position may have it from JOIN)
-      const stoploss = position.stoploss !== undefined ? position.stoploss : null;
+      // CRITICAL FIX: Get stoploss from Strategy, not from position (position doesn't have stoploss field)
+      // Try multiple sources in order of preference:
+      // 1. Strategy.stoploss (from JOIN or explicit fetch)
+      // 2. position.strategy_stoploss (if JOIN included it)
+      // 3. Fetch Strategy explicitly if not available
+      let stoploss = null;
+      
+      if (position.strategy?.stoploss !== undefined) {
+        stoploss = Number(position.strategy.stoploss);
+      } else if (position.strategy_stoploss !== undefined) {
+        stoploss = Number(position.strategy_stoploss);
+      } else {
+        // Fallback: fetch Strategy explicitly
+        try {
+          const { Strategy } = await import('../models/Strategy.js');
+          const strategy = await Strategy.findById(position.strategy_id);
+          if (strategy && strategy.stoploss !== undefined) {
+            stoploss = Number(strategy.stoploss);
+          }
+        } catch (e) {
+          logger.warn(`[calculateUpdatedStopLoss] Failed to fetch Strategy ${position.strategy_id} for position ${position.id}: ${e?.message || e}`);
+        }
+      }
       
       if (!Number.isFinite(entry) || entry <= 0) {
         logger.warn(`[calculateUpdatedStopLoss] Invalid entry price: ${entry}, cannot calculate initial SL`);

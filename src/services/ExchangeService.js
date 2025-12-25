@@ -27,6 +27,10 @@ export class ExchangeService {
     this._tickerCacheTime = new Map(); // key: symbol -> timestamp
     this._maxTickerCacheSize = 200; // Maximum number of symbols to cache (reduced from 500 to save memory)
     this._tickerCacheTTL = 30 * 1000; // 30 seconds TTL (reduced from 1 minute)
+    
+    // Cache for futures balance to reduce rate limits (short-term cache)
+    this._futuresBalanceCache = null; // { balance, timestamp }
+    this._futuresBalanceCacheTTL = 3000; // 3 seconds TTL
   }
 
   /**
@@ -364,11 +368,26 @@ export class ExchangeService {
           const { exchangeInfoService } = await import('./ExchangeInfoService.js');
 
           // Only set margin type once per symbol (cache in _binanceConfiguredSymbols)
+          // CRITICAL: Handle -4046 error (margin type already configured) gracefully
           if (!this._binanceConfiguredSymbols.has(normalizedSymbol)) {
             const marginType = (configService.getString('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED') || 'CROSSED').toUpperCase();
+            try {
             await this.binanceDirectClient.setMarginType(normalizedSymbol, marginType);
             this._binanceConfiguredSymbols.add(normalizedSymbol);
             logger.debug(`[Cache] Set margin type for ${normalizedSymbol} to ${marginType} (cached)`);
+            } catch (marginErr) {
+              // Handle -4046: margin type already configured (can happen on restart or multi-instance)
+              const errMsg = marginErr?.message || '';
+              const errCode = marginErr?.code || '';
+              if (errMsg.includes('-4046') || errCode === '-4046' || errMsg.includes('No need to change margin type')) {
+                // Margin type already set - treat as success and cache it
+                this._binanceConfiguredSymbols.add(normalizedSymbol);
+                logger.debug(`[Cache] Margin type for ${normalizedSymbol} already configured (code -4046), cached`);
+              } else {
+                // Other error - log but don't fail order creation
+                logger.warn(`[Binance] Failed to set margin type for ${normalizedSymbol}: ${errMsg || marginErr}`);
+              }
+            }
           }
 
           // Use bot's default_leverage if set, otherwise use max leverage from symbol_filters cache
@@ -441,10 +460,46 @@ export class ExchangeService {
             price,
             positionSide
           );
+          
+          // CRITICAL FIX: Check actual order status after placing LIMIT order
+          // Binance LIMIT orders can fill immediately, partially, or be IOC
+          // Don't assume status='open' - check exchange response
+          try {
+            const orderInfo = await this.binanceDirectClient.getOrder(normalizedSymbol, order.orderId);
+            const orderStatus = (orderInfo?.status || '').toUpperCase();
+            const executedQty = parseFloat(orderInfo?.executedQty || '0') || 0;
+            
+            // If order is already filled or partially filled, update status
+            if (orderStatus === 'FILLED' || executedQty > 0) {
+              // Try to get average fill price
+              try {
+                avgFillPrice = await this.binanceDirectClient.getOrderAverageFillPrice(normalizedSymbol, order.orderId);
+              } catch (_) {
+                // Fallback to order price if avgFillPrice not available
+                avgFillPrice = parseFloat(orderInfo?.price || price || currentPrice);
+              }
+              
+              logger.debug(
+                `[Binance LIMIT] Order ${order.orderId} for ${normalizedSymbol} status=${orderStatus}, ` +
+                `executedQty=${executedQty}, avgFillPrice=${avgFillPrice}`
+              );
+            }
+          } catch (statusErr) {
+            // If status check fails, log but continue with default assumption
+            logger.warn(
+              `[Binance LIMIT] Failed to check order status for ${order.orderId}: ${statusErr?.message || statusErr}. ` +
+              `Assuming order is open (will be verified by EntryOrderMonitor).`
+            );
+          }
         }
         
         // Convert to CCXT-like format
         const isLimit = type === 'limit';
+        const isFilled = avgFillPrice !== null && avgFillPrice > 0;
+        const finalStatus = isLimit && !isFilled ? 'open' : 'closed';
+        const finalFilled = isFilled ? quantity : (isLimit ? 0 : quantity);
+        const finalRemaining = isLimit && !isFilled ? quantity : 0;
+        
         return {
           id: order.orderId.toString(),
           symbol: normalizedSymbol,
@@ -453,9 +508,9 @@ export class ExchangeService {
           amount: quantity,
           price: avgFillPrice || price || currentPrice,
           avgFillPrice: avgFillPrice || undefined,
-          status: isLimit ? 'open' : 'closed',
-          filled: isLimit ? 0 : quantity,
-          remaining: isLimit ? quantity : 0,
+          status: finalStatus,
+          filled: finalFilled,
+          remaining: finalRemaining,
           timestamp: Date.now(),
           datetime: new Date().toISOString()
         };
@@ -531,6 +586,7 @@ export class ExchangeService {
       }
 
       // Margin check for MEXC: amount = margin * leverage; use bot's default_leverage if set, otherwise max leverage per coin from symbol_filters
+      // CRITICAL FIX: Cache futures balance to reduce rate limits when placing multiple orders
       if ((this.bot.exchange || '').toLowerCase() === 'mexc') {
         try {
           let maxLev;
@@ -543,8 +599,24 @@ export class ExchangeService {
           }
           const feeBuffer = Number(configService.getNumber('MEXC_MARGIN_FEE_BUFFER', 0.002)); // 0.2% buffer
           const marginNeeded = (notional / Math.max(maxLev, 1)) * (1 + Math.max(0, feeBuffer));
+          
+          // Use cached balance if available and fresh (within TTL)
+          let futFree = 0;
+          const now = Date.now();
+          if (this._futuresBalanceCache && (now - this._futuresBalanceCache.timestamp) < this._futuresBalanceCacheTTL) {
+            futFree = Number(this._futuresBalanceCache.balance?.free || 0);
+            logger.debug(`[MEXC Margin] Using cached futures balance: ${futFree.toFixed(6)} USDT (age: ${now - this._futuresBalanceCache.timestamp}ms)`);
+          } else {
+            // Fetch fresh balance and cache it
           const futBal = await this.getBalance('future').catch(() => ({ free: 0 }));
-          const futFree = Number(futBal?.free || 0);
+            futFree = Number(futBal?.free || 0);
+            this._futuresBalanceCache = {
+              balance: futBal,
+              timestamp: now
+            };
+            logger.debug(`[MEXC Margin] Fetched fresh futures balance: ${futFree.toFixed(6)} USDT`);
+          }
+          
           if (futFree + 1e-8 < marginNeeded) {
             throw new Error(`Insufficient futures margin: need ~${marginNeeded.toFixed(6)} USDT (amount=${notional.toFixed(6)} / lev=${maxLev}), free=${futFree.toFixed(6)} USDT`);
           }
@@ -1118,10 +1190,34 @@ export class ExchangeService {
         }
       }
 
+      // No price available from any source - return null (not an error)
+      logger.debug(`[ExchangeService] No price available for ${symbol} (bot ${this.bot.id}) from any source`);
       return null;
     } catch (error) {
-      logger.error(`Failed to get ticker price for bot ${this.bot.id}:`, error);
+      // CRITICAL FIX: Distinguish between "price unavailable" (soft) vs "price fetch error" (hard)
+      const errorMsg = error?.message || '';
+      
+      // Soft errors: price temporarily unavailable (WS not ready, symbol not found, etc.)
+      const softErrors = [
+        'Invalid symbol',
+        'symbol not found',
+        'BadSymbol',
+        'does not have market symbol',
+        '-1121', // Binance: Invalid symbol
+        '-1122'  // Binance: Invalid symbol status
+      ];
+      
+      const isSoftError = softErrors.some(softErr => errorMsg.includes(softErr));
+      
+      if (isSoftError) {
+        // Soft error: price unavailable, return null (caller should handle gracefully)
+        logger.debug(`[ExchangeService] Price unavailable for ${symbol} (soft error): ${errorMsg}`);
+        return null;
+      } else {
+        // Hard error: actual failure (network, API, etc.) - throw to caller
+        logger.error(`Failed to get ticker price for bot ${this.bot.id} (${symbol}):`, error);
       throw error;
+      }
     }
   }
 
@@ -1215,6 +1311,42 @@ export class ExchangeService {
     } catch (e) {
       logger.warn(`getOrderStatus failed for bot ${this.bot.id} (${symbol}/${orderId}): ${e?.message || e}`);
       return { status: 'unknown', filled: 0, raw: null };
+    }
+  }
+
+  /**
+   * Get average fill price for an order
+   * Abstract method that works for all exchanges (not just Binance)
+   * @param {string} symbol - Symbol
+   * @param {string|number} orderId - Order ID
+   * @returns {Promise<number|null>} Average fill price or null if not available
+   */
+  async getOrderAverageFillPrice(symbol, orderId) {
+    try {
+      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+        return await this.binanceDirectClient.getOrderAverageFillPrice(symbol, orderId);
+      }
+      
+      // For other exchanges, try to get from order status
+      const orderStatus = await this.getOrderStatus(symbol, orderId);
+      if (orderStatus?.raw) {
+        // Try to extract average price from order data
+        const raw = orderStatus.raw;
+        if (raw.avgPrice && Number.isFinite(Number(raw.avgPrice))) {
+          return Number(raw.avgPrice);
+        }
+        if (raw.average && Number.isFinite(Number(raw.average))) {
+          return Number(raw.average);
+        }
+        if (raw.price && Number.isFinite(Number(raw.price))) {
+          return Number(raw.price);
+        }
+      }
+      
+      return null;
+    } catch (e) {
+      logger.warn(`getOrderAverageFillPrice failed for ${symbol}/${orderId}: ${e?.message || e}`);
+      return null;
     }
   }
 

@@ -109,4 +109,48 @@ logger.setLevel = function(level) {
   return true;
 };
 
+/**
+ * Order-specific logger
+ * - orders.log: info and warning logs for order creation
+ * - orders-error.log: error logs for order creation
+ */
+const orderLogger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    winston.format.errors({ stack: true }),
+    winston.format.splat(),
+    winston.format.printf(({ timestamp, level, message, ...meta }) => {
+      // Simple format: timestamp level: message
+      let msg = `${timestamp} [${level.toUpperCase()}]: ${message}`;
+      const rest = Object.keys(meta || {}).filter(k => k !== 'service').length > 0 
+        ? ` ${JSON.stringify(Object.fromEntries(Object.entries(meta).filter(([k]) => k !== 'service')))}` 
+        : '';
+      return msg + rest;
+    })
+  ),
+  defaultMeta: { service: 'bot-oc-orders' },
+  transports: [
+    // orders.log: info and warning
+    new winston.transports.File({
+      filename: path.join(LOG_DIR, 'orders.log'),
+      level: 'warn', // warn and info (warn includes info)
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 5,
+      tailable: true
+    }),
+    // orders-error.log: errors only
+    new winston.transports.File({
+      filename: path.join(LOG_DIR, 'orders-error.log'),
+      level: 'error',
+      maxsize: 5 * 1024 * 1024, // 5MB
+      maxFiles: 3,
+      tailable: true,
+      handleExceptions: false,
+      handleRejections: false
+    })
+  ]
+});
+
+export { orderLogger };
 export default logger;

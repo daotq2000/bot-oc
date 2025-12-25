@@ -58,8 +58,10 @@ export function calculatePnLPercent(entryPrice, currentPrice, side) {
  * @returns {number} OC percentage
  */
 export function calculateOC(open, close) {
-  if (!open || open === 0) return 0;
-  return ((close - open) / open) * 100;
+  const o = Number(open);
+  const c = Number(close);
+  if (!Number.isFinite(o) || o === 0 || !Number.isFinite(c)) return 0;
+  return ((c - o) / o) * 100;
 }
 
 /**
@@ -109,12 +111,11 @@ export function calculateShortEntryPrice(open, oc, extend) {
 /**
  * Calculate take profit price
  * @param {number} entryPrice - Entry price
- * @param {number} oc - OC percentage
  * @param {number} takeProfit - Take profit value (e.g., 50 = 5%)
  * @param {'long'|'short'} side - Position side
  * @returns {number} Take profit price
  */
-export function calculateTakeProfit(entryPrice, oc, takeProfit, side) {
+export function calculateTakeProfit(entryPrice, takeProfit, side) {
   const e = Number(entryPrice);
   const tp = Number(takeProfit);
   if (!Number.isFinite(e) || !Number.isFinite(tp)) return NaN;
@@ -157,59 +158,76 @@ export function calculateInitialStopLoss(entryPrice, stoploss, side) {
 
 /**
  * Calculate next trailing take profit price - moves from initial TP towards entry
- * This is the NEW logic: TP trails from initial TP towards entry, NOT SL movement
+ * 
+ * IMPORTANT: Trailing TP is TIME-BASED ONLY, not price-based.
+ * This ensures predictable behavior and avoids premature position closure.
+ * 
+ * Logic:
+ * - TP starts at initialTP and trails towards entryPrice
+ * - Trailing speed: reducePercent% of the total range (initialTP → entry) per minute
+ * - Example: If range = 100, reducePercent = 40, then step = 40 per minute
+ * 
  * @param {number} prevTP - Previous take profit price
  * @param {number} entryPrice - Entry price (target to trail towards)
  * @param {number} initialTP - Initial take profit price (starting point)
- * @param {number} reducePercent - Reduce percentage per minute (direct percentage, e.g., 40 = 40%)
+ * @param {number} reducePercent - Trailing percentage per minute (direct percentage, e.g., 40 = 40% of range per minute)
  * @param {'long'|'short'} side - Position side
+ * @param {number} minutesElapsed - Minutes elapsed since last update (default: 1)
  * @returns {number} Next take profit price
  */
-export function calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, reducePercent, side) {
+export function calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, reducePercent, side, minutesElapsed = 1) {
   const prev = Number(prevTP);
   const entry = Number(entryPrice);
   const initial = Number(initialTP);
   const reduce = Number(reducePercent);
+  const minutes = Number(minutesElapsed) || 1;
   
+  // Input validation
   if (!Number.isFinite(prev) || !Number.isFinite(entry) || !Number.isFinite(initial) || !Number.isFinite(reduce) || reduce <= 0) {
     return prev; // Return previous TP if inputs are invalid
   }
   
-  // Calculate step value: percentage of the range from initial TP to Entry
-  // reduce/up_reduce are direct percentages (e.g., 40 = 40%, not divided by 10)
-  // This is different from take_profit which uses divide-by-10 format
-  const range = Math.abs(initial - entry);
-  const stepValue = range * (reduce / 100);
+  // Total distance from initial TP → entry
+  const totalRange = Math.abs(initial - entry);
+  
+  // Step per minute: reducePercent% of total range
+  // Example: range = 100, reduce = 40 → stepPerMinute = 40
+  const stepPerMinute = totalRange * (reduce / 100);
+  
+  // Total step for elapsed time
+  const step = stepPerMinute * minutes;
   
   if (side === 'long') {
     // LONG: TP moves DOWN (decreases) from initial TP towards entry
-    // newTP = prevTP - stepValue (but don't go below entry)
-    const newTP = prev - stepValue;
+    // newTP = prevTP - step (but don't go below entry)
+    const newTP = prev - step;
     return Math.max(newTP, entry); // Don't go below entry
-  } else { // SHORT
+  } else {
     // SHORT: TP moves UP (increases) from initial TP towards entry
-    // newTP = prevTP + stepValue (but don't go above entry)
-    const newTP = prev + stepValue;
-    return Math.min(newTP, entry); // Don't go above entry
+    // newTP = prevTP + step
+    // CRITICAL FIX: Allow TP to cross entry for early loss-cutting when price moves against position
+    // This protects account from large losses when price moves strongly against SHORT position
+    const newTP = prev + step;
+    // Allow TP to exceed entry (no Math.min limit) to enable early exit when price rises above entry
+    // This is intentional: if price moves against SHORT (above entry), trailing TP will trigger earlier to minimize loss
+    return newTP;
   }
 }
 
 /**
  * Calculate next trailing stop loss price based on previous SL and reduce/up_reduce
- * @deprecated This function is no longer used for trailing - SL should remain static after initial setup
- * Only used for initial SL calculation
+ * @deprecated This function is DEPRECATED - SL should remain static after initial setup
+ * @throws {Error} Always throws error to prevent accidental usage
  */
 export function calculateNextTrailingStop(prevSL, entryPrice, reducePercent, side, tpPrice = null) {
-  // This function is deprecated - SL should not be moved after initial setup
-  // Return previous SL to keep it static
-  return Number(prevSL);
+  throw new Error('calculateNextTrailingStop is deprecated. Stop Loss should remain static after initial setup. Do not use this function.');
 }
 
 /**
  * Calculate dynamic stop loss based on elapsed time (converging from TP)
- * @deprecated This function is kept for backward compatibility but should not be used for trailing stops
+ * @deprecated This function is DEPRECATED - SL should remain static after initial setup
+ * @throws {Error} Always throws error to prevent accidental usage
  */
 export function calculateDynamicStopLoss(tpPrice, oc, reduce, upReduce, minutesElapsed, side, entryPrice = null) {
-  // Deprecated - not used anymore
-  return null;
+  throw new Error('calculateDynamicStopLoss is deprecated. Stop Loss should remain static after initial setup. Do not use this function.');
 }

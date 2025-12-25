@@ -6,6 +6,37 @@ import { PriceAlertConfig } from '../models/PriceAlertConfig.js';
 import { configService } from './ConfigService.js';
 import logger from '../utils/logger.js';
 
+// CRITICAL FIX: Lazy-load fetch implementation for Node < 18 compatibility
+// Top-level await is not supported, so we'll initialize on first use
+let fetchImpl = null;
+async function getFetchImpl() {
+  if (fetchImpl !== null) return fetchImpl;
+  
+  try {
+    // Try to use global fetch (Node 18+)
+    if (typeof fetch !== 'undefined') {
+      fetchImpl = fetch;
+      return fetchImpl;
+    }
+  } catch (_) {}
+  
+  try {
+    // Fallback to node-fetch for older Node versions
+    const nodeFetch = await import('node-fetch');
+    fetchImpl = nodeFetch.default || nodeFetch;
+    return fetchImpl;
+  } catch (e) {
+    // If node-fetch not available, try global fetch one more time
+    if (typeof fetch !== 'undefined') {
+      fetchImpl = fetch;
+      return fetchImpl;
+    }
+    logger.warn('[ExchangeInfoService] fetch not available. MEXC contract API calls will fail.');
+    fetchImpl = false; // Mark as failed to avoid retrying
+    return null;
+  }
+}
+
 /**
  * Exchange Info Service - Manages fetching and caching of symbol filters
  */
@@ -150,30 +181,11 @@ class ExchangeInfoService {
         }
       }
 
-      // Get current symbols from DB for this exchange
-      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('binance');
+      // Get exchange symbols list
       const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
 
-      // Delete symbols that are no longer available on exchange
-      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('binance', exchangeSymbols);
-      if (deletedCount > 0) {
-        this.logger.info(`Deleted ${deletedCount} delisted/unavailable Binance symbols from database.`);
-        
-        // Also delete strategies for delisted symbols
-        try {
-          const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('binance');
-          const delistedSymbols = currentDbSymbols.filter(s => !exchangeSymbols.includes(s));
-          
-          if (delistedSymbols.length > 0) {
-            const deletedStrategiesCount = await Strategy.deleteBySymbols('binance', delistedSymbols);
-            if (deletedStrategiesCount > 0) {
-              this.logger.info(`Deleted ${deletedStrategiesCount} strategies for ${delistedSymbols.length} delisted Binance symbols: ${delistedSymbols.join(', ')}`);
-            }
-          }
-        } catch (e) {
-          this.logger.error('Failed to delete strategies for delisted Binance symbols:', e?.message || e);
-        }
-      }
+      // CRITICAL FIX: Use helper to sync delisted symbols (query BEFORE delete)
+      await this.syncDelistedSymbols('binance', exchangeSymbols);
 
       // Bulk insert/update into the database
       await this.symbolFilterDAO.bulkUpsert(filtersToSave);
@@ -290,38 +302,31 @@ class ExchangeInfoService {
       if (filtersToSave.length === 0) {
         const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
         if (futuresOnly) {
-          this.logger.warn('No MEXC swap markets via CCXT. Futures-only mode: skipping spot fallback.');
+          this.logger.warn('No MEXC swap markets via CCXT. Trying contract API...');
+          try {
+            await this.updateMexcFiltersFromContractAPI();
+            return;
+          } catch (e) {
+            this.logger.warn('Contract API failed, skipping spot fallback (futures-only mode)');
+            return;
+          }
+        }
+        this.logger.warn('No MEXC swap markets via CCXT. Trying contract API then spot exchangeInfo...');
+        try {
+          await this.updateMexcFiltersFromContractAPI();
+          return;
+        } catch (e) {
+          this.logger.warn('Contract API failed, falling back to spot exchangeInfo');
+          await this.updateMexcFiltersFromSpotExchangeInfo();
           return;
         }
-        this.logger.warn('No MEXC swap markets via CCXT. Falling back to /api/v3/exchangeInfo');
-        await this.updateMexcFiltersFromSpotExchangeInfo();
-        return;
       }
 
-      // Get current symbols from DB for this exchange
-      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+      // Get exchange symbols list
       const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
 
-      // Delete symbols that are no longer available on exchange
-      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
-      if (deletedCount > 0) {
-        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database.`);
-        
-        // Also delete strategies for delisted symbols
-        try {
-          const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
-          const delistedSymbols = currentDbSymbols.filter(s => !exchangeSymbols.includes(s));
-          
-          if (delistedSymbols.length > 0) {
-            const deletedStrategiesCount = await Strategy.deleteBySymbols('mexc', delistedSymbols);
-            if (deletedStrategiesCount > 0) {
-              this.logger.info(`Deleted ${deletedStrategiesCount} strategies for ${delistedSymbols.length} delisted MEXC symbols: ${delistedSymbols.join(', ')}`);
-            }
-          }
-        } catch (e) {
-          this.logger.error('Failed to delete strategies for delisted MEXC symbols:', e?.message || e);
-        }
-      }
+      // CRITICAL FIX: Use helper to sync delisted symbols (query BEFORE delete)
+      await this.syncDelistedSymbols('mexc', exchangeSymbols);
 
       await this.symbolFilterDAO.bulkUpsert(filtersToSave);
       this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters in the database.`);
@@ -333,19 +338,131 @@ class ExchangeInfoService {
       this.logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
       const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
       if (futuresOnly) {
-        this.logger.warn('Futures-only mode enabled: skipping MEXC spot exchangeInfo fallback.');
+        this.logger.warn('Futures-only mode enabled. Trying contract API...');
+        try {
+          await this.updateMexcFiltersFromContractAPI();
+          return;
+        } catch (e) {
+          this.logger.warn('Contract API failed, skipping spot fallback (futures-only mode)');
+          return;
+        }
+      }
+      this.logger.info('Falling back to MEXC contract API then spot exchangeInfo...');
+      try {
+        await this.updateMexcFiltersFromContractAPI();
+      } catch (e) {
+        this.logger.info('Contract API failed, falling back to spot exchangeInfo...');
+        await this.updateMexcFiltersFromSpotExchangeInfo();
+      }
+    }
+  }
+
+  /**
+   * Fetch MEXC futures contracts from contract API (preferred method)
+   * This is more accurate than spot API for futures trading
+   */
+  async updateMexcFiltersFromContractAPI() {
+    try {
+      const fetchFn = await getFetchImpl();
+      if (!fetchFn) {
+        throw new Error('fetch not available. Cannot fetch MEXC contract API.');
+      }
+      const url = 'https://contract.mexc.co/api/v1/contract/detail';
+      this.logger.info('Fetching MEXC futures contracts from contract API...');
+      const res = await fetchFn(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text}`);
+      }
+      const data = await res.json();
+      const contracts = data?.data || [];
+      
+      if (contracts.length === 0) {
+        this.logger.warn('MEXC contract API returned no contracts. Skipping update.');
         return;
       }
-      this.logger.info('Falling back to MEXC spot exchangeInfo (REST) ...');
-      await this.updateMexcFiltersFromSpotExchangeInfo();
+
+      const filtersToSave = [];
+      for (const contract of contracts) {
+        // Only USDT-margined perpetual contracts
+        if ((contract.quoteCoin || '').toUpperCase() !== 'USDT') continue;
+        if (contract.futureType !== 1) continue; // 1 = perpetual
+        
+        // Normalize symbol: BTC_USDT -> BTCUSDT
+        const symbol = (contract.symbol || '').replace(/_/g, '').toUpperCase();
+        if (!symbol || !symbol.endsWith('USDT')) continue;
+
+        // Extract precision from contractSize
+        // contractSize is the size of one contract (e.g., 0.0001 for BTC)
+        const contractSize = Number(contract.contractSize || 0);
+        let stepSize = '0.001'; // default
+        if (contractSize > 0) {
+          // Calculate step size from contract size
+          const decimals = contractSize.toString().split('.')[1]?.length || 0;
+          stepSize = (1 / Math.pow(10, decimals)).toFixed(decimals);
+        }
+
+        // Price precision: typically 2-8 decimals for USDT pairs
+        // CRITICAL: Heuristic tickSize is risky - mark with source flag for debugging
+        // TODO: Fetch actual priceScale from contract detail endpoint if available
+        let tickSize = '0.01'; // default (conservative)
+        // For major coins, use finer precision (heuristic - may be inaccurate)
+        const baseSymbol = symbol.replace('USDT', '');
+        if (['BTC', 'ETH', 'BNB'].includes(baseSymbol)) {
+          tickSize = '0.1';
+        }
+        // WARNING: This is a heuristic and may cause order rejections
+        // Consider fetching priceScale from contract detail or using a more conservative default
+
+        const minNotional = 5; // Conservative default
+        const maxLeverage = Number(contract.maxLeverage || 50);
+
+        filtersToSave.push({
+          exchange: 'mexc',
+          symbol,
+          tick_size: tickSize,
+          step_size: stepSize,
+          min_notional: minNotional,
+          max_leverage: maxLeverage
+        });
+      }
+
+      if (filtersToSave.length === 0) {
+        this.logger.warn('No valid MEXC futures contracts found. Skipping update.');
+        return;
+      }
+
+      // Get current symbols from DB for this exchange
+      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+
+      // Delete symbols that are no longer available on exchange
+      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
+      if (deletedCount > 0) {
+        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database (contract API).`);
+      }
+
+      await this.symbolFilterDAO.bulkUpsert(filtersToSave);
+      this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from contract API.`);
+
+      // Refresh cache
+      this.filtersCache.clear();
+      await this.loadFiltersFromDB();
+    } catch (err) {
+      this.logger.error('MEXC contract API failed:', err?.message || err);
+      throw err; // Re-throw to trigger fallback
     }
   }
 
   // Fallback: use MEXC spot exchangeInfo endpoint to get symbols
   async updateMexcFiltersFromSpotExchangeInfo() {
     try {
+      const fetchFn = await getFetchImpl();
+      if (!fetchFn) {
+        throw new Error('fetch not available. Cannot fetch MEXC spot exchangeInfo.');
+      }
       const url = 'https://api.mexc.co/api/v3/exchangeInfo';
-      const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+      const res = await fetchFn(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(`HTTP ${res.status}: ${text}`);
@@ -354,9 +471,13 @@ class ExchangeInfoService {
       const symbols = data?.symbols || [];
       const filtersToSave = [];
       for (const s of symbols) {
-        const status = (s.status || '').toUpperCase();
+        // MEXC uses numeric status: 1 = TRADING, 2 = BREAK, etc.
+        const status = s.status;
+        const statusStr = String(status || '').toUpperCase();
         const quote = (s.quoteAsset || '').toUpperCase();
-        if (status !== 'TRADING' || quote !== 'USDT') continue;
+        // Accept status === 1 or status === 'TRADING' or status === '1'
+        const isTrading = status === 1 || statusStr === 'TRADING' || statusStr === '1';
+        if (!isTrading || quote !== 'USDT') continue;
         const symbol = (s.symbol || `${(s.baseAsset||'').toUpperCase()}USDT`).toUpperCase();
 
         // Parse filters similar to Binance-compatible schema
@@ -384,30 +505,11 @@ class ExchangeInfoService {
         return;
       }
 
-      // Get current symbols from DB for this exchange
-      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+      // Get exchange symbols list
       const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
 
-      // Delete symbols that are no longer available on exchange
-      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
-      if (deletedCount > 0) {
-        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database (REST fallback).`);
-        
-        // Also delete strategies for delisted symbols
-        try {
-          const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
-          const delistedSymbols = currentDbSymbols.filter(s => !exchangeSymbols.includes(s));
-          
-          if (delistedSymbols.length > 0) {
-            const deletedStrategiesCount = await Strategy.deleteBySymbols('mexc', delistedSymbols);
-            if (deletedStrategiesCount > 0) {
-              this.logger.info(`Deleted ${deletedStrategiesCount} strategies for ${delistedSymbols.length} delisted MEXC symbols (REST fallback): ${delistedSymbols.join(', ')}`);
-            }
-          }
-        } catch (e) {
-          this.logger.error('Failed to delete strategies for delisted MEXC symbols (REST fallback):', e?.message || e);
-        }
-      }
+      // CRITICAL FIX: Use helper to sync delisted symbols (query BEFORE delete)
+      await this.syncDelistedSymbols('mexc', exchangeSymbols);
 
       await this.symbolFilterDAO.bulkUpsert(filtersToSave);
       this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from REST spot exchangeInfo.`);
@@ -417,6 +519,54 @@ class ExchangeInfoService {
       await this.loadFiltersFromDB();
     } catch (err) {
       this.logger.error('MEXC REST fallback failed:', err?.message || err);
+    }
+  }
+
+  /**
+   * CRITICAL FIX: Sync delisted symbols - query BEFORE delete, then delete from symbol_filters and strategies
+   * This prevents the bug where delisted symbols are not properly identified after deletion
+   * @param {string} exchange - Exchange name (binance, mexc, etc.)
+   * @param {Array<string>} exchangeSymbols - Array of symbols currently available on exchange (uppercase)
+   * @returns {Promise<void>}
+   */
+  async syncDelistedSymbols(exchange, exchangeSymbols) {
+    try {
+      // CRITICAL: Query DB symbols BEFORE deletion to identify delisted symbols
+      const dbSymbolsBefore = await this.symbolFilterDAO.getSymbolsByExchange(exchange);
+      
+      // Normalize exchange symbols to uppercase for comparison
+      const normalizedExchangeSymbols = exchangeSymbols.map(s => String(s).toUpperCase());
+      
+      // Find delisted symbols (in DB but not in exchange)
+      const delistedSymbols = dbSymbolsBefore.filter(dbSymbol => 
+        !normalizedExchangeSymbols.includes(dbSymbol.toUpperCase())
+      );
+      
+      if (delistedSymbols.length === 0) {
+        this.logger.debug(`No delisted symbols found for ${exchange}`);
+        return;
+      }
+      
+      this.logger.info(`Found ${delistedSymbols.length} delisted symbols for ${exchange}: ${delistedSymbols.slice(0, 5).join(', ')}${delistedSymbols.length > 5 ? '...' : ''}`);
+      
+      // Delete delisted symbols from symbol_filters
+      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols(exchange, normalizedExchangeSymbols);
+      if (deletedCount > 0) {
+        this.logger.info(`Deleted ${deletedCount} delisted symbols from symbol_filters for ${exchange}`);
+      }
+      
+      // Delete strategies for delisted symbols
+      if (delistedSymbols.length > 0) {
+        try {
+          await Strategy.deleteBySymbols(exchange, delistedSymbols);
+          this.logger.info(`Deleted strategies for ${delistedSymbols.length} delisted symbols on ${exchange}`);
+        } catch (e) {
+          this.logger.warn(`Failed to delete strategies for delisted symbols: ${e?.message || e}`);
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Error syncing delisted symbols for ${exchange}:`, error);
+      // Don't throw - allow update to continue even if delist sync fails
     }
   }
 
@@ -532,58 +682,109 @@ class ExchangeInfoService {
   /**
    * Get the filters for a specific symbol from the cache.
    * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @param {string} exchange - The exchange name (e.g., 'binance', 'mexc')
    * @returns {Object|null} The filters or null if not found.
    */
-  getFilters(symbol) {
+  getFilters(symbol, exchange = null) {
     if (!this.isInitialized) {
       this.logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
     }
-    const key = symbol.toUpperCase();
-    const cached = this.filtersCache.get(key);
+    
+    // CRITICAL FIX: Use exchange:symbol as cache key
+    const symbolUpper = symbol.toUpperCase();
+    const exchangeLower = exchange ? String(exchange).toLowerCase() : null;
+    
+    // If exchange is provided, use exact match
+    if (exchangeLower) {
+      const cacheKey = `${exchangeLower}:${symbolUpper}`;
+      const cached = this.filtersCache.get(cacheKey);
     if (cached) {
       cached.lastAccess = Date.now();
+        return cached;
+      }
     }
-    return cached;
+    
+    // Fallback: try to find any exchange (for backward compatibility)
+    // Prefer Binance if multiple exchanges have the same symbol
+    let found = null;
+    let foundExchange = null;
+    for (const [key, data] of this.filtersCache.entries()) {
+      if (key.endsWith(`:${symbolUpper}`)) {
+        const ex = data.exchange || key.split(':')[0];
+        if (!found || ex === 'binance') {
+          found = data;
+          foundExchange = ex;
+        }
+      }
+    }
+    
+    if (found) {
+      found.lastAccess = Date.now();
+      if (exchangeLower && foundExchange !== exchangeLower) {
+        this.logger.debug(`[ExchangeInfoService] Found filters for ${symbolUpper} from ${foundExchange} but requested ${exchangeLower}. Consider specifying exchange.`);
+      }
+      return found;
+    }
+    
+    return null;
   }
 
   /**
    * Get tick size for a specific symbol from cache
    * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @param {string} exchange - The exchange name (optional, for exact match)
    * @returns {string|null} The tick size or null if not found
    */
-  getTickSize(symbol) {
-    const filters = this.getFilters(symbol);
+  getTickSize(symbol, exchange = null) {
+    const filters = this.getFilters(symbol, exchange);
     return filters ? filters.tickSize : null;
   }
 
   /**
    * Get step size for a specific symbol from cache
    * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @param {string} exchange - The exchange name (optional, for exact match)
    * @returns {string|null} The step size or null if not found
    */
-  getStepSize(symbol) {
-    const filters = this.getFilters(symbol);
+  getStepSize(symbol, exchange = null) {
+    const filters = this.getFilters(symbol, exchange);
     return filters ? filters.stepSize : null;
   }
 
   /**
    * Get minimum notional for a specific symbol from cache
    * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @param {string} exchange - The exchange name (optional, for exact match)
    * @returns {number|null} The minimum notional or null if not found
    */
-  getMinNotional(symbol) {
-    const filters = this.getFilters(symbol);
+  getMinNotional(symbol, exchange = null) {
+    const filters = this.getFilters(symbol, exchange);
     return filters ? filters.minNotional : null;
   }
 
   /**
    * Get maximum leverage for a specific symbol from cache
    * @param {string} symbol - The trading symbol (e.g., BTCUSDT)
+   * @param {string} exchange - The exchange name (optional, for exact match)
    * @returns {number|null} The maximum leverage or null if not found
    */
-  getMaxLeverage(symbol) {
-    const filters = this.getFilters(symbol);
+  getMaxLeverage(symbol, exchange = null) {
+    const filters = this.getFilters(symbol, exchange);
     return filters ? filters.maxLeverage : null;
+  }
+
+  /**
+   * Destroy service - cleanup timers and resources
+   * Should be called on shutdown to prevent memory leaks
+   */
+  destroy() {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+      this.logger.debug('[ExchangeInfoService] Cleanup timer cleared');
+    }
+    this.filtersCache.clear();
+    this.isInitialized = false;
   }
 }
 

@@ -1,5 +1,5 @@
 import { PriceAlertScanner } from '../jobs/PriceAlertScanner.js';
-import { OcAlertScanner } from '../jobs/OcAlertScanner.js';
+import { realtimeOCDetector } from '../services/RealtimeOCDetector.js';
 import { priceAlertSymbolTracker } from '../services/PriceAlertSymbolTracker.js';
 import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import { webSocketManager } from '../services/WebSocketManager.js';
@@ -19,7 +19,6 @@ export class PriceAlertWorker {
   constructor() {
     this.telegramService = null;
     this.priceAlertScanner = null;
-    this.ocAlertScanner = null;
     this.isRunning = false;
     this.refreshInterval = null;
     this.subscriptionInterval = null;
@@ -49,9 +48,8 @@ export class PriceAlertWorker {
       // Small delay to reduce CPU load
       await new Promise(resolve => setTimeout(resolve, 300));
 
-      // Initialize OC Alert Scanner
-      this.ocAlertScanner = new OcAlertScanner();
-      await this.ocAlertScanner.initialize(telegramService);
+      // Initialize OC Alert functionality (merged into RealtimeOCDetector)
+      await realtimeOCDetector.initializeAlerts(telegramService);
       
       // Small delay before WebSocket subscriptions
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -106,10 +104,8 @@ export class PriceAlertWorker {
         this.priceAlertScanner.start();
       }
 
-      // Start OC Alert Scanner
-      if (this.ocAlertScanner) {
-        this.ocAlertScanner.start();
-      }
+      // Start OC Alert scan (merged into RealtimeOCDetector)
+      realtimeOCDetector.startAlertScan();
 
       logger.info('[PriceAlertWorker] ✅ Price Alert system started');
     } catch (error) {
@@ -141,9 +137,8 @@ export class PriceAlertWorker {
       if (this.priceAlertScanner) {
         this.priceAlertScanner.stop();
       }
-      if (this.ocAlertScanner) {
-        this.ocAlertScanner.stop();
-      }
+      // Stop OC Alert scan (merged into RealtimeOCDetector)
+      realtimeOCDetector.stopAlertScan();
 
       logger.info('[PriceAlertWorker] ✅ Price Alert system stopped');
     } catch (error) {
@@ -183,16 +178,17 @@ export class PriceAlertWorker {
       if (mexcSymbols.length > 0) {
         logger.info(`[PriceAlertWorker] Subscribing MEXC WS to ${mexcSymbols.length} Price Alert symbols`);
         try {
+          // Ensure WebSocket is connected before subscribing
+          if (mexcPriceWs.ws?.readyState !== 1) {
+            logger.info(`[PriceAlertWorker] MEXC WebSocket not connected, ensuring connection...`);
+            mexcPriceWs.ensureConnected();
+            // Wait a bit for connection to establish
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+          
+          // Subscribe symbols
           mexcPriceWs.subscribe(mexcSymbols);
-          // Ensure WebSocket is connected (subscribe() calls ensureConnected(), but verify after a delay)
-          setTimeout(() => {
-            if (mexcPriceWs.ws?.readyState !== 1) {
-              logger.warn(`[PriceAlertWorker] MEXC WebSocket not connected after subscribe, ensuring connection...`);
-              mexcPriceWs.ensureConnected();
-            } else {
-              logger.debug(`[PriceAlertWorker] MEXC WebSocket connected successfully`);
-            }
-          }, 1000);
+          logger.debug(`[PriceAlertWorker] MEXC WebSocket subscribed to ${mexcSymbols.length} symbols`);
         } catch (error) {
           logger.error(`[PriceAlertWorker] Failed to subscribe MEXC symbols:`, error?.message || error);
         }
@@ -205,14 +201,18 @@ export class PriceAlertWorker {
       if (binanceSymbols.length > 0) {
         logger.info(`[PriceAlertWorker] Subscribing Binance WS to ${binanceSymbols.length} Price Alert symbols`);
         try {
-          webSocketManager.subscribe(binanceSymbols);
-          // Binance WebSocket should auto-connect via connect() call in app.js
-          // But ensure it's connected
+          // Ensure WebSocket is connected before subscribing
           const status = webSocketManager.getStatus();
           if (status.connectedCount === 0) {
-            logger.warn(`[PriceAlertWorker] Binance WebSocket not connected, calling connect()...`);
+            logger.info(`[PriceAlertWorker] Binance WebSocket not connected, calling connect()...`);
             webSocketManager.connect();
+            // Wait a bit for connection to establish
+            await new Promise(resolve => setTimeout(resolve, 1000));
           }
+          
+          // Subscribe symbols
+          webSocketManager.subscribe(binanceSymbols);
+          logger.debug(`[PriceAlertWorker] Binance WebSocket subscribed to ${binanceSymbols.length} symbols`);
         } catch (error) {
           logger.error(`[PriceAlertWorker] Failed to subscribe Binance symbols:`, error?.message || error);
         }
@@ -236,9 +236,8 @@ export class PriceAlertWorker {
         isRunning: this.priceAlertScanner.isRunning,
         isScanning: this.priceAlertScanner.isScanning
       } : null,
-      ocAlertScanner: this.ocAlertScanner ? {
-        isRunning: this.ocAlertScanner.isRunning
-      } : null,
+      ocAlertEnabled: realtimeOCDetector.alertEnabled,
+      ocAlertScanRunning: realtimeOCDetector.alertScanRunning,
       trackingSymbols: {
         mexc: priceAlertSymbolTracker.getSymbolsForExchange('mexc').size,
         binance: priceAlertSymbolTracker.getSymbolsForExchange('binance').size

@@ -105,26 +105,36 @@ export class TelegramService {
 
         try {
           logger.debug(`[Telegram] Sending message to ${chatId}, length=${message.length}`);
-          await this.bot.telegram.sendMessage(chatId, message, {
+          
+          // Add timeout for Telegram API call (10 seconds)
+          const telegramTimeout = Number(configService.getNumber('TELEGRAM_API_TIMEOUT_MS', 10000));
+          const sendPromise = this.bot.telegram.sendMessage(chatId, message, {
             parse_mode: 'HTML',
             ...options
           });
+          
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error(`Telegram API timeout after ${telegramTimeout}ms`)), telegramTimeout)
+          );
+          
+          await Promise.race([sendPromise, timeoutPromise]);
+          
           this._lastSendAt = Date.now();
           this._perChatLastSend.set(chatId, this._lastSendAt);
-          logger.debug(`[Telegram] ✅ Successfully sent message to ${chatId}`);
+          logger.info(`[Telegram] ✅ Successfully sent message to ${chatId}`);
         } catch (error) {
           const msg = error?.message || '';
           const retryAfter = Number(error?.response?.parameters?.retry_after || error?.parameters?.retry_after || NaN);
-          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT/i.test(msg);
+          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT|socket hang/i.test(msg);
 
           if (transient) {
             // Respect Telegram retry_after when present
-            const backoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000) : 1000;
+            const backoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000) : 2000; // Increased default backoff to 2s
             logger.warn(`[Telegram] Throttled or transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, msg=${msg}`);
             this._queue.unshift({ chatId, message, options }); // requeue
             await new Promise(r => setTimeout(r, backoffMs));
           } else {
-            logger.error(`[Telegram] Failed to send message to ${chatId}:`, msg);
+            logger.error(`[Telegram] Failed to send message to ${chatId}:`, msg, error?.stack);
           }
         }
       }
@@ -556,12 +566,17 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
 └ ${formatPrice(open)} → ${formatPrice(currentPrice)}
     `.trim();
 
-    logger.info(`[VolatilityAlert] Sending alert to ${chatId}: ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
+    logger.info(`[VolatilityAlert] Queuing alert to ${chatId}: ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
+    
+    // sendMessage is queue-based, so we queue it and let the queue processor handle it
+    // The actual send status will be logged by _processQueue
     try {
       await this.sendMessage(chatId, message);
-      logger.debug(`[VolatilityAlert] ✅ Alert sent successfully to ${chatId}`);
+      // Note: sendMessage returns immediately after queuing, actual send happens in _processQueue
+      // We log "queued" here, and "sent successfully" is logged in _processQueue
+      logger.debug(`[VolatilityAlert] Alert queued for ${chatId}: ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
     } catch (error) {
-      logger.error(`[VolatilityAlert] Failed to send alert to ${chatId}:`, error?.message || error);
+      logger.error(`[VolatilityAlert] Failed to queue alert to ${chatId}:`, error?.message || error);
       throw error;
     }
   }
@@ -586,7 +601,7 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
   /**
    * Send concurrency limit alert (trade rejected due to max concurrent trades limit)
    * @param {Object} strategy - Strategy object
-   * @param {Object} status - Concurrency status from ConcurrencyManager
+   * @param {Object} status - Concurrency status (deprecated - ConcurrencyManager removed)
    */
   async sendConcurrencyLimitAlert(strategy, status) {
     try {

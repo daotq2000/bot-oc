@@ -74,20 +74,36 @@ export class OrderService {
     }
   }
 
-  // Send central log to fixed tracking channel
-  async sendCentralLog(message) {
+  // Send central log to file (orders.log / orders-error.log) instead of Telegram
+  // level: 'info' | 'warn' | 'error'
+  async sendCentralLog(message, level = 'info') {
     try {
-      const channelId = '-1003163801780';
-      if (!this.telegramService || !this.telegramService.sendMessage) return;
-      await this.telegramService.sendMessage(channelId, String(message || ''));
+      const { orderLogger } = await import('../utils/logger.js');
+      const logMessage = String(message || '');
+      
+      if (level === 'error') {
+        orderLogger.error(logMessage);
+      } else if (level === 'warn') {
+        orderLogger.warn(logMessage);
+      } else {
+        orderLogger.info(logMessage);
+      }
     } catch (e) {
-      logger.warn(`[OrderService] Failed to send central log: ${e?.message || e}`);
+      logger.warn(`[OrderService] Failed to write order log: ${e?.message || e}`);
+      // Fallback to main logger if orderLogger fails
+      if (level === 'error') {
+        logger.error(`[OrderService] ${message}`);
+      } else if (level === 'warn') {
+        logger.warn(`[OrderService] ${message}`);
+      } else {
+        logger.info(`[OrderService] ${message}`);
+      }
     }
   }
 
   /**
    * Execute signal and create order
-   * @param {Object} signal - Signal object from StrategyService
+   * @param {Object} signal - Signal object from RealtimeOCDetector/WebSocketOCConsumer
    * @returns {Promise<Object|null>} Position object or null
    */
   async executeSignal(signal) {
@@ -131,29 +147,37 @@ export class OrderService {
       }
       
       // Per-coin exposure limit (max_amount_per_coin, in USDT) - configurable per bot
+      // CRITICAL FIX: Include both open positions AND pending LIMIT entry orders to prevent overexposure
       const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
       if (Number.isFinite(maxAmountPerCoin) && maxAmountPerCoin > 0) {
         try {
           const pool = (await import('../config/database.js')).default;
           // NOTE: amount is stored in USDT (strategy.amount), so we sum p.amount.
+          // Include both open positions and pending entry orders to prevent overexposure
           const [rows] = await pool.execute(
-            `SELECT COALESCE(SUM(p.amount), 0) AS total_amount
-             FROM positions p
-             JOIN strategies s ON p.strategy_id = s.id
-             WHERE s.bot_id = ? AND p.status = 'open' AND p.symbol = ?`,
-            [strategy.bot_id, strategy.symbol]
+            `SELECT 
+              COALESCE(SUM(CASE WHEN p.status = 'open' THEN p.amount ELSE 0 END), 0) AS positions_amount,
+              COALESCE(SUM(CASE WHEN eo.status = 'open' THEN eo.amount ELSE 0 END), 0) AS pending_orders_amount
+             FROM strategies s
+             LEFT JOIN positions p ON p.strategy_id = s.id AND p.status = 'open' AND p.symbol = ?
+             LEFT JOIN entry_orders eo ON eo.strategy_id = s.id AND eo.status = 'open' AND eo.symbol = ?
+             WHERE s.bot_id = ? AND s.symbol = ?
+             GROUP BY s.bot_id, s.symbol`,
+            [strategy.symbol, strategy.symbol, strategy.bot_id, strategy.symbol]
           );
-          const currentAmount = Number(rows?.[0]?.total_amount || 0);
+          const positionsAmount = Number(rows?.[0]?.positions_amount || 0);
+          const pendingOrdersAmount = Number(rows?.[0]?.pending_orders_amount || 0);
+          const currentAmount = positionsAmount + pendingOrdersAmount;
           const projectedAmount = currentAmount + Number(amount || 0);
 
           if (projectedAmount > maxAmountPerCoin) {
             logger.warn(
               `[OrderService] max_amount_per_coin exceeded for bot ${strategy.bot_id}, symbol=${strategy.symbol}. ` +
-              `current=${currentAmount}, new=${amount}, projected=${projectedAmount}, limit=${maxAmountPerCoin}. Skipping strategy ${strategy.id}`
+              `positions=${positionsAmount}, pending=${pendingOrdersAmount}, current=${currentAmount}, new=${amount}, projected=${projectedAmount}, limit=${maxAmountPerCoin}. Skipping strategy ${strategy.id}`
             );
             await this.sendCentralLog(
               `Order SkipMaxPerCoin | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
-              `${String(side).toUpperCase()} current=${currentAmount} new=${amount} limit=${maxAmountPerCoin}`
+              `${String(side).toUpperCase()} positions=${positionsAmount} pending=${pendingOrdersAmount} current=${currentAmount} new=${amount} limit=${maxAmountPerCoin}`
             );
             return null;
           }
@@ -166,8 +190,6 @@ export class OrderService {
         }
       }
       
-      let orderCreated = false;
-
       // Check if entry price is still valid
       const currentPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
       
@@ -264,15 +286,34 @@ export class OrderService {
             const avg = await this.exchangeService.getOrderAverageFillPrice(strategy.symbol, order.id);
             if (Number.isFinite(avg) && avg > 0) {
               effectiveEntryPrice = avg;
-            hasImmediateExposure = true;
-            logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
+              hasImmediateExposure = true;
+              logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, using avgFillPrice=${avg} as entry.`);
+            } else {
+              // Fallback to entryPrice if avgFillPrice not available
+              effectiveEntryPrice = entryPrice;
+              hasImmediateExposure = true;
+              logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
+            }
           } else {
-            logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} filled immediately, fallback to entryPrice=${entryPrice}.`);
-            hasImmediateExposure = true;
+            // CRITICAL FIX: If LIMIT order price was crossed, treat as exposure even if status is 'open'
+            // Exchange lag can cause status to be 'open' even when order is already filled
+            const priceCrossed = 
+              (side === 'long' && currentPrice > entryPrice) ||
+              (side === 'short' && currentPrice < entryPrice);
+            
+            if (priceCrossed) {
+              // Price crossed entry - order likely filled but status not updated yet
+              // Treat as exposure to avoid duplicate position creation
+              effectiveEntryPrice = currentPrice; // Use current price as best estimate
+              hasImmediateExposure = true;
+              logger.warn(
+                `[OrderService] LIMIT order ${order.id} for ${strategy.symbol} price crossed (status=${st?.status || 'n/a'}, ` +
+                `currentPrice=${currentPrice}, entryPrice=${entryPrice}). Treating as filled to avoid duplicate position.`
+              );
+            } else {
+              logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
+            }
           }
-        } else {
-          logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);
-        }
         }
       } catch (e) {
         logger.warn(`[OrderService] Failed to refine entry price from exchange for order ${order?.id} ${strategy.symbol}: ${e?.message || e}`);
@@ -280,7 +321,7 @@ export class OrderService {
 
       // Calculate temporary TP/SL prices based on the effective entry price
       const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
-      const tempTpPrice = calculateTakeProfit(effectiveEntryPrice, strategy.oc, strategy.take_profit, side);
+      const tempTpPrice = calculateTakeProfit(effectiveEntryPrice, strategy.take_profit, side);
       // Only compute SL when strategy.stoploss > 0. No fallback to reduce/up_reduce
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
       const hasValidStoploss = Number.isFinite(rawStoploss) && rawStoploss > 0;
@@ -291,6 +332,8 @@ export class OrderService {
       if (hasImmediateExposure || orderType === 'market') {
         // MARKET or immediately-filled LIMIT: create Position right away
         try {
+          // CRITICAL FIX: Set tp_sl_pending flag to indicate TP/SL orders need to be placed by PositionMonitor
+          // This prevents position from running without TP/SL if PositionMonitor hasn't run yet
           position = await Position.create({
             strategy_id: strategy.id,
             bot_id: strategy.bot_id,
@@ -301,13 +344,15 @@ export class OrderService {
             amount: amount,
             take_profit_price: tempTpPrice, // Use temporary TP price
             stop_loss_price: tempSlPrice, // Use temporary SL price
-            current_reduce: strategy.reduce
+            current_reduce: strategy.reduce,
+            tp_sl_pending: true // Flag: TP/SL orders will be placed by PositionMonitor
           });
           
-          // CRITICAL: Finalize reservation immediately after Position is created
-          // Position created successfully
-          orderCreated = true;
-          logger.debug(`[OrderService] Position ${position.id} created for bot ${strategy.bot_id}`);
+          logger.debug(`[OrderService] Position ${position.id} created for bot ${strategy.bot_id} (tp_sl_pending=true, will be placed by PositionMonitor)`);
+          
+          // NOTE: Initial SL placement is handled by PositionMonitor to ensure consistency
+          // The tp_sl_pending flag ensures PositionMonitor will place TP/SL orders
+          // For MARKET orders, PositionMonitor should run soon after position creation
         } catch (posError) {
           // If Position creation failed
           logger.error(`[OrderService] Failed to create Position: ${posError?.message || posError}`);
@@ -370,13 +415,14 @@ export class OrderService {
         strategy.bot = await Bot.findById(strategy.bot_id);
       }
 
-      // Send Telegram notification to bot chat
-      try {
-        await this.telegramService.sendOrderNotification(position, strategy);
-        logger.debug(`[OrderService] ✅ Order notification sent successfully for position ${position.id}`);
-      } catch (e) {
-        logger.error(`[OrderService] Failed to send order notification for position ${position.id}:`, e);
-      }
+      // Telegram notification disabled to avoid spam and rate limits
+      // Order logs are now written to logs/orders.log and logs/orders-error.log files
+      // try {
+      //   await this.telegramService.sendOrderNotification(position, strategy);
+      //   logger.debug(`[OrderService] ✅ Order notification sent successfully for position ${position.id}`);
+      // } catch (e) {
+      //   logger.error(`[OrderService] Failed to send order notification for position ${position.id}:`, e);
+      // }
 
       // Send entry trade alert to central channel
       try {
@@ -452,7 +498,7 @@ export class OrderService {
       // Central log: failure
       try {
         const strat = signal?.strategy || {};
-        await this.sendCentralLog(`Order Error | bot=${strat?.bot_id} strat=${strat?.id} ${strat?.symbol} ${String(signal?.side).toUpperCase()} msg=${error?.message || error} code=${error?.code || ''}`);
+        await this.sendCentralLog(`Order Error | bot=${strat?.bot_id} strat=${strat?.id} ${strat?.symbol} ${String(signal?.side).toUpperCase()} msg=${error?.message || error} code=${error?.code || ''}`, 'error');
       } catch (_) {}
       throw error;
     } finally {
@@ -469,11 +515,23 @@ export class OrderService {
    * @returns {boolean}
    */
   shouldUseMarketOrder(side, currentPrice, entryPrice) {
+    if (!Number.isFinite(currentPrice) || !Number.isFinite(entryPrice) || currentPrice <= 0 || entryPrice <= 0) {
+      return false; // Invalid prices, use limit as safe default
+    }
+    
     const priceDiff = Math.abs(currentPrice - entryPrice) / entryPrice * 100;
     
-    // If price is more than 0.5% away, use limit order
-    // Otherwise, use market order to ensure execution
-    return priceDiff < 0.5;
+    // CRITICAL FIX: Use MARKET order when:
+    // 1. Price already crossed entry (missed limit opportunity)
+    // 2. Price is too far from entry (>0.5%) - limit unlikely to fill
+    // 
+    // Use LIMIT order when:
+    // - Price is close to entry (<0.5%) and hasn't crossed yet
+    const hasCrossedEntry = 
+      (side === 'long' && currentPrice > entryPrice) ||
+      (side === 'short' && currentPrice < entryPrice);
+    
+    return hasCrossedEntry || priceDiff > 0.5;
   }
 
   /**

@@ -234,11 +234,12 @@ export class WebSocketOCConsumer {
 
       // The 'extend' logic is disabled for the counter-trend strategy as it's based on the previous trend-following model.
       const extendOK = true;
+      const extendVal = strategy.extend || 0;
       
       logger.info(`[WebSocketOCConsumer] Extend check for strategy ${strategy.id}: extendOK=${extendOK}, extendVal=${extendVal}, side=${side}, currentPrice=${currentPrice}, entryPrice=${entryPrice}, baseOpen=${baseOpen}, totalExtendDistance=${totalExtendDistance}`);
 
       // Calculate TP and SL (based on side)
-      const tpPrice = calculateTakeProfit(entryPrice, Math.abs(oc), strategy.take_profit || 55, side);
+      const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit || 55, side);
       // Only compute SL when strategy.stoploss > 0. No fallback to reduce/up_reduce
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
@@ -317,7 +318,9 @@ export class WebSocketOCConsumer {
         logger.debug(`[WebSocketOCConsumer] ✅ Order triggered for strategy ${strategy.id}`);
       }
     } catch (error) {
-      logger.error(`[WebSocketOCConsumer] Error processing match:`, error?.message || error);
+      logger.error(`[WebSocketOCConsumer] Error processing match:`, error?.message || error, error?.stack);
+      // Re-throw to allow caller to handle
+      throw error;
     }
   }
 
