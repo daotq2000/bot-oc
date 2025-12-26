@@ -329,7 +329,7 @@ export class RealtimeOCDetector {
         resolve(null);
         return;
       }
-
+      
       this._restFetchQueue.push({ resolve, reject, exchange: ex, symbol: sym, interval, bucketStart });
       this._processRestFetchQueue(); // Start processing if not already running
     });
@@ -493,8 +493,8 @@ export class RealtimeOCDetector {
     }
 
     const openPrice = fetched;
-    this.openFetchCache.set(key, fetched);
-    logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
+        this.openFetchCache.set(key, fetched);
+        logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
 
     // ✅ OPTIMIZED: LRUCache automatically evicts least recently used - no manual eviction needed
     // Store in cache (LRUCache handles eviction automatically)
@@ -692,7 +692,7 @@ export class RealtimeOCDetector {
       // ✅ OPTIMIZED: Check strategies in parallel (limited concurrency)
       const concurrency = Number(configService.getNumber('OC_DETECT_CONCURRENCY', 10));
       const matches = [];
-      
+
       for (let i = 0; i < validStrategies.length; i += concurrency) {
         const batch = validStrategies.slice(i, i + concurrency);
         const results = await Promise.all(
@@ -787,31 +787,31 @@ export class RealtimeOCDetector {
       return null; // Skip nếu không có open price
     }
 
-    const interval = strategy.interval || '1m';
-    const ocThreshold = Number(strategy.oc || 0);
+        const interval = strategy.interval || '1m';
+        const ocThreshold = Number(strategy.oc || 0);
 
-    if (ocThreshold <= 0) {
+        if (ocThreshold <= 0) {
       return null;
-    }
+        }
 
-    // Calculate OC
-    const oc = this.calculateOC(openPrice, currentPrice);
-    const absOC = Math.abs(oc);
-    const direction = this.getDirection(openPrice, currentPrice);
+        // Calculate OC
+        const oc = this.calculateOC(openPrice, currentPrice);
+        const absOC = Math.abs(oc);
+        const direction = this.getDirection(openPrice, currentPrice);
 
-    // Check if OC meets threshold
-    if (absOC >= ocThreshold) {
+        // Check if OC meets threshold
+        if (absOC >= ocThreshold) {
       logger.info(`[RealtimeOCDetector] ✅ MATCH FOUND: ${symbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} strategy_id=${strategy.id} bot_id=${strategy.bot_id}`);
       
       return {
-        strategy,
-        oc,
-        absOC,
-        direction,
-        openPrice,
-        currentPrice,
-        interval,
-        timestamp
+            strategy,
+            oc,
+            absOC,
+            direction,
+            openPrice,
+            currentPrice,
+            interval,
+            timestamp
       };
     }
 

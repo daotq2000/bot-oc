@@ -121,7 +121,7 @@ export class Position {
       take_profit_price,
       stop_loss_price,
       current_reduce,
-      tp_order_id = null,
+      exit_order_id = null,
       sl_order_id = null
     } = data;
 
@@ -141,11 +141,11 @@ export class Position {
     const [result] = await pool.execute(
       `INSERT INTO positions (
         strategy_id, bot_id, order_id, symbol, side, entry_price, amount,
-        take_profit_price, stop_loss_price, current_reduce, tp_order_id, sl_order_id, opened_at
+        take_profit_price, stop_loss_price, current_reduce, exit_order_id, sl_order_id, opened_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         safe(strategy_id), safe(bot_id), safe(order_id), safe(symbol), safe(side), safe(entry_price), safe(amount),
-        safe(take_profit_price), safe(stop_loss_price), safe(current_reduce), safe(tp_order_id), safe(sl_order_id),
+        safe(take_profit_price), safe(stop_loss_price), safe(current_reduce), safe(exit_order_id), safe(sl_order_id),
         openedAt
       ]
     );

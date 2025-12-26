@@ -37,20 +37,20 @@ export class PositionService {
     try {
       // PRIORITY CHECK 1: Check order status from WebSocket cache (no REST API call)
       // This detects when TP/SL orders are filled via WebSocket ORDER_TRADE_UPDATE events
-      if (position.tp_order_id) {
+      if (position.exit_order_id) {
         // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
         // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
         const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
-        const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id, exchange);
+        const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
         
         // Debug logging for cache miss
         if (!cachedTpStatus) {
-          logger.debug(`[TP/SL Check] TP order ${position.tp_order_id} for position ${position.id} not found in cache (exchange: ${exchange})`);
+          logger.debug(`[TP/SL Check] TP order ${position.exit_order_id} for position ${position.id} not found in cache (exchange: ${exchange})`);
         }
         // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
         if (cachedTpStatus && cachedTpStatus.status === 'closed') {
           // TP order has been filled - position is already closed on exchange
-          logger.info(`[TP/SL Check] TP order ${position.tp_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
+          logger.info(`[TP/SL Check] TP order ${position.exit_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
           
           // Get fill price from cache or current price
           const fillPrice = cachedTpStatus.avgPrice || await this.exchangeService.getTickerPrice(position.symbol);
@@ -113,19 +113,19 @@ export class PositionService {
           // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
           const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
           
-          if (position.tp_order_id) {
-            const cachedTpStatus = orderStatusCache.getOrderStatus(position.tp_order_id, exchange);
+          if (position.exit_order_id) {
+            const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
             // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
             if (cachedTpStatus?.status === 'closed') {
               closeReason = 'tp_hit';
             } else {
               // Fallback to REST API only if cache miss
               try {
-                const tpOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.tp_order_id);
+                const tpOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
                 if (tpOrderStatus?.status === 'closed' || tpOrderStatus?.status === 'FILLED') {
                   closeReason = 'tp_hit';
                   // Update cache for future use
-                  orderStatusCache.updateOrderStatus(position.tp_order_id, {
+                  orderStatusCache.updateOrderStatus(position.exit_order_id, {
                     status: tpOrderStatus.status,
                     filled: tpOrderStatus.filled || 0,
                     avgPrice: tpOrderStatus.raw?.avgPrice || null,
@@ -514,12 +514,12 @@ export class PositionService {
             
             if (movedTP >= effectiveThreshold) {
               logger.debug(`[TP Replace] Movement threshold met, proceeding with TP order replacement`);
-              if (position.tp_order_id) {
+              if (position.exit_order_id) {
                 try {
-                  await this.exchangeService.cancelOrder(position.tp_order_id, position.symbol);
-                  logger.debug(`[TP Replace] Cancelled old TP order ${position.tp_order_id} for position ${position.id}`);
+                  await this.exchangeService.cancelOrder(position.exit_order_id, position.symbol);
+                  logger.debug(`[TP Replace] Cancelled old TP order ${position.exit_order_id} for position ${position.id}`);
                 } catch (e) {
-                  logger.warn(`[TP Replace] Failed to cancel old TP order ${position.tp_order_id}: ${e?.message || e}`);
+                  logger.warn(`[TP Replace] Failed to cancel old TP order ${position.exit_order_id}: ${e?.message || e}`);
                 }
               }
               
@@ -556,15 +556,19 @@ export class PositionService {
                     if (position.side !== 'long' && position.side !== 'short') {
                       logger.error(`[TP Replace] ⚠️ Invalid position.side value: ${position.side} for position ${position.id}. Expected 'long' or 'short'.`);
                     }
-                    const tpRes = await this.exchangeService.createTakeProfitLimit(position.symbol, position.side, newTP, qty);
-                    const newTpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
-                    const updatePayload = { 
+                    // ✅ Unified exit order: type switches based on profit/loss zone (STOP_MARKET <-> TAKE_PROFIT_MARKET)
+                    const { ExitOrderManager } = await import('./ExitOrderManager.js');
+                    const mgr = new ExitOrderManager(this.exchangeService);
+                    const placed = await mgr.placeOrReplaceExitOrder(position, newTP);
+
+                    const newExitOrderId = placed?.orderId ? String(placed.orderId) : null;
+                    const updatePayload = {
                       take_profit_price: newTP,
-                      tp_synced: newTpOrderId ? true : false // Track if TP order was successfully placed
+                      tp_synced: newExitOrderId ? true : false // Track if exit order was successfully placed
                     };
-                    if (newTpOrderId) updatePayload.tp_order_id = newTpOrderId;
+                    if (newExitOrderId) updatePayload.exit_order_id = newExitOrderId;
                     await Position.update(position.id, updatePayload);
-                    logger.debug(`[TP Replace] ✅ Placed new TP ${newTpOrderId || ''} @ ${newTP} for position ${position.id} (tp_synced=${updatePayload.tp_synced})`);
+                    logger.debug(`[TP Replace] ✅ Placed new EXIT (${placed?.orderType || 'n/a'}) ${newExitOrderId || ''} @ stop=${placed?.stopPrice ?? newTP} for position ${position.id} (tp_synced=${updatePayload.tp_synced})`);
                   } catch (tpError) {
                     // If TP order creation fails, still update take_profit_price in DB
                     // This allows trailing TP to continue working even if orders can't be placed
@@ -826,47 +830,39 @@ export class PositionService {
    * @param {number} newTP - New TP price (which has crossed entry)
    */
   async _convertTpToStopLimit(position, newTP) {
+    // ❗IMPORTANT CHANGE (duplicate-TP fix):
+    // Previously, when trailing TP crossed entry, we converted the TP into a STOP_LIMIT (SL) order.
+    // This created 2 different "take profit"-like closing orders on Binance UI (TAKE_PROFIT + STOP),
+    // and could lead to conflicts / duplicates.
+    //
+    // New behavior:
+    // - We DO NOT create any STOP/STOP_LIMIT order here.
+    // - We simply cancel the existing TP order (if any).
+    // - Then we rely on the existing market-close path in the caller when TP gets close to market,
+    //   or PositionMonitor/SL logic if stoploss is enabled.
     try {
-      logger.debug(`[TP->SL Convert] Converting TP to STOP_LIMIT for position ${position.id} at price ${newTP.toFixed(2)}`);
-      
-      // Cancel existing TP order
-      if (position.tp_order_id) {
+      logger.warn(
+        `[TP->SL Convert] Disabled STOP_LIMIT conversion to avoid duplicate TP orders. ` +
+        `Will cancel existing TP order only. position=${position.id} newTP=${Number(newTP).toFixed(2)}`
+      );
+
+      if (position.exit_order_id) {
         try {
-          await this.exchangeService.cancelOrder(position.tp_order_id, position.symbol);
-          logger.info(`[TP->SL Convert] Cancelled TP order ${position.tp_order_id} for position ${position.id}`);
+          await this.exchangeService.cancelOrder(position.exit_order_id, position.symbol);
+          logger.info(`[TP->SL Convert] Cancelled TP order ${position.exit_order_id} for position ${position.id}`);
         } catch (e) {
-          logger.warn(`[TP->SL Convert] Failed to cancel TP order ${position.tp_order_id}: ${e?.message || e}`);
+          logger.warn(`[TP->SL Convert] Failed to cancel TP order ${position.exit_order_id}: ${e?.message || e}`);
         }
       }
-      
-      // Delay before creating STOP_LIMIT order to avoid rate limits
-      const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
-      if (delayMs > 0) {
-        logger.debug(`[TP->SL Convert] Waiting ${delayMs}ms before placing STOP_LIMIT order for position ${position.id}...`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
-      
-      // Create STOP_LIMIT order at the new TP price
-      const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
-      if (qty > 0) {
-        const slRes = await this.exchangeService.createStopLossLimit(position.symbol, position.side, newTP, qty);
-        const newSlOrderId = slRes?.orderId ? String(slRes.orderId) : null;
-        if (newSlOrderId) {
-          // Update position: clear TP order, set SL order, update TP price (for tracking)
-          await Position.update(position.id, { 
-            tp_order_id: null, 
-            sl_order_id: newSlOrderId,
-            take_profit_price: newTP // Keep TP price for reference
-          });
-          logger.info(`[TP->SL Convert] Created STOP_LIMIT order ${newSlOrderId} @ ${newTP.toFixed(2)} for position ${position.id}`);
-        } else {
-          logger.warn(`[TP->SL Convert] Failed to create STOP_LIMIT order for position ${position.id}`);
-        }
-      } else {
-        logger.warn(`[TP->SL Convert] Skip creating STOP_LIMIT, qty=${qty}`);
-      }
+
+      // Clear TP order id in DB to prevent any further replacement attempts using the old id.
+      await Position.update(position.id, {
+        exit_order_id: null,
+        tp_synced: false, // mark not synced so monitor can decide what to do next
+        take_profit_price: newTP // keep for tracking / trailing state
+      });
     } catch (e) {
-      logger.error(`[TP->SL Convert] Error converting TP to STOP_LIMIT: ${e?.message || e}`);
+      logger.error(`[TP->SL Convert] Error in disabled conversion handler: ${e?.message || e}`);
     }
   }
 

@@ -107,7 +107,7 @@ export class PositionMonitor {
    * Uses soft lock to prevent race conditions when multiple instances run concurrently.
    * @param {Object} position - Position object
    */
-  async placeTpSlOrders(position) {
+  async placeExitOrder(position) {
     // Skip if position is not open
     if (position.status !== 'open') {
       return;
@@ -136,34 +136,34 @@ export class PositionMonitor {
     }
 
     // Check if TP/SL orders still exist on exchange
-    // If tp_order_id exists in DB but order is not on exchange (filled/canceled), we should recreate it
-    // CRITICAL FIX: Also check tp_sl_pending flag - if true, we need to place TP/SL even if tp_order_id exists
+    // If exit_order_id exists in DB but order is not on exchange (filled/canceled), we should recreate it
+    // CRITICAL FIX: Also check tp_sl_pending flag - if true, we need to place TP/SL even if exit_order_id exists
     const isTPSLPending = position.tp_sl_pending === true || position.tp_sl_pending === 1;
-    let needsTp = !position.tp_order_id || isTPSLPending;
+    let needsTp = !position.exit_order_id || isTPSLPending;
     let needsSl = !position.sl_order_id || isTPSLPending;
 
-    // If tp_order_id exists, verify it's still active on exchange
-    if (position.tp_order_id) {
+    // If exit_order_id exists, verify it's still active on exchange
+    if (position.exit_order_id) {
       try {
         const exchangeService = this.exchangeServices.get(position.bot_id);
         if (exchangeService) {
-          const orderStatus = await exchangeService.getOrderStatus(position.symbol, position.tp_order_id);
+          const orderStatus = await exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
           const status = (orderStatus?.status || '').toLowerCase();
           // If order is filled, canceled, or expired, we need to recreate it
           if (status === 'filled' || status === 'canceled' || status === 'cancelled' || status === 'expired') {
-            logger.warn(`[Place TP/SL] TP order ${position.tp_order_id} for position ${position.id} is ${status} on exchange, will recreate`);
+            logger.warn(`[Place TP/SL] TP order ${position.exit_order_id} for position ${position.id} is ${status} on exchange, will recreate`);
             needsTp = true;
-            // Clear tp_order_id in DB so we can recreate
-            await Position.update(position.id, { tp_order_id: null });
-            position.tp_order_id = null;
+            // Clear exit_order_id in DB so we can recreate
+            await Position.update(position.id, { exit_order_id: null });
+            position.exit_order_id = null;
           }
         }
       } catch (e) {
         // If we can't check order status, assume it might be missing and try to recreate
-        logger.warn(`[Place TP/SL] Could not verify TP order ${position.tp_order_id} for position ${position.id}: ${e?.message || e}. Will try to recreate.`);
+        logger.warn(`[Place TP/SL] Could not verify TP order ${position.exit_order_id} for position ${position.id}: ${e?.message || e}. Will try to recreate.`);
         needsTp = true;
-        await Position.update(position.id, { tp_order_id: null });
-        position.tp_order_id = null;
+        await Position.update(position.id, { exit_order_id: null });
+        position.exit_order_id = null;
       }
     }
 
@@ -192,6 +192,16 @@ export class PositionMonitor {
       }
     }
 
+    // --- De-duplicate safety (Binance): if exchange has multiple reduce-only close orders, keep only one TP + one SL ---
+    try {
+      const exchangeService = this.exchangeServices.get(position.bot_id);
+      if (exchangeService && exchangeService.bot?.exchange === 'binance') {
+        await this._dedupeCloseOrdersOnExchange(exchangeService, position);
+      }
+    } catch (e) {
+      logger.debug(`[Place TP/SL] Dedupe open orders skipped/failed for position ${position.id}: ${e?.message || e}`);
+    }
+
     // Skip if both TP and SL already exist and are active, AND tp_sl_pending is false
     if (!needsTp && !needsSl && !isTPSLPending) {
       // Release lock before returning
@@ -200,7 +210,7 @@ export class PositionMonitor {
     }
     
     // If tp_sl_pending is true but we have both orders, clear the flag
-    if (isTPSLPending && position.tp_order_id && (!needsSl || position.sl_order_id)) {
+    if (isTPSLPending && position.exit_order_id && (!needsSl || position.sl_order_id)) {
       // Both orders exist, clear pending flag
       await Position.update(position.id, { tp_sl_pending: false });
       logger.debug(`[Place TP/SL] Cleared tp_sl_pending flag for position ${position.id} (both TP and SL exist)`);
@@ -303,20 +313,23 @@ export class PositionMonitor {
                                           Number.isFinite(Number(currentPosition.initial_tp_price)) && 
                                           Number(currentPosition.initial_tp_price) > 0;
           
-          const tpRes = await exchangeService.createTakeProfitLimit(position.symbol, position.side, tpPrice, quantity);
-          const tpOrderId = tpRes?.orderId ? String(tpRes.orderId) : null;
+          // ✅ Unified exit order: type switches based on profit/loss zone (STOP_MARKET <-> TAKE_PROFIT_MARKET)
+          const { ExitOrderManager } = await import('../services/ExitOrderManager.js');
+          const mgr = new ExitOrderManager(exchangeService);
+          const placed = await mgr.placeOrReplaceExitOrder(position, tpPrice);
+          const tpOrderId = placed?.orderId ? String(placed.orderId) : null;
           if (tpOrderId) {
             // Store initial TP price for trailing calculation (only if not already set)
             const updateData = { 
-              tp_order_id: tpOrderId, 
+              exit_order_id: tpOrderId, 
               take_profit_price: tpPrice,
-              tp_sl_pending: false // Clear pending flag after successful TP placement
+              tp_sl_pending: false // Clear pending flag after successful EXIT placement
             };
             if (!shouldPreserveInitialTP) {
               updateData.initial_tp_price = tpPrice; // Only set if not already set
             }
             await Position.update(position.id, updateData);
-            logger.info(`[Place TP/SL] ✅ Placed TP order ${tpOrderId} for position ${position.id} @ ${tpPrice} ${shouldPreserveInitialTP ? '(preserved initial TP)' : '(initial TP)'}`);
+            logger.info(`[Place TP/SL] ✅ Placed EXIT order ${tpOrderId} for position ${position.id} @ ${tpPrice} ${shouldPreserveInitialTP ? '(preserved initial TP)' : '(initial TP)'}`);
           } else {
             // Order creation returned null (e.g., price too close to market)
             logger.warn(`[Place TP/SL] ⚠️ TP order creation returned null for position ${position.id} @ ${tpPrice}. Updating TP price in DB only.`);
@@ -369,12 +382,12 @@ export class PositionMonitor {
             logger.warn(`[Place TP/SL] Invalid SL detected for position ${position.id}: SL=${slPriceNum}, Entry=${entryPrice}, Side=${position.side}. Force closing position immediately to minimize risk.`);
             
             // Cancel TP order if any
-            if (position.tp_order_id) {
+            if (position.exit_order_id) {
               try {
-                await exchangeService.cancelOrder(position.tp_order_id, position.symbol);
-                logger.info(`[Place TP/SL] Cancelled TP order ${position.tp_order_id} for position ${position.id}`);
+                await exchangeService.cancelOrder(position.exit_order_id, position.symbol);
+                logger.info(`[Place TP/SL] Cancelled TP order ${position.exit_order_id} for position ${position.id}`);
               } catch (e) {
-                logger.warn(`[Place TP/SL] Failed to cancel TP order ${position.tp_order_id}: ${e?.message || e}`);
+                logger.warn(`[Place TP/SL] Failed to cancel TP order ${position.exit_order_id}: ${e?.message || e}`);
               }
             }
             
@@ -400,7 +413,7 @@ export class PositionMonitor {
           if (slOrderId) {
             // Clear tp_sl_pending flag if both TP and SL are now placed
             const currentPosition = await Position.findById(position.id);
-            const hasTP = currentPosition?.tp_order_id && currentPosition.tp_order_id.trim() !== '';
+            const hasTP = currentPosition?.exit_order_id && currentPosition.exit_order_id.trim() !== '';
             const updateData = { 
               sl_order_id: slOrderId, 
               stop_loss_price: slPrice 
@@ -444,6 +457,75 @@ export class PositionMonitor {
   }
 
   /**
+   * Binance-only: remove duplicated close orders (TP/SL) to avoid order spam / Binance open-order limits.
+   * Keeps at most 1 unified STOP_MARKET exit order (tracked by position.exit_order_id) and 1 STOP order (only if strategy stoploss enabled).
+   * Also tries to keep the orders referenced by position.exit_order_id / position.sl_order_id (if present).
+   */
+  async _dedupeCloseOrdersOnExchange(exchangeService, position) {
+    const symbol = position.symbol;
+    const side = position.side;
+    const desiredPositionSide = side === 'long' ? 'LONG' : 'SHORT';
+
+    const openOrders = await exchangeService.getOpenOrders(symbol);
+    if (!Array.isArray(openOrders) || openOrders.length <= 1) return;
+
+    // Only consider close / reduce-only style orders
+    const reduceOnlyOrders = openOrders.filter(o => {
+      const isReduceOnly = o?.reduceOnly === true || o?.reduceOnly === 'true';
+      const isClosePosition = o?.closePosition === true || o?.closePosition === 'true';
+      const type = String(o?.type || '').toUpperCase();
+      const isTpOrStop = type === 'STOP_MARKET' || type === 'TAKE_PROFIT_MARKET' || type === 'STOP' || type === 'STOP_LOSS' || type === 'STOP_LOSS_LIMIT';
+      // Some responses don't include reduceOnly flag but include closePosition
+      return (isReduceOnly || isClosePosition) && isTpOrStop;
+    });
+
+    if (reduceOnlyOrders.length <= 2) return;
+
+    // Match positionSide if present (hedge mode)
+    const scoped = reduceOnlyOrders.filter(o => {
+      const ps = String(o?.positionSide || '').toUpperCase();
+      return !ps || ps === desiredPositionSide;
+    });
+
+    if (scoped.length <= 2) return;
+
+    // Unified exit order types
+    const exitTypes = new Set(['STOP_MARKET', 'TAKE_PROFIT_MARKET']);
+    const stopTypes = new Set(['STOP', 'STOP_LOSS', 'STOP_LOSS_LIMIT']);
+
+    const keepIds = new Set();
+    if (position.exit_order_id) keepIds.add(String(position.exit_order_id));
+    if (position.sl_order_id) keepIds.add(String(position.sl_order_id));
+
+    const byTimeAsc = [...scoped].sort((a, b) => Number(a?.time || a?.updateTime || a?.origTime || 0) - Number(b?.time || b?.updateTime || b?.origTime || 0));
+
+    const exits = byTimeAsc.filter(o => exitTypes.has(String(o?.type || '').toUpperCase()));
+    const stops = byTimeAsc.filter(o => stopTypes.has(String(o?.type || '').toUpperCase()));
+
+    // Keep newest order of each class if not explicitly referenced
+    const newestExit = exits.length ? exits[exits.length - 1] : null;
+    const newestStop = stops.length ? stops[stops.length - 1] : null;
+    if (newestExit?.orderId) keepIds.add(String(newestExit.orderId));
+    if (newestStop?.orderId) keepIds.add(String(newestStop.orderId));
+
+    const toCancel = scoped.filter(o => !keepIds.has(String(o?.orderId)));
+    if (toCancel.length === 0) return;
+
+    logger.warn(
+      `[Place Exit] Detected ${scoped.length} reduce-only close orders on exchange for ${symbol} (${desiredPositionSide}). ` +
+      `Cancelling ${toCancel.length} duplicates to enforce 1-exit-order invariant.`
+    );
+
+    for (const o of toCancel) {
+      try {
+        await exchangeService.cancelOrder(String(o.orderId), symbol);
+      } catch (e) {
+        logger.debug(`[Place TP/SL] Failed to cancel duplicate order ${o?.orderId} for ${symbol}: ${e?.message || e}`);
+      }
+    }
+  }
+
+  /**
    * Check for unfilled orders that should be cancelled (candle ended)
    * @param {Object} position - Position object
    */
@@ -457,16 +539,16 @@ export class PositionMonitor {
       if (!exchangeService || !orderService) return;
 
       // TTL-based cancellation for ENTRY orders only (not TP/SL orders)
-      // IMPORTANT: This only cancels position.order_id (entry order), NOT tp_order_id or sl_order_id
+      // IMPORTANT: This only cancels position.order_id (entry order), NOT exit_order_id or sl_order_id
       // EntryOrderMonitor handles entry orders from entry_orders table, but this is a fallback
       // for positions that may still have an unfilled entry order_id
-      // TP/SL orders (tp_order_id, sl_order_id) are NEVER cancelled by this TTL
+      // TP/SL orders (exit_order_id, sl_order_id) are NEVER cancelled by this TTL
       const ttlMinutes = Number(configService.getNumber('ENTRY_ORDER_TTL_MINUTES', 30));
       const ttlMs = Math.max(1, ttlMinutes) * 60 * 1000;
       const openedAtMs = new Date(position.opened_at).getTime();
       const now = Date.now();
 
-      // Only check position.order_id (entry order), NOT tp_order_id or sl_order_id
+      // Only check position.order_id (entry order), NOT exit_order_id or sl_order_id
       if (position.status === 'open' && position.order_id && now - openedAtMs >= ttlMs) {
         // Check actual order status on exchange to avoid cancelling filled orders
         // This is the ENTRY order, not TP/SL orders

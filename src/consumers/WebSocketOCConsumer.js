@@ -230,7 +230,7 @@ export class WebSocketOCConsumer {
   async _detectAndProcess(tick) {
     try {
       const { exchange, symbol, price, timestamp } = tick;
-      
+
       // Detect OC and match with strategies
       const matches = await realtimeOCDetector.detectOC(exchange, symbol, price, timestamp, 'WebSocketOCConsumer');
 
@@ -389,9 +389,9 @@ export class WebSocketOCConsumer {
         );
       } else if (!extendOK) {
         // Counter-trend: If extend condition not met, either place passive LIMIT (if enabled) or skip.
-        // New behaviour:
-        // - Không yêu cầu giá phải chạm 100% mức extend.
-        // - Cho phép đặt LIMIT nếu chênh lệch giữa currentPrice và entryPrice <= EXTEND_LIMIT_MAX_DIFF_RATIO * quãng đường extend.
+      // New behaviour:
+      // - Không yêu cầu giá phải chạm 100% mức extend.
+      // - Cho phép đặt LIMIT nếu chênh lệch giữa currentPrice và entryPrice <= EXTEND_LIMIT_MAX_DIFF_RATIO * quãng đường extend.
         const allowPassive = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
         if (allowPassive) {
           // Allow overriding max diff ratio via config (default 0.5 = 50%)

@@ -242,7 +242,7 @@ export class PositionSync {
             // Match all positions with same symbol+side (there can be multiple positions)
             for (const dbPos of dbPosArray) {
               matchedDbPositionIds.add(dbPos.id); // Mark as matched
-              await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
+            await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
             }
           }
           processedCount++;
@@ -394,52 +394,131 @@ export class PositionSync {
       return false;
     }
 
-    // Try to find matching entry_order first (use normalized symbol for consistency)
-    const [entryOrders] = await pool.execute(
-      `SELECT * FROM entry_orders 
-       WHERE bot_id = ? AND side = ? AND status = 'open'
-         AND (symbol = ? OR symbol = ? OR symbol = ?)
-       ORDER BY created_at DESC LIMIT 1`,
-      [botId, side, normalizedSymbol, `${normalizedSymbol}/USDT`, symbol]
-    );
+      // Try to find matching entry_order first (use normalized symbol for consistency)
+      const [entryOrders] = await pool.execute(
+        `SELECT * FROM entry_orders 
+         WHERE bot_id = ? AND side = ? AND status = 'open'
+           AND (symbol = ? OR symbol = ? OR symbol = ?)
+         ORDER BY created_at DESC LIMIT 1`,
+        [botId, side, normalizedSymbol, `${normalizedSymbol}/USDT`, symbol]
+      );
 
-    if (entryOrders.length > 0) {
-      const entry = entryOrders[0];
-      logger.info(`[PositionSync] Found matching entry_order ${entry.id} for missing position ${symbol} ${side}`);
-      // Try to create Position directly using entry_order data
-      try {
-        const { Strategy } = await import('../models/Strategy.js');
-        const strategy = await Strategy.findById(entry.strategy_id);
-        if (!strategy) {
-          logger.warn(`[PositionSync] Strategy ${entry.strategy_id} not found for entry_order ${entry.id}`);
+      if (entryOrders.length > 0) {
+        const entry = entryOrders[0];
+        logger.info(`[PositionSync] Found matching entry_order ${entry.id} for missing position ${symbol} ${side}`);
+        // Try to create Position directly using entry_order data
+        try {
+          const { Strategy } = await import('../models/Strategy.js');
+          const strategy = await Strategy.findById(entry.strategy_id);
+          if (!strategy) {
+            logger.warn(`[PositionSync] Strategy ${entry.strategy_id} not found for entry_order ${entry.id}`);
+            return false;
+          }
+          
+          // Use entry_order data to create Position
+          const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+          const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || entry.entry_price || 0);
+          const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit, side);
+          const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+          const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+          const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
+          
+          // Use normalized symbol for consistency
+            const position = await Position.create({
+              strategy_id: entry.strategy_id,
+              bot_id: botId,
+              order_id: entry.order_id,
+            symbol: normalizedSymbol, // Use normalized symbol
+              side: side,
+              entry_price: entryPrice,
+              amount: entry.amount,
+              take_profit_price: tpPrice,
+              stop_loss_price: slPrice,
+              current_reduce: strategy.reduce
+            });
+            
+            await EntryOrder.markFilled(entry.id);
+            
+          logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${normalizedSymbol} ${side}`);
+            return true;
+        } catch (error) {
+          // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)
+          if (error?.code === 'ER_DUP_ENTRY' || error?.message?.includes('Duplicate entry') || error?.message?.includes('UNIQUE constraint')) {
+            logger.info(
+              `[PositionSync] Position already exists for ${normalizedSymbol} ${side} on bot ${botId} ` +
+              `(race condition detected, another process created it first)`
+            );
+            return false; // Not an error, just skip
+          }
+          logger.error(`[PositionSync] Error creating Position from entry_order ${entry.id}:`, error?.message || error);
           return false;
         }
-        
-        // Use entry_order data to create Position
-        const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
-        const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || entry.entry_price || 0);
-        const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit, side);
-        const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
-        const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
-        const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
-        
-        // Use normalized symbol for consistency
+      }
+
+      // Try to find matching strategy (use normalized symbol for consistency)
+      const [strategies] = await pool.execute(
+        `SELECT * FROM strategies 
+         WHERE bot_id = ? AND is_active = TRUE
+           AND (symbol = ? OR symbol = ? OR symbol = ?)
+         ORDER BY created_at DESC LIMIT 1`,
+        [botId, normalizedSymbol, `${normalizedSymbol}/USDT`, symbol]
+      );
+
+      if (strategies.length === 0) {
+        logger.debug(`[PositionSync] No matching strategy found for missing position ${symbol} ${side} on bot ${botId}`);
+        return false; // Can't create Position without strategy
+      }
+
+      const strategy = strategies[0];
+
+      // Get position details from exchange
+      // CRITICAL: Parse raw amount first to determine side correctly
+      const rawAmt = parseFloat(exPos.positionAmt ?? exPos.contracts ?? 0);
+      const contracts = Math.abs(rawAmt);
+      
+      // CRITICAL FIX: Verify side matches rawAmt to prevent side mismatch bugs
+      const verifiedSide = rawAmt > 0 ? 'long' : rawAmt < 0 ? 'short' : null;
+      if (verifiedSide && verifiedSide !== side) {
+        logger.error(
+          `[PositionSync] ⚠️ SIDE MISMATCH when creating position for ${symbol}: ` +
+          `Parameter side=${side}, but rawAmt=${rawAmt} indicates side=${verifiedSide}. ` +
+          `Using verified side from rawAmt to prevent incorrect position creation.`
+        );
+        // Use verified side from rawAmt instead of parameter
+        // This prevents creating position with wrong side if parameter was incorrect
+        side = verifiedSide;
+      }
+      
+      const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || 0);
+      const markPrice = parseFloat(exPos.markPrice || exPos.info?.markPrice || entryPrice || 0);
+      
+      // Calculate amount in USDT (approximate)
+      const amount = contracts * markPrice;
+
+      // Calculate TP/SL
+      const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+      const tpPrice = calculateTakeProfit(entryPrice || markPrice, strategy.take_profit, side);
+      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+      const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+      const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice || markPrice, rawStoploss, side) : null;
+
+      // OPTIMISTIC LOCK: Create Position directly without transaction (fast)
+      // UNIQUE constraint will prevent duplicates if race condition occurs
+      try {
         const position = await Position.create({
-          strategy_id: entry.strategy_id,
+          strategy_id: strategy.id,
           bot_id: botId,
-          order_id: entry.order_id,
-          symbol: normalizedSymbol, // Use normalized symbol
+          order_id: `sync_${normalizedSymbol}_${side}_${Date.now()}`, // Traceable order_id
+          symbol: normalizedSymbol, // Use normalized symbol for consistency
           side: side,
-          entry_price: entryPrice,
-          amount: entry.amount,
+          entry_price: entryPrice || markPrice,
+          amount: amount,
           take_profit_price: tpPrice,
           stop_loss_price: slPrice,
           current_reduce: strategy.reduce
         });
-        
-        await EntryOrder.markFilled(entry.id);
-        
-        logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${normalizedSymbol} ${side}`);
+
+        logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} (synced from exchange)`);
         return true;
       } catch (error) {
         // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)
@@ -450,88 +529,9 @@ export class PositionSync {
           );
           return false; // Not an error, just skip
         }
-        logger.error(`[PositionSync] Error creating Position from entry_order ${entry.id}:`, error?.message || error);
+        logger.error(`[PositionSync] Error creating missing position for ${symbol} ${side}:`, error?.message || error);
         return false;
       }
-    }
-
-    // Try to find matching strategy (use normalized symbol for consistency)
-    const [strategies] = await pool.execute(
-      `SELECT * FROM strategies 
-       WHERE bot_id = ? AND is_active = TRUE
-         AND (symbol = ? OR symbol = ? OR symbol = ?)
-       ORDER BY created_at DESC LIMIT 1`,
-      [botId, normalizedSymbol, `${normalizedSymbol}/USDT`, symbol]
-    );
-
-    if (strategies.length === 0) {
-      logger.debug(`[PositionSync] No matching strategy found for missing position ${symbol} ${side} on bot ${botId}`);
-      return false; // Can't create Position without strategy
-    }
-
-    const strategy = strategies[0];
-
-    // Get position details from exchange
-    // CRITICAL: Parse raw amount first to determine side correctly
-    const rawAmt = parseFloat(exPos.positionAmt ?? exPos.contracts ?? 0);
-    const contracts = Math.abs(rawAmt);
-    
-    // CRITICAL FIX: Verify side matches rawAmt to prevent side mismatch bugs
-    const verifiedSide = rawAmt > 0 ? 'long' : rawAmt < 0 ? 'short' : null;
-    if (verifiedSide && verifiedSide !== side) {
-      logger.error(
-        `[PositionSync] ⚠️ SIDE MISMATCH when creating position for ${symbol}: ` +
-        `Parameter side=${side}, but rawAmt=${rawAmt} indicates side=${verifiedSide}. ` +
-        `Using verified side from rawAmt to prevent incorrect position creation.`
-      );
-      // Use verified side from rawAmt instead of parameter
-      // This prevents creating position with wrong side if parameter was incorrect
-      side = verifiedSide;
-    }
-    
-    const entryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || exPos.markPrice || 0);
-    const markPrice = parseFloat(exPos.markPrice || exPos.info?.markPrice || entryPrice || 0);
-    
-    // Calculate amount in USDT (approximate)
-    const amount = contracts * markPrice;
-
-    // Calculate TP/SL
-    const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
-    const tpPrice = calculateTakeProfit(entryPrice || markPrice, strategy.take_profit, side);
-    const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
-    const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
-    const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice || markPrice, rawStoploss, side) : null;
-
-    // OPTIMISTIC LOCK: Create Position directly without transaction (fast)
-    // UNIQUE constraint will prevent duplicates if race condition occurs
-    try {
-      const position = await Position.create({
-        strategy_id: strategy.id,
-        bot_id: botId,
-        order_id: `sync_${normalizedSymbol}_${side}_${Date.now()}`, // Traceable order_id
-        symbol: normalizedSymbol, // Use normalized symbol for consistency
-        side: side,
-        entry_price: entryPrice || markPrice,
-        amount: amount,
-        take_profit_price: tpPrice,
-        stop_loss_price: slPrice,
-        current_reduce: strategy.reduce
-      });
-
-      logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} (synced from exchange)`);
-      return true;
-    } catch (error) {
-      // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)
-      if (error?.code === 'ER_DUP_ENTRY' || error?.message?.includes('Duplicate entry') || error?.message?.includes('UNIQUE constraint')) {
-        logger.info(
-          `[PositionSync] Position already exists for ${normalizedSymbol} ${side} on bot ${botId} ` +
-          `(race condition detected, another process created it first)`
-        );
-        return false; // Not an error, just skip
-      }
-      logger.error(`[PositionSync] Error creating missing position for ${symbol} ${side}:`, error?.message || error);
-      return false;
-    }
   }
 
   /**

@@ -916,6 +916,22 @@ export class ExchangeService {
     throw new Error('createTakeProfitLimit not supported on this exchange');
   }
 
+  async createCloseStopMarket(symbol, side, stopPrice) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+      return await this.binanceDirectClient.createCloseStopMarket(normalizedSymbol, side, stopPrice);
+    }
+    throw new Error('createCloseStopMarket not supported on this exchange');
+  }
+
+  async createCloseTakeProfitMarket(symbol, side, stopPrice) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+      return await this.binanceDirectClient.createCloseTakeProfitMarket(normalizedSymbol, side, stopPrice);
+    }
+    throw new Error('createCloseTakeProfitMarket not supported on this exchange');
+  }
+
   async createStopLossLimit(symbol, side, slPrice, quantity) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
       const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
@@ -1287,6 +1303,14 @@ export class ExchangeService {
     // CCXT does not have a unified method for this, so we'll skip for other exchanges for now.
     logger.warn(`[ExchangeService] cancelAllOpenOrders not implemented for ${this.bot.exchange}`);
     return { success: true };
+  }
+
+  async getOpenOrders(symbol) {
+    if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      return await this.binanceDirectClient.getOpenOrders(symbol);
+    }
+    logger.warn(`[ExchangeService] getOpenOrders not implemented for ${this.bot.exchange}`);
+    return [];
   }
 
   async cancelOrder(orderId, symbol) {

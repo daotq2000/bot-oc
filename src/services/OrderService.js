@@ -158,18 +158,18 @@ export class OrderService {
       if (!canOpen) {
         // Get current total for logging
         const currentTotal = await positionLimitService.getCurrentTotalAmount(strategy.bot_id, strategy.symbol);
-        const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
+      const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
         
-        logger.warn(
+            logger.warn(
           `[OrderService] [POSITION_LIMIT_REACHED] bot=${strategy.bot_id} symbol=${strategy.symbol} ` +
           `current=${currentTotal.toFixed(2)} new=${Number(amount || 0).toFixed(2)} max=${maxAmountPerCoin.toFixed(2)}. ` +
           `Skipping strategy ${strategy.id}`
-        );
-        await this.sendCentralLog(
-          `Order SkipMaxPerCoin | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
+            );
+            await this.sendCentralLog(
+              `Order SkipMaxPerCoin | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
           `${String(side).toUpperCase()} current=${currentTotal.toFixed(2)} new=${Number(amount || 0).toFixed(2)} max=${maxAmountPerCoin.toFixed(2)}`
-        );
-        return null;
+            );
+            return null;
       }
       
       // Check if entry price is still valid

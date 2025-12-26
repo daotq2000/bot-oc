@@ -1818,6 +1818,101 @@ export class BinanceDirectClient {
     return await this.makeRequest('/fapi/v1/allOpenOrders', 'DELETE', { symbol: normalizedSymbol }, true);
   }
 
+  /**
+   * List open orders for a symbol
+   */
+  async getOpenOrders(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    return await this.makeRequest('/fapi/v1/openOrders', 'GET', { symbol: normalizedSymbol }, true);
+  }
+
+  /**
+   * Create CLOSE-POSITION STOP_MARKET
+   * LONG closes with SELL; SHORT closes with BUY.
+   */
+  async createCloseStopMarket(symbol, side, stopPrice) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+
+    const [tickSize, dualSide, currentPrice] = await Promise.all([
+      this.getTickSize(normalizedSymbol),
+      this.getDualSidePosition(),
+      this.getPrice(normalizedSymbol)
+    ]);
+
+    const formattedStop = this.formatPrice(stopPrice, tickSize);
+    const orderSide = side === 'long' ? 'SELL' : 'BUY';
+    const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+
+    // Validate side vs market to avoid -2021
+    let finalStop = formattedStop;
+    const nudgePct = 0.005;
+    if (Number.isFinite(currentPrice) && currentPrice > 0) {
+      if (side === 'long' && finalStop >= currentPrice) {
+        finalStop = this.formatPrice(currentPrice * (1 - nudgePct), tickSize);
+      }
+      if (side === 'short' && finalStop <= currentPrice) {
+        finalStop = this.formatPrice(currentPrice * (1 + nudgePct), tickSize);
+      }
+    }
+
+    const params = {
+      symbol: normalizedSymbol,
+      side: orderSide,
+      type: 'STOP_MARKET',
+      stopPrice: String(finalStop),
+      closePosition: 'true',
+      timeInForce: 'GTC'
+    };
+
+    if (dualSide) params.positionSide = positionSide;
+
+    return await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
+  }
+
+  /**
+   * Create CLOSE-POSITION TAKE_PROFIT_MARKET
+   * LONG closes with SELL; SHORT closes with BUY.
+   */
+  async createCloseTakeProfitMarket(symbol, side, stopPrice) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+
+    const [tickSize, dualSide, currentPrice] = await Promise.all([
+      this.getTickSize(normalizedSymbol),
+      this.getDualSidePosition(),
+      this.getPrice(normalizedSymbol)
+    ]);
+
+    const formattedStop = this.formatPrice(stopPrice, tickSize);
+    const orderSide = side === 'long' ? 'SELL' : 'BUY';
+    const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+
+    // Validate side vs market to avoid -2021
+    let finalStop = formattedStop;
+    const nudgePct = 0.005;
+    if (Number.isFinite(currentPrice) && currentPrice > 0) {
+      // TAKE_PROFIT_MARKET trigger direction is opposite of STOP_MARKET
+      if (side === 'long' && finalStop <= currentPrice) {
+        finalStop = this.formatPrice(currentPrice * (1 + nudgePct), tickSize);
+      }
+      if (side === 'short' && finalStop >= currentPrice) {
+        finalStop = this.formatPrice(currentPrice * (1 - nudgePct), tickSize);
+      }
+    }
+
+    const params = {
+      symbol: normalizedSymbol,
+      side: orderSide,
+      type: 'TAKE_PROFIT_MARKET',
+      stopPrice: String(finalStop),
+      closePosition: 'true',
+      timeInForce: 'GTC'
+    };
+
+    if (dualSide) params.positionSide = positionSide;
+
+    return await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
+  }
+
   async cancelOrder(symbol, orderId) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
     const params = { symbol: normalizedSymbol, orderId: orderId };
