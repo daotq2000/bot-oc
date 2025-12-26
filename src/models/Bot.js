@@ -58,7 +58,8 @@ export class Bot {
       telegram_alert_channel_id = null,
       binance_testnet = null,
       concurrency_lock_timeout = null,
-      is_active = true
+      is_active = true,
+      is_reverse_strategy = true // Default to reverse strategy
     } = data;
 
     const [result] = await pool.execute(
@@ -67,14 +68,14 @@ export class Bot {
         telegram_chat_id, future_balance_target, spot_transfer_threshold,
         transfer_frequency, withdraw_enabled, withdraw_address,
         withdraw_network, spot_balance_threshold, max_concurrent_trades,
-        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active, is_reverse_strategy
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         bot_name, exchange, uid, access_key, secret_key, proxy,
         telegram_chat_id, future_balance_target, spot_transfer_threshold,
         transfer_frequency, withdraw_enabled, withdraw_address,
         withdraw_network, spot_balance_threshold, max_concurrent_trades,
-        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active
+        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active, is_reverse_strategy
       ]
     );
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import { OrderService } from '../../../src/services/OrderService.js';
 import { mockExchangeService, mockTelegramService } from '../../utils/mocks.js';
+import { positionLimitService } from '../../../src/services/PositionLimitService.js';
 
 describe('OrderService', () => {
   let orderService;
@@ -45,6 +46,10 @@ describe('OrderService', () => {
 
     // Mock EntryOrder model methods
     EntryOrder.create = jest.fn();
+
+    // Mock PositionLimitService
+    positionLimitService.canOpenNewPosition = jest.fn().mockResolvedValue(true);
+    positionLimitService.getCurrentTotalAmount = jest.fn().mockResolvedValue(0);
 
     // Create OrderService instance
     orderService = new OrderService(mockExchangeService, mockTelegramService);
@@ -293,18 +298,26 @@ describe('OrderService', () => {
       const signal = createMockSignal();
       signal.strategy.bot.max_amount_per_coin = 50; // Limit is 50
       
-      // Mock database: current amount = 40, new amount = 100, total = 140 > 50
+      // Mock PositionLimitService to reject
+      positionLimitService.canOpenNewPosition = jest.fn().mockResolvedValue(false);
+      positionLimitService.getCurrentTotalAmount = jest.fn().mockResolvedValue(40);
+      
       await mockDbExecute((query) => {
         if (query.includes('COUNT(*)')) {
           return Promise.resolve([[{ count: 0 }]]); // Position count
         }
-        return Promise.resolve([[{ positions_amount: 40, pending_orders_amount: 0 }]]); // Exposure
+        return Promise.resolve([]);
       });
       
       const result = await orderService.executeSignal(signal);
       
       expect(result).toBeNull();
       expect(mockExchangeService.createOrder).not.toHaveBeenCalled();
+      expect(positionLimitService.canOpenNewPosition).toHaveBeenCalledWith({
+        botId: signal.strategy.bot_id,
+        symbol: signal.strategy.symbol,
+        newOrderAmount: signal.amount
+      });
     });
 
     it('should create market order when price crossed entry', async () => {

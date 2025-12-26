@@ -341,7 +341,7 @@ export class PositionSync {
 
   /**
    * Create Position record for position that exists on exchange but not in database
-   * Uses transaction with SELECT FOR UPDATE to prevent race conditions
+   * Uses optimistic locking (no transaction, relies on UNIQUE constraint) for better performance
    * @param {number} botId - Bot ID
    * @param {string} symbol - Symbol (normalized)
    * @param {string} side - 'long' or 'short'
@@ -349,60 +349,53 @@ export class PositionSync {
    * @param {ExchangeService} exchangeService - Exchange service instance
    */
   async createMissingPosition(botId, symbol, side, exPos, exchangeService) {
-    const connection = await pool.getConnection();
-    try {
-      await connection.beginTransaction();
+    // CRITICAL: Normalize side parameter to ensure consistency (lowercase 'long' or 'short')
+    let normalizedSide = String(side || '').toLowerCase();
+    if (normalizedSide !== 'long' && normalizedSide !== 'short') {
+      logger.error(`[PositionSync] Invalid side parameter: ${JSON.stringify(side)}, must be 'long' or 'short'`);
+      return false;
+    }
+    side = normalizedSide; // Use normalized side
 
-      // CRITICAL: Normalize side parameter to ensure consistency (lowercase 'long' or 'short')
-      let normalizedSide = String(side || '').toLowerCase();
-      if (normalizedSide !== 'long' && normalizedSide !== 'short') {
-        logger.error(`[PositionSync] Invalid side parameter: ${JSON.stringify(side)}, must be 'long' or 'short'`);
-        await connection.rollback();
-        return false;
-      }
-      side = normalizedSide; // Use normalized side
+    // Normalize symbol to ensure consistency
+    const normalizedSymbol = this.normalizeSymbol(symbol);
 
-      // Normalize symbol to ensure consistency
-      const normalizedSymbol = this.normalizeSymbol(symbol);
+    // OPTIMISTIC LOCK: Check for existing position without lock (fast read)
+    // This is a performance optimization - we rely on UNIQUE constraint to prevent duplicates
+    const [existing] = await pool.execute(
+      `SELECT p.id, p.symbol, p.side
+       FROM positions p
+       JOIN strategies s ON p.strategy_id = s.id
+       WHERE s.bot_id = ? 
+         AND p.status = 'open'
+         AND p.side = ?
+         AND (
+           p.symbol = ? OR 
+           p.symbol = ? OR 
+           s.symbol = ? OR 
+           s.symbol = ?
+         )
+       LIMIT 1`,
+      [
+        botId,
+        side,
+        normalizedSymbol,
+        `${normalizedSymbol}/USDT`,
+        normalizedSymbol,
+        `${normalizedSymbol}/USDT`
+      ]
+    );
 
-      // SAFEGUARD: Check for existing position with SELECT FOR UPDATE to prevent race conditions
-      // This locks the rows and prevents concurrent creation
-      const [existing] = await connection.execute(
-        `SELECT p.id, p.symbol, p.side
-         FROM positions p
-         JOIN strategies s ON p.strategy_id = s.id
-         WHERE s.bot_id = ? 
-           AND p.status = 'open'
-           AND p.side = ?
-           AND (
-             p.symbol = ? OR 
-             p.symbol = ? OR 
-             s.symbol = ? OR 
-             s.symbol = ?
-           )
-         LIMIT 1
-         FOR UPDATE`,
-        [
-          botId,
-          side,
-          normalizedSymbol,
-          `${normalizedSymbol}/USDT`,
-          normalizedSymbol,
-          `${normalizedSymbol}/USDT`
-        ]
+    if (existing.length > 0) {
+      logger.info(
+        `[PositionSync] Skip creating duplicate Position for ${normalizedSymbol} ${side} on bot ${botId} ` +
+        `(found existing position id=${existing[0].id}, symbol=${existing[0].symbol})`
       );
-
-      if (existing.length > 0) {
-        await connection.rollback();
-        logger.info(
-          `[PositionSync] Skip creating duplicate Position for ${normalizedSymbol} ${side} on bot ${botId} ` +
-          `(found existing position id=${existing[0].id}, symbol=${existing[0].symbol})`
-        );
-        return false;
-      }
+      return false;
+    }
 
       // Try to find matching entry_order first (use normalized symbol for consistency)
-      const [entryOrders] = await connection.execute(
+      const [entryOrders] = await pool.execute(
         `SELECT * FROM entry_orders 
          WHERE bot_id = ? AND side = ? AND status = 'open'
            AND (symbol = ? OR symbol = ? OR symbol = ?)
@@ -445,19 +438,25 @@ export class PositionSync {
             });
             
             await EntryOrder.markFilled(entry.id);
-          await connection.commit();
             
           logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${normalizedSymbol} ${side}`);
             return true;
         } catch (error) {
-          await connection.rollback();
+          // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)
+          if (error?.code === 'ER_DUP_ENTRY' || error?.message?.includes('Duplicate entry') || error?.message?.includes('UNIQUE constraint')) {
+            logger.info(
+              `[PositionSync] Position already exists for ${normalizedSymbol} ${side} on bot ${botId} ` +
+              `(race condition detected, another process created it first)`
+            );
+            return false; // Not an error, just skip
+          }
           logger.error(`[PositionSync] Error creating Position from entry_order ${entry.id}:`, error?.message || error);
           return false;
         }
       }
 
       // Try to find matching strategy (use normalized symbol for consistency)
-      const [strategies] = await connection.execute(
+      const [strategies] = await pool.execute(
         `SELECT * FROM strategies 
          WHERE bot_id = ? AND is_active = TRUE
            AND (symbol = ? OR symbol = ? OR symbol = ?)
@@ -503,13 +502,14 @@ export class PositionSync {
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
       const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice || markPrice, rawStoploss, side) : null;
 
-      // Create Position record with normalized symbol
-      // Use timestamp + symbol + side for order_id to make it traceable
+      // OPTIMISTIC LOCK: Create Position directly without transaction (fast)
+      // UNIQUE constraint will prevent duplicates if race condition occurs
+      try {
         const position = await Position.create({
           strategy_id: strategy.id,
           bot_id: botId,
-        order_id: `sync_${normalizedSymbol}_${side}_${Date.now()}`, // Traceable order_id
-        symbol: normalizedSymbol, // Use normalized symbol for consistency
+          order_id: `sync_${normalizedSymbol}_${side}_${Date.now()}`, // Traceable order_id
+          symbol: normalizedSymbol, // Use normalized symbol for consistency
           side: side,
           entry_price: entryPrice || markPrice,
           amount: amount,
@@ -518,15 +518,23 @@ export class PositionSync {
           current_reduce: strategy.reduce
         });
 
-      await connection.commit();
-      logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} (synced from exchange)`);
+        logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} (synced from exchange)`);
         return true;
+      } catch (error) {
+        // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)
+        if (error?.code === 'ER_DUP_ENTRY' || error?.message?.includes('Duplicate entry') || error?.message?.includes('UNIQUE constraint')) {
+          logger.info(
+            `[PositionSync] Position already exists for ${normalizedSymbol} ${side} on bot ${botId} ` +
+            `(race condition detected, another process created it first)`
+          );
+          return false; // Not an error, just skip
+        }
+        logger.error(`[PositionSync] Error creating missing position for ${symbol} ${side}:`, error?.message || error);
+        return false;
+      }
     } catch (error) {
-      await connection.rollback();
-      logger.error(`[PositionSync] Error creating missing position for ${symbol} ${side}:`, error?.message || error);
+      logger.error(`[PositionSync] Unexpected error in createMissingPosition for ${symbol} ${side}:`, error?.message || error);
       return false;
-    } finally {
-      connection.release();
     }
   }
 

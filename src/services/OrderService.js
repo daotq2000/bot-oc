@@ -1,6 +1,7 @@
 import { Position } from '../models/Position.js';
 import { EntryOrder } from '../models/EntryOrder.js';
 import { TelegramService } from './TelegramService.js';
+import { positionLimitService } from './PositionLimitService.js';
 
 import logger from '../utils/logger.js';
 import { configService } from './ConfigService.js';
@@ -146,48 +147,29 @@ export class OrderService {
         }
       }
       
-      // Per-coin exposure limit (max_amount_per_coin, in USDT) - configurable per bot
-      // CRITICAL FIX: Include both open positions AND pending LIMIT entry orders to prevent overexposure
-      const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
-      if (Number.isFinite(maxAmountPerCoin) && maxAmountPerCoin > 0) {
-        try {
-          const pool = (await import('../config/database.js')).default;
-          // NOTE: amount is stored in USDT (strategy.amount), so we sum p.amount.
-          // Include both open positions and pending entry orders to prevent overexposure
-          const [rows] = await pool.execute(
-            `SELECT 
-              COALESCE(SUM(CASE WHEN p.status = 'open' THEN p.amount ELSE 0 END), 0) AS positions_amount,
-              COALESCE(SUM(CASE WHEN eo.status = 'open' THEN eo.amount ELSE 0 END), 0) AS pending_orders_amount
-             FROM strategies s
-             LEFT JOIN positions p ON p.strategy_id = s.id AND p.status = 'open' AND p.symbol = ?
-             LEFT JOIN entry_orders eo ON eo.strategy_id = s.id AND eo.status = 'open' AND eo.symbol = ?
-             WHERE s.bot_id = ? AND s.symbol = ?
-             GROUP BY s.bot_id, s.symbol`,
-            [strategy.symbol, strategy.symbol, strategy.bot_id, strategy.symbol]
-          );
-          const positionsAmount = Number(rows?.[0]?.positions_amount || 0);
-          const pendingOrdersAmount = Number(rows?.[0]?.pending_orders_amount || 0);
-          const currentAmount = positionsAmount + pendingOrdersAmount;
-          const projectedAmount = currentAmount + Number(amount || 0);
+      // Per-coin exposure limit (max_amount_per_coin, in USDT) - HARD LIMIT
+      // Check using PositionLimitService before creating any new order
+      const canOpen = await positionLimitService.canOpenNewPosition({
+        botId: strategy.bot_id,
+        symbol: strategy.symbol,
+        newOrderAmount: amount
+      });
 
-          if (projectedAmount > maxAmountPerCoin) {
-            logger.warn(
-              `[OrderService] max_amount_per_coin exceeded for bot ${strategy.bot_id}, symbol=${strategy.symbol}. ` +
-              `positions=${positionsAmount}, pending=${pendingOrdersAmount}, current=${currentAmount}, new=${amount}, projected=${projectedAmount}, limit=${maxAmountPerCoin}. Skipping strategy ${strategy.id}`
-            );
-            await this.sendCentralLog(
-              `Order SkipMaxPerCoin | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
-              `${String(side).toUpperCase()} positions=${positionsAmount} pending=${pendingOrdersAmount} current=${currentAmount} new=${amount} limit=${maxAmountPerCoin}`
-            );
-            return null;
-          }
-        } catch (exposureErr) {
-          logger.warn(
-            `[OrderService] Failed to check max_amount_per_coin for bot ${strategy.bot_id}, symbol=${strategy.symbol}:`,
-            exposureErr?.message || exposureErr
-          );
-          // If exposure check fails, we proceed but log the issue.
-        }
+      if (!canOpen) {
+        // Get current total for logging
+        const currentTotal = await positionLimitService.getCurrentTotalAmount(strategy.bot_id, strategy.symbol);
+        const maxAmountPerCoin = Number(strategy.bot?.max_amount_per_coin || 0);
+        
+        logger.warn(
+          `[OrderService] [POSITION_LIMIT_REACHED] bot=${strategy.bot_id} symbol=${strategy.symbol} ` +
+          `current=${currentTotal.toFixed(2)} new=${Number(amount || 0).toFixed(2)} max=${maxAmountPerCoin.toFixed(2)}. ` +
+          `Skipping strategy ${strategy.id}`
+        );
+        await this.sendCentralLog(
+          `Order SkipMaxPerCoin | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
+          `${String(side).toUpperCase()} current=${currentTotal.toFixed(2)} new=${Number(amount || 0).toFixed(2)} max=${maxAmountPerCoin.toFixed(2)}`
+        );
+        return null;
       }
       
       // Check if entry price is still valid

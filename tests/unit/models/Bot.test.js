@@ -69,6 +69,46 @@ describe('Bot Model', () => {
       expect(pool.execute).toHaveBeenCalled();
       expect(result).toHaveProperty('id', 1);
     });
+
+    it('should create a bot with is_reverse_strategy defaulting to true', async () => {
+      const botData = {
+        bot_name: 'New Bot',
+        exchange: 'mexc',
+        access_key: 'key',
+        secret_key: 'secret',
+      };
+
+      pool.execute
+        .mockResolvedValueOnce([[], { insertId: 1 }]) // Insert result
+        .mockResolvedValueOnce([[{ id: 1, ...botData, is_reverse_strategy: true }]]); // FindById result
+
+      const result = await Bot.create(botData);
+
+      // Check that is_reverse_strategy is included in INSERT statement
+      const insertCall = pool.execute.mock.calls[0];
+      expect(insertCall[0]).toContain('is_reverse_strategy');
+      expect(insertCall[1]).toContain(true); // Default value
+    });
+
+    it('should create a bot with is_reverse_strategy = false when specified', async () => {
+      const botData = {
+        bot_name: 'New Bot',
+        exchange: 'mexc',
+        access_key: 'key',
+        secret_key: 'secret',
+        is_reverse_strategy: false
+      };
+
+      pool.execute
+        .mockResolvedValueOnce([[], { insertId: 1 }]) // Insert result
+        .mockResolvedValueOnce([[{ id: 1, ...botData }]]); // FindById result
+
+      const result = await Bot.create(botData);
+
+      // Check that is_reverse_strategy = false is included in INSERT statement
+      const insertCall = pool.execute.mock.calls[0];
+      expect(insertCall[1]).toContain(false);
+    });
   });
 });
 

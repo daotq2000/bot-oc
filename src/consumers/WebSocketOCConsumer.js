@@ -216,8 +216,18 @@ export class WebSocketOCConsumer {
       // Import calculator functions for TP/SL calculation
       const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
 
-      // Counter-trend side mapping: bullish → short, bearish → long
-      const side = direction === 'bullish' ? 'short' : 'long';
+      // Determine side based on is_reverse_strategy from bot
+      // is_reverse_strategy = true (default): Reverse strategy - bullish → SHORT, bearish → LONG
+      // is_reverse_strategy = false: Trend-following strategy - bullish → LONG, bearish → SHORT
+      const isReverseStrategy = strategy.is_reverse_strategy !== undefined 
+        ? (strategy.is_reverse_strategy === true || strategy.is_reverse_strategy === 1 || strategy.is_reverse_strategy === '1')
+        : true; // Default to reverse strategy if not specified
+      
+      const side = isReverseStrategy
+        ? (direction === 'bullish' ? 'short' : 'long')  // Reverse: bullish → SHORT, bearish → LONG
+        : (direction === 'bullish' ? 'long' : 'short');  // Trend-following: bullish → LONG, bearish → SHORT
+      
+      logger.debug(`[WebSocketOCConsumer] Strategy ${strategy.id} (bot_id=${strategy.bot_id}): is_reverse_strategy=${isReverseStrategy}, direction=${direction}, side=${side}`);
 
       // Use interval open price for entry calculation (per-bucket open)
       const baseOpen = Number.isFinite(Number(match.openPrice)) && Number(match.openPrice) > 0

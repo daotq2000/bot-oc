@@ -281,9 +281,11 @@ Amount: ${amountStr} (100%)`.trim();
       logger.info(`[CloseSummaryAlert] Sending alert for position ${position.id} to channel ${channelId}`);
 
       const symbol = this.formatSymbolUnderscore(position.symbol);
-      const isWin = (position.close_reason === 'tp_hit');
+      const pnlVal = Number(position.pnl || 0);
+      const isWin = pnlVal > 0; // WIN if PNL > 0, LOSE if PNL <= 0
       const sideTitle = position.side === 'long' ? 'Long' : 'Short';
-      const title = `🏆 ${symbol} | ${sideTitle} ${isWin ? 'WIN' : 'LOSE'}`;
+      const emoji = isWin ? '🏆' : '😡';
+      const title = `${emoji} ${symbol} | ${sideTitle} ${isWin ? 'WIN' : 'LOSE'}`;
 
       const wins = Number(stats?.wins || 0);
       const loses = Number(stats?.loses || 0);
@@ -300,7 +302,6 @@ Amount: ${amountStr} (100%)`.trim();
       const closePrice = this.formatPriceAdaptive(position.close_price);
       const amountStr = Number(position.amount).toFixed(2);
 
-      const pnlVal = Number(position.pnl || 0);
       const pnlPct = this.calculatePercent(position.entry_price, position.close_price, position.side);
       
       const pnlLine = `${pnlVal >= 0 ? '' : ''}${pnlVal.toFixed(2)}$ ~ ${pnlPct >= 0 ? '' : ''}${pnlPct.toFixed(2)}% (before fees)`;
