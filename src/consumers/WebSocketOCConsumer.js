@@ -26,10 +26,22 @@ export class WebSocketOCConsumer {
     this.cleanupInterval = null;
     this.processedCount = 0;
     this.matchCount = 0;
+    this.skippedCount = 0; // Track skipped ticks due to throttling
     
     // Cache for open positions to avoid excessive DB queries
     this.openPositionsCache = new Map(); // strategyId -> { hasOpenPosition: boolean, lastCheck: timestamp }
     this.openPositionsCacheTTL = 5000; // 5 seconds TTL
+    
+    // ✅ OPTIMIZED: Batch processing for price ticks
+    this._tickQueue = [];
+    this._batchSize = Number(configService.getNumber('WS_TICK_BATCH_SIZE', 20));
+    this._batchTimeout = Number(configService.getNumber('WS_TICK_BATCH_TIMEOUT_MS', 50));
+    this._processing = false;
+    this._batchTimer = null;
+    
+    // ✅ OPTIMIZED: Throttling per symbol
+    this._lastProcessed = new Map(); // exchange|symbol -> timestamp
+    this._minTickInterval = Number(configService.getNumber('WS_TICK_MIN_INTERVAL_MS', 100));
   }
 
   /**
@@ -107,6 +119,7 @@ export class WebSocketOCConsumer {
 
   /**
    * Handle price tick from WebSocket
+   * ✅ OPTIMIZED: Batch processing + throttling
    * @param {string} exchange - Exchange name
    * @param {string} symbol - Symbol
    * @param {number} price - Current price
@@ -128,32 +141,100 @@ export class WebSocketOCConsumer {
         return; // Invalid price
       }
 
-      this.processedCount++;
+      // ✅ OPTIMIZED: Throttle - chỉ process mỗi symbol mỗi N ms
+      const key = `${exchange}|${symbol}`;
+      const lastProcessed = this._lastProcessed.get(key);
+      if (lastProcessed && (timestamp - lastProcessed) < this._minTickInterval) {
+        this.skippedCount++;
+        return; // Skip - too soon
+      }
 
-      // Log PIPPIN and first few price ticks (debug only)
-      const isPippin = symbol?.toUpperCase().includes('PIPPIN');
-      if (isPippin || this.processedCount <= 10) {
-        // Reduce logging frequency to save memory (log every 10000 ticks instead of every tick)
-        if (this.processedCount % 10000 === 0) {
-          logger.debug(`[WebSocketOCConsumer] 📥 Received price tick: ${exchange} ${symbol} = ${price} (count: ${this.processedCount}, isRunning: ${this.isRunning})`);
+      // ✅ OPTIMIZED: Add to batch queue
+      this._tickQueue.push({ exchange, symbol, price, timestamp });
+
+      // Process batch nếu đủ size
+      if (this._tickQueue.length >= this._batchSize) {
+        await this._processBatch();
+      } else if (!this._batchTimer) {
+        // Schedule batch processing after timeout
+        this._batchTimer = setTimeout(() => {
+          this._batchTimer = null;
+          this._processBatch();
+        }, this._batchTimeout);
+      }
+    } catch (error) {
+      logger.error(`[WebSocketOCConsumer] Error in handlePriceTick:`, error?.message || error);
+    }
+  }
+
+  /**
+   * ✅ OPTIMIZED: Process batch of price ticks
+   * Deduplicates ticks (only latest per symbol) and processes in parallel
+   */
+  async _processBatch() {
+    if (this._processing || this._tickQueue.length === 0) return;
+    
+    this._processing = true;
+    const startTime = Date.now();
+
+    try {
+      const batch = this._tickQueue.splice(0, this._batchSize);
+      
+      // ✅ Deduplicate: Chỉ lấy tick mới nhất cho mỗi symbol
+      const latest = new Map();
+      for (const tick of batch) {
+        const key = `${tick.exchange}|${tick.symbol}`;
+        const existing = latest.get(key);
+        if (!existing || existing.timestamp < tick.timestamp) {
+          latest.set(key, tick);
         }
       }
 
-      // Log every 10000th price tick for debugging (reduced frequency)
-      if (this.processedCount % 10000 === 0) {
-        logger.debug(`[WebSocketOCConsumer] Processed ${this.processedCount} price ticks, ${this.matchCount} matches`);
+      // Process unique symbols in parallel (limited concurrency)
+      const concurrency = Number(configService.getNumber('WS_TICK_CONCURRENCY', 10));
+      const ticks = Array.from(latest.values());
+      
+      for (let i = 0; i < ticks.length; i += concurrency) {
+        const batch = ticks.slice(i, i + concurrency);
+        const results = await Promise.allSettled(
+          batch.map(tick => this._detectAndProcess(tick))
+        );
+        
+        // Update last processed timestamps
+        batch.forEach(tick => {
+          this._lastProcessed.set(`${tick.exchange}|${tick.symbol}`, tick.timestamp);
+        });
       }
 
-      // Detect OC and match with strategies
-      if (isPippin) {
-        logger.debug(`[WebSocketOCConsumer] 🔍 Calling detectOC for ${exchange} ${symbol} @ ${price}`);
+      this.processedCount += latest.size;
+      
+      const duration = Date.now() - startTime;
+      if (duration > 100) {
+        logger.debug(`[WebSocketOCConsumer] Processed batch of ${latest.size} ticks in ${duration}ms`);
       }
+    } catch (error) {
+      logger.error('[WebSocketOCConsumer] Batch processing error:', error?.message || error);
+    } finally {
+      this._processing = false;
+      
+      // Process remaining nếu có
+      if (this._tickQueue.length > 0) {
+        setTimeout(() => this._processBatch(), this._batchTimeout);
+      }
+    }
+  }
+
+  /**
+   * ✅ OPTIMIZED: Detect OC and process matches for a single tick
+   */
+  async _detectAndProcess(tick) {
+    try {
+      const { exchange, symbol, price, timestamp } = tick;
+      
+      // Detect OC and match with strategies
       const matches = await realtimeOCDetector.detectOC(exchange, symbol, price, timestamp, 'WebSocketOCConsumer');
 
       if (matches.length === 0) {
-        if (isPippin) {
-          logger.warn(`[WebSocketOCConsumer] ⚠️ No matches found for ${exchange} ${symbol} @ ${price}`);
-        }
         return; // No matches
       }
 
@@ -215,38 +296,67 @@ export class WebSocketOCConsumer {
 
       // Import calculator functions for TP/SL calculation
       const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
+      const { determineSide } = await import('../utils/sideSelector.js');
 
-      // Determine side based on is_reverse_strategy from bot
-      // is_reverse_strategy = true (default): Reverse strategy - bullish → SHORT, bearish → LONG
-      // is_reverse_strategy = false: Trend-following strategy - bullish → LONG, bearish → SHORT
-      const isReverseStrategy = strategy.is_reverse_strategy !== undefined 
-        ? (strategy.is_reverse_strategy === true || strategy.is_reverse_strategy === 1 || strategy.is_reverse_strategy === '1')
-        : true; // Default to reverse strategy if not specified
-      
-      const side = isReverseStrategy
-        ? (direction === 'bullish' ? 'short' : 'long')  // Reverse: bullish → SHORT, bearish → LONG
-        : (direction === 'bullish' ? 'long' : 'short');  // Trend-following: bullish → LONG, bearish → SHORT
-      
-      logger.debug(`[WebSocketOCConsumer] Strategy ${strategy.id} (bot_id=${strategy.bot_id}): is_reverse_strategy=${isReverseStrategy}, direction=${direction}, side=${side}`);
+      // Determine side based on direction, trade_type and is_reverse_strategy from bot
+      const side = determineSide(direction, strategy.trade_type, strategy.is_reverse_strategy);
+      logger.debug(
+        `[WebSocketOCConsumer] Side mapping: strategy_id=${strategy.id}, bot_id=${strategy.bot_id}, ` +
+        `direction=${direction}, trade_type=${strategy.trade_type}, is_reverse_strategy=${strategy.is_reverse_strategy}, side=${side}`
+      );
+
+      // If side is null, skip this match (strategy không phù hợp với direction hiện tại)
+      if (!side) {
+        logger.info(
+          `[WebSocketOCConsumer] ⏭️ Strategy ${strategy.id} skipped by side mapping ` +
+          `(direction=${direction}, trade_type=${strategy.trade_type}, is_reverse_strategy=${strategy.is_reverse_strategy})`
+        );
+        return;
+      }
 
       // Use interval open price for entry calculation (per-bucket open)
       const baseOpen = Number.isFinite(Number(match.openPrice)) && Number(match.openPrice) > 0
         ? Number(match.openPrice)
         : currentPrice;
 
-      // Calculate entry price based on trend-following side and OPEN price
-      const entryPrice = side === 'long'
-        ? calculateLongEntryPrice(currentPrice, Math.abs(oc), strategy.extend || 0)
-        : calculateShortEntryPrice(currentPrice, Math.abs(oc), strategy.extend || 0);
+      // Determine entry price and order type based on strategy type:
+      // - Counter-trend (is_reverse_strategy = true): Use extend logic with LIMIT order
+      // - Trend-following (is_reverse_strategy = false): Use current price with MARKET order
+      const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
+      let entryPrice;
+      let forceMarket = false;
 
-      // Pre-calculate extend distance (full 100% extend move from baseOpen to entryPrice)
-      const totalExtendDistance = Math.abs(baseOpen - entryPrice);
+      if (isReverseStrategy) {
+        // Counter-trend: Calculate entry price with extend logic
+        // LONG: entry = current - extendRatio * delta (entry < current)
+        // SHORT: entry = current + extendRatio * delta (entry > current)
+        // where delta = abs(current - open), extendRatio = extend / 100
+        entryPrice = side === 'long'
+          ? calculateLongEntryPrice(currentPrice, baseOpen, strategy.extend || 0)
+          : calculateShortEntryPrice(currentPrice, baseOpen, strategy.extend || 0);
+      } else {
+        // Trend-following: Use current price directly, force MARKET order
+        entryPrice = currentPrice;
+        forceMarket = true;
+        logger.info(
+          `[WebSocketOCConsumer] Trend-following strategy ${strategy.id}: ` +
+          `entry=${entryPrice} (using current price), forceMarket=true`
+        );
+      }
 
-      // The 'extend' logic is disabled for the counter-trend strategy as it's based on the previous trend-following model.
-      const extendOK = true;
+      // Pre-calculate extend distance (only for counter-trend)
+      const totalExtendDistance = isReverseStrategy ? Math.abs(baseOpen - entryPrice) : 0;
+
+      // Extend check only applies to counter-trend strategies
+      const extendOK = isReverseStrategy ? true : true; // Always OK for trend-following (no extend needed)
       const extendVal = strategy.extend || 0;
       
-      logger.info(`[WebSocketOCConsumer] Extend check for strategy ${strategy.id}: extendOK=${extendOK}, extendVal=${extendVal}, side=${side}, currentPrice=${currentPrice}, entryPrice=${entryPrice}, baseOpen=${baseOpen}, totalExtendDistance=${totalExtendDistance}`);
+      logger.info(
+        `[WebSocketOCConsumer] Entry calculation for strategy ${strategy.id}: ` +
+        `is_reverse_strategy=${isReverseStrategy}, extendOK=${extendOK}, extendVal=${extendVal}, ` +
+        `side=${side}, currentPrice=${currentPrice}, entryPrice=${entryPrice}, baseOpen=${baseOpen}, ` +
+        `totalExtendDistance=${totalExtendDistance}, forceMarket=${forceMarket}`
+      );
 
       // Calculate TP and SL (based on side)
       const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit || 55, side);
@@ -266,14 +376,22 @@ export class WebSocketOCConsumer {
         timestamp: match.timestamp,
         tpPrice: tpPrice,
         slPrice: slPrice,
-        amount: strategy.amount || 1000 // Default amount if not set
+        amount: strategy.amount || 1000, // Default amount if not set
+        forceMarket: forceMarket // Force MARKET order for trend-following strategies
       };
 
-      // If extend condition not met, either place passive LIMIT (if enabled) or skip.
-      // New behaviour:
-      // - Không yêu cầu giá phải chạm 100% mức extend.
-      // - Cho phép đặt LIMIT nếu chênh lệch giữa currentPrice và entryPrice <= EXTEND_LIMIT_MAX_DIFF_RATIO * quãng đường extend.
-      if (!extendOK) {
+      // Extend check only applies to counter-trend strategies
+      // For trend-following (is_reverse_strategy = false), skip extend check and use MARKET order
+      if (!isReverseStrategy) {
+        // Trend-following: Skip extend check, MARKET order will be used
+        logger.info(
+          `[WebSocketOCConsumer] Trend-following strategy ${strategy.id}: Skipping extend check, using MARKET order`
+        );
+      } else if (!extendOK) {
+        // Counter-trend: If extend condition not met, either place passive LIMIT (if enabled) or skip.
+        // New behaviour:
+        // - Không yêu cầu giá phải chạm 100% mức extend.
+        // - Cho phép đặt LIMIT nếu chênh lệch giữa currentPrice và entryPrice <= EXTEND_LIMIT_MAX_DIFF_RATIO * quãng đường extend.
         const allowPassive = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
         if (allowPassive) {
           // Allow overriding max diff ratio via config (default 0.5 = 50%)

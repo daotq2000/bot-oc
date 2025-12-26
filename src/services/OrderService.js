@@ -175,15 +175,26 @@ export class OrderService {
       // Check if entry price is still valid
       const currentPrice = await this.exchangeService.getTickerPrice(strategy.symbol);
       
-      // For limit orders, we need to check if price is close enough
-      // If price already passed entry, use market order
-      let orderType = this.shouldUseMarketOrder(side, currentPrice, entryPrice)
-        ? 'market'
-        : 'limit';
-
-      // Force passive limit if strategy indicates so (fallback when extend not met)
-      if (signal.forcePassiveLimit) {
+      // Determine order type:
+      // 1. Force MARKET if signal.forceMarket is true (trend-following strategies)
+      // 2. Force LIMIT if signal.forcePassiveLimit is true (extend not met for counter-trend)
+      // 3. Otherwise, use shouldUseMarketOrder() logic
+      let orderType;
+      if (signal.forceMarket) {
+        // Trend-following: Always use MARKET order to avoid "order would immediately trigger" error
+        orderType = 'market';
+        logger.info(
+          `[OrderService] Force MARKET order for trend-following strategy ${strategy.id} ` +
+          `(entry=${entryPrice}, current=${currentPrice})`
+        );
+      } else if (signal.forcePassiveLimit) {
+        // Counter-trend with extend not met: Use LIMIT order
         orderType = 'limit';
+      } else {
+        // Default: Check if price already passed entry or too far from entry
+        orderType = this.shouldUseMarketOrder(side, currentPrice, entryPrice)
+          ? 'market'
+          : 'limit';
       }
 
       // Create order

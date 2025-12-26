@@ -2,6 +2,7 @@ import { strategyCache } from './StrategyCache.js';
 import logger from '../utils/logger.js';
 import ccxt from 'ccxt';
 import { configService } from './ConfigService.js';
+import { LRUCache } from '../utils/LRUCache.js';
 
 /**
  * RealtimeOCDetector
@@ -21,12 +22,14 @@ export class RealtimeOCDetector {
     // Track open prices per interval bucket
     // Key: exchange|symbol|interval|bucketStart
     // Value: { open, bucketStart, lastUpdate }
-    this.openPriceCache = new Map();
+    // ✅ OPTIMIZED: Use LRUCache for O(1) eviction instead of O(n log n) sort
+    this.openPriceCache = new LRUCache(1000);
     this.maxOpenPriceCacheSize = 1000; // Reduced from 2000 to save memory
 
     // Cache fetched opens from REST to avoid repeated external calls
     // Key: exchange|symbol|interval|bucketStart -> open
-    this.openFetchCache = new Map();
+    // ✅ OPTIMIZED: Use LRUCache for O(1) eviction
+    this.openFetchCache = new LRUCache(200);
     this.maxOpenFetchCacheSize = 200; // Reduced from 500 to save memory
 
     // Prime tolerance: if we are already inside the bucket more than this, try REST OHLCV open
@@ -35,7 +38,8 @@ export class RealtimeOCDetector {
     // Track last processed price per symbol to avoid duplicate processing
     // Key: exchange|symbol
     // Value: { price, timestamp }
-    this.lastPriceCache = new Map();
+    // ✅ OPTIMIZED: Use LRUCache for O(1) eviction
+    this.lastPriceCache = new LRUCache(600);
     this.maxLastPriceCacheSize = 600; // Reduced from 1000 to save memory (534 Binance + MEXC symbols)
     
     // Minimum price change threshold to trigger recalculation (0.01% default)
@@ -267,6 +271,7 @@ export class RealtimeOCDetector {
   /**
    * Fetch interval open from REST OHLCV for current bucket (best-effort)
    * Uses queue to avoid CCXT throttle queue overflow
+   * ✅ OPTIMIZED: Deduplicate requests trong queue
    */
   async fetchOpenFromRest(exchange, symbol, interval, bucketStart) {
     // Check cache first to avoid unnecessary requests
@@ -290,6 +295,32 @@ export class RealtimeOCDetector {
       } catch (_) {}
     }
 
+    // ✅ OPTIMIZED: Check if request already in queue (deduplicate)
+    const queueKey = `${ex}|${sym}|${interval}|${bucketStart}`;
+    const existingRequest = this._restFetchQueue.find(r => {
+      const rKey = `${r.exchange}|${r.symbol}|${r.interval}|${r.bucketStart}`;
+      return rKey === queueKey;
+    });
+    
+    if (existingRequest) {
+      // Request already queued, chain to existing promise
+      return new Promise((resolve, reject) => {
+        // Store original callbacks
+        const originalResolve = existingRequest.resolve;
+        const originalReject = existingRequest.reject;
+        
+        // Chain new callbacks
+        existingRequest.resolve = (result) => {
+          if (originalResolve) originalResolve(result);
+          resolve(result);
+        };
+        existingRequest.reject = (error) => {
+          if (originalReject) originalReject(error);
+          reject(error);
+        };
+      });
+    }
+
     // Queue the request to avoid throttle queue overflow
     return new Promise((resolve, reject) => {
       // Reject if queue is too full
@@ -298,8 +329,8 @@ export class RealtimeOCDetector {
         resolve(null);
         return;
       }
-      
-      this._restFetchQueue.push({ resolve, reject, exchange, symbol, interval, bucketStart });
+
+      this._restFetchQueue.push({ resolve, reject, exchange: ex, symbol: sym, interval, bucketStart });
       this._processRestFetchQueue(); // Start processing if not already running
     });
   }
@@ -462,16 +493,11 @@ export class RealtimeOCDetector {
     }
 
     const openPrice = fetched;
-        this.openFetchCache.set(key, fetched);
-        logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
+    this.openFetchCache.set(key, fetched);
+    logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
 
-    // Enforce max cache size (LRU eviction)
-    if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(key)) {
-      const oldest = Array.from(this.openPriceCache.entries())
-        .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate)[0];
-      if (oldest) this.openPriceCache.delete(oldest[0]);
-    }
-    // Store in cache
+    // ✅ OPTIMIZED: LRUCache automatically evicts least recently used - no manual eviction needed
+    // Store in cache (LRUCache handles eviction automatically)
     this.openPriceCache.set(key, { open: openPrice, bucketStart, lastUpdate: timestamp });
     return openPrice;
   }
@@ -524,18 +550,8 @@ export class RealtimeOCDetector {
           try {
             const restOpen = await this.fetchOpenFromRest(normalizedExchange, normalizedSymbol, interval, bucketStart);
             if (Number.isFinite(restOpen) && restOpen > 0) {
-              // Enforce max cache size
-              if (this.openFetchCache.size >= this.maxOpenFetchCacheSize && !this.openFetchCache.has(fetchKey)) {
-                const oldest = Array.from(this.openFetchCache.keys())[0];
-                if (oldest) this.openFetchCache.delete(oldest);
-              }
+              // ✅ OPTIMIZED: LRUCache automatically evicts - no manual eviction needed
               this.openFetchCache.set(fetchKey, restOpen);
-              // Also update openPriceCache with size limit
-              if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(fetchKey)) {
-                const oldest = Array.from(this.openPriceCache.entries())
-                  .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate)[0];
-                if (oldest) this.openPriceCache.delete(oldest[0]);
-              }
               this.openPriceCache.set(fetchKey, { open: restOpen, bucketStart, lastUpdate: Date.now() });
               logger.info(`[RealtimeOCDetector] Primed REST open for ${normalizedSymbol} ${interval} at ${restOpen}`);
             }
@@ -544,12 +560,7 @@ export class RealtimeOCDetector {
       }
     }
 
-    // Enforce max cache size (LRU eviction)
-    if (this.openPriceCache.size >= this.maxOpenPriceCacheSize && !this.openPriceCache.has(key)) {
-      const oldest = Array.from(this.openPriceCache.entries())
-        .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate)[0];
-      if (oldest) this.openPriceCache.delete(oldest[0]);
-    }
+    // ✅ OPTIMIZED: LRUCache automatically evicts - no manual eviction needed
     this.openPriceCache.set(key, {
       open: openPrice,
       bucketStart,
@@ -596,12 +607,7 @@ export class RealtimeOCDetector {
 
     const lastPrice = this.lastPriceCache.get(key);
     if (!lastPrice) {
-      // Enforce max cache size (LRU eviction)
-      if (this.lastPriceCache.size >= this.maxLastPriceCacheSize && !this.lastPriceCache.has(key)) {
-        const oldest = Array.from(this.lastPriceCache.entries())
-          .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
-        if (oldest) this.lastPriceCache.delete(oldest[0]);
-      }
+      // ✅ OPTIMIZED: LRUCache automatically evicts - no manual eviction needed
       this.lastPriceCache.set(key, { price: currentPrice, timestamp: Date.now() });
       return true;
     }
@@ -609,12 +615,7 @@ export class RealtimeOCDetector {
     // Check if price changed significantly
     const priceChange = Math.abs((currentPrice - lastPrice.price) / lastPrice.price);
     if (priceChange >= this.priceChangeThreshold) {
-      // Enforce max cache size (LRU eviction)
-      if (this.lastPriceCache.size >= this.maxLastPriceCacheSize && !this.lastPriceCache.has(key)) {
-        const oldest = Array.from(this.lastPriceCache.entries())
-          .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
-        if (oldest) this.lastPriceCache.delete(oldest[0]);
-      }
+      // ✅ OPTIMIZED: LRUCache automatically evicts - no manual eviction needed
       this.lastPriceCache.set(key, { price: currentPrice, timestamp: Date.now() });
       return true;
     }
@@ -660,51 +661,51 @@ export class RealtimeOCDetector {
         return []; // No strategies for this symbol
       }
 
-      // Only log when checking strategies (reduced frequency)
-      if (this._detectCount <= 10 || this._detectCount % 1000 === 0) {
-        logger.debug(`[RealtimeOCDetector] Checking ${strategies.length} strategies for ${normalizedExchange} ${normalizedSymbol}`);
+      // ✅ OPTIMIZED: Pre-filter strategies - chỉ check strategies hợp lệ
+      const validStrategies = strategies.filter(s => {
+        const ocThreshold = Number(s.oc || 0);
+        return ocThreshold > 0 && 
+               s.is_active && 
+               (s.bot?.is_active !== false) &&
+               s.interval; // Must have interval
+      });
+
+      if (validStrategies.length === 0) {
+        return [];
       }
 
+      // Only log when checking strategies (reduced frequency)
+      if (this._detectCount <= 10 || this._detectCount % 1000 === 0) {
+        logger.debug(`[RealtimeOCDetector] Checking ${validStrategies.length} valid strategies for ${normalizedExchange} ${normalizedSymbol}`);
+      }
+
+      // ✅ OPTIMIZED: Batch get open prices cho tất cả unique intervals
+      const intervals = [...new Set(validStrategies.map(s => s.interval || '1m'))];
+      const openPricesMap = await this._batchGetOpenPrices(
+        normalizedExchange,
+        normalizedSymbol,
+        intervals,
+        currentPrice,
+        timestamp
+      );
+
+      // ✅ OPTIMIZED: Check strategies in parallel (limited concurrency)
+      const concurrency = Number(configService.getNumber('OC_DETECT_CONCURRENCY', 10));
       const matches = [];
-
-      for (const strategy of strategies) {
-        const interval = strategy.interval || '1m';
-        const ocThreshold = Number(strategy.oc || 0);
-
-        if (ocThreshold <= 0) {
-          logger.debug(`[RealtimeOCDetector] Strategy ${strategy.id} has invalid OC threshold: ${ocThreshold}`);
-          continue;
-        }
-
-        // Get open price for this interval bucket
-        const openPrice = await this.getAccurateOpen(normalizedExchange, normalizedSymbol, interval, currentPrice, timestamp);
-
-        // Calculate OC
-        const oc = this.calculateOC(openPrice, currentPrice);
-        const absOC = Math.abs(oc);
-        const direction = this.getDirection(openPrice, currentPrice);
-
-        // Log calculation details for debugging (reduced frequency)
-        if ((normalizedSymbol.includes('PIPPIN') || absOC >= ocThreshold * 0.8) && this._detectCount % 100 === 0) {
-          logger.debug(`[RealtimeOCDetector] Strategy ${strategy.id}: ${normalizedSymbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%)`);
-        }
-
-        // Check if OC meets threshold
-        if (absOC >= ocThreshold) {
-          matches.push({
+      
+      for (let i = 0; i < validStrategies.length; i += concurrency) {
+        const batch = validStrategies.slice(i, i + concurrency);
+        const results = await Promise.all(
+          batch.map(strategy => this._checkStrategy(
             strategy,
-            oc,
-            absOC,
-            direction,
-            openPrice,
+            normalizedSymbol,
+            openPricesMap.get(strategy.interval || '1m'),
             currentPrice,
-            interval,
             timestamp
-          });
-
-          logger.info(`[RealtimeOCDetector] ✅ MATCH FOUND: ${normalizedSymbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} strategy_id=${strategy.id} bot_id=${strategy.bot_id}`);
-        }
-        // Removed else logging - too frequent
+          ))
+        );
+        
+        matches.push(...results.filter(m => m !== null));
       }
 
       if (matches.length > 0) {
@@ -719,6 +720,105 @@ export class RealtimeOCDetector {
   }
 
   /**
+   * ✅ OPTIMIZED: Batch get open prices cho nhiều intervals
+   * Cache-first strategy với parallel fetch cho missing entries
+   * @param {string} exchange - Exchange name
+   * @param {string} symbol - Symbol
+   * @param {Array<string>} intervals - Array of intervals
+   * @param {number} currentPrice - Current price
+   * @param {number} timestamp - Current timestamp
+   * @returns {Promise<Map<string, number>>} Map of interval -> open price
+   */
+  async _batchGetOpenPrices(exchange, symbol, intervals, currentPrice, timestamp) {
+    const bucketStarts = intervals.map(int => this.getBucketStart(int, timestamp));
+    const keys = intervals.map((int, i) => 
+      `${exchange}|${symbol}|${int}|${bucketStarts[i]}`
+    );
+
+    // Check cache first
+    const cached = new Map();
+    const missing = [];
+    
+    keys.forEach((key, i) => {
+      const cachedValue = this.openPriceCache.get(key);
+      if (cachedValue && cachedValue.bucketStart === bucketStarts[i] && 
+          Number.isFinite(cachedValue.open) && cachedValue.open > 0) {
+        cached.set(intervals[i], cachedValue.open);
+      } else {
+        missing.push({ 
+          interval: intervals[i], 
+          key, 
+          bucketStart: bucketStarts[i] 
+        });
+      }
+    });
+
+    // Batch fetch missing (parallel với limit)
+    if (missing.length > 0) {
+      const fetchPromises = missing.map(({ interval, bucketStart }) =>
+        this.getAccurateOpen(exchange, symbol, interval, currentPrice, timestamp)
+          .then(open => ({ interval, open }))
+          .catch(() => ({ interval, open: null }))
+      );
+      
+      const fetched = await Promise.all(fetchPromises);
+      
+      fetched.forEach(({ interval, open }) => {
+        if (open && Number.isFinite(open) && open > 0) {
+          cached.set(interval, open);
+        }
+      });
+    }
+
+    return cached;
+  }
+
+  /**
+   * ✅ OPTIMIZED: Check một strategy với open price đã có sẵn
+   * @param {Object} strategy - Strategy object
+   * @param {string} symbol - Symbol (for logging)
+   * @param {number|null} openPrice - Open price (null nếu không có)
+   * @param {number} currentPrice - Current price
+   * @param {number} timestamp - Timestamp
+   * @returns {Object|null} Match object hoặc null
+   */
+  _checkStrategy(strategy, symbol, openPrice, currentPrice, timestamp) {
+    if (!openPrice || !Number.isFinite(openPrice) || openPrice <= 0) {
+      return null; // Skip nếu không có open price
+    }
+
+    const interval = strategy.interval || '1m';
+    const ocThreshold = Number(strategy.oc || 0);
+
+    if (ocThreshold <= 0) {
+      return null;
+    }
+
+    // Calculate OC
+    const oc = this.calculateOC(openPrice, currentPrice);
+    const absOC = Math.abs(oc);
+    const direction = this.getDirection(openPrice, currentPrice);
+
+    // Check if OC meets threshold
+    if (absOC >= ocThreshold) {
+      logger.info(`[RealtimeOCDetector] ✅ MATCH FOUND: ${symbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} strategy_id=${strategy.id} bot_id=${strategy.bot_id}`);
+      
+      return {
+        strategy,
+        oc,
+        absOC,
+        direction,
+        openPrice,
+        currentPrice,
+        interval,
+        timestamp
+      };
+    }
+
+    return null;
+  }
+
+  /**
    * Clean up old cache entries (call periodically)
    * @param {number} maxAge - Maximum age in milliseconds (default: 1 hour)
    */
@@ -726,54 +826,32 @@ export class RealtimeOCDetector {
     const now = Date.now();
     let cleaned = 0;
 
-    // Clean open price cache (by age and size)
+    // Clean open price cache (by age only - size limit handled by LRUCache)
+    // ✅ OPTIMIZED: LRUCache handles size limit automatically, only clean by age here
     for (const [key, value] of this.openPriceCache.entries()) {
       if (now - value.lastUpdate > maxAge) {
         this.openPriceCache.delete(key);
         cleaned++;
       }
     }
-    // Enforce max size (LRU eviction)
-    if (this.openPriceCache.size > this.maxOpenPriceCacheSize) {
-      const entries = Array.from(this.openPriceCache.entries())
-        .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate);
-      const toRemove = entries.slice(0, this.openPriceCache.size - this.maxOpenPriceCacheSize);
-      for (const [key] of toRemove) {
-        this.openPriceCache.delete(key);
-        cleaned++;
-      }
-    }
+    // Size limit is handled automatically by LRUCache - no manual eviction needed
 
-    // Clean open fetch cache (by age and size)
+    // Clean open fetch cache (by age only - size limit handled by LRUCache)
+    // ✅ OPTIMIZED: LRUCache handles size limit automatically, only clean by age here
     for (const [key, timestamp] of this.openFetchCache.entries()) {
       // openFetchCache stores just values, need to track age differently
-      // For now, just enforce size limit
-    }
-    if (this.openFetchCache.size > this.maxOpenFetchCacheSize) {
-      const toRemove = Array.from(this.openFetchCache.keys())
-        .slice(0, this.openFetchCache.size - this.maxOpenFetchCacheSize);
-      for (const key of toRemove) {
-        this.openFetchCache.delete(key);
-        cleaned++;
-      }
+      // For now, LRUCache handles size limit automatically
     }
 
-    // Clean last price cache (by age and size)
+    // Clean last price cache (by age only - size limit handled by LRUCache)
+    // ✅ OPTIMIZED: LRUCache handles size limit automatically, only clean by age here
     for (const [key, value] of this.lastPriceCache.entries()) {
       if (now - value.timestamp > maxAge) {
         this.lastPriceCache.delete(key);
         cleaned++;
       }
     }
-    if (this.lastPriceCache.size > this.maxLastPriceCacheSize) {
-      const entries = Array.from(this.lastPriceCache.entries())
-        .sort((a, b) => a[1].timestamp - b[1].timestamp);
-      const toRemove = entries.slice(0, this.lastPriceCache.size - this.maxLastPriceCacheSize);
-      for (const [key] of toRemove) {
-        this.lastPriceCache.delete(key);
-        cleaned++;
-      }
-    }
+    // Size limit is handled automatically by LRUCache - no manual eviction needed
 
     // Clean public clients cache (size limit only)
     if (this._publicClients.size > this.maxPublicClients) {

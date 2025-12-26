@@ -76,36 +76,68 @@ export function getCandleDirection(open, close) {
 
 /**
  * Calculate entry price for LONG position
- * Entry triggers when price drops below: open - (open * oc * extend / 10000)
- * @param {number} open - Candle open price
- * @param {number} oc - OC percentage
- * @param {number} extend - Extend percentage
- * @returns {number} Entry price
+ * Entry must be LOWER than current price (pullback entry)
+ * Formula: entry = current - extendRatio * delta
+ * where delta = abs(current - open), extendRatio = extend / 100
+ * 
+ * @param {number} current - Current market price (price at signal detection)
+ * @param {number} open - Candle open price (base price of OC)
+ * @param {number} extend - Extend percentage (e.g., 60 = 60%)
+ * @returns {number} Entry price (always < current)
  */
-export function calculateLongEntryPrice(open, oc, extend) {
+export function calculateLongEntryPrice(current, open, extend) {
+  const curr = Number(current);
   const o = Number(open);
-  const ocN = Number(oc);
   const ext = Number(extend);
-  if (!Number.isFinite(o) || !Number.isFinite(ocN) || !Number.isFinite(ext)) return NaN;
-  const entryOffset = (o * ocN * ext) / 10000;
-  return o - entryOffset;
+  
+  if (!Number.isFinite(curr) || !Number.isFinite(o) || !Number.isFinite(ext)) {
+    return NaN;
+  }
+  
+  // Normalize extend: 60 -> 0.6
+  const extendRatio = ext / 100;
+  
+  // Calculate delta: absolute distance between current and open
+  const delta = Math.abs(curr - o);
+  
+  // LONG: entry = current - extendRatio * delta
+  // This ensures entry < current (pullback entry)
+  const entry = curr - extendRatio * delta;
+  
+  return entry;
 }
 
 /**
  * Calculate entry price for SHORT position
- * Entry triggers when price rises above: open + (open * oc * extend / 10000)
- * @param {number} open - Candle open price
- * @param {number} oc - OC percentage
- * @param {number} extend - Extend percentage
- * @returns {number} Entry price
+ * Entry must be HIGHER than current price (pullback entry for counter-trend)
+ * Formula: entry = current + extendRatio * delta
+ * where delta = abs(current - open), extendRatio = extend / 100
+ * 
+ * @param {number} current - Current market price (price at signal detection)
+ * @param {number} open - Candle open price (base price of OC)
+ * @param {number} extend - Extend percentage (e.g., 60 = 60%)
+ * @returns {number} Entry price (always > current)
  */
-export function calculateShortEntryPrice(open, oc, extend) {
+export function calculateShortEntryPrice(current, open, extend) {
+  const curr = Number(current);
   const o = Number(open);
-  const ocN = Number(oc);
   const ext = Number(extend);
-  if (!Number.isFinite(o) || !Number.isFinite(ocN) || !Number.isFinite(ext)) return NaN;
-  const entryOffset = (o * ocN * ext) / 10000;
-  return o + entryOffset;
+  
+  if (!Number.isFinite(curr) || !Number.isFinite(o) || !Number.isFinite(ext)) {
+    return NaN;
+  }
+  
+  // Normalize extend: 60 -> 0.6
+  const extendRatio = ext / 100;
+  
+  // Calculate delta: absolute distance between current and open
+  const delta = Math.abs(curr - o);
+  
+  // SHORT: entry = current + extendRatio * delta
+  // This ensures entry > current (pullback entry for counter-trend)
+  const entry = curr + extendRatio * delta;
+  
+  return entry;
 }
 
 /**

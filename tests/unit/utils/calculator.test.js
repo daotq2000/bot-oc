@@ -47,18 +47,111 @@ describe('Calculator Utilities', () => {
   });
 
   describe('calculateLongEntryPrice', () => {
-    it('should calculate long entry price correctly', () => {
-      const entry = calculateLongEntryPrice(50000, 2.0, 10.0);
-      // entry = 50000 - (50000 * 2.0 * 10.0 / 10000) = 50000 - 100 = 49900
+    it('should calculate long entry price correctly (entry < current)', () => {
+      // Formula: entry = current - extendRatio * delta
+      // current = 50000, open = 49000, extend = 10%
+      // delta = abs(50000 - 49000) = 1000
+      // extendRatio = 10 / 100 = 0.1
+      // entry = 50000 - 0.1 * 1000 = 50000 - 100 = 49900
+      const entry = calculateLongEntryPrice(50000, 49000, 10.0);
       expect(entry).toBe(49900);
+      // Verify entry < current
+      expect(entry).toBeLessThan(50000);
+    });
+
+    it('should calculate long entry price for YB example (extend 60%)', () => {
+      // Real example from user: YB signal
+      // open = 0.3759, current = 0.45096606, extend = 60%
+      const current = 0.45096606;
+      const open = 0.3759;
+      const extend = 60;
+      
+      // delta = abs(0.45096606 - 0.3759) = 0.07506606
+      // extendRatio = 60 / 100 = 0.6
+      // entry = 0.45096606 - 0.6 * 0.07506606 = 0.405926424
+      const entry = calculateLongEntryPrice(current, open, extend);
+      const expected = 0.45096606 - 0.6 * Math.abs(0.45096606 - 0.3759);
+      expect(entry).toBeCloseTo(expected, 8);
+      expect(entry).toBeCloseTo(0.405926424, 6);
+      // Verify entry < current
+      expect(entry).toBeLessThan(current);
+    });
+
+    it('should handle bullish market (current > open)', () => {
+      const entry = calculateLongEntryPrice(51000, 50000, 50);
+      // delta = 1000, extendRatio = 0.5
+      // entry = 51000 - 0.5 * 1000 = 50500
+      expect(entry).toBe(50500);
+      expect(entry).toBeLessThan(51000);
+      expect(entry).toBeGreaterThan(50000);
+    });
+
+    it('should handle bearish market (current < open)', () => {
+      const entry = calculateLongEntryPrice(49000, 50000, 50);
+      // delta = abs(49000 - 50000) = 1000, extendRatio = 0.5
+      // entry = 49000 - 0.5 * 1000 = 48500
+      expect(entry).toBe(48500);
+      expect(entry).toBeLessThan(49000);
+    });
+
+    it('should return NaN for invalid inputs', () => {
+      expect(calculateLongEntryPrice(NaN, 50000, 10)).toBeNaN();
+      expect(calculateLongEntryPrice(50000, NaN, 10)).toBeNaN();
+      expect(calculateLongEntryPrice(50000, 49000, NaN)).toBeNaN();
     });
   });
 
   describe('calculateShortEntryPrice', () => {
-    it('should calculate short entry price correctly', () => {
-      const entry = calculateShortEntryPrice(50000, 2.0, 10.0);
-      // entry = 50000 + (50000 * 2.0 * 10.0 / 10000) = 50000 + 100 = 50100
+    it('should calculate short entry price correctly (entry > current)', () => {
+      // Formula: entry = current + extendRatio * delta
+      // current = 50000, open = 51000, extend = 10%
+      // delta = abs(50000 - 51000) = 1000
+      // extendRatio = 10 / 100 = 0.1
+      // entry = 50000 + 0.1 * 1000 = 50100
+      const entry = calculateShortEntryPrice(50000, 51000, 10.0);
       expect(entry).toBe(50100);
+      // Verify entry > current
+      expect(entry).toBeGreaterThan(50000);
+    });
+
+    it('should calculate short entry price for YB example (extend 60%)', () => {
+      // Real example from user: YB signal (counter-trend SHORT)
+      // open = 0.3759, current = 0.45096606, extend = 60%
+      const current = 0.45096606;
+      const open = 0.3759;
+      const extend = 60;
+      
+      // delta = abs(0.45096606 - 0.3759) = 0.07506606
+      // extendRatio = 60 / 100 = 0.6
+      // entry = 0.45096606 + 0.6 * 0.07506606 = 0.496005696
+      const entry = calculateShortEntryPrice(current, open, extend);
+      const expected = 0.45096606 + 0.6 * Math.abs(0.45096606 - 0.3759);
+      expect(entry).toBeCloseTo(expected, 8);
+      expect(entry).toBeCloseTo(0.496005696, 6);
+      // Verify entry > current
+      expect(entry).toBeGreaterThan(current);
+    });
+
+    it('should handle bullish market (current > open)', () => {
+      const entry = calculateShortEntryPrice(51000, 50000, 50);
+      // delta = 1000, extendRatio = 0.5
+      // entry = 51000 + 0.5 * 1000 = 51500
+      expect(entry).toBe(51500);
+      expect(entry).toBeGreaterThan(51000);
+    });
+
+    it('should handle bearish market (current < open)', () => {
+      const entry = calculateShortEntryPrice(49000, 50000, 50);
+      // delta = abs(49000 - 50000) = 1000, extendRatio = 0.5
+      // entry = 49000 + 0.5 * 1000 = 49500
+      expect(entry).toBe(49500);
+      expect(entry).toBeGreaterThan(49000);
+    });
+
+    it('should return NaN for invalid inputs', () => {
+      expect(calculateShortEntryPrice(NaN, 50000, 10)).toBeNaN();
+      expect(calculateShortEntryPrice(50000, NaN, 10)).toBeNaN();
+      expect(calculateShortEntryPrice(50000, 51000, NaN)).toBeNaN();
     });
   });
 

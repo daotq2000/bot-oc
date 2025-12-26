@@ -3,12 +3,15 @@
  * 
  * Throttles log messages to prevent excessive logging and reduce memory usage.
  * Useful for high-frequency operations like WebSocket price ticks, position updates, etc.
+ * 
+ * ✅ OPTIMIZED: Added sampling feature for very high-frequency logs
  */
 export class LogThrottle {
   constructor(options = {}) {
     this.maxMessagesPerInterval = options.maxMessagesPerInterval || 10;
     this.intervalMs = options.intervalMs || 60000; // Default: 1 minute
     this.messageCounts = new Map(); // messageKey -> { count, firstTime, lastTime }
+    this.sampleCounts = new Map(); // messageKey -> count (for sampling)
     this.cleanupInterval = null;
     
     // Cleanup old entries every 5 minutes
@@ -113,6 +116,31 @@ export class LogThrottle {
   }
 
   /**
+   * Sampling: Log every Nth occurrence
+   * Useful for very high-frequency logs (e.g., price ticks)
+   * @param {string} messageKey - Unique key for the message type
+   * @param {number} sampleRate - Log every Nth message (default: 100)
+   * @returns {boolean} - true if should log this occurrence
+   */
+  shouldLogSample(messageKey, sampleRate = 100) {
+    const count = (this.sampleCounts.get(messageKey) || 0) + 1;
+    this.sampleCounts.set(messageKey, count);
+    
+    if (count % sampleRate === 0) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Reset sample counter for a message key
+   * @param {string} messageKey
+   */
+  resetSample(messageKey) {
+    this.sampleCounts.delete(messageKey);
+  }
+
+  /**
    * Get statistics
    */
   getStats() {
@@ -122,6 +150,10 @@ export class LogThrottle {
         key,
         count: entry.count,
         age: Date.now() - entry.firstTime
+      })),
+      sampleCounts: Array.from(this.sampleCounts.entries()).map(([key, count]) => ({
+        key,
+        count
       }))
     };
   }
