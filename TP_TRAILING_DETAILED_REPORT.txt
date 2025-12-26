@@ -153,7 +153,7 @@ Data Migration:
    Lines: ~175-195
 
 2. src/jobs/PositionMonitor.js
-   Function: placeTpSlOrders()
+   Function: placeExitOrder()
    Change: Save initial_tp_price when creating TP order
    Lines: ~150-170
 

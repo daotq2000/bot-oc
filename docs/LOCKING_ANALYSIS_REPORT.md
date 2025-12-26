@@ -78,7 +78,7 @@ UPDATE positions SET is_processing = 0 WHERE id = ?
 
 ### 2.1. PositionMonitor.js
 
-**Method:** `placeTpSlOrders()` (dòng 107-230)
+**Method:** `placeExitOrder()` (dòng 107-230)
 
 **Mục đích:** Tránh race condition khi nhiều instance cùng place TP/SL orders
 
@@ -214,7 +214,7 @@ position = await Position.create({
 | Loại Lock | Vị Trí | Mục Đích | An Toàn | Phức Tạp |
 |-----------|--------|----------|---------|----------|
 | **Pessimistic** | PositionSync.createMissingPosition | Tạo position từ exchange | ✅✅✅ Rất an toàn | ⚠️ Cần transaction |
-| **Soft Lock** | PositionMonitor.placeTpSlOrders | Place TP/SL orders | ✅✅ Tương đối an toàn | ✅ Đơn giản |
+| **Soft Lock** | PositionMonitor.placeExitOrder | Place TP/SL orders | ✅✅ Tương đối an toàn | ✅ Đơn giản |
 | **Soft Lock** | PositionService.updatePosition | Update position (trailing TP) | ✅✅ Tương đối an toàn | ✅ Đơn giản |
 | **Soft Lock** | PositionSync.syncPositions | Sync positions | ✅✅ Tương đối an toàn | ✅ Đơn giản |
 | **Không có** | EntryOrderMonitor._confirmEntryWithPosition | Tạo position từ entry order | ⚠️ Dựa vào UNIQUE | ✅ Đơn giản |

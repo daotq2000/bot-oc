@@ -327,7 +327,7 @@ export class PositionService {
               const takeProfit = Number(position.take_profit || 0);
               
               if (entryPriceForTP > 0 && takeProfit > 0) {
-                // Calculate initial TP from strategy (same calculation as placeTpSlOrders)
+                // Calculate initial TP from strategy (same calculation as placeExitOrder)
                 initialTP = calculateTakeProfit(entryPriceForTP, takeProfit, position.side);
                 // Save it to DB for future use
                 await Position.update(position.id, { initial_tp_price: initialTP });
@@ -562,7 +562,7 @@ export class PositionService {
                     const placed = await mgr.placeOrReplaceExitOrder(position, newTP);
 
                     const newExitOrderId = placed?.orderId ? String(placed.orderId) : null;
-                    const updatePayload = {
+                    const updatePayload = { 
                       take_profit_price: newTP,
                       tp_synced: newExitOrderId ? true : false // Track if exit order was successfully placed
                     };
@@ -854,9 +854,9 @@ export class PositionService {
           logger.warn(`[TP->SL Convert] Failed to cancel TP order ${position.exit_order_id}: ${e?.message || e}`);
         }
       }
-
+      
       // Clear TP order id in DB to prevent any further replacement attempts using the old id.
-      await Position.update(position.id, {
+          await Position.update(position.id, { 
         exit_order_id: null,
         tp_synced: false, // mark not synced so monitor can decide what to do next
         take_profit_price: newTP // keep for tracking / trailing state

@@ -80,7 +80,7 @@ for (const serviceName of serviceFiles) {
 const conflicts = [];
 
 // Check position-related operations
-const positionOps = ['updatePosition', 'closePosition', 'createPosition', 'placeTpSlOrders'];
+const positionOps = ['updatePosition', 'closePosition', 'createPosition', 'placeExitOrder'];
 const positionServices = Object.keys(analysis).filter(s => {
   const content = fs.readFileSync(analysis[s].file, 'utf8');
   return positionOps.some(op => content.includes(op));

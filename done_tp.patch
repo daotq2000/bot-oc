@@ -2839,7 +2839,7 @@ new file mode 100755
 +    // 8. Place TP/SL orders
 +    console.log('📌 Placing TP/SL orders...\n');
 +    let pos = await Position.findById(positionId);
-+    await posMonitor.placeTpSlOrders(pos);
++    await posMonitor.placeExitOrder(pos);
 +    await sleep(3000);
 +
 +    // 9. Reload position
@@ -2995,7 +2995,7 @@ new file mode 100644
 + * - Mở 1 lệnh SHORT BTCUSDT với size nhỏ, dùng MARKET để khớp ngay
 + * - Ngay sau khi position mở:
 + *   + Đảm bảo Position được tạo trong DB
-+ *   + Gọi PositionMonitor.placeTpSlOrders() để đặt TP/SL trên sàn
++ *   + Gọi PositionMonitor.placeExitOrder() để đặt TP/SL trên sàn
 + *   + Gọi PositionMonitor.monitorPosition() vài lần để quan sát log đuổi SL/TP
 + *
 + * Usage:
@@ -3246,9 +3246,9 @@ new file mode 100644
 +      sl_order_id: pos.sl_order_id
 +    });
 +
-+    // 4) Force TP/SL placement via PositionMonitor.placeTpSlOrders
-+    console.log('\n[3] Forcing TP/SL placement via PositionMonitor.placeTpSlOrders() ...');
-+    await posMonitor.placeTpSlOrders(pos);
++    // 4) Force TP/SL placement via PositionMonitor.placeExitOrder
++    console.log('\n[3] Forcing TP/SL placement via PositionMonitor.placeExitOrder() ...');
++    await posMonitor.placeExitOrder(pos);
 +    await sleep(3000);
 +
 +    // 5) Reload position to inspect TP/SL orders
@@ -3930,7 +3930,7 @@ diff --git a/src/services/PositionService.js b/src/services/PositionService.js
 +            let initialTP = prevTP; // Fallback to current TP
 +            
 +            if (entryPriceForTP > 0 && takeProfit > 0) {
-+              // Recalculate initial TP from strategy (same calculation as placeTpSlOrders)
++              // Recalculate initial TP from strategy (same calculation as placeExitOrder)
 +              initialTP = calculateTakeProfit(entryPriceForTP, oc, takeProfit, position.side);
 +              logger.debug(`[TP Trail] Calculated initial TP from strategy: ${initialTP.toFixed(2)} (entry=${entryPriceForTP}, take_profit=${takeProfit})`);
              } else {

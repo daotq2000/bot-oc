@@ -141,7 +141,7 @@ async function testTpSide() {
     const takeProfit = strategy?.take_profit || 50;
     const tpPrice = calculateTakeProfit(fillPrice, takeProfit, position.side);
     
-    console.log(`\nStep 1: PositionMonitor.placeTpSlOrders()`);
+    console.log(`\nStep 1: PositionMonitor.placeExitOrder()`);
     console.log(`   - position.side = ${JSON.stringify(position.side)}`);
     console.log(`   - Calls: exchangeService.createTakeProfitLimit(position.symbol, position.side, tpPrice, quantity)`);
     console.log(`   - Parameters: symbol=${position.symbol}, side=${JSON.stringify(position.side)}, tpPrice=${tpPrice}`);

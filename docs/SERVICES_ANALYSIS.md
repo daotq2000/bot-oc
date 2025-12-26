@@ -145,7 +145,7 @@
 #### 2. **TP/SL Order Placement - 2 nơi có thể xử lý**
 
 **Services/Jobs xử lý:**
-- `PositionMonitor.placeTpSlOrders()` - Place TP/SL cho positions mới
+- `PositionMonitor.placeExitOrder()` - Place TP/SL cho positions mới
 - `PositionService._maybeReplaceTpOrder()` - Replace TP order khi trailing
 
 **Xung đột:**

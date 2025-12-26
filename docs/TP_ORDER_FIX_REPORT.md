@@ -175,7 +175,7 @@ node scripts/fix_missing_tp_orders.js
 ```
 OrderService.executeSignal()
   → Position.create({ tp_sl_pending: true })
-  → PositionMonitor.placeTpSlOrders()
+  → PositionMonitor.placeExitOrder()
     → Đặt TP/SL order
     → Clear tp_sl_pending flag
 ```
@@ -184,14 +184,14 @@ OrderService.executeSignal()
 ```
 EntryOrderMonitor._confirmEntryWithPosition()
   → Position.create({ tp_sl_pending: true })  // ✅ FIXED
-  → PositionMonitor.placeTpSlOrders()
+  → PositionMonitor.placeExitOrder()
     → Đặt TP/SL order
     → Clear tp_sl_pending flag
 ```
 
 ### 3. PositionMonitor xử lý position có `tp_sl_pending = true`
 ```
-PositionMonitor.placeTpSlOrders()
+PositionMonitor.placeExitOrder()
   → Check tp_sl_pending flag  // ✅ FIXED
   → Đặt TP/SL order nếu cần
   → Clear tp_sl_pending flag sau khi thành công

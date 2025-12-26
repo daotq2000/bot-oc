@@ -165,7 +165,7 @@ async function checkTpOrdersOnExchange() {
     if (totalTpOrdersOnExchange === 0 && positions.length > 0) {
       console.log(`\n   ❌ VẤN ĐỀ: Không có TP orders nào trên exchange!`);
       console.log(`   → Có thể:`);
-      console.log(`     1. placeTpSlOrders() không được gọi`);
+      console.log(`     1. placeExitOrder() không được gọi`);
       console.log(`     2. createTakeProfitLimit() trả về null hoặc lỗi`);
       console.log(`     3. Orders bị reject bởi exchange`);
       console.log(`     4. Orders đã fill ngay lập tức`);

@@ -105,7 +105,7 @@ async function main() {
     // 6) Place TP/SL orders
     console.log('\n[2] Placing TP/SL orders...');
     let pos = await Position.findById(res.id);
-    await posMonitor.placeTpSlOrders(pos);
+    await posMonitor.placeExitOrder(pos);
     await sleep(3000);
 
     pos = await Position.findById(res.id);

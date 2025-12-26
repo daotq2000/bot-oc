@@ -646,7 +646,7 @@ export class PositionMonitor {
         
         // First, try to place TP/SL for new positions that might be missing them
         await Promise.allSettled(
-          batch.map(p => this.placeTpSlOrders(p))
+          batch.map(p => this.placeExitOrder(p))
         );
 
         // Then, monitor positions (update dynamic SL, check for TP/SL hit)

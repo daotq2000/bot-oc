@@ -8,7 +8,7 @@
  * - Mở 1 lệnh SHORT BTCUSDT với size nhỏ, dùng MARKET để khớp ngay
  * - Ngay sau khi position mở:
  *   + Đảm bảo Position được tạo trong DB
- *   + Gọi PositionMonitor.placeTpSlOrders() để đặt TP/SL trên sàn
+ *   + Gọi PositionMonitor.placeExitOrder() để đặt TP/SL trên sàn
  *   + Gọi PositionMonitor.monitorPosition() vài lần để quan sát log đuổi SL/TP
  *
  * Usage:
@@ -259,9 +259,9 @@ async function main() {
       sl_order_id: pos.sl_order_id
     });
 
-    // 4) Force TP/SL placement via PositionMonitor.placeTpSlOrders
-    console.log('\n[3] Forcing TP/SL placement via PositionMonitor.placeTpSlOrders() ...');
-    await posMonitor.placeTpSlOrders(pos);
+    // 4) Force TP/SL placement via PositionMonitor.placeExitOrder
+    console.log('\n[3] Forcing TP/SL placement via PositionMonitor.placeExitOrder() ...');
+    await posMonitor.placeExitOrder(pos);
     await sleep(3000);
 
     // 5) Reload position to inspect TP/SL orders
