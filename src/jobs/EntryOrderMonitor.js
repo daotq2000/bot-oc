@@ -339,24 +339,26 @@ export class EntryOrderMonitor {
 
       logger.debug(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
 
-      // Telegram notification disabled to avoid spam and rate limits
-      // Order logs are now written to logs/orders.log and logs/orders-error.log files
-      // try {
-      //   if (this.telegramService?.sendOrderNotification) {
-      //     await this.telegramService.sendOrderNotification(position, strategy);
-      //   }
+      // CRITICAL FIX: Enable Telegram notification when entry order is filled
+      // This alerts user when position is opened
+      try {
+        // Ensure bot info is available for Telegram alert
+        if (!strategy.bot && strategy.bot_id) {
+          const { Bot } = await import('../models/Bot.js');
+          strategy.bot = await Bot.findById(strategy.bot_id);
+        }
 
-      //   if (!strategy.bot && strategy.bot_id) {
-      //     const { Bot } = await import('../models/Bot.js');
-      //     strategy.bot = await Bot.findById(strategy.bot_id);
-      //   }
-
-      //   if (this.telegramService?.sendEntryTradeAlert) {
-      //     await this.telegramService.sendEntryTradeAlert(position, strategy, strategy.oc);
-      //   }
-      // } catch (e) {
-      //   logger.warn(`[EntryOrderMonitor] Failed to send Telegram notifications for Position ${position.id}: ${e?.message || e}`);
-      // }
+        // Send entry trade alert to Telegram channel
+        if (this.telegramService?.sendEntryTradeAlert) {
+          await this.telegramService.sendEntryTradeAlert(position, strategy, strategy.oc);
+          logger.info(`[EntryOrderMonitor] ✅ Entry trade alert sent for Position ${position.id}`);
+        } else {
+          logger.debug(`[EntryOrderMonitor] TelegramService.sendEntryTradeAlert not available, skipping alert for Position ${position.id}`);
+        }
+      } catch (e) {
+        // Non-critical: log error but don't fail position creation
+        logger.warn(`[EntryOrderMonitor] Failed to send Telegram notifications for Position ${position.id}: ${e?.message || e}`);
+      }
       } catch (posError) {
         // If Position creation failed, log error and let EntryOrderMonitor retry later
         // PositionSync will also try to create it from exchange

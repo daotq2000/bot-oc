@@ -47,14 +47,32 @@ async function addForeignKeyAndIndex() {
   }
 
   // Add FK if not exists (MySQL no easy way to check; try-catch)
+  // CRITICAL FIX: Use RESTRICT instead of CASCADE to prevent automatic deletion of positions
+  // RESTRICT prevents deletion of bot if there are positions referencing it
   try {
-    await pool.execute('ALTER TABLE positions ADD CONSTRAINT fk_positions_bot_id FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE');
-    console.log('Added FK fk_positions_bot_id');
+    await pool.execute('ALTER TABLE positions ADD CONSTRAINT fk_positions_bot_id FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE RESTRICT');
+    console.log('Added FK fk_positions_bot_id with ON DELETE RESTRICT (prevents CASCADE DELETE)');
   } catch (e) {
     if (!String(e?.message || '').toLowerCase().includes('duplicate')) {
       console.log('FK add warning:', e.message || e);
     } else {
       console.log('FK fk_positions_bot_id already exists');
+      // Check if existing FK uses CASCADE and warn
+      try {
+        const [fkInfo] = await pool.execute(`
+          SELECT CONSTRAINT_NAME, DELETE_RULE
+          FROM information_schema.KEY_COLUMN_USAGE k
+          JOIN information_schema.REFERENTIAL_CONSTRAINTS r
+            ON k.CONSTRAINT_NAME = r.CONSTRAINT_NAME
+          WHERE k.TABLE_NAME = 'positions'
+            AND k.CONSTRAINT_NAME = 'fk_positions_bot_id'
+        `);
+        if (fkInfo.length > 0 && fkInfo[0].DELETE_RULE === 'CASCADE') {
+          console.warn('⚠️  WARNING: Existing FK uses CASCADE DELETE. Run migration to change to RESTRICT.');
+        }
+      } catch (checkError) {
+        // Ignore check errors
+      }
     }
   }
 }

@@ -117,6 +117,15 @@ export class PositionSync {
         return;
       }
       
+      // Get open positions from database for this bot (must be done before checking exchangePositions.length)
+      const [dbPositions] = await pool.execute(
+        `SELECT p.*, s.symbol as strategy_symbol, s.bot_id
+         FROM positions p
+         JOIN strategies s ON p.strategy_id = s.id
+         WHERE s.bot_id = ? AND p.status = 'open'`,
+        [botId]
+      );
+      
       // If no positions on exchange, all DB positions should be closed
       if (exchangePositions.length === 0) {
         logger.info(`[PositionSync] No positions on exchange for bot ${botId}, closing all open positions in DB`);
@@ -161,15 +170,6 @@ export class PositionSync {
         logger.info(`[PositionSync] Closed ${closedCount} positions for bot ${botId} (exchange has no positions)`);
         return;
       }
-
-      // Get open positions from database for this bot
-      const [dbPositions] = await pool.execute(
-        `SELECT p.*, s.symbol as strategy_symbol, s.bot_id
-         FROM positions p
-         JOIN strategies s ON p.strategy_id = s.id
-         WHERE s.bot_id = ? AND p.status = 'open'`,
-        [botId]
-      );
 
       // Helper to normalize symbol exactly like we do for exchange positions
       const normalizeSymbol = (symbol) => this.normalizeSymbol(symbol);
@@ -504,11 +504,14 @@ export class PositionSync {
 
       // OPTIMISTIC LOCK: Create Position directly without transaction (fast)
       // UNIQUE constraint will prevent duplicates if race condition occurs
+      // CRITICAL FIX: Set order_id = null for synced positions (no real order exists)
+      // Fake order_id like "sync_..." causes Binance API errors when querying order status
+      // Synced positions are positions that already exist on exchange, not newly created orders
       try {
         const position = await Position.create({
           strategy_id: strategy.id,
           bot_id: botId,
-          order_id: `sync_${normalizedSymbol}_${side}_${Date.now()}`, // Traceable order_id
+          order_id: null, // CRITICAL: No real order_id for synced positions (position already existed on exchange)
           symbol: normalizedSymbol, // Use normalized symbol for consistency
           side: side,
           entry_price: entryPrice || markPrice,
@@ -518,7 +521,10 @@ export class PositionSync {
           current_reduce: strategy.reduce
         });
 
-        logger.info(`[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} (synced from exchange)`);
+        logger.info(
+          `[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} ` +
+          `(synced from exchange, order_id=null because position already existed on exchange, not from new order)`
+        );
         return true;
       } catch (error) {
         // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)

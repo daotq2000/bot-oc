@@ -236,7 +236,16 @@ class ExchangeInfoService {
         };
       } catch (_) {}
       // Explicitly fetch swap markets from the correct public endpoint to avoid 404s
+      try {
       await mexc.fetchMarkets({ 'type': 'swap' });
+      } catch (fetchError) {
+        // Handle 404 or other API errors gracefully
+        if (fetchError?.code === 404 || fetchError?.message?.includes('404') || fetchError?.message?.includes('Not Found')) {
+          this.logger.warn(`[MEXC] 404 error fetching swap markets (API endpoint may have changed): ${fetchError?.message || fetchError}. Skipping MEXC filter update.`);
+          return; // Skip update if API endpoint is not available
+        }
+        throw fetchError; // Re-throw other errors
+      }
 
       const filtersToSave = [];
       const markets = mexc.markets || {};

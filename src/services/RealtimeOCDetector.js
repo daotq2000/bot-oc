@@ -652,6 +652,14 @@ export class RealtimeOCDetector {
       // Get strategies for this symbol
       const strategies = strategyCache.getStrategies(normalizedExchange, normalizedSymbol);
       
+      // Debug logging for MITOUSDT bot 5
+      if (normalizedSymbol === 'MITOUSDT') {
+        const bot5Strategies = strategies.filter(s => s.bot_id === 5);
+        if (bot5Strategies.length > 0) {
+          logger.debug(`[RealtimeOCDetector] Found ${bot5Strategies.length} bot 5 strategies for MITOUSDT: ${bot5Strategies.map(s => `id=${s.id} OC=${s.oc}% interval=${s.interval}`).join(', ')}`);
+        }
+      }
+      
       // Log strategy lookup result (reduced logging)
       if (strategies.length === 0) {
         // Only log for specific symbols or first few times
@@ -664,11 +672,26 @@ export class RealtimeOCDetector {
       // ✅ OPTIMIZED: Pre-filter strategies - chỉ check strategies hợp lệ
       const validStrategies = strategies.filter(s => {
         const ocThreshold = Number(s.oc || 0);
-        return ocThreshold > 0 && 
+        const isValid = ocThreshold > 0 && 
                s.is_active && 
                (s.bot?.is_active !== false) &&
                s.interval; // Must have interval
+        
+        // Debug logging for MITOUSDT bot 5
+        if (normalizedSymbol === 'MITOUSDT' && s.bot_id === 5 && !isValid) {
+          logger.debug(`[RealtimeOCDetector] ⚠️ Strategy ${s.id} (bot 5) filtered out: ocThreshold=${ocThreshold}, is_active=${s.is_active}, bot.is_active=${s.bot?.is_active}, interval=${s.interval}`);
+        }
+        
+        return isValid;
       });
+      
+      // Debug logging for MITOUSDT bot 5
+      if (normalizedSymbol === 'MITOUSDT') {
+        const bot5ValidStrategies = validStrategies.filter(s => s.bot_id === 5);
+        if (bot5ValidStrategies.length > 0) {
+          logger.debug(`[RealtimeOCDetector] ${bot5ValidStrategies.length} bot 5 strategies passed validation for MITOUSDT`);
+        }
+      }
 
       if (validStrategies.length === 0) {
         return [];
@@ -784,6 +807,10 @@ export class RealtimeOCDetector {
    */
   _checkStrategy(strategy, symbol, openPrice, currentPrice, timestamp) {
     if (!openPrice || !Number.isFinite(openPrice) || openPrice <= 0) {
+      // Debug logging for specific strategies
+      if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
+        logger.debug(`[RealtimeOCDetector] ⚠️ Strategy ${strategy.id} (bot ${strategy.bot_id}) skipped: no open price for ${symbol}`);
+      }
       return null; // Skip nếu không có open price
     }
 
@@ -791,6 +818,10 @@ export class RealtimeOCDetector {
         const ocThreshold = Number(strategy.oc || 0);
 
         if (ocThreshold <= 0) {
+      // Debug logging for specific strategies
+      if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
+        logger.debug(`[RealtimeOCDetector] ⚠️ Strategy ${strategy.id} (bot ${strategy.bot_id}) skipped: invalid OC threshold ${ocThreshold} for ${symbol}`);
+      }
       return null;
         }
 
@@ -798,6 +829,11 @@ export class RealtimeOCDetector {
         const oc = this.calculateOC(openPrice, currentPrice);
         const absOC = Math.abs(oc);
         const direction = this.getDirection(openPrice, currentPrice);
+
+        // Debug logging for specific strategies (even when not matching)
+        if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
+          logger.debug(`[RealtimeOCDetector] 🔍 Checking strategy ${strategy.id} (bot ${strategy.bot_id}): ${symbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} open=${openPrice} current=${currentPrice}`);
+        }
 
         // Check if OC meets threshold
         if (absOC >= ocThreshold) {
@@ -813,6 +849,11 @@ export class RealtimeOCDetector {
             interval,
             timestamp
       };
+    } else {
+      // Debug logging when threshold not met for specific strategies
+      if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
+        logger.debug(`[RealtimeOCDetector] ⚠️ Strategy ${strategy.id} (bot ${strategy.bot_id}) NOT MATCHED: ${symbol} ${interval} OC=${oc.toFixed(2)}% < threshold=${ocThreshold}% (open=${openPrice} current=${currentPrice})`);
+      }
     }
 
     return null;

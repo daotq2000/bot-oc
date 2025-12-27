@@ -167,10 +167,27 @@ export class Strategy {
 
   /**
    * Delete strategy
+   * CRITICAL: Check for open positions before deletion to prevent CASCADE DELETE
    * @param {number} id - Strategy ID
    * @returns {Promise<boolean>}
+   * @throws {Error} If strategy has open positions
    */
   static async delete(id) {
+    // CRITICAL PROTECTION: Check for open positions before deletion
+    // Foreign key constraint may have ON DELETE CASCADE which will delete all positions
+    // This protection prevents accidental deletion of open positions
+    const { Position } = await import('./Position.js');
+    const openPositions = await Position.findOpen(id);
+    
+    if (openPositions.length > 0) {
+      throw new Error(
+        `Cannot delete strategy ${id}: Strategy has ${openPositions.length} open position(s). ` +
+        `Please close all positions before deleting the strategy. ` +
+        `Deleting strategy with open positions may cause CASCADE DELETE of positions. ` +
+        `Open positions: ${openPositions.map(p => `pos=${p.id} symbol=${p.symbol}`).join(', ')}`
+      );
+    }
+    
     const [result] = await pool.execute(
       'DELETE FROM strategies WHERE id = ?',
       [id]
@@ -180,9 +197,11 @@ export class Strategy {
 
   /**
    * Delete strategies for delisted symbols
+   * CRITICAL: Check for open positions before deletion to prevent CASCADE DELETE
    * @param {string} exchange - Exchange name (binance, mexc)
    * @param {Array<string>} delistedSymbols - Array of delisted symbols
    * @returns {Promise<number>} Number of deleted strategies
+   * @throws {Error} If any strategy has open positions
    */
   static async deleteBySymbols(exchange, delistedSymbols) {
     if (!Array.isArray(delistedSymbols) || delistedSymbols.length === 0) {
@@ -194,7 +213,47 @@ export class Strategy {
       return 0;
     }
 
+    // CRITICAL PROTECTION: Check for open positions before deletion
+    // Find all strategies that will be deleted
     const placeholders = normalizedSymbols.map(() => '?').join(',');
+    const [strategiesToDelete] = await pool.execute(
+      `SELECT s.id, s.symbol, s.bot_id
+       FROM strategies s
+       JOIN bots b ON s.bot_id = b.id
+       WHERE b.exchange = ? AND s.symbol IN (${placeholders})`,
+      [exchange, ...normalizedSymbols]
+    );
+
+    if (strategiesToDelete.length === 0) {
+      return 0;
+    }
+
+    // Check for open positions for these strategies
+    const strategyIds = strategiesToDelete.map(s => s.id);
+    const strategyPlaceholders = strategyIds.map(() => '?').join(',');
+    const { Position } = await import('./Position.js');
+    const [openPositions] = await pool.execute(
+      `SELECT p.id, p.strategy_id, p.symbol, s.symbol as strategy_symbol
+       FROM positions p
+       JOIN strategies s ON p.strategy_id = s.id
+       WHERE p.strategy_id IN (${strategyPlaceholders}) AND p.status = 'open'`,
+      strategyIds
+    );
+
+    if (openPositions.length > 0) {
+      const affectedStrategies = new Set(openPositions.map(p => p.strategy_id));
+      const affectedSymbols = Array.from(new Set(openPositions.map(p => p.strategy_symbol || p.symbol)));
+      throw new Error(
+        `Cannot delete strategies for delisted symbols ${normalizedSymbols.join(', ')}: ` +
+        `${openPositions.length} open position(s) found. ` +
+        `Please close all positions before deleting strategies. ` +
+        `Affected strategies: ${Array.from(affectedStrategies).join(', ')}, ` +
+        `Affected symbols: ${affectedSymbols.join(', ')}. ` +
+        `Open positions: ${openPositions.map(p => `pos=${p.id} strategy=${p.strategy_id} symbol=${p.symbol || p.strategy_symbol}`).join(', ')}`
+      );
+    }
+
+    // Safe to delete - no open positions
     const sql = `
       DELETE s FROM strategies s
       JOIN bots b ON s.bot_id = b.id

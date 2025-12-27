@@ -455,7 +455,17 @@ export class ExchangeService {
           }
         }
 
-        logger.debug(`Calculated quantity: ${quantity} for ${symbol} (amount: ${amount} USDT, price: ${currentPrice})`);
+        // CRITICAL FIX: Format quantity according to stepSize BEFORE placing order
+        // This ensures quantity is always a multiple of stepSize to avoid validation errors
+        const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
+        const formattedQuantity = this.binanceDirectClient.formatQuantity(quantity, stepSize);
+        const finalQuantity = parseFloat(formattedQuantity);
+        
+        if (!Number.isFinite(finalQuantity) || finalQuantity <= 0) {
+          throw new Error(`Invalid formatted quantity for ${normalizedSymbol}: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
+        }
+        
+        logger.debug(`Calculated quantity: ${quantity} -> formatted: ${finalQuantity} for ${symbol} (amount: ${amount} USDT, price: ${currentPrice}, stepSize: ${stepSize})`);
 
         let order;
         let avgFillPrice = null;
@@ -463,7 +473,7 @@ export class ExchangeService {
           order = await this.binanceDirectClient.placeMarketOrder(
             normalizedSymbol,
             side,
-            quantity,
+            finalQuantity, // Use formatted quantity
             positionSide
           );
           try {
@@ -473,7 +483,7 @@ export class ExchangeService {
           order = await this.binanceDirectClient.placeLimitOrder(
             normalizedSymbol,
             side,
-            quantity,
+            finalQuantity, // Use formatted quantity
             price,
             positionSide
           );

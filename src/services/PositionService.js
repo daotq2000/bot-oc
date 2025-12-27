@@ -100,37 +100,51 @@ export class PositionService {
       }
 
       // PRIORITY CHECK 2: Check if position has been closed on exchange (no exposure)
-      // This detects when position is closed on exchange but DB still shows 'open'
+      // CRITICAL FIX: Only close position if order is FILLED, not CANCELED
+      // This prevents false alerts when TP order is cancelled (e.g., during dedupe or trailing TP)
       // Only check if WebSocket cache doesn't have the order status (fallback)
       try {
         const closableQty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
         if (!closableQty || closableQty <= 0) {
           // Position has no exposure on exchange - it's already closed
-          // Check cache first, then fallback to REST API only if cache miss
-          let closeReason = 'closed_on_exchange';
-          
+          // CRITICAL: Verify order status is FILLED, not CANCELED before closing position
           // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
-          // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
           const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
           
+          let closeReason = null;
+          let verifiedFillPrice = null;
+          
+          // Check TP order status first
           if (position.exit_order_id) {
             const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
-            // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
+            // CRITICAL FIX: Only close if order status is 'closed' (FILLED), not 'canceled'
             if (cachedTpStatus?.status === 'closed') {
               closeReason = 'tp_hit';
+              verifiedFillPrice = cachedTpStatus.avgPrice;
             } else {
               // Fallback to REST API only if cache miss
               try {
                 const tpOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
-                if (tpOrderStatus?.status === 'closed' || tpOrderStatus?.status === 'FILLED') {
+                const normalizedStatus = tpOrderStatus?.status?.toLowerCase() || '';
+                // CRITICAL: Only accept FILLED/closed status, reject CANCELED/EXPIRED
+                if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
                   closeReason = 'tp_hit';
+                  verifiedFillPrice = tpOrderStatus.raw?.avgPrice || tpOrderStatus.avgPrice || null;
                   // Update cache for future use
                   orderStatusCache.updateOrderStatus(position.exit_order_id, {
                     status: tpOrderStatus.status,
                     filled: tpOrderStatus.filled || 0,
-                    avgPrice: tpOrderStatus.raw?.avgPrice || null,
+                    avgPrice: verifiedFillPrice,
                     symbol: position.symbol
                   }, exchange);
+                } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
+                  // Order was cancelled, not filled - DO NOT close position
+                  logger.warn(
+                    `[TP/SL Check] ⚠️ TP order ${position.exit_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                    `Position has no exposure but order was cancelled (likely during dedupe/trailing). ` +
+                    `Will NOT close position to prevent false alert.`
+                  );
+                  return; // Exit early - don't close position
                 }
               } catch (e) {
                 logger.debug(`[TP/SL Check] Failed to check TP order via REST API: ${e?.message || e}`);
@@ -138,24 +152,37 @@ export class PositionService {
             }
           }
           
-          if (position.sl_order_id && closeReason !== 'tp_hit') {
+          // Check SL order status if TP not filled
+          if (!closeReason && position.sl_order_id) {
             const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
-            // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
+            // CRITICAL FIX: Only close if order status is 'closed' (FILLED), not 'canceled'
             if (cachedSlStatus?.status === 'closed') {
               closeReason = 'sl_hit';
+              verifiedFillPrice = cachedSlStatus.avgPrice;
             } else {
               // Fallback to REST API only if cache miss
               try {
                 const slOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.sl_order_id);
-                if (slOrderStatus?.status === 'closed' || slOrderStatus?.status === 'FILLED') {
+                const normalizedStatus = slOrderStatus?.status?.toLowerCase() || '';
+                // CRITICAL: Only accept FILLED/closed status, reject CANCELED/EXPIRED
+                if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
                   closeReason = 'sl_hit';
+                  verifiedFillPrice = slOrderStatus.raw?.avgPrice || slOrderStatus.avgPrice || null;
                   // Update cache for future use
                   orderStatusCache.updateOrderStatus(position.sl_order_id, {
                     status: slOrderStatus.status,
                     filled: slOrderStatus.filled || 0,
-                    avgPrice: slOrderStatus.raw?.avgPrice || null,
+                    avgPrice: verifiedFillPrice,
                     symbol: position.symbol
                   }, exchange);
+                } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
+                  // Order was cancelled, not filled - DO NOT close position
+                  logger.warn(
+                    `[TP/SL Check] ⚠️ SL order ${position.sl_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                    `Position has no exposure but order was cancelled. ` +
+                    `Will NOT close position to prevent false alert.`
+                  );
+                  return; // Exit early - don't close position
                 }
               } catch (e) {
                 logger.debug(`[TP/SL Check] Failed to check SL order via REST API: ${e?.message || e}`);
@@ -163,16 +190,28 @@ export class PositionService {
             }
           }
           
-          const currentPrice = await this.exchangeService.getTickerPrice(position.symbol);
-          if (currentPrice) {
-            const pnl = calculatePnL(
-              position.entry_price,
-              currentPrice,
-              position.amount,
-              position.side
+          // CRITICAL: Only close position if we verified order was FILLED (not cancelled)
+          if (closeReason) {
+            const currentPrice = verifiedFillPrice || await this.exchangeService.getTickerPrice(position.symbol);
+            if (currentPrice) {
+              const pnl = calculatePnL(
+                position.entry_price,
+                currentPrice,
+                position.amount,
+                position.side
+              );
+              logger.info(
+                `[TP/SL Check] ✅ Position ${position.id} closed on exchange with verified ${closeReason}. ` +
+                `Order status confirmed FILLED. Closing in DB.`
+              );
+              return await this.closePosition(position, currentPrice, pnl, closeReason);
+            }
+          } else {
+            // Position has no exposure but no verified fill - likely order was cancelled
+            logger.warn(
+              `[TP/SL Check] ⚠️ Position ${position.id} has no exposure but no verified TP/SL fill. ` +
+              `Orders may have been cancelled. Will NOT close position to prevent false alert.`
             );
-            logger.info(`[TP/SL Check] Position ${position.id} has no exposure on exchange (already closed). Closing in DB with reason: ${closeReason}`);
-            return await this.closePosition(position, currentPrice, pnl, closeReason);
           }
         }
       } catch (e) {
@@ -247,42 +286,42 @@ export class PositionService {
       
       const prevMinutes = Number(position.minutes_elapsed || 0);
       let actualMinutesElapsed;
+      let minutesToProcess = 1; // Default: process 1 minute per call
       
       if (useTimeBasedCalculation) {
         const now = Date.now();
-        actualMinutesElapsed = Math.floor((now - openedAt) / (60 * 1000)); // Minutes since position opened
-        logger.debug(`[TP Trail] pos=${position.id} Timing check: opened_at=${position.opened_at} openedAt=${openedAt} now=${now} actualMinutesElapsed=${actualMinutesElapsed} prevMinutes=${prevMinutes} timeDiff=${now - openedAt}ms (${Math.floor((now - openedAt) / 1000)}s)`);
+        const totalMinutesElapsed = Math.floor((now - openedAt) / (60 * 1000)); // Total minutes since position opened
+        logger.debug(`[TP Trail] pos=${position.id} Timing check: opened_at=${position.opened_at} openedAt=${openedAt} now=${now} totalMinutesElapsed=${totalMinutesElapsed} prevMinutes=${prevMinutes} timeDiff=${now - openedAt}ms (${Math.floor((now - openedAt) / 1000)}s)`);
         
         // Only update TP if actual minutes have increased (ensures exactly once per minute)
-        if (actualMinutesElapsed <= prevMinutes) {
-          logger.debug(`[TP Trail] pos=${position.id} actualMinutes=${actualMinutesElapsed} <= prevMinutes=${prevMinutes}, skipping TP trail (not yet time for next step)`);
-          // Still update PnL and return without changing TP
-          const updatePayload = {
-            pnl: pnl
-          };
-          const updated = await Position.update(position.id, updatePayload);
-          return updated;
+        if (totalMinutesElapsed <= prevMinutes) {
+          logger.debug(`[TP Trail] pos=${position.id} totalMinutes=${totalMinutesElapsed} <= prevMinutes=${prevMinutes}, skipping TP trail (not yet time for next step)`);
+          // Still update PnL and minutes_elapsed (increment by 0 if no time passed, or by actual difference)
+          // CRITICAL FIX: Always update minutes_elapsed to current time, even if no TP trail
+          actualMinutesElapsed = totalMinutesElapsed; // Use actual time elapsed
+          minutesToProcess = 0; // No minutes to process for trailing
+        } else {
+          // Calculate how many minutes to process (max 1 minute per call to ensure smooth movement)
+          minutesToProcess = Math.min(totalMinutesElapsed - prevMinutes, 1); // Only process 1 minute at a time
+          actualMinutesElapsed = prevMinutes + minutesToProcess; // Incremental value for DB update
+          
+          // WARN if downtime detected (more than 5 minutes skipped)
+          if (totalMinutesElapsed - prevMinutes > 5) {
+            logger.warn(
+              `[TP Trail] ⚠️ Downtime detected for position ${position.id}: ` +
+              `prevMinutes=${prevMinutes}, totalMinutes=${totalMinutesElapsed}, ` +
+              `skipped=${totalMinutesElapsed - prevMinutes} minutes. ` +
+              `Processing only 1 minute to prevent large TP jumps.`
+            );
+          }
+          
+          logger.debug(`[TP Trail] pos=${position.id} Proceeding with TP trail: totalMinutes=${totalMinutesElapsed} > prevMinutes=${prevMinutes}, processing ${minutesToProcess} minute(s), targetMinutes=${actualMinutesElapsed}`);
         }
-        
-        // Calculate how many minutes to process (max 1 minute per call to ensure smooth movement)
-        const minutesToProcess = Math.min(actualMinutesElapsed - prevMinutes, 1); // Only process 1 minute at a time
-        actualMinutesElapsed = prevMinutes + minutesToProcess; // Use incremental value
-        
-        // WARN if downtime detected (more than 5 minutes skipped)
-        if (actualMinutesElapsed - prevMinutes > 5) {
-          logger.warn(
-            `[TP Trail] ⚠️ Downtime detected for position ${position.id}: ` +
-            `prevMinutes=${prevMinutes}, actualMinutes=${Math.floor((now - openedAt) / (60 * 1000))}, ` +
-            `skipped=${Math.floor((now - openedAt) / (60 * 1000)) - prevMinutes} minutes. ` +
-            `Processing only 1 minute to prevent large TP jumps.`
-          );
-        }
-        
-        logger.debug(`[TP Trail] pos=${position.id} Proceeding with TP trail: actualMinutes=${Math.floor((now - openedAt) / (60 * 1000))} > prevMinutes=${prevMinutes}, processing ${minutesToProcess} minute(s), targetMinutes=${actualMinutesElapsed}`);
       } else {
         // Fallback: increment-based calculation
         actualMinutesElapsed = prevMinutes + 1;
-        logger.debug(`[TP Trail] pos=${position.id} Using increment-based calculation: prevMinutes=${prevMinutes} -> actualMinutesElapsed=${actualMinutesElapsed}`);
+        minutesToProcess = 1; // Process 1 minute
+        logger.debug(`[TP Trail] pos=${position.id} Using increment-based calculation: prevMinutes=${prevMinutes} -> actualMinutesElapsed=${actualMinutesElapsed}, minutesToProcess=${minutesToProcess}`);
       }
       
       // Only set initial SL if it doesn't exist (SL should NOT be moved after initial setup)
@@ -303,9 +342,17 @@ export class PositionService {
           const marketPrice = Number(currentPrice);
           const reduce = Number(position.reduce || 0);
           const upReduce = Number(position.up_reduce || 0);
-          const minutesElapsed = actualMinutesElapsed; // Use calculated minutes
+          
+          // CRITICAL FIX: Use minutesToProcess (1 minute) instead of actualMinutesElapsed (total minutes)
+          // This ensures TP trails incrementally, not jumping based on total time elapsed
+          const minutesForTrailing = minutesToProcess; // Only process 1 minute at a time
 
-          logger.debug(`[TP Trail] Starting TP trail check for position ${position.id}: prevTP=${prevTP} entryPrice=${entryPrice} marketPrice=${marketPrice} reduce=${reduce} upReduce=${upReduce} minutesElapsed=${minutesElapsed}`);
+          logger.info(
+            `[TP Trail] 🎯 Starting TP trail check | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
+            `prevTP=${prevTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} marketPrice=${marketPrice.toFixed(8)} ` +
+            `reduce=${reduce} upReduce=${upReduce} minutesToProcess=${minutesForTrailing} prevMinutes=${prevMinutes} actualMinutesElapsed=${actualMinutesElapsed} ` +
+            `initial_tp_price=${position.initial_tp_price || 'N/A'} timestamp=${new Date().toISOString()}`
+          );
 
           // Need initial TP to calculate trailing
           if (!Number.isFinite(prevTP) || prevTP <= 0) {
@@ -344,64 +391,131 @@ export class PositionService {
             
             const trailingPercent = position.side === 'long' ? upReduce : reduce;
             
-            // Calculate next TP: trails from initial TP towards entry
-            // Trailing is TIME-BASED ONLY (not price-based) for predictable behavior
-            const newTP = calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, trailingPercent, position.side, minutesElapsed);
-            
-            logger.debug(
-              `[TP Trail] pos=${position.id} ${position.symbol} side=${position.side} ` +
-              `prevTP=${prevTP.toFixed(2)} newTP=${newTP.toFixed(2)} entry=${entryPrice.toFixed(2)} ` +
-              `initialTP=${initialTP.toFixed(2)} trailing=${trailingPercent} minutesElapsed=${minutesElapsed}`
-            );
+            // CRITICAL FIX: Only trail TP if there are minutes to process
+            if (minutesForTrailing <= 0) {
+              logger.debug(`[TP Trail] pos=${position.id} minutesToProcess=${minutesForTrailing}, skipping TP trail calculation`);
+            } else {
+              // Calculate next TP: trails from initial TP towards entry
+              // Trailing is TIME-BASED ONLY (not price-based) for predictable behavior
+              // CRITICAL FIX: Use minutesForTrailing (1 minute) instead of total minutes elapsed
+              // This ensures incremental movement, not jumping based on total time
+              const newTP = calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, trailingPercent, position.side, minutesForTrailing);
+              
+              // Calculate step details for debugging
+              const totalRange = Math.abs(initialTP - entryPrice);
+              const stepPerMinute = totalRange * (trailingPercent / 100);
+              const step = stepPerMinute * minutesForTrailing;
+              
+              logger.info(
+                `[TP Trail] 📊 Calculated new TP | pos=${position.id} ${position.symbol} side=${position.side} ` +
+                `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} entry=${entryPrice.toFixed(8)} ` +
+                `initialTP=${initialTP.toFixed(8)} trailing=${trailingPercent}% minutesToProcess=${minutesForTrailing} ` +
+                `totalRange=${totalRange.toFixed(8)} stepPerMinute=${stepPerMinute.toFixed(8)} step=${step.toFixed(8)} ` +
+                `change=${((newTP - prevTP) / prevTP * 100).toFixed(3)}% absoluteChange=${Math.abs(newTP - prevTP).toFixed(8)} ` +
+                `timestamp=${new Date().toISOString()}`
+              );
+              
+              // Warn if newTP equals prevTP (no movement)
+              if (Math.abs(newTP - prevTP) < 0.00000001) {
+                logger.warn(
+                  `[TP Trail] ⚠️ WARNING: newTP (${newTP.toFixed(8)}) equals prevTP (${prevTP.toFixed(8)})! ` +
+                  `No movement detected. Check calculation: totalRange=${totalRange.toFixed(8)} stepPerMinute=${stepPerMinute.toFixed(8)} step=${step.toFixed(8)} ` +
+                  `trailingPercent=${trailingPercent}% minutesForTrailing=${minutesForTrailing} | pos=${position.id}`
+                );
+              }
 
-            // Check if TP has crossed entry (Case 2)
-            const hasCrossedEntry = (position.side === 'long' && newTP <= entryPrice) || 
-                                   (position.side === 'short' && newTP >= entryPrice);
-            
-            if (hasCrossedEntry) {
-              // Case 2: TP has crossed entry - check if too close to market
-              const distanceFromMarket = Math.abs(newTP - marketPrice);
-              const distancePercent = (distanceFromMarket / marketPrice) * 100;
+              // Check if TP has crossed entry (Case 2)
+              const hasCrossedEntry = (position.side === 'long' && newTP <= entryPrice) || 
+                                     (position.side === 'short' && newTP >= entryPrice);
               
-              logger.debug(`[TP Trail] TP ${newTP.toFixed(2)} crossed entry ${entryPrice.toFixed(2)} for ${position.side} position ${position.id}. Distance from market: ${distancePercent.toFixed(3)}%`);
-              
-              // Configurable threshold for market close (default 0.5%)
-              const marketCloseThreshold = Number(configService.getNumber('TRAILING_MARKET_CLOSE_THRESHOLD', 0.5));
-              
-              if (distancePercent <= marketCloseThreshold) {
-                // Too close to market - close position immediately
-                logger.warn(`[TP Trail] TP too close to market (${distancePercent.toFixed(3)}% <= ${marketCloseThreshold}%). Closing position ${position.id} by MARKET order.`);
+              if (hasCrossedEntry) {
+                // Case 2: TP has crossed entry → market has moved against the position.
+                // NEW REQUIREMENT: Force close immediately to preserve capital.
+                // close_reason = tp_cross_entry_force_close
+                logger.warn(
+                  `[TP Trail] 🚨 TP crossed entry → FORCE CLOSE | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
+                  `entry=${entryPrice.toFixed(8)} prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} market=${marketPrice.toFixed(8)} ` +
+                  `reason=tp_cross_entry_force_close`
+                );
+
+                // Persist trailing state for audit/debug even if close fails
+                try {
+                  await Position.update(position.id, { take_profit_price: newTP });
+                } catch (e) {
+                  logger.warn(`[TP Trail] Failed to persist take_profit_price before force close | pos=${position.id}: ${e?.message || e}`);
+                }
+
                 try {
                   const qty = await getCachedClosableQty();
                   if (qty > 0) {
-                    await this.exchangeService.closePosition(position.symbol, position.side, qty);
-                    await this.closePosition(position, marketPrice, pnl, 'trailing_exit');
-                    logger.debug(`[TP Trail] Closed position ${position.id} by MARKET order (TP too close to market)`);
+                    // Close on exchange first
+                    const closeRes = await this.exchangeService.closePosition(position.symbol, position.side, qty);
+                    const fillPrice = Number(closeRes?.avgFillPrice || closeRes?.average || closeRes?.price || marketPrice);
+                    const safeClosePrice = Number.isFinite(fillPrice) && fillPrice > 0 ? fillPrice : Number(marketPrice);
+
+                    const recomputedPnL = calculatePnL(
+                      position.entry_price,
+                      safeClosePrice,
+                      position.amount,
+                      position.side
+                    );
+
+                    // Close in DB + send telegram
+                    const closed = await Position.close(position.id, safeClosePrice, recomputedPnL, 'tp_cross_entry_force_close');
+
+                    // Cleanup remaining open orders
+                    try {
+                      await this.exchangeService.cancelAllOpenOrders(position.symbol);
+                    } catch (e) {
+                      logger.warn(`[TP Trail] Failed to cleanup open orders after force close | pos=${position.id}: ${e?.message || e}`);
+                    }
+
+                    await this.sendTelegramCloseNotification(closed);
+                    return await Position.findById(position.id);
+                  } else {
+                    // No exposure → close DB only
+                    const recomputedPnL = calculatePnL(
+                      position.entry_price,
+                      marketPrice,
+                      position.amount,
+                      position.side
+                    );
+                    const closed = await Position.close(position.id, marketPrice, recomputedPnL, 'tp_cross_entry_force_close');
+                    await this.sendTelegramCloseNotification(closed);
                     return await Position.findById(position.id);
                   }
                 } catch (e) {
-                  logger.error(`[TP Trail] Failed to close position by MARKET: ${e?.message || e}`);
+                  logger.error(`[TP Trail] ❌ FORCE CLOSE FAILED | pos=${position.id}: ${e?.message || e}`);
+                  // Keep position open in DB if we couldn't confirm closure.
                 }
               } else {
-                // Convert TP order to STOP_LIMIT order
-                await this._convertTpToStopLimit(position, newTP);
+                // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
+                // Try to replace TP order, but continue even if it fails
+                try {
+                  await this._maybeReplaceTpOrder(position, prevTP, newTP, getCachedClosableQty);
+                } catch (replaceError) {
+                  logger.warn(`[TP Trail] Failed to replace TP order for position ${position.id}: ${replaceError?.message || replaceError}. Continuing with TP price update.`);
+                }
+                
+                // Always update take_profit_price in DB (minutes_elapsed will be updated at the end)
+                // This ensures trailing TP works even if order replacement fails
+                // CRITICAL: This update must happen regardless of order replacement success/failure
+                try {
+                  await Position.update(position.id, { 
+                    take_profit_price: newTP
+                    // NOTE: minutes_elapsed will be updated in final updatePayload below to avoid double update
+                  });
+                  logger.info(
+                    `[TP Trail] ✅ Updated take_profit_price in DB (profit zone) | pos=${position.id} ` +
+                    `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} hasCrossedEntry=false`
+                  );
+                } catch (updateError) {
+                  logger.error(
+                    `[TP Trail] ❌ CRITICAL: Failed to update take_profit_price in DB | pos=${position.id} ` +
+                    `newTP=${newTP.toFixed(8)} error=${updateError?.message || updateError}`
+                  );
+                }
               }
-            } else {
-              // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
-              // Try to replace TP order, but continue even if it fails
-              try {
-                await this._maybeReplaceTpOrder(position, prevTP, newTP, getCachedClosableQty);
-              } catch (replaceError) {
-                logger.warn(`[TP Trail] Failed to replace TP order for position ${position.id}: ${replaceError?.message || replaceError}. Continuing with TP price update.`);
-              }
-              
-              // Always update take_profit_price in DB (minutes_elapsed will be updated at the end)
-              // This ensures trailing TP works even if order replacement fails
-              await Position.update(position.id, { 
-                take_profit_price: newTP
-                // NOTE: minutes_elapsed will be updated in final updatePayload below to avoid double update
-              });
-              logger.debug(`[TP Trail] ✅ Updated position ${position.id}: take_profit_price=${newTP.toFixed(2)} (prev=${prevTP.toFixed(2)})`);
             }
           }
         } catch (e) {
@@ -486,7 +600,7 @@ export class PositionService {
   /**
    * Internal helper: quyết định có cần hủy / đặt lại TP order hay không
    */
-  async _maybeReplaceTpOrder(position, prevTP, desiredTP) {
+  async _maybeReplaceTpOrder(position, prevTP, desiredTP, getCachedClosableQty) {
     try {
           const entryPrice = Number(position.entry_price || 0);
           const newTP = Number(desiredTP || 0);
@@ -510,27 +624,56 @@ export class PositionService {
           if (tickTP > 0 && newTP > 0 && prevTP > 0) {
             const movedTP = Math.abs(newTP - prevTP);
             const effectiveThreshold = thresholdTicksTP * tickTP;
-            logger.debug(`[TP Replace] Movement check: movedTP=${movedTP.toFixed(4)} effectiveThreshold=${effectiveThreshold.toFixed(4)}`);
             
-            if (movedTP >= effectiveThreshold) {
-              logger.debug(`[TP Replace] Movement threshold met, proceeding with TP order replacement`);
-              if (position.exit_order_id) {
-                try {
-                  await this.exchangeService.cancelOrder(position.exit_order_id, position.symbol);
-                  logger.debug(`[TP Replace] Cancelled old TP order ${position.exit_order_id} for position ${position.id}`);
-                } catch (e) {
-                  logger.warn(`[TP Replace] Failed to cancel old TP order ${position.exit_order_id}: ${e?.message || e}`);
-                }
-              }
+            // Additional cooldown check: only replace if price changed significantly (>0.1% of current price)
+            // This prevents unnecessary order replacements that create dangerous gaps
+            const minPriceChangePercent = Number(configService.getNumber('EXIT_ORDER_MIN_PRICE_CHANGE_PCT', 0.1)); // 0.1%
+            const avgPrice = (newTP + prevTP) / 2;
+            const minPriceChange = avgPrice * (minPriceChangePercent / 100);
+            const priceChangePercent = (movedTP / avgPrice) * 100;
+            
+            logger.info(
+              `[TP Replace] 🔍 Movement check | pos=${position.id} ` +
+              `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
+              `movedTP=${movedTP.toFixed(8)} effectiveThreshold=${effectiveThreshold.toFixed(8)} ` +
+              `minPriceChange=${minPriceChange.toFixed(8)} (${minPriceChangePercent}%) ` +
+              `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
+              `tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP}`
+            );
+            
+            // Replace only if BOTH conditions are met:
+            // 1. Movement >= tick-based threshold (precision requirement)
+            // 2. Movement >= minimum price change % (cooldown requirement)
+            const tickThresholdMet = movedTP >= effectiveThreshold;
+            const priceChangeThresholdMet = movedTP >= minPriceChange;
+            
+            logger.info(
+              `[TP Replace] 🔍 Threshold check result | pos=${position.id} ` +
+              `tickThresholdMet=${tickThresholdMet} (${movedTP.toFixed(8)} >= ${effectiveThreshold.toFixed(8)}) ` +
+              `priceChangeThresholdMet=${priceChangeThresholdMet} (${movedTP.toFixed(8)} >= ${minPriceChange.toFixed(8)}) ` +
+              `willReplace=${tickThresholdMet && priceChangeThresholdMet}`
+            );
+            
+            if (tickThresholdMet && priceChangeThresholdMet) {
+              const replaceStartTime = Date.now();
+              const timestamp = new Date().toISOString();
               
-              // Delay before creating new TP order to avoid rate limits
-              const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
-              if (delayMs > 0) {
-                logger.debug(`[TP Replace] Waiting ${delayMs}ms before placing new TP order for position ${position.id}...`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-              }
+              logger.info(
+                `[TP Replace] 🎯 THRESHOLD MET: Proceeding with TP order replacement | pos=${position.id} ` +
+                `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
+                `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
+                `priceChangePercent=${priceChangePercent.toFixed(3)}% timestamp=${timestamp}`
+              );
+              
+              // NOTE: ExitOrderManager.placeOrReplaceExitOrder now uses atomic replace pattern:
+              // Creates new order FIRST, then cancels old order. No delay needed.
               
               const qty = getCachedClosableQty ? await getCachedClosableQty() : await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+              logger.debug(
+                `[TP Replace] Quantity check | pos=${position.id} qty=${qty} ` +
+                `symbol=${position.symbol} side=${position.side}`
+              );
+              
               if (qty > 0) {
                 // CRITICAL FIX: Allow TP to cross entry for SHORT positions (early loss-cutting)
                 // For SHORT: TP can be above entry (loss zone) to enable early exit when price moves against position
@@ -549,45 +692,117 @@ export class PositionService {
                   }
                 }
                 
+                logger.debug(
+                  `[TP Replace] Validation check | pos=${position.id} ` +
+                  `entryPrice=${entryPrice.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
+                  `side=${position.side} isValidTP=${isValidTP}`
+                );
+                
                 if (isValidTP) {
                   try {
-                    // Debug logging to verify position.side is correct
-                    logger.debug(`[TP Replace] Creating TP order: position.id=${position.id}, position.side=${position.side}, symbol=${position.symbol}, newTP=${newTP.toFixed(8)}, entryPrice=${entryPrice.toFixed(8)}`);
+                    const oldExitOrderId = position.exit_order_id || null;
+                    
+                    logger.info(
+                      `[TP Replace] 🚀 CALLING ExitOrderManager | pos=${position.id} ` +
+                      `symbol=${position.symbol} side=${position.side} ` +
+                      `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
+                      `oldExitOrderId=${oldExitOrderId || 'null'} timestamp=${new Date().toISOString()}`
+                    );
+                    
                     if (position.side !== 'long' && position.side !== 'short') {
-                      logger.error(`[TP Replace] ⚠️ Invalid position.side value: ${position.side} for position ${position.id}. Expected 'long' or 'short'.`);
+                      logger.error(
+                        `[TP Replace] ⚠️ INVALID position.side: ${position.side} for position ${position.id}. ` +
+                        `Expected 'long' or 'short'.`
+                      );
                     }
+                    
                     // ✅ Unified exit order: type switches based on profit/loss zone (STOP_MARKET <-> TAKE_PROFIT_MARKET)
                     const { ExitOrderManager } = await import('./ExitOrderManager.js');
                     const mgr = new ExitOrderManager(this.exchangeService);
                     const placed = await mgr.placeOrReplaceExitOrder(position, newTP);
 
+                    const replaceEndTime = Date.now();
+                    const replaceDuration = replaceEndTime - replaceStartTime;
                     const newExitOrderId = placed?.orderId ? String(placed.orderId) : null;
+                    
+                    logger.info(
+                      `[TP Replace] ✅ ExitOrderManager returned | pos=${position.id} ` +
+                      `newExitOrderId=${newExitOrderId || 'null'} oldExitOrderId=${oldExitOrderId || 'null'} ` +
+                      `orderType=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice?.toFixed(8) || newTP.toFixed(8)} ` +
+                      `replaceDuration=${replaceDuration}ms timestamp=${new Date().toISOString()}`
+                    );
+
                     const updatePayload = { 
                       take_profit_price: newTP,
-                      tp_synced: newExitOrderId ? true : false // Track if exit order was successfully placed
+                      // tp_synced may not exist in older DB schemas; only set it when supported
+                      ...(Position?.rawAttributes?.tp_synced ? { tp_synced: newExitOrderId ? true : false } : {})
                     };
                     if (newExitOrderId) updatePayload.exit_order_id = newExitOrderId;
+                    
+                    const dbUpdateStart = Date.now();
                     await Position.update(position.id, updatePayload);
-                    logger.debug(`[TP Replace] ✅ Placed new EXIT (${placed?.orderType || 'n/a'}) ${newExitOrderId || ''} @ stop=${placed?.stopPrice ?? newTP} for position ${position.id} (tp_synced=${updatePayload.tp_synced})`);
+                    const dbUpdateDuration = Date.now() - dbUpdateStart;
+                    
+                    logger.info(
+                      `[TP Replace] ✅ DB UPDATED | pos=${position.id} ` +
+                      `exit_order_id=${newExitOrderId || 'null'} take_profit_price=${newTP.toFixed(8)} ` +
+                      `tp_synced=${updatePayload.tp_synced || 'N/A'} ` +
+                      `dbUpdateDuration=${dbUpdateDuration}ms totalDuration=${Date.now() - replaceStartTime}ms ` +
+                      `timestamp=${new Date().toISOString()}`
+                    );
                   } catch (tpError) {
+                    const replaceEndTime = Date.now();
+                    const replaceDuration = replaceEndTime - replaceStartTime;
+                    
+                    logger.error(
+                      `[TP Replace] ❌ FAILED: ExitOrderManager error | pos=${position.id} ` +
+                      `newTP=${newTP.toFixed(8)} oldExitOrderId=${position.exit_order_id || 'null'} ` +
+                      `replaceDuration=${replaceDuration}ms error=${tpError?.message || tpError} ` +
+                      `stack=${tpError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
+                    );
+                    
                     // If TP order creation fails, still update take_profit_price in DB
                     // This allows trailing TP to continue working even if orders can't be placed
                     // Mark as not synced so PositionMonitor can retry later
-                    logger.warn(`[TP Replace] ⚠️ Failed to place TP order @ ${newTP} for position ${position.id}: ${tpError?.message || tpError}. Updating TP price in DB only (tp_synced=false).`);
+                    logger.warn(
+                      `[TP Replace] ⚠️ FALLBACK: Updating DB only (order not placed) | pos=${position.id} ` +
+                      `take_profit_price=${newTP.toFixed(8)} tp_synced=false ` +
+                      `(will retry later via PositionMonitor) timestamp=${new Date().toISOString()}`
+                    );
+                    
                     await Position.update(position.id, { 
                       take_profit_price: newTP,
-                      tp_synced: false // Mark as not synced for retry
+                      ...(Position?.rawAttributes?.tp_synced ? { tp_synced: false } : {}) // Mark as not synced for retry (if supported)
                     });
-                    logger.debug(`[TP Replace] Updated TP price in DB to ${newTP} for position ${position.id} (order not placed, will retry)`);
+                    
+                    logger.debug(
+                      `[TP Replace] ✅ DB updated (fallback) | pos=${position.id} ` +
+                      `take_profit_price=${newTP.toFixed(8)} timestamp=${new Date().toISOString()}`
+                    );
                   }
                 } else {
-                  logger.debug(`[TP Replace] TP ${newTP} is invalid for LONG position (must be >= entry ${entryPrice}), skipping TP order creation (will be handled by SL conversion)`);
+                  logger.warn(
+                    `[TP Replace] ⚠️ SKIP: Invalid TP for LONG position | pos=${position.id} ` +
+                    `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
+                    `(must be >= entry, will be handled by SL conversion) timestamp=${new Date().toISOString()}`
+                  );
                 }
               } else {
-                logger.warn(`[TP Replace] Skip placing new TP, qty=${qty}`);
+                logger.warn(
+                  `[TP Replace] ⚠️ SKIP: Invalid quantity | pos=${position.id} ` +
+                  `qty=${qty} symbol=${position.symbol} side=${position.side} ` +
+                  `timestamp=${new Date().toISOString()}`
+                );
               }
             } else {
-              logger.debug(`[TP Replace] Movement ${movedTP.toFixed(4)} < threshold ${effectiveThreshold.toFixed(4)}, skipping TP order replacement`);
+              logger.warn(
+                `[TP Replace] ⚠️ THRESHOLD NOT MET: Skipping TP order replacement | pos=${position.id} ` +
+                `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
+                `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
+                `tickThresholdMet=${tickThresholdMet} priceChangeThresholdMet=${priceChangeThresholdMet} ` +
+                `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
+                `(Order will NOT be replaced, but DB take_profit_price will be updated)`
+              );
             }
           } else {
             logger.warn(`[TP Replace] Invalid tickTP (${tickTP}) or TP values (prevTP=${prevTP} newTP=${newTP}), skipping TP order replacement`);
@@ -750,19 +965,102 @@ export class PositionService {
   async closePosition(position, currentPrice, pnl, reason) {
     try {
 
-      // Pre-check: ensure there is exposure to close on exchange
+      // CRITICAL FIX: Verify position is actually closed on exchange before sending alert
+      // This prevents false alerts when TP order is cancelled (e.g., during dedupe or trailing TP)
+      // Only allow closing if:
+      // 1. Order status is FILLED (verified in updatePosition), OR
+      // 2. Position has no exposure on exchange (already closed)
       let hasExposure = false;
+      let verifiedClose = false;
+      
       try {
         const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
         hasExposure = qty && qty > 0;
         
         if (!hasExposure) {
-          logger.warn(`[CloseGuard] Position ${position.id} (${position.symbol}) has no exchange exposure - closing in DB only`);
-          // Don't return - continue to close in DB
+          // Position has no exposure - it's already closed on exchange
+          // This is safe to close in DB and send alert
+          verifiedClose = true;
+          logger.info(`[CloseGuard] ✅ Position ${position.id} (${position.symbol}) has no exchange exposure - verified closed on exchange`);
+        } else {
+          // Position still has exposure - verify order was FILLED before closing
+          // Check order status from cache or REST API
+          const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
+          
+          if (position.exit_order_id) {
+            const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
+            if (cachedTpStatus?.status === 'closed') {
+              verifiedClose = true;
+              logger.info(`[CloseGuard] ✅ TP order ${position.exit_order_id} verified FILLED - safe to close position ${position.id}`);
+            } else {
+              // Fallback to REST API
+              try {
+                const tpOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
+                const normalizedStatus = tpOrderStatus?.status?.toLowerCase() || '';
+                if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
+                  verifiedClose = true;
+                  logger.info(`[CloseGuard] ✅ TP order ${position.exit_order_id} verified FILLED via REST - safe to close position ${position.id}`);
+                } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
+                  // Order was cancelled, not filled - DO NOT close position
+                  logger.error(
+                    `[CloseGuard] ❌ BLOCKED: TP order ${position.exit_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                    `Position still has exposure. Will NOT close position to prevent false alert.`
+                  );
+                  throw new Error(`TP order ${position.exit_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                }
+              } catch (e) {
+                if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
+                logger.warn(`[CloseGuard] Failed to verify TP order status: ${e?.message || e}`);
+              }
+            }
+          }
+          
+          if (!verifiedClose && position.sl_order_id) {
+            const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
+            if (cachedSlStatus?.status === 'closed') {
+              verifiedClose = true;
+              logger.info(`[CloseGuard] ✅ SL order ${position.sl_order_id} verified FILLED - safe to close position ${position.id}`);
+            } else {
+              // Fallback to REST API
+              try {
+                const slOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.sl_order_id);
+                const normalizedStatus = slOrderStatus?.status?.toLowerCase() || '';
+                if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
+                  verifiedClose = true;
+                  logger.info(`[CloseGuard] ✅ SL order ${position.sl_order_id} verified FILLED via REST - safe to close position ${position.id}`);
+                } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
+                  // Order was cancelled, not filled - DO NOT close position
+                  logger.error(
+                    `[CloseGuard] ❌ BLOCKED: SL order ${position.sl_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                    `Position still has exposure. Will NOT close position to prevent false alert.`
+                  );
+                  throw new Error(`SL order ${position.sl_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                }
+              } catch (e) {
+                if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
+                logger.warn(`[CloseGuard] Failed to verify SL order status: ${e?.message || e}`);
+              }
+            }
+          }
+          
+          // If position has exposure but no verified fill, block closing
+          if (!verifiedClose) {
+            logger.error(
+              `[CloseGuard] ❌ BLOCKED: Position ${position.id} has exposure but no verified TP/SL fill. ` +
+              `Orders may have been cancelled. Will NOT close position to prevent false alert.`
+            );
+            throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+          }
         }
       } catch (e) {
+        if (e?.message?.includes('BLOCKED') || e?.message?.includes('Cannot close')) {
+          // Re-throw blocking errors
+          throw e;
+        }
         logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
-        // Continue to close in DB anyway
+        // For other errors, continue to close in DB (backward compatibility)
+        // But log warning that verification failed
+        logger.warn(`[CloseGuard] ⚠️ Verification failed but continuing to close position ${position.id} (backward compatibility)`);
       }
 
       // Close on exchange (only if position exists)
@@ -824,47 +1122,6 @@ export class PositionService {
     }
   }
 
-  /**
-   * Convert TP order to STOP_LIMIT order when TP crosses entry
-   * @param {Object} position - Position object
-   * @param {number} newTP - New TP price (which has crossed entry)
-   */
-  async _convertTpToStopLimit(position, newTP) {
-    // ❗IMPORTANT CHANGE (duplicate-TP fix):
-    // Previously, when trailing TP crossed entry, we converted the TP into a STOP_LIMIT (SL) order.
-    // This created 2 different "take profit"-like closing orders on Binance UI (TAKE_PROFIT + STOP),
-    // and could lead to conflicts / duplicates.
-    //
-    // New behavior:
-    // - We DO NOT create any STOP/STOP_LIMIT order here.
-    // - We simply cancel the existing TP order (if any).
-    // - Then we rely on the existing market-close path in the caller when TP gets close to market,
-    //   or PositionMonitor/SL logic if stoploss is enabled.
-    try {
-      logger.warn(
-        `[TP->SL Convert] Disabled STOP_LIMIT conversion to avoid duplicate TP orders. ` +
-        `Will cancel existing TP order only. position=${position.id} newTP=${Number(newTP).toFixed(2)}`
-      );
-
-      if (position.exit_order_id) {
-        try {
-          await this.exchangeService.cancelOrder(position.exit_order_id, position.symbol);
-          logger.info(`[TP->SL Convert] Cancelled TP order ${position.exit_order_id} for position ${position.id}`);
-        } catch (e) {
-          logger.warn(`[TP->SL Convert] Failed to cancel TP order ${position.exit_order_id}: ${e?.message || e}`);
-        }
-      }
-      
-      // Clear TP order id in DB to prevent any further replacement attempts using the old id.
-          await Position.update(position.id, { 
-        exit_order_id: null,
-        tp_synced: false, // mark not synced so monitor can decide what to do next
-        take_profit_price: newTP // keep for tracking / trailing state
-      });
-    } catch (e) {
-      logger.error(`[TP->SL Convert] Error in disabled conversion handler: ${e?.message || e}`);
-    }
-  }
 
   /**
    * Check if position order should be cancelled (candle ended without fill)

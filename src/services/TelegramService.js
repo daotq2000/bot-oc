@@ -125,16 +125,27 @@ export class TelegramService {
         } catch (error) {
           const msg = error?.message || '';
           const retryAfter = Number(error?.response?.parameters?.retry_after || error?.parameters?.retry_after || NaN);
-          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT|socket hang/i.test(msg);
+          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT|socket hang|EAI_AGAIN|ENOTFOUND/i.test(msg);
+          
+          // Check for specific Telegram API errors
+          const isTelegramError = error?.response?.error_code || error?.code;
+          const isChatNotFound = /chat.*not.*found|chat_id.*invalid/i.test(msg) || error?.response?.error_code === 400;
+          const isForbidden = /forbidden|blocked/i.test(msg) || error?.response?.error_code === 403;
 
-          if (transient) {
+          if (isChatNotFound || isForbidden) {
+            // Chat not found or bot blocked - don't retry, just log warning
+            logger.warn(`[Telegram] Chat ${chatId} not found or bot blocked. Skipping message. Error: ${msg}`);
+            // Don't requeue - this is a permanent error
+          } else if (transient) {
             // Respect Telegram retry_after when present
             const backoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000) : 2000; // Increased default backoff to 2s
             logger.warn(`[Telegram] Throttled or transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, msg=${msg}`);
             this._queue.unshift({ chatId, message, options }); // requeue
             await new Promise(r => setTimeout(r, backoffMs));
           } else {
-            logger.error(`[Telegram] Failed to send message to ${chatId}:`, msg, error?.stack);
+            // Other errors - log but don't spam
+            logger.error(`[Telegram] Failed to send message to ${chatId}: ${msg}`, error?.stack || '');
+            // Don't requeue for unknown errors to avoid infinite loops
           }
         }
       }

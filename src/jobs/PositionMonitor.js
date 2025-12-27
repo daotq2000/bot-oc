@@ -192,16 +192,6 @@ export class PositionMonitor {
       }
     }
 
-    // --- De-duplicate safety (Binance): if exchange has multiple reduce-only close orders, keep only one TP + one SL ---
-    try {
-      const exchangeService = this.exchangeServices.get(position.bot_id);
-      if (exchangeService && exchangeService.bot?.exchange === 'binance') {
-        await this._dedupeCloseOrdersOnExchange(exchangeService, position);
-      }
-    } catch (e) {
-      logger.debug(`[Place TP/SL] Dedupe open orders skipped/failed for position ${position.id}: ${e?.message || e}`);
-    }
-
     // Skip if both TP and SL already exist and are active, AND tp_sl_pending is false
     if (!needsTp && !needsSl && !isTPSLPending) {
       // Release lock before returning
@@ -211,9 +201,17 @@ export class PositionMonitor {
     
     // If tp_sl_pending is true but we have both orders, clear the flag
     if (isTPSLPending && position.exit_order_id && (!needsSl || position.sl_order_id)) {
-      // Both orders exist, clear pending flag
+      // Both orders exist, clear pending flag (only if column exists)
+      try {
+        if (Position?.rawAttributes?.tp_sl_pending) {
       await Position.update(position.id, { tp_sl_pending: false });
       logger.debug(`[Place TP/SL] Cleared tp_sl_pending flag for position ${position.id} (both TP and SL exist)`);
+        } else {
+          logger.debug(`[Place TP/SL] Skipped clearing tp_sl_pending (column not supported) for position ${position.id}`);
+        }
+      } catch (e) {
+        logger.debug(`[Place TP/SL] Failed to clear tp_sl_pending flag (column may not exist): ${e?.message || e}`);
+      }
       await this._releasePositionLock(position.id);
       return;
     }
@@ -228,14 +226,28 @@ export class PositionMonitor {
       }
 
       // Get the actual fill price from the exchange (abstract method, not exchange-specific)
-      let fillPrice = await exchangeService.getOrderAverageFillPrice(position.symbol, position.order_id);
+      // CRITICAL FIX: Check order_id before querying exchange (synced positions have order_id=null)
+      let fillPrice = null;
+      if (position.order_id) {
+        try {
+          fillPrice = await exchangeService.getOrderAverageFillPrice(position.symbol, position.order_id);
+        } catch (e) {
+          logger.debug(`[Place TP/SL] Failed to get fill price from exchange for position ${position.id} (order_id=${position.order_id}): ${e?.message || e}`);
+        }
+      } else {
+        logger.debug(`[Place TP/SL] Position ${position.id} has no order_id (synced position), skipping getOrderAverageFillPrice`);
+      }
+      
       if (!fillPrice || !Number.isFinite(fillPrice) || fillPrice <= 0) {
         // Fallback to position.entry_price if available
         if (position.entry_price && Number.isFinite(Number(position.entry_price)) && Number(position.entry_price) > 0) {
           fillPrice = Number(position.entry_price);
-          logger.info(`[Place TP/SL] Could not get fill price from exchange for position ${position.id}, using entry_price from DB: ${fillPrice}`);
+          logger.info(
+            `[Place TP/SL] Using entry_price from DB for position ${position.id} ` +
+            `(order_id=${position.order_id || 'null'}, synced position or order not found): ${fillPrice}`
+          );
         } else {
-          logger.warn(`[Place TP/SL] Could not get fill price for position ${position.id} (order_id=${position.order_id}), will retry.`);
+          logger.warn(`[Place TP/SL] Could not get fill price for position ${position.id} (order_id=${position.order_id || 'null'}), will retry.`);
           // Release lock before returning
           await this._releasePositionLock(position.id);
           return;
@@ -251,6 +263,8 @@ export class PositionMonitor {
       const strategy = await Strategy.findById(position.strategy_id);
       if (!strategy) {
         logger.warn(`[Place TP/SL] Strategy ${position.strategy_id} not found for position ${position.id}`);
+        // Release lock before returning
+        await this._releasePositionLock(position.id);
         return;
       }
 
@@ -275,7 +289,24 @@ export class PositionMonitor {
         takeProfit = null;
       }
       
-      const tpPrice = takeProfit ? calculateTakeProfit(fillPrice, takeProfit, position.side) : null;
+      // CRITICAL FIX: Use trailing TP from DB if available, otherwise calculate initial TP
+      // This ensures we use the latest trailing TP price, not the initial TP
+      let tpPrice = null;
+      if (position.take_profit_price && Number.isFinite(Number(position.take_profit_price)) && Number(position.take_profit_price) > 0) {
+        // Use trailing TP from DB (already calculated by PositionService.updatePosition)
+        tpPrice = Number(position.take_profit_price);
+        logger.info(
+          `[Place TP/SL] ✅ Using trailing TP from DB | pos=${position.id} ` +
+          `take_profit_price=${tpPrice} (from DB, already trailing) timestamp=${new Date().toISOString()}`
+        );
+      } else if (takeProfit) {
+        // Calculate initial TP if not available in DB
+        tpPrice = calculateTakeProfit(fillPrice, takeProfit, position.side);
+        logger.info(
+          `[Place TP/SL] 📊 Calculated initial TP | pos=${position.id} ` +
+          `tpPrice=${tpPrice} (calculated from strategy) timestamp=${new Date().toISOString()}`
+        );
+      }
       
       // Only set SL if strategy.stoploss > 0. No fallback to reduce/up_reduce
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : (position.stoploss !== undefined ? Number(position.stoploss) : NaN);
@@ -316,23 +347,106 @@ export class PositionMonitor {
           // ✅ Unified exit order: type switches based on profit/loss zone (STOP_MARKET <-> TAKE_PROFIT_MARKET)
           const { ExitOrderManager } = await import('../services/ExitOrderManager.js');
           const mgr = new ExitOrderManager(exchangeService);
+          
+          logger.info(
+            `[Place TP/SL] 🚀 Calling ExitOrderManager.placeOrReplaceExitOrder | pos=${position.id} ` +
+            `symbol=${position.symbol} side=${position.side} tpPrice=${tpPrice} ` +
+            `currentExitOrderId=${position.exit_order_id || 'NULL'} timestamp=${new Date().toISOString()}`
+          );
+          
           const placed = await mgr.placeOrReplaceExitOrder(position, tpPrice);
           const tpOrderId = placed?.orderId ? String(placed.orderId) : null;
+          
+          logger.info(
+            `[Place TP/SL] 📋 ExitOrderManager returned | pos=${position.id} ` +
+            `tpOrderId=${tpOrderId || 'NULL'} orderType=${placed?.orderType || 'N/A'} ` +
+            `stopPrice=${placed?.stopPrice || tpPrice} timestamp=${new Date().toISOString()}`
+          );
+          
           if (tpOrderId) {
             // Store initial TP price for trailing calculation (only if not already set)
+            // CRITICAL: Only include tp_sl_pending if column exists (backward compatibility)
             const updateData = { 
               exit_order_id: tpOrderId, 
-              take_profit_price: tpPrice,
-              tp_sl_pending: false // Clear pending flag after successful EXIT placement
+              take_profit_price: tpPrice
             };
             if (!shouldPreserveInitialTP) {
               updateData.initial_tp_price = tpPrice; // Only set if not already set
             }
+            
+            // Only set tp_sl_pending if Position model supports it (check rawAttributes)
+            if (Position?.rawAttributes?.tp_sl_pending) {
+              updateData.tp_sl_pending = false; // Clear pending flag after successful EXIT placement
+            }
+            
+            logger.info(
+              `[Place TP/SL] 💾 Updating DB with exit_order_id | pos=${position.id} ` +
+              `exit_order_id=${tpOrderId} take_profit_price=${tpPrice} ` +
+              `initial_tp_price=${updateData.initial_tp_price || 'preserved'} ` +
+              `tp_sl_pending=${updateData.tp_sl_pending !== undefined ? updateData.tp_sl_pending : 'N/A (column not supported)'} ` +
+              `timestamp=${new Date().toISOString()}`
+            );
+            
+            try {
             await Position.update(position.id, updateData);
-            logger.info(`[Place TP/SL] ✅ Placed EXIT order ${tpOrderId} for position ${position.id} @ ${tpPrice} ${shouldPreserveInitialTP ? '(preserved initial TP)' : '(initial TP)'}`);
+              logger.info(
+                `[Place TP/SL] ✅ Placed EXIT order ${tpOrderId} for position ${position.id} @ ${tpPrice} ` +
+                `${shouldPreserveInitialTP ? '(preserved initial TP)' : '(initial TP)'} ` +
+                `timestamp=${new Date().toISOString()}`
+              );
+              
+              // CRITICAL FIX: Run dedupe AFTER successfully creating new order to clean up old duplicate orders
+              // This ensures new order exists before cancelling old ones, preventing miss hit TP
+              try {
+                const exchangeService = this.exchangeServices.get(position.bot_id);
+                if (exchangeService && exchangeService.bot?.exchange === 'binance') {
+                  // Refresh position to get latest exit_order_id
+                  const refreshedPosition = await Position.findById(position.id);
+                  if (refreshedPosition) {
+                    await this._dedupeCloseOrdersOnExchange(exchangeService, refreshedPosition);
+                  }
+                }
+              } catch (dedupeError) {
+                // Non-critical: dedupe failure doesn't affect order placement
+                logger.debug(`[Place TP/SL] Dedupe after order creation skipped/failed for position ${position.id}: ${dedupeError?.message || dedupeError}`);
+              }
+            } catch (dbError) {
+              // If error is about missing column, retry without that column
+              if (dbError?.message?.includes("Unknown column") || dbError?.message?.includes("tp_sl_pending")) {
+                logger.warn(
+                  `[Place TP/SL] ⚠️ DB column error, retrying without tp_sl_pending | pos=${position.id} ` +
+                  `error=${dbError?.message || dbError} timestamp=${new Date().toISOString()}`
+                );
+                const retryData = { 
+                  exit_order_id: tpOrderId, 
+                  take_profit_price: tpPrice
+                };
+                if (!shouldPreserveInitialTP) {
+                  retryData.initial_tp_price = tpPrice;
+                }
+                // Retry without tp_sl_pending
+                await Position.update(position.id, retryData);
+                logger.info(
+                  `[Place TP/SL] ✅ Retry successful: Placed EXIT order ${tpOrderId} for position ${position.id} @ ${tpPrice} ` +
+                  `(without tp_sl_pending column) timestamp=${new Date().toISOString()}`
+                );
+              } else {
+                logger.error(
+                  `[Place TP/SL] ❌ DB UPDATE FAILED after order creation! | pos=${position.id} ` +
+                  `tpOrderId=${tpOrderId} error=${dbError?.message || dbError} ` +
+                  `stack=${dbError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
+                );
+                // CRITICAL: Order was created on exchange but DB update failed!
+                // This will cause the order to be cancelled by dedupe on next run
+                throw new Error(`DB update failed after order creation: ${dbError?.message || dbError}`);
+              }
+            }
           } else {
             // Order creation returned null (e.g., price too close to market)
-            logger.warn(`[Place TP/SL] ⚠️ TP order creation returned null for position ${position.id} @ ${tpPrice}. Updating TP price in DB only.`);
+            logger.warn(
+              `[Place TP/SL] ⚠️ TP order creation returned null for position ${position.id} @ ${tpPrice}. ` +
+              `Updating TP price in DB only. timestamp=${new Date().toISOString()}`
+            );
             const updateData = { take_profit_price: tpPrice };
             if (!shouldPreserveInitialTP) {
               updateData.initial_tp_price = tpPrice; // Only set if not already set
@@ -342,8 +456,16 @@ export class PositionMonitor {
         } catch (e) {
           // If TP order creation fails, still update take_profit_price in DB
           // This allows trailing TP to work even if orders can't be placed
-          logger.error(`[Place TP/SL] ❌ Failed to create TP order for position ${position.id}:`, e?.message || e);
-          logger.warn(`[Place TP/SL] Updating TP price in DB to ${tpPrice} for position ${position.id} (order not placed, trailing TP will still work)`);
+          logger.error(
+            `[Place TP/SL] ❌ EXCEPTION in TP order placement | pos=${position.id} ` +
+            `error=${e?.message || e} stack=${e?.stack || 'N/A'} ` +
+            `timestamp=${new Date().toISOString()}`
+          );
+          logger.warn(
+            `[Place TP/SL] Updating TP price in DB to ${tpPrice} for position ${position.id} ` +
+            `(order may have been created on exchange but DB update failed - check logs above) ` +
+            `timestamp=${new Date().toISOString()}`
+          );
           try {
             const currentPosition = await Position.findById(position.id);
             const shouldPreserveInitialTP = currentPosition?.initial_tp_price && 
@@ -381,11 +503,11 @@ export class PositionMonitor {
           if (isInvalidSL) {
             logger.warn(`[Place TP/SL] Invalid SL detected for position ${position.id}: SL=${slPriceNum}, Entry=${entryPrice}, Side=${position.side}. Force closing position immediately to minimize risk.`);
             
-            // Cancel TP order if any
+            // Cancel TP order if any (invalid SL detected, must close position immediately)
             if (position.exit_order_id) {
               try {
                 await exchangeService.cancelOrder(position.exit_order_id, position.symbol);
-                logger.info(`[Place TP/SL] Cancelled TP order ${position.exit_order_id} for position ${position.id}`);
+                logger.info(`[Place TP/SL] Cancelled TP order ${position.exit_order_id} for position ${position.id} (invalid SL detected)`);
               } catch (e) {
                 logger.warn(`[Place TP/SL] Failed to cancel TP order ${position.exit_order_id}: ${e?.message || e}`);
               }
@@ -418,12 +540,27 @@ export class PositionMonitor {
               sl_order_id: slOrderId, 
               stop_loss_price: slPrice 
             };
-            // Clear pending flag if both TP and SL are placed
-            if (hasTP) {
+            // Clear pending flag if both TP and SL are placed (only if column exists)
+            if (hasTP && Position?.rawAttributes?.tp_sl_pending) {
               updateData.tp_sl_pending = false;
             }
             await Position.update(position.id, updateData);
             logger.debug(`[Place TP/SL] ✅ Placed SL order ${slOrderId} for position ${position.id} @ ${slPrice}`);
+            
+            // CRITICAL FIX: Run dedupe AFTER successfully creating SL order to clean up old duplicate orders
+            try {
+              const exchangeService = this.exchangeServices.get(position.bot_id);
+              if (exchangeService && exchangeService.bot?.exchange === 'binance') {
+                // Refresh position to get latest sl_order_id
+                const refreshedPosition = await Position.findById(position.id);
+                if (refreshedPosition) {
+                  await this._dedupeCloseOrdersOnExchange(exchangeService, refreshedPosition);
+                }
+              }
+            } catch (dedupeError) {
+              // Non-critical: dedupe failure doesn't affect order placement
+              logger.debug(`[Place TP/SL] Dedupe after SL creation skipped/failed for position ${position.id}: ${dedupeError?.message || dedupeError}`);
+            }
           }
         } catch (e) {
           logger.error(`[Place TP/SL] ❌ Failed to create SL order for position ${position.id}:`, e?.message || e);
@@ -465,9 +602,21 @@ export class PositionMonitor {
     const symbol = position.symbol;
     const side = position.side;
     const desiredPositionSide = side === 'long' ? 'LONG' : 'SHORT';
+    const timestamp = new Date().toISOString();
+
+    logger.debug(
+      `[Dedupe] 🔍 Starting dedupe check | pos=${position.id} symbol=${symbol} side=${side} ` +
+      `exit_order_id=${position.exit_order_id || 'NULL'} sl_order_id=${position.sl_order_id || 'NULL'} ` +
+      `timestamp=${timestamp}`
+    );
 
     const openOrders = await exchangeService.getOpenOrders(symbol);
-    if (!Array.isArray(openOrders) || openOrders.length <= 1) return;
+    if (!Array.isArray(openOrders) || openOrders.length <= 1) {
+      logger.debug(`[Dedupe] ⏭️  SKIP: ${openOrders?.length || 0} open orders (<=1), no dedupe needed | pos=${position.id}`);
+      return;
+    }
+
+    logger.debug(`[Dedupe] 📋 Found ${openOrders.length} total open orders on exchange | pos=${position.id} symbol=${symbol}`);
 
     // Only consider close / reduce-only style orders
     const reduceOnlyOrders = openOrders.filter(o => {
@@ -479,7 +628,15 @@ export class PositionMonitor {
       return (isReduceOnly || isClosePosition) && isTpOrStop;
     });
 
-    if (reduceOnlyOrders.length <= 2) return;
+    logger.debug(
+      `[Dedupe] 🔍 Filtered to ${reduceOnlyOrders.length} reduce-only close orders | pos=${position.id} ` +
+      `(types: ${reduceOnlyOrders.map(o => o?.type).join(', ')})`
+    );
+
+    if (reduceOnlyOrders.length <= 2) {
+      logger.debug(`[Dedupe] ⏭️  SKIP: ${reduceOnlyOrders.length} reduce-only orders (<=2), no dedupe needed | pos=${position.id}`);
+      return;
+    }
 
     // Match positionSide if present (hedge mode)
     const scoped = reduceOnlyOrders.filter(o => {
@@ -487,40 +644,134 @@ export class PositionMonitor {
       return !ps || ps === desiredPositionSide;
     });
 
-    if (scoped.length <= 2) return;
+    logger.debug(
+      `[Dedupe] 🎯 Scoped to ${scoped.length} orders matching positionSide=${desiredPositionSide} | pos=${position.id} ` +
+      `(orderIds: ${scoped.map(o => o?.orderId).join(', ')})`
+    );
+
+    if (scoped.length <= 2) {
+      logger.debug(`[Dedupe] ⏭️  SKIP: ${scoped.length} scoped orders (<=2), no dedupe needed | pos=${position.id}`);
+      return;
+    }
 
     // Unified exit order types
     const exitTypes = new Set(['STOP_MARKET', 'TAKE_PROFIT_MARKET']);
     const stopTypes = new Set(['STOP', 'STOP_LOSS', 'STOP_LOSS_LIMIT']);
 
     const keepIds = new Set();
-    if (position.exit_order_id) keepIds.add(String(position.exit_order_id));
-    if (position.sl_order_id) keepIds.add(String(position.sl_order_id));
+    if (position.exit_order_id) {
+      keepIds.add(String(position.exit_order_id));
+      logger.debug(`[Dedupe] ✅ Keeping exit_order_id from DB: ${position.exit_order_id} | pos=${position.id}`);
+    } else {
+      logger.warn(
+        `[Dedupe] ⚠️  WARNING: exit_order_id is NULL in DB but found ${scoped.length} exit orders on exchange! ` +
+        `This may indicate a race condition or order was created but DB not updated. ` +
+        `Will keep newest exit order to avoid cancelling valid order. | pos=${position.id}`
+      );
+    }
+    if (position.sl_order_id) {
+      keepIds.add(String(position.sl_order_id));
+      logger.debug(`[Dedupe] ✅ Keeping sl_order_id from DB: ${position.sl_order_id} | pos=${position.id}`);
+    }
 
     const byTimeAsc = [...scoped].sort((a, b) => Number(a?.time || a?.updateTime || a?.origTime || 0) - Number(b?.time || b?.updateTime || b?.origTime || 0));
 
     const exits = byTimeAsc.filter(o => exitTypes.has(String(o?.type || '').toUpperCase()));
     const stops = byTimeAsc.filter(o => stopTypes.has(String(o?.type || '').toUpperCase()));
 
+    logger.debug(
+      `[Dedupe] 📊 Categorized orders | pos=${position.id} ` +
+      `exits=${exits.length} (${exits.map(o => `${o?.orderId}(${o?.type})`).join(', ')}) ` +
+      `stops=${stops.length} (${stops.map(o => `${o?.orderId}(${o?.type})`).join(', ')})`
+    );
+
     // Keep newest order of each class if not explicitly referenced
     const newestExit = exits.length ? exits[exits.length - 1] : null;
     const newestStop = stops.length ? stops[stops.length - 1] : null;
-    if (newestExit?.orderId) keepIds.add(String(newestExit.orderId));
-    if (newestStop?.orderId) keepIds.add(String(newestStop.orderId));
+    if (newestExit?.orderId) {
+      keepIds.add(String(newestExit.orderId));
+      logger.debug(
+        `[Dedupe] ✅ Keeping newest exit order: ${newestExit.orderId} (${newestExit.type}) | pos=${position.id} ` +
+        `time=${newestExit.time || newestExit.updateTime || 'N/A'}`
+      );
+    }
+    if (newestStop?.orderId) {
+      keepIds.add(String(newestStop.orderId));
+      logger.debug(
+        `[Dedupe] ✅ Keeping newest stop order: ${newestStop.orderId} (${newestStop.type}) | pos=${position.id} ` +
+        `time=${newestStop.time || newestStop.updateTime || 'N/A'}`
+      );
+    }
 
     const toCancel = scoped.filter(o => !keepIds.has(String(o?.orderId)));
-    if (toCancel.length === 0) return;
+    
+    logger.info(
+      `[Dedupe] 📋 Dedupe summary | pos=${position.id} symbol=${symbol} ` +
+      `total=${scoped.length} keep=${keepIds.size} cancel=${toCancel.length} ` +
+      `keepIds=[${Array.from(keepIds).join(', ')}] ` +
+      `cancelIds=[${toCancel.map(o => o?.orderId).join(', ')}]`
+    );
 
-    logger.warn(
-      `[Place Exit] Detected ${scoped.length} reduce-only close orders on exchange for ${symbol} (${desiredPositionSide}). ` +
-      `Cancelling ${toCancel.length} duplicates to enforce 1-exit-order invariant.`
+    if (toCancel.length === 0) {
+      logger.debug(`[Dedupe] ✅ No orders to cancel | pos=${position.id}`);
+      return;
+    }
+
+    // CRITICAL FIX: If exit_order_id is NULL in DB but we found exit orders on exchange,
+    // DO NOT cancel them! This indicates the order was just created and DB hasn't been updated yet.
+    // Instead, log a warning and skip cancellation for exit orders.
+    if (!position.exit_order_id && exits.length > 0) {
+      logger.error(
+        `[Dedupe] 🚨 CRITICAL: exit_order_id is NULL in DB but found ${exits.length} exit orders on exchange! ` +
+        `This is likely a race condition. Will NOT cancel exit orders to avoid data loss. ` +
+        `Position ${position.id} needs manual intervention or PositionMonitor.placeExitOrder should be called. ` +
+        `Found exit orders: ${exits.map(o => `${o.orderId}(${o.type}@${o.stopPrice || o.price})`).join(', ')}`
+      );
+      
+      // Only cancel stop orders (SL), not exit orders (TP)
+      const stopOrdersToCancel = toCancel.filter(o => stopTypes.has(String(o?.type || '').toUpperCase()));
+      if (stopOrdersToCancel.length > 0) {
+        logger.warn(
+          `[Dedupe] ⚠️  Will cancel ${stopOrdersToCancel.length} duplicate STOP orders only (not exit orders) | pos=${position.id}`
+        );
+        for (const o of stopOrdersToCancel) {
+          try {
+            logger.info(`[Dedupe] 🗑️  Cancelling duplicate STOP order ${o.orderId} (${o.type}) | pos=${position.id} symbol=${symbol}`);
+            await exchangeService.cancelOrder(String(o.orderId), symbol);
+            logger.info(`[Dedupe] ✅ Cancelled duplicate STOP order ${o.orderId} | pos=${position.id}`);
+          } catch (e) {
+            logger.error(`[Dedupe] ❌ Failed to cancel duplicate STOP order ${o.orderId}: ${e?.message || e} | pos=${position.id}`);
+          }
+        }
+      }
+      return; // Exit early, don't cancel exit orders
+    }
+
+    // CRITICAL FIX: Enable cancellation of duplicate orders to prevent order spam
+    // Only cancel if exit_order_id exists in DB (race condition protection above)
+    logger.info(
+      `[Dedupe] 🗑️  Cancelling ${toCancel.length} duplicate orders | pos=${position.id} symbol=${symbol} ` +
+      `to enforce 1-exit-order invariant. Orders to cancel: ${toCancel.map(o => `${o.orderId}(${o.type})`).join(', ')}`
     );
 
     for (const o of toCancel) {
       try {
+        const cancelStart = Date.now();
+        logger.info(
+          `[Dedupe] 🗑️  Cancelling duplicate order ${o.orderId} (${o.type}) | pos=${position.id} ` +
+          `symbol=${symbol} stopPrice=${o.stopPrice || o.price || 'N/A'} timestamp=${new Date().toISOString()}`
+        );
         await exchangeService.cancelOrder(String(o.orderId), symbol);
+        const cancelDuration = Date.now() - cancelStart;
+        logger.info(
+          `[Dedupe] ✅ Cancelled duplicate order ${o.orderId} | pos=${position.id} ` +
+          `duration=${cancelDuration}ms timestamp=${new Date().toISOString()}`
+        );
       } catch (e) {
-        logger.debug(`[Place TP/SL] Failed to cancel duplicate order ${o?.orderId} for ${symbol}: ${e?.message || e}`);
+        logger.error(
+          `[Dedupe] ❌ Failed to cancel duplicate order ${o.orderId}: ${e?.message || e} | pos=${position.id} ` +
+          `stack=${e?.stack || 'N/A'}`
+        );
       }
     }
   }

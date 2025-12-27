@@ -1,4 +1,5 @@
 import pool from '../config/database.js';
+import logger from '../utils/logger.js';
 
 /**
  * Bot model
@@ -114,10 +115,40 @@ export class Bot {
 
   /**
    * Delete bot
+   * CRITICAL: Check for open positions before deletion to prevent CASCADE DELETE
    * @param {number} id - Bot ID
    * @returns {Promise<boolean>}
+   * @throws {Error} If bot has open positions
    */
   static async delete(id) {
+    // CRITICAL PROTECTION: Check for open positions before deletion
+    // Foreign key constraint has ON DELETE CASCADE which will delete all positions
+    // This protection prevents accidental deletion of open positions
+    const { Position } = await import('./Position.js');
+    const openPositionsCount = await Position.countOpenByBot(id);
+    
+    if (openPositionsCount > 0) {
+      throw new Error(
+        `Cannot delete bot ${id}: Bot has ${openPositionsCount} open position(s). ` +
+        `Please close all positions before deleting the bot. ` +
+        `Deleting bot with open positions will cause CASCADE DELETE of all positions (including open ones).`
+      );
+    }
+    
+    // Also check for closed positions (optional - just for logging)
+    const [closedCount] = await pool.execute(
+      'SELECT COUNT(*) as count FROM positions WHERE bot_id = ? AND status = ?',
+      [id, 'closed']
+    );
+    const closedPositionsCount = closedCount[0]?.count || 0;
+    
+    if (closedPositionsCount > 0) {
+      logger.warn(
+        `[Bot.delete] Bot ${id} has ${closedPositionsCount} closed position(s) that will be deleted via CASCADE. ` +
+        `This is acceptable but may affect historical data.`
+      );
+    }
+    
     const [result] = await pool.execute(
       'DELETE FROM bots WHERE id = ?',
       [id]

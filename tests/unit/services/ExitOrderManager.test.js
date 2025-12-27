@@ -49,11 +49,39 @@ describe('ExitOrderManager', () => {
     expect(exchangeService.createCloseStopMarket).toHaveBeenCalled();
   });
 
-  it('should cancel existing exit order before placing a new one', async () => {
+  it('should use atomic replace: create new order FIRST, then cancel old order', async () => {
     const position = { id: 5, status: 'open', symbol: 'BTC/USDT', side: 'long', entry_price: 100, exit_order_id: 'old' };
 
+    // Track call order
+    const callOrder = [];
+    exchangeService.createCloseTakeProfitMarket.mockImplementation(() => {
+      callOrder.push('create');
+      return Promise.resolve({ orderId: 'new' });
+    });
+    exchangeService.cancelOrder.mockImplementation(() => {
+      callOrder.push('cancel');
+      return Promise.resolve({ ok: true });
+    });
+
     await mgr.placeOrReplaceExitOrder(position, 110);
+    
+    // Verify atomic replace: create BEFORE cancel
+    expect(callOrder).toEqual(['create', 'cancel']);
+    expect(exchangeService.createCloseTakeProfitMarket).toHaveBeenCalled();
     expect(exchangeService.cancelOrder).toHaveBeenCalledWith('old', 'BTC/USDT');
+    expect(position.exit_order_id).toBe('new'); // New order ID is set
+  });
+
+  it('should NOT cancel old order if new order creation fails', async () => {
+    const position = { id: 6, status: 'open', symbol: 'BTC/USDT', side: 'long', entry_price: 100, exit_order_id: 'old' };
+
+    exchangeService.createCloseTakeProfitMarket.mockRejectedValue(new Error('Create failed'));
+
+    await expect(mgr.placeOrReplaceExitOrder(position, 110)).rejects.toThrow('Create failed');
+    
+    // Old order should NOT be cancelled if new order creation fails
+    expect(exchangeService.cancelOrder).not.toHaveBeenCalled();
+    expect(position.exit_order_id).toBe('old'); // Old order ID preserved
   });
 
   it('nudge: LONG TAKE_PROFIT_MARKET must have stopPrice > currentPrice', async () => {
