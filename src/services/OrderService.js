@@ -295,15 +295,13 @@ export class OrderService {
               (side === 'short' && currentPrice < entryPrice);
             
             if (priceCrossed) {
-              // Price crossed entry - order likely filled but status not updated yet.
-              // IMPORTANT: DO NOT use currentPrice as entry estimate because it can be worse than the alert entry,
-              // causing large drift between alert entry and recorded position entry.
-              // Use the intended entryPrice as the best available estimate until we can fetch avgFillPrice.
-              effectiveEntryPrice = entryPrice;
+              // Price crossed entry - order likely filled but status not updated yet
+              // Treat as exposure to avoid duplicate position creation
+              effectiveEntryPrice = currentPrice; // Use current price as best estimate
               hasImmediateExposure = true;
               logger.warn(
                 `[OrderService] LIMIT order ${order.id} for ${strategy.symbol} price crossed (status=${st?.status || 'n/a'}, ` +
-                `currentPrice=${currentPrice}, entryPrice=${entryPrice}). Treating as filled (using entryPrice as entry estimate) to avoid duplicate position.`
+                `currentPrice=${currentPrice}, entryPrice=${entryPrice}). Treating as filled to avoid duplicate position.`
               );
             } else {
               logger.debug(`[OrderService] LIMIT order ${order.id} for ${strategy.symbol} not filled yet (status=${st?.status || 'n/a'}, filled=${filledQty}). Position will track exposure via guards.`);

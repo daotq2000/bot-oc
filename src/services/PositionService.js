@@ -446,47 +446,15 @@ export class PositionService {
                 }
 
                 try {
-                  const qty = await getCachedClosableQty();
-                  if (qty > 0) {
-                    // Close on exchange first
-                    const closeRes = await this.exchangeService.closePosition(position.symbol, position.side, qty);
-                    const fillPrice = Number(closeRes?.avgFillPrice || closeRes?.average || closeRes?.price || marketPrice);
-                    const safeClosePrice = Number.isFinite(fillPrice) && fillPrice > 0 ? fillPrice : Number(marketPrice);
-
-                    const recomputedPnL = calculatePnL(
-                      position.entry_price,
-                      safeClosePrice,
-                      position.amount,
-                      position.side
-                    );
-
-                    // Close in DB + send telegram
-                    const closed = await Position.close(position.id, safeClosePrice, recomputedPnL, 'tp_cross_entry_force_close');
-
-                    // Cleanup remaining open orders
-                    try {
-                      await this.exchangeService.cancelAllOpenOrders(position.symbol);
-                    } catch (e) {
-                      logger.warn(`[TP Trail] Failed to cleanup open orders after force close | pos=${position.id}: ${e?.message || e}`);
-                    }
-
-                    await this.sendTelegramCloseNotification(closed);
-                    return await Position.findById(position.id);
-                  } else {
-                    // No exposure → close DB only
-                    const recomputedPnL = calculatePnL(
-                      position.entry_price,
-                      marketPrice,
-                      position.amount,
-                      position.side
-                    );
-                    const closed = await Position.close(position.id, marketPrice, recomputedPnL, 'tp_cross_entry_force_close');
-                    await this.sendTelegramCloseNotification(closed);
-                    return await Position.findById(position.id);
-                  }
+                  // Use closePosition() method which now bypasses CloseGuard for tp_cross_entry_force_close
+                  // This ensures proper cleanup and notification handling
+                  const closed = await this.closePosition(position, marketPrice, pnl, 'tp_cross_entry_force_close');
+                  logger.info(`[TP Trail] ✅ Force closed position ${position.id} successfully`);
+                  return closed;
                 } catch (e) {
                   logger.error(`[TP Trail] ❌ FORCE CLOSE FAILED | pos=${position.id}: ${e?.message || e}`);
                   // Keep position open in DB if we couldn't confirm closure.
+                  // Position remains open, but take_profit_price has been updated above
                 }
               } else {
                 // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
@@ -965,102 +933,131 @@ export class PositionService {
   async closePosition(position, currentPrice, pnl, reason) {
     try {
 
-      // CRITICAL FIX: Verify position is actually closed on exchange before sending alert
-      // This prevents false alerts when TP order is cancelled (e.g., during dedupe or trailing TP)
-      // Only allow closing if:
-      // 1. Order status is FILLED (verified in updatePosition), OR
-      // 2. Position has no exposure on exchange (already closed)
-      let hasExposure = false;
-      let verifiedClose = false;
+      // CRITICAL FIX: Skip CloseGuard for force close reasons (tp_cross_entry_force_close)
+      // Force close is intentional and should bypass verification checks
+      const isForceClose = reason === 'tp_cross_entry_force_close';
       
-      try {
-        const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
-        hasExposure = qty && qty > 0;
+      if (isForceClose) {
+        logger.info(`[CloseGuard] ⚠️ FORCE CLOSE: Skipping CloseGuard for position ${position.id} (reason: ${reason})`);
+      } else {
+        // CRITICAL FIX: Verify position is actually closed on exchange before sending alert
+        // This prevents false alerts when TP order is cancelled (e.g., during dedupe or trailing TP)
+        // Only allow closing if:
+        // 1. Order status is FILLED (verified in updatePosition), OR
+        // 2. Position has no exposure on exchange (already closed)
+        let hasExposure = false;
+        let verifiedClose = false;
         
-        if (!hasExposure) {
-          // Position has no exposure - it's already closed on exchange
-          // This is safe to close in DB and send alert
-          verifiedClose = true;
-          logger.info(`[CloseGuard] ✅ Position ${position.id} (${position.symbol}) has no exchange exposure - verified closed on exchange`);
-        } else {
-          // Position still has exposure - verify order was FILLED before closing
-          // Check order status from cache or REST API
-          const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
+        try {
+          const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+          hasExposure = qty && qty > 0;
           
-          if (position.exit_order_id) {
-            const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
-            if (cachedTpStatus?.status === 'closed') {
-              verifiedClose = true;
-              logger.info(`[CloseGuard] ✅ TP order ${position.exit_order_id} verified FILLED - safe to close position ${position.id}`);
-            } else {
-              // Fallback to REST API
-              try {
-                const tpOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
-                const normalizedStatus = tpOrderStatus?.status?.toLowerCase() || '';
-                if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
-                  verifiedClose = true;
-                  logger.info(`[CloseGuard] ✅ TP order ${position.exit_order_id} verified FILLED via REST - safe to close position ${position.id}`);
-                } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
-                  // Order was cancelled, not filled - DO NOT close position
-                  logger.error(
-                    `[CloseGuard] ❌ BLOCKED: TP order ${position.exit_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
-                    `Position still has exposure. Will NOT close position to prevent false alert.`
-                  );
-                  throw new Error(`TP order ${position.exit_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+          if (!hasExposure) {
+            // Position has no exposure - it's already closed on exchange
+            // This is safe to close in DB and send alert
+            verifiedClose = true;
+            logger.info(`[CloseGuard] ✅ Position ${position.id} (${position.symbol}) has no exchange exposure - verified closed on exchange`);
+          } else {
+            // Position still has exposure - verify order was FILLED before closing
+            // Check order status from cache or REST API
+            const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
+            
+            if (position.exit_order_id) {
+              const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
+              if (cachedTpStatus?.status === 'closed') {
+                verifiedClose = true;
+                logger.info(`[CloseGuard] ✅ TP order ${position.exit_order_id} verified FILLED - safe to close position ${position.id}`);
+              } else {
+                // Fallback to REST API
+                try {
+                  const tpOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
+                  const normalizedStatus = tpOrderStatus?.status?.toLowerCase() || '';
+                  if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
+                    verifiedClose = true;
+                    logger.info(`[CloseGuard] ✅ TP order ${position.exit_order_id} verified FILLED via REST - safe to close position ${position.id}`);
+                  } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
+                    // Order was cancelled, not filled - DO NOT close position
+                    logger.error(
+                      `[CloseGuard] ❌ BLOCKED: TP order ${position.exit_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                      `Position still has exposure. Will NOT close position to prevent false alert.`
+                    );
+                    throw new Error(`TP order ${position.exit_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                  }
+                } catch (e) {
+                  if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
+                  logger.warn(`[CloseGuard] Failed to verify TP order status: ${e?.message || e}`);
                 }
-              } catch (e) {
-                if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
-                logger.warn(`[CloseGuard] Failed to verify TP order status: ${e?.message || e}`);
               }
             }
-          }
-          
-          if (!verifiedClose && position.sl_order_id) {
-            const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
-            if (cachedSlStatus?.status === 'closed') {
-              verifiedClose = true;
-              logger.info(`[CloseGuard] ✅ SL order ${position.sl_order_id} verified FILLED - safe to close position ${position.id}`);
-            } else {
-              // Fallback to REST API
-              try {
-                const slOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.sl_order_id);
-                const normalizedStatus = slOrderStatus?.status?.toLowerCase() || '';
-                if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
-                  verifiedClose = true;
-                  logger.info(`[CloseGuard] ✅ SL order ${position.sl_order_id} verified FILLED via REST - safe to close position ${position.id}`);
-                } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
-                  // Order was cancelled, not filled - DO NOT close position
-                  logger.error(
-                    `[CloseGuard] ❌ BLOCKED: SL order ${position.sl_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
-                    `Position still has exposure. Will NOT close position to prevent false alert.`
-                  );
-                  throw new Error(`SL order ${position.sl_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+            
+            if (!verifiedClose && position.sl_order_id) {
+              const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
+              if (cachedSlStatus?.status === 'closed') {
+                verifiedClose = true;
+                logger.info(`[CloseGuard] ✅ SL order ${position.sl_order_id} verified FILLED - safe to close position ${position.id}`);
+              } else {
+                // Fallback to REST API
+                try {
+                  const slOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.sl_order_id);
+                  const normalizedStatus = slOrderStatus?.status?.toLowerCase() || '';
+                  if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
+                    verifiedClose = true;
+                    logger.info(`[CloseGuard] ✅ SL order ${position.sl_order_id} verified FILLED via REST - safe to close position ${position.id}`);
+                  } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
+                    // Order was cancelled, not filled - DO NOT close position
+                    logger.error(
+                      `[CloseGuard] ❌ BLOCKED: SL order ${position.sl_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                      `Position still has exposure. Will NOT close position to prevent false alert.`
+                    );
+                    throw new Error(`SL order ${position.sl_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                  }
+                } catch (e) {
+                  if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
+                  logger.warn(`[CloseGuard] Failed to verify SL order status: ${e?.message || e}`);
                 }
-              } catch (e) {
-                if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
-                logger.warn(`[CloseGuard] Failed to verify SL order status: ${e?.message || e}`);
               }
             }
+            
+            // If position has exposure but no verified fill, block closing
+            if (!verifiedClose) {
+              logger.error(
+                `[CloseGuard] ❌ BLOCKED: Position ${position.id} has exposure but no verified TP/SL fill. ` +
+                `Orders may have been cancelled. Will NOT close position to prevent false alert.`
+              );
+              throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+            }
           }
-          
-          // If position has exposure but no verified fill, block closing
-          if (!verifiedClose) {
-            logger.error(
-              `[CloseGuard] ❌ BLOCKED: Position ${position.id} has exposure but no verified TP/SL fill. ` +
-              `Orders may have been cancelled. Will NOT close position to prevent false alert.`
-            );
-            throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+        } catch (e) {
+          if (e?.message?.includes('BLOCKED') || e?.message?.includes('Cannot close')) {
+            // Re-throw blocking errors
+            throw e;
           }
+          logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+          // For other errors, continue to close in DB (backward compatibility)
+          // But log warning that verification failed
+          logger.warn(`[CloseGuard] ⚠️ Verification failed but continuing to close position ${position.id} (backward compatibility)`);
         }
-      } catch (e) {
-        if (e?.message?.includes('BLOCKED') || e?.message?.includes('Cannot close')) {
-          // Re-throw blocking errors
-          throw e;
+      }
+      
+      // Check exposure for force close (to determine if we need to close on exchange)
+      let hasExposure = false;
+      if (isForceClose) {
+        try {
+          const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+          hasExposure = qty && qty > 0;
+        } catch (e) {
+          logger.warn(`[CloseGuard] Unable to check exposure for force close position ${position.id}: ${e?.message || e}`);
+          hasExposure = true; // Assume has exposure to be safe
         }
-        logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
-        // For other errors, continue to close in DB (backward compatibility)
-        // But log warning that verification failed
-        logger.warn(`[CloseGuard] ⚠️ Verification failed but continuing to close position ${position.id} (backward compatibility)`);
+      } else {
+        // For non-force-close, hasExposure was already checked above
+        try {
+          const qty = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+          hasExposure = qty && qty > 0;
+        } catch (e) {
+          logger.warn(`[CloseGuard] Unable to check exposure for position ${position.id}: ${e?.message || e}`);
+          hasExposure = false; // Assume no exposure for backward compatibility
+        }
       }
 
       // Close on exchange (only if position exists)
