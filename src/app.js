@@ -76,6 +76,7 @@ async function start() {
       logger.info('Seeding default application configs...');
       // Master alert toggle
       await AppConfig.set('ENABLE_ALERTS', 'true', 'Master switch to enable/disable all Telegram alerts from DB');
+      await AppConfig.set('OC_REST_FETCH_MAX_QUEUE', '2000', 'Queue store OC prie value in heap');
       // Strategy and scanning configs
       await AppConfig.set('ENABLE_LIMIT_ON_EXTEND_MISS', 'true', 'Allow placing passive LIMIT when extend condition is not met');
       await AppConfig.set('EXTEND_LIMIT_MAX_DIFF_RATIO', '10', 'Max relative distance (0-1) between current and entry price (as fraction of full extend) to allow passive LIMIT on extend miss');
