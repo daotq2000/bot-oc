@@ -55,6 +55,18 @@ export class RealtimeOCDetector {
     this._restFetchDelay = Number(configService.getNumber('OC_REST_FETCH_DELAY_MS', 30)); // Reduced from 50ms to 30ms
     this._maxRestFetchQueue = Number(configService.getNumber('OC_REST_FETCH_MAX_QUEUE', 300)); // Increased from 100 to 300
     this._restFetchConcurrent = Number(configService.getNumber('OC_REST_FETCH_CONCURRENT', 2)); // Process 2 requests concurrently
+
+    // ✅ FIX D: Circuit breaker & stale-queue eviction
+    // Prevent retry storms for the same (exchange|symbol|interval|bucketStart) when REST is failing.
+    this._restOpenFailCache = new LRUCache(2000); // key -> { untilTs, count, lastError }
+    this._restOpenFailTtlMs = Number(configService.getNumber('OC_REST_OPEN_FAIL_TTL_MS', 4000));
+    this._restQueueEvictStaleMs = Number(configService.getNumber('OC_REST_QUEUE_EVICT_STALE_MS', 120000)); // 2 minutes
+    this._restQueueDropOverbucket = configService.getBoolean('OC_REST_QUEUE_DROP_OVERBUCKET', true);
+
+    // ✅ FIX: Advanced OC matching logic (peak-hold, retracement)
+    this._ocMatchStateCache = new LRUCache(5000);
+    this.ocReverseRetraceRatio = Number(configService.getNumber('OC_REVERSE_RETRACE_RATIO', 0.2)); // 20% retrace from peak
+    this.ocReverseStallMs = Number(configService.getNumber('OC_REVERSE_STALL_MS', 4000)); // 4s without new peak
     
     // Alert functionality (optional, merged from OcAlertScanner)
     this.telegramService = null;
@@ -241,11 +253,16 @@ export class RealtimeOCDetector {
       }
       
       // Process batch concurrently
-      const promises = batch.map(async ({ resolve, reject, exchange, symbol, interval, bucketStart }) => {
+      const promises = batch.map(async ({ resolve, reject, exchange, symbol, interval, bucketStart, queueKey }) => {
         try {
           const result = await this._fetchOpenFromRestDirect(exchange, symbol, interval, bucketStart);
+          // Mark failure for circuit breaker
+          if (result && result.error) {
+            try { this._markRestOpenFailure(queueKey || `${exchange}|${symbol}|${interval}|${bucketStart}`, result.error); } catch (_) {}
+          }
           resolve(result);
         } catch (error) {
+          try { this._markRestOpenFailure(queueKey || `${exchange}|${symbol}|${interval}|${bucketStart}`, error); } catch (_) {}
           reject(error);
         }
       });
@@ -273,6 +290,56 @@ export class RealtimeOCDetector {
    * Uses queue to avoid CCXT throttle queue overflow
    * ✅ OPTIMIZED: Deduplicate requests trong queue
    */
+  _isRestOpenCircuitOpen(queueKey) {
+    const now = Date.now();
+    const st = this._restOpenFailCache.get(queueKey);
+    if (!st) return false;
+    return Number(st.untilTs || 0) > now;
+  }
+
+  _markRestOpenFailure(queueKey, error) {
+    const now = Date.now();
+    const prev = this._restOpenFailCache.get(queueKey);
+    const count = (prev?.count || 0) + 1;
+    const backoff = Math.min(this._restOpenFailTtlMs * count, 30000); // cap 30s
+    this._restOpenFailCache.set(queueKey, {
+      untilTs: now + backoff,
+      count,
+      lastError: error?.message || String(error || '')
+    });
+  }
+
+  _evictStaleRestQueue(now = Date.now()) {
+    if (!this._restFetchQueue || this._restFetchQueue.length === 0) return;
+
+    const before = this._restFetchQueue.length;
+    const ttlMs = Math.max(5000, this._restQueueEvictStaleMs);
+
+    // Drop very old requests (queued too long)
+    this._restFetchQueue = this._restFetchQueue.filter(r => {
+      const enq = Number(r.enqueuedAt || 0);
+      if (!enq) return true;
+      return (now - enq) <= ttlMs;
+    });
+
+    // Drop requests whose bucketStart is already in the past (over-bucket)
+    if (this._restQueueDropOverbucket) {
+      this._restFetchQueue = this._restFetchQueue.filter(r => {
+        const bs = Number(r.bucketStart || 0);
+        if (!bs) return true;
+        const intervalMs = this.getIntervalMs(r.interval || '1m');
+        // if we're beyond the candle end, this OPEN is no longer useful
+        return now < (bs + intervalMs);
+      });
+    }
+
+    const after = this._restFetchQueue.length;
+    const dropped = before - after;
+    if (dropped > 0) {
+      logger.warn(`[RealtimeOCDetector] Evicted ${dropped} stale REST open requests from queue (now=${after})`);
+    }
+  }
+
   async fetchOpenFromRest(exchange, symbol, interval, bucketStart) {
     // Check cache first to avoid unnecessary requests
     const ex = (exchange || '').toLowerCase();
@@ -280,7 +347,7 @@ export class RealtimeOCDetector {
     const key = `${ex}|${sym}|${interval}|${bucketStart}`;
     const cached = this.openFetchCache.get(key);
     if (Number.isFinite(cached) && cached > 0) {
-      return cached;
+      return { open: cached, error: null }; // ✅ FIX C: Return result object
     }
 
     // For Binance, prioritize WebSocket data - skip REST if WebSocket should have it
@@ -290,7 +357,7 @@ export class RealtimeOCDetector {
         const wsOpen = webSocketManager.getKlineOpen(sym, interval, bucketStart);
         if (Number.isFinite(wsOpen) && wsOpen > 0) {
           // WebSocket has data, skip REST
-          return wsOpen;
+          return { open: wsOpen, error: null }; // ✅ FIX C: Return result object
         }
       } catch (_) {}
     }
@@ -323,15 +390,28 @@ export class RealtimeOCDetector {
 
     // Queue the request to avoid throttle queue overflow
     return new Promise((resolve, reject) => {
-      // Reject if queue is too full
-      if (this._restFetchQueue.length >= this._maxRestFetchQueue) {
-        logger.debug(`[RealtimeOCDetector] REST fetch queue full (${this._restFetchQueue.length}), skipping ${ex} ${sym}`);
-        resolve(null);
+      // ✅ FIX D: Evict stale requests before enforcing max queue
+      this._evictStaleRestQueue(Date.now());
+
+      // ✅ FIX D: Circuit breaker - do not enqueue if circuit is open
+      if (this._isRestOpenCircuitOpen(queueKey)) {
+        const st = this._restOpenFailCache.get(queueKey);
+        resolve({ open: null, error: new Error(`REST open circuit open (${st?.lastError || 'unknown'})`) });
         return;
       }
-      
-      this._restFetchQueue.push({ resolve, reject, exchange: ex, symbol: sym, interval, bucketStart });
-      this._processRestFetchQueue(); // Start processing if not already running
+
+      // If queue is too full, drop oldest to keep system realtime (priority > completeness)
+      if (this._restFetchQueue.length >= this._maxRestFetchQueue) {
+        const dropCount = Math.max(1, Math.floor(this._maxRestFetchQueue * 0.1)); // drop 10%
+        for (let i = 0; i < dropCount && this._restFetchQueue.length > 0; i++) {
+          const dropped = this._restFetchQueue.shift();
+          try { dropped?.resolve?.({ open: null, error: new Error('Dropped due to queue overflow') }); } catch (_) {}
+        }
+        logger.warn(`[RealtimeOCDetector] REST fetch queue overflow. Dropped ${dropCount} oldest requests. queue=${this._restFetchQueue.length}/${this._maxRestFetchQueue}`);
+      }
+
+      this._restFetchQueue.push({ resolve, reject, exchange: ex, symbol: sym, interval, bucketStart, enqueuedAt: Date.now(), queueKey });
+      this._processRestFetchQueue();
     });
   }
 
@@ -390,11 +470,17 @@ export class RealtimeOCDetector {
           ohlcv = await Promise.race([fetchPromise, timeoutPromise]);
         } catch (e2) {
           // Don't log throttle errors as debug (they're expected when queue is full)
-          if (!e2?.message?.includes('throttle queue') && !e2?.message?.includes('maxCapacity')) {
-            logger.debug(`[RealtimeOCDetector] fetchOHLCV failed for ${ex} ${marketSymbol}: ${lastError?.message || lastError || e2?.message || e2}`);
+          const finalError = lastError || e2;
+          if (!finalError?.message?.includes('throttle queue') && !finalError?.message?.includes('maxCapacity')) {
+            logger.debug(`[RealtimeOCDetector] fetchOHLCV failed for ${ex} ${marketSymbol}: ${finalError?.message || finalError}`);
           }
-          return null;
+          return { open: null, error: finalError }; // ✅ FIX C: Return error object
         }
+      }
+
+      // ✅ FIX C: unwrap error object from fallback
+      if (ohlcv && typeof ohlcv === 'object' && !Array.isArray(ohlcv) && 'error' in ohlcv) {
+        return ohlcv;
       }
 
       if (!Array.isArray(ohlcv) || ohlcv.length === 0) return null;
@@ -411,19 +497,21 @@ export class RealtimeOCDetector {
       }
 
       const open = Number(candle?.[1]);
-      if (!Number.isFinite(open) || open <= 0) return null;
+      if (!Number.isFinite(open) || open <= 0) {
+        return { open: null, error: new Error('Invalid open price in candle data') };
+      }
       
       // Cache the result
       const key = `${ex}|${String(symbol || '').toUpperCase().replace(/[\/:_]/g, '')}|${interval}|${bucketStart}`;
       this.openFetchCache.set(key, open);
       
-      return open;
+      return { open, error: null }; // ✅ FIX C: Return result object
     } catch (e) {
       // Don't log throttle errors as debug
       if (!e?.message?.includes('throttle queue') && !e?.message?.includes('maxCapacity')) {
         logger.debug(`[RealtimeOCDetector] fetchOpenFromRest error: ${e?.message || e}`);
       }
-      return null;
+      return { open: null, error: e }; // ✅ FIX C: Return error object
     }
   }
 
@@ -445,7 +533,7 @@ export class RealtimeOCDetector {
     // Cache hit
     const cached = this.openPriceCache.get(key);
     if (cached && cached.bucketStart === bucketStart && Number.isFinite(cached.open) && cached.open > 0) {
-      return cached.open;
+      return { open: cached.open, error: null }; // ✅ FIX C: Return result object
     }
 
     // 1) Try WebSocket kline OPEN cache first (no REST) - CRITICAL for Binance to avoid throttle
@@ -456,7 +544,7 @@ export class RealtimeOCDetector {
         if (Number.isFinite(wsOpen) && wsOpen > 0) {
           // Store in cache
           this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp });
-          return wsOpen;
+          return { open: wsOpen, error: null }; // ✅ FIX C: Return result object
         }
         // If WebSocket doesn't have data, log for monitoring (but don't spam)
         if (this._detectCount && this._detectCount % 1000 === 0) {
@@ -468,38 +556,68 @@ export class RealtimeOCDetector {
     }
 
     // 2) Fallback: REST OHLCV open (with queue to avoid throttle)
-    const fetched = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
-    if (!Number.isFinite(fetched) || fetched <= 0) {
-      // If queue is full and WebSocket doesn't have data, use currentPrice as temporary fallback
-      // This is less accurate but better than skipping OC calculation entirely
-      if (this._restFetchQueue.length >= this._maxRestFetchQueue) {
-        logger.debug(
-          `[RealtimeOCDetector] Queue full for ${sym} ${interval}, using currentPrice as temporary open (bucketStart=${bucketStart})`
-        );
-        // Use currentPrice as temporary open (will be updated when REST fetch completes)
-        const tempOpen = currentPrice;
-        if (Number.isFinite(tempOpen) && tempOpen > 0) {
-          // Store temporarily (will be overwritten when REST data arrives)
-          this.openPriceCache.set(key, { open: tempOpen, bucketStart, lastUpdate: timestamp });
-          return tempOpen;
-        }
-      }
+    // ✅ FIX A: For Binance 1m/5m, DO NOT rely on REST open (too slow / rate-limited / causes missed OC).
+    // Require WebSocket kline OPEN to be available. If not available yet, skip OC for this tick.
+    if (ex === 'binance' && (interval === '1m' || interval === '5m')) {
+      logger.debug(
+        `[RealtimeOCDetector] Binance WS kline open not ready for ${sym} ${interval} (bucketStart=${bucketStart}) → skip (no REST fallback)`
+      );
+      return { open: null, error: new Error('Binance 1m/5m requires WebSocket kline open') };
+    }
+
+    // ✅ FIX C: Handle the result object from fetchOpenFromRest
+    const result = await this.fetchOpenFromRest(ex, sym, interval, bucketStart);
+    
+    if (result.error) {
+      // Log detailed error info
+      const errorInfo = {
+        exchange: ex,
+        symbol: sym,
+        interval,
+        bucketStart,
+        error: result.error.message || String(result.error),
+        queueSize: this._restFetchQueue.length,
+        maxQueue: this._maxRestFetchQueue,
+        timestamp: new Date().toISOString()
+      };
       
       logger.warn(
-        `[RealtimeOCDetector] ❌ Unable to fetch REST OPEN for ${sym} ${interval} (bucketStart=${bucketStart}). ` +
-        `Skipping OC calculation for this tick.`
+        `[RealtimeOCDetector] ❌ Failed to fetch REST OPEN for ${ex.toUpperCase()} ${sym} ${interval}: ${result.error.message || 'Unknown error'}`,
+        errorInfo
       );
-      return null;
+      
+      // Apply safe fallback if within window
+      const elapsedInBucket = timestamp - bucketStart;
+      const safeFallbackWindowMs = 2000; // 2 seconds
+      
+      if (elapsedInBucket <= safeFallbackWindowMs) {
+        logger.debug(
+          `[RealtimeOCDetector] Using currentPrice as fallback for ${sym} ${interval} (elapsed=${elapsedInBucket}ms, error=${result.error.message || 'unknown'})`
+        );
+        const tempOpen = currentPrice;
+        this.openPriceCache.set(key, { open: tempOpen, bucketStart, lastUpdate: timestamp });
+        return { open: tempOpen, error: result.error }; // Still return error for tracking but with fallback value
+      } else {
+        return { open: null, error: result.error };
+      }
+    }
+    
+    const fetched = result.open;
+    if (!Number.isFinite(fetched) || fetched <= 0) {
+      return { 
+        open: null, 
+        error: new Error(`Invalid open price: ${fetched}`) 
+      };
     }
 
     const openPrice = fetched;
-        this.openFetchCache.set(key, fetched);
-        logger.info(`[RealtimeOCDetector] Using REST open for ${sym} ${interval}: ${fetched}`);
+    // Cache the result (openFetchCache stores the raw open number)
+    this.openFetchCache.set(key, openPrice);
 
-    // ✅ OPTIMIZED: LRUCache automatically evicts least recently used - no manual eviction needed
     // Store in cache (LRUCache handles eviction automatically)
     this.openPriceCache.set(key, { open: openPrice, bucketStart, lastUpdate: timestamp });
-    return openPrice;
+
+    return { open: openPrice, error: null };
   }
 
   /**
@@ -806,56 +924,67 @@ export class RealtimeOCDetector {
    * @returns {Object|null} Match object hoặc null
    */
   _checkStrategy(strategy, symbol, openPrice, currentPrice, timestamp) {
-    if (!openPrice || !Number.isFinite(openPrice) || openPrice <= 0) {
-      // Debug logging for specific strategies
-      if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
-        logger.debug(`[RealtimeOCDetector] ⚠️ Strategy ${strategy.id} (bot ${strategy.bot_id}) skipped: no open price for ${symbol}`);
-      }
-      return null; // Skip nếu không có open price
+    if (!openPrice || !Number.isFinite(openPrice) || openPrice <= 0) return null;
+
+    const interval = strategy.interval || '1m';
+    const ocThreshold = Number(strategy.oc || 0);
+    if (ocThreshold <= 0) return null;
+
+    const oc = this.calculateOC(openPrice, currentPrice);
+    const absOC = Math.abs(oc);
+    const direction = this.getDirection(openPrice, currentPrice);
+
+    // Identify reverse flag (from bot)
+    const isReverse = Boolean(strategy.bot?.is_reverse_strategy);
+
+    // Build state key per bucket
+    const bucketStart = this.getBucketStart(interval, timestamp);
+    const stateKey = `${strategy.id}|${symbol}|${interval}|${bucketStart}`;
+    let st = this._ocMatchStateCache.get(stateKey);
+    if (!st) {
+      st = { armed: false, fired: false, firstCrossTs: 0, peakAbs: 0, peakTs: 0 };
+      this._ocMatchStateCache.set(stateKey, st);
     }
 
-        const interval = strategy.interval || '1m';
-        const ocThreshold = Number(strategy.oc || 0);
-
-        if (ocThreshold <= 0) {
-      // Debug logging for specific strategies
-      if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
-        logger.debug(`[RealtimeOCDetector] ⚠️ Strategy ${strategy.id} (bot ${strategy.bot_id}) skipped: invalid OC threshold ${ocThreshold} for ${symbol}`);
+    // TREND-FOLLOW (isReverse = false): fire at first cross >= threshold
+    if (!isReverse) {
+      if (!st.fired && absOC >= ocThreshold) {
+        st.fired = true;
+        return { strategy, oc, absOC, direction, openPrice, currentPrice, interval, timestamp };
       }
       return null;
-        }
-
-        // Calculate OC
-        const oc = this.calculateOC(openPrice, currentPrice);
-        const absOC = Math.abs(oc);
-        const direction = this.getDirection(openPrice, currentPrice);
-
-        // Debug logging for specific strategies (even when not matching)
-        if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
-          logger.debug(`[RealtimeOCDetector] 🔍 Checking strategy ${strategy.id} (bot ${strategy.bot_id}): ${symbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} open=${openPrice} current=${currentPrice}`);
-        }
-
-        // Check if OC meets threshold
-        if (absOC >= ocThreshold) {
-      logger.info(`[RealtimeOCDetector] ✅ MATCH FOUND: ${symbol} ${interval} OC=${oc.toFixed(2)}% (threshold=${ocThreshold}%) direction=${direction} strategy_id=${strategy.id} bot_id=${strategy.bot_id}`);
-      
-      return {
-            strategy,
-            oc,
-            absOC,
-            direction,
-            openPrice,
-            currentPrice,
-            interval,
-            timestamp
-      };
-    } else {
-      // Debug logging when threshold not met for specific strategies
-      if (strategy.id === 16193 || (symbol === 'MITOUSDT' && strategy.bot_id === 5)) {
-        logger.debug(`[RealtimeOCDetector] ⚠️ Strategy ${strategy.id} (bot ${strategy.bot_id}) NOT MATCHED: ${symbol} ${interval} OC=${oc.toFixed(2)}% < threshold=${ocThreshold}% (open=${openPrice} current=${currentPrice})`);
-      }
     }
 
+    // REVERSE logic (peak-hold + retracement)
+    const now = timestamp;
+    const retraceRatio = this.ocReverseRetraceRatio;
+    const stallMs = this.ocReverseStallMs;
+
+    if (!st.armed) {
+      if (absOC >= ocThreshold) {
+        st.armed = true;
+        st.firstCrossTs = now;
+        st.peakAbs = absOC;
+        st.peakTs = now;
+      }
+      return null;
+    }
+
+    // update peak while climbing
+    if (absOC > st.peakAbs) {
+      st.peakAbs = absOC;
+      st.peakTs = now;
+      return null;
+    }
+
+    // retrace condition
+    const retracedEnough = absOC <= st.peakAbs * (1 - retraceRatio);
+    const stalled = now - st.peakTs >= stallMs;
+
+    if (!st.fired && (retracedEnough || stalled)) {
+      st.fired = true;
+      return { strategy, oc, absOC, direction, openPrice, currentPrice, interval, timestamp };
+    }
     return null;
   }
 
