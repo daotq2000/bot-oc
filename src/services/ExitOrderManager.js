@@ -50,15 +50,15 @@ export class ExitOrderManager {
       // LONG: TP must be ABOVE entry (profit zone)
       // exit > entry → TAKE_PROFIT_MARKET (profit zone)
       // exit <= entry → STOP_MARKET (loss/breakeven zone)
-      return exit > entry ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
+      return exit > entry ? 'TAKE_PROFIT' : 'STOP';
     }
     
     // SHORT: TP must be BELOW entry (profit zone)
-    // exit < entry → TAKE_PROFIT_MARKET (profit zone)
-    // exit >= entry → STOP_MARKET (loss/breakeven zone)
+    // exit < entry → TAKE_PROFIT (profit zone)
+    // exit >= entry → STOP (loss/breakeven zone)
     // CRITICAL: If TP crosses entry (exit >= entry), it's no longer a profit target
     // This can happen with trailing TP that moves towards entry
-    return exit < entry ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
+    return exit < entry ? 'TAKE_PROFIT' : 'STOP';
   }
 
   _isValidStopVsMarket(type, side, stopPrice, currentPrice) {
@@ -68,13 +68,17 @@ export class ExitOrderManager {
 
     if (side === 'long') {
       // LONG closes with SELL
-      if (type === 'TAKE_PROFIT_MARKET') return stop > cur;
-      return stop < cur; // STOP_MARKET
+      // TAKE_PROFIT: stopPrice must be ABOVE current price
+      // STOP:        stopPrice must be BELOW current price
+      if (type === 'TAKE_PROFIT') return stop > cur;
+      return stop < cur; // STOP
     }
 
     // SHORT closes with BUY
-    if (type === 'TAKE_PROFIT_MARKET') return stop < cur;
-    return stop > cur; // STOP_MARKET
+    // TAKE_PROFIT: stopPrice must be BELOW current price
+    // STOP:        stopPrice must be ABOVE current price
+    if (type === 'TAKE_PROFIT') return stop < cur;
+    return stop > cur; // STOP
   }
 
   _nudgeStopPrice(type, side, currentPrice) {
@@ -84,9 +88,9 @@ export class ExitOrderManager {
 
     // push stop to the nearest valid side of market
     if (side === 'long') {
-      return type === 'TAKE_PROFIT_MARKET' ? cur * (1 + pct) : cur * (1 - pct);
+      return type === 'TAKE_PROFIT' ? cur * (1 + pct) : cur * (1 - pct);
     }
-    return type === 'TAKE_PROFIT_MARKET' ? cur * (1 - pct) : cur * (1 + pct);
+    return type === 'TAKE_PROFIT' ? cur * (1 - pct) : cur * (1 + pct);
   }
 
   async placeOrReplaceExitOrder(position, desiredExitPrice) {
@@ -108,7 +112,7 @@ export class ExitOrderManager {
     try {
       const openOrders = await this.exchangeService.getOpenOrders(position.symbol);
       if (Array.isArray(openOrders) && openOrders.length > 0) {
-        const exitTypes = new Set(['STOP_MARKET', 'TAKE_PROFIT_MARKET']);
+        const exitTypes = new Set(['STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET']); // Support both old and new types
         const positionSide = side === 'long' ? 'LONG' : 'SHORT';
         
         // Find existing exit orders for this position
@@ -179,9 +183,9 @@ export class ExitOrderManager {
     );
 
     // 1) Decide order type based on TP price vs entry (profit zone vs loss zone)
-    // CRITICAL FIX: For trailing TP, allow TP to cross entry and use STOP_MARKET in loss zone
-    // - LONG: exit > entry → TAKE_PROFIT_MARKET (profit zone), exit <= entry → STOP_MARKET (loss zone)
-    // - SHORT: exit < entry → TAKE_PROFIT_MARKET (profit zone), exit >= entry → STOP_MARKET (loss zone)
+    // CRITICAL FIX: For trailing TP, allow TP to cross entry and use STOP in loss zone
+    // - LONG: exit > entry → TAKE_PROFIT (profit zone), exit <= entry → STOP (loss zone)
+    // - SHORT: exit < entry → TAKE_PROFIT (profit zone), exit >= entry → STOP (loss zone)
     const desiredExit = Number(desiredExitPrice);
     const orderType = this._decideExitType(side, entry, desiredExit);
     const typeDecisionTime = Date.now();
@@ -193,7 +197,7 @@ export class ExitOrderManager {
       logger.info(
         `[ExitOrderManager] 📊 TP in loss zone (crossed entry) | pos=${position.id} side=${side} ` +
         `entry=${entry.toFixed(8)} desiredExit=${desiredExit.toFixed(8)} orderType=${orderType} ` +
-        `(will use STOP_MARKET for loss zone) time=${typeDecisionTime - startTime}ms`
+        `(will use STOP for loss zone) time=${typeDecisionTime - startTime}ms`
       );
     } else {
       logger.info(
@@ -238,7 +242,7 @@ export class ExitOrderManager {
     let res;
     let newOrderId = null;
     try {
-      if (orderType === 'STOP_MARKET') {
+      if (orderType === 'STOP' || orderType === 'STOP_MARKET') {
         res = await this.exchangeService.createCloseStopMarket(position.symbol, side, stopPrice);
       } else {
         res = await this.exchangeService.createCloseTakeProfitMarket(position.symbol, side, stopPrice);
@@ -264,10 +268,42 @@ export class ExitOrderManager {
     } catch (createError) {
       const createEndTime = Date.now();
       const createDuration = createEndTime - createStartTime;
+      const errorMessage = createError?.message || String(createError);
+      
+      // CRITICAL FIX: Handle -2021 error (Order would immediately trigger)
+      // This happens when stopPrice is already crossed by market price
+      // Fallback: Close position immediately with MARKET order
+      if (errorMessage.includes('-2021') || errorMessage.includes('would immediately trigger')) {
+        logger.warn(
+          `[ExitOrderManager] ⚠️ Order would immediately trigger (-2021) | pos=${position.id} ` +
+          `type=${orderType} stopPrice=${stopPrice.toFixed(8)} currentPrice=${currentPrice?.toFixed(8) || 'unknown'} ` +
+          `(falling back to MARKET close) duration=${createDuration}ms`
+        );
+        
+        try {
+          // Close position immediately with MARKET order
+          // Pass null for amount to let closePosition auto-detect from exchange
+          const marketCloseResult = await this.exchangeService.closePosition(position.symbol, side, null);
+          logger.info(
+            `[ExitOrderManager] ✅ FALLBACK SUCCESS: Position closed with MARKET order | pos=${position.id} ` +
+            `symbol=${position.symbol} side=${side} result=${JSON.stringify(marketCloseResult)}`
+          );
+          // Return null to indicate position was closed (no exit order needed)
+          return null;
+        } catch (fallbackError) {
+          logger.error(
+            `[ExitOrderManager] ❌ FALLBACK FAILED: Could not close position with MARKET order | pos=${position.id} ` +
+            `error=${fallbackError?.message || fallbackError}`
+          );
+          // Re-throw original error if fallback also fails
+          throw createError;
+        }
+      }
+      
       logger.error(
         `[ExitOrderManager] ❌ STEP 1 FAILED: Create error | pos=${position.id} ` +
         `type=${orderType} stopPrice=${stopPrice.toFixed(8)} oldOrderId=${oldOrderId || 'null'} ` +
-        `duration=${createDuration}ms error=${createError?.message || createError} ` +
+        `duration=${createDuration}ms error=${errorMessage} ` +
         `stack=${createError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
       );
       // If new order creation fails, keep old order (don't cancel it)

@@ -456,38 +456,110 @@ export class ExchangeService {
         }
 
         // CRITICAL FIX: Format quantity according to stepSize BEFORE placing order
-        // This ensures quantity is always a multiple of stepSize to avoid validation errors
+        // Retry 3 times with slightly different quantities (in step units) to ensure validation passes
+        // and reduce floating/rounding edge cases.
         const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
-        const formattedQuantity = this.binanceDirectClient.formatQuantity(quantity, stepSize);
-        const finalQuantity = parseFloat(formattedQuantity);
-        
-        if (!Number.isFinite(finalQuantity) || finalQuantity <= 0) {
-          throw new Error(`Invalid formatted quantity for ${normalizedSymbol}: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
+        const step = parseFloat(stepSize || '0');
+        if (!Number.isFinite(step) || step <= 0) {
+          throw new Error(`Invalid stepSize for ${normalizedSymbol}: ${stepSize}`);
         }
-        
-        logger.debug(`Calculated quantity: ${quantity} -> formatted: ${finalQuantity} for ${symbol} (amount: ${amount} USDT, price: ${currentPrice}, stepSize: ${stepSize})`);
+
+        const baseQty = parseFloat(this.binanceDirectClient.formatQuantity(quantity, stepSize));
+        if (!Number.isFinite(baseQty) || baseQty <= 0) {
+          throw new Error(`Invalid formatted quantity for ${normalizedSymbol}: ${baseQty} (original: ${quantity}, stepSize: ${stepSize})`);
+        }
+
+        // Try: baseQty, baseQty - 1 step, baseQty - 2 steps (never increase notional)
+        // Decreasing helps pass strict step validations and avoids min-notional inflation.
+        const candidates = [
+          baseQty,
+          parseFloat(this.binanceDirectClient.formatQuantity(Math.max(0, baseQty - step), stepSize)),
+          parseFloat(this.binanceDirectClient.formatQuantity(Math.max(0, baseQty - 2 * step), stepSize))
+        ].filter(q => Number.isFinite(q) && q > 0);
+
+        // Deduplicate (string compare to keep precision stable)
+        const uniq = [];
+        const seen = new Set();
+        for (const q of candidates) {
+          const key = String(q);
+          if (!seen.has(key)) {
+            seen.add(key);
+            uniq.push(q);
+          }
+        }
+
+        logger.debug(
+          `[OrderRetry] ${normalizedSymbol} candidates=${uniq.join(',')} rawQty=${quantity} stepSize=${stepSize} ` +
+          `amountUSDT=${amount} price=${currentPrice} bot=${this.bot.id}`
+        );
 
         let order;
         let avgFillPrice = null;
-        if (type === 'market') {
-          order = await this.binanceDirectClient.placeMarketOrder(
-            normalizedSymbol,
-            side,
-            finalQuantity, // Use formatted quantity
-            positionSide
+        let lastErr = null;
+
+        for (let attempt = 0; attempt < Math.min(3, uniq.length); attempt++) {
+          const finalQuantity = uniq[attempt];
+
+          // Re-check min notional using effective notional for this candidate
+          if (minNotional) {
+            const effectiveNotional = finalQuantity * Number(currentPrice);
+            if (!Number.isFinite(effectiveNotional) || effectiveNotional + 1e-8 < Number(minNotional)) {
+              logger.warn(
+                `[OrderRetry] Skip candidate qty=${finalQuantity} for ${normalizedSymbol}: ` +
+                `effectiveNotional=${effectiveNotional} < minNotional=${minNotional}`
+              );
+              continue;
+            }
+          }
+
+          logger.info(
+            `[OrderRetry] Attempt ${attempt + 1}/3 placing ${type.toUpperCase()} order for ${normalizedSymbol} ` +
+            `side=${side} qty=${finalQuantity} stepSize=${stepSize} rawQty=${quantity}`
           );
+
           try {
-            avgFillPrice = await this.binanceDirectClient.getOrderAverageFillPrice(normalizedSymbol, order.orderId);
-          } catch (_) {}
-        } else {
-          order = await this.binanceDirectClient.placeLimitOrder(
-            normalizedSymbol,
-            side,
-            finalQuantity, // Use formatted quantity
-            price,
-            positionSide
-          );
-          
+            if (type === 'market') {
+              order = await this.binanceDirectClient.placeMarketOrder(
+                normalizedSymbol,
+                side,
+                finalQuantity,
+                positionSide
+              );
+              try {
+                avgFillPrice = await this.binanceDirectClient.getOrderAverageFillPrice(normalizedSymbol, order.orderId);
+              } catch (_) {}
+            } else {
+              order = await this.binanceDirectClient.placeLimitOrder(
+                normalizedSymbol,
+                side,
+                finalQuantity,
+                price,
+                positionSide
+              );
+            }
+            // Success
+            lastErr = null;
+            break;
+          } catch (e) {
+            lastErr = e;
+            const msg = e?.message || String(e);
+            // Retry only for quantity/precision validation problems
+            const isQtyValidation = msg.includes('Order validation failed') || msg.includes('Invalid quantity') || msg.includes('-4131') || msg.includes('-1111');
+            logger.warn(
+              `[OrderRetry] Attempt ${attempt + 1}/3 failed for ${normalizedSymbol} qty=${finalQuantity}: ${msg}`
+            );
+            if (!isQtyValidation) {
+              throw e; // not a quantity validation issue => don't retry
+            }
+          }
+        }
+
+        if (!order) {
+          throw lastErr || new Error(`Failed to create ${type} order for ${normalizedSymbol} after 3 attempts`);
+        }
+
+        // For LIMIT orders: status check and avgFillPrice will be handled below
+        if (type === 'limit' && order) {
           // CRITICAL FIX: Check actual order status after placing LIMIT order
           // Binance LIMIT orders can fill immediately, partially, or be IOC
           // Don't assume status='open' - check exchange response

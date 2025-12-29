@@ -544,15 +544,26 @@ export class RealtimeOCDetector {
         if (Number.isFinite(wsOpen) && wsOpen > 0) {
           // Store in cache
           this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp });
-          return { open: wsOpen, error: null }; // ✅ FIX C: Return result object
+          return { open: wsOpen, error: null };
         }
+
+        // ✅ NEW: Fallback to previous candle CLOSE as current OPEN (race-condition safe)
+        // Open(t) should equal Close(t-1). This fixes the "kline open not ready" spam at bucket start.
+        const intervalMs = this.getIntervalMs(interval);
+        const prevBucketStart = bucketStart - intervalMs;
+        const prevClose = webSocketManager.getKlineClose(sym, interval, prevBucketStart);
+        if (Number.isFinite(prevClose) && prevClose > 0) {
+          this.openPriceCache.set(key, { open: prevClose, bucketStart, lastUpdate: timestamp });
+          return { open: prevClose, error: null };
+        }
+
         // If WebSocket doesn't have data, log for monitoring (but don't spam)
         if (this._detectCount && this._detectCount % 1000 === 0) {
-          logger.debug(`[RealtimeOCDetector] WebSocket kline open not available for ${sym} ${interval}, will use REST fallback`);
+          logger.debug(`[RealtimeOCDetector] WebSocket kline open/prevClose not available for ${sym} ${interval}, will use REST fallback`);
         }
       }
     } catch (wsErr) {
-      logger.debug(`[RealtimeOCDetector] getKlineOpen failed for ${sym} ${interval}: ${wsErr?.message || wsErr}`);
+      logger.debug(`[RealtimeOCDetector] getKlineOpen/getKlineClose failed for ${sym} ${interval}: ${wsErr?.message || wsErr}`);
     }
 
     // 2) Fallback: REST OHLCV open (with queue to avoid throttle)

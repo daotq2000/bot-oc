@@ -67,6 +67,7 @@ export class PositionSync {
   /**
    * Sync positions from exchange to database
    * Creates Position records for positions that exist on exchange but not in database
+   * CRITICAL: Uses soft locking (is_processing) to prevent race conditions with PositionMonitor
    */
   async syncPositions() {
     if (this.isRunning) {
@@ -75,18 +76,34 @@ export class PositionSync {
     }
 
     this.isRunning = true;
+    const startTime = Date.now();
     try {
-      logger.debug('[PositionSync] Starting position sync from exchange...');
+      logger.info('[PositionSync] Starting position sync from exchange...');
+
+      let totalProcessed = 0;
+      let totalCreated = 0;
+      let totalClosed = 0;
+      let totalErrors = 0;
 
       for (const [botId, exchangeService] of this.exchangeServices.entries()) {
         try {
-          await this.syncBotPositions(botId, exchangeService);
+          const result = await this.syncBotPositions(botId, exchangeService);
+          if (result) {
+            totalProcessed += result.processed || 0;
+            totalCreated += result.created || 0;
+            totalClosed += result.closed || 0;
+          }
         } catch (error) {
+          totalErrors++;
           logger.error(`[PositionSync] Error syncing positions for bot ${botId}:`, error?.message || error);
         }
       }
 
-      logger.debug('[PositionSync] Position sync completed');
+      const duration = Date.now() - startTime;
+      logger.info(
+        `[PositionSync] Position sync completed in ${duration}ms: ` +
+        `processed=${totalProcessed}, created=${totalCreated}, closed=${totalClosed}, errors=${totalErrors}`
+      );
     } catch (error) {
       logger.error('[PositionSync] Error in syncPositions:', error);
     } finally {
@@ -318,6 +335,13 @@ export class PositionSync {
         `[PositionSync] Processed ${processedCount} exchange positions for bot ${botId}, ` +
         `created ${createdCount} missing positions, closed ${closedCount} orphan positions`
       );
+      
+      // Return summary for aggregation
+      return {
+        processed: processedCount,
+        created: createdCount,
+        closed: closedCount
+      };
     } catch (error) {
       logger.error(`[PositionSync] Error syncing bot ${botId}:`, error?.message || error);
       throw error;

@@ -93,13 +93,17 @@ export class EntryOrderMonitor {
 
   /**
    * Handle Binance ORDER_TRADE_UPDATE user-data event
+   * CRITICAL: Updates orderStatusCache for ALL orders (entry, TP, SL) to enable fast order status checks
    * @param {number} botId
    * @param {Object} evt
    */
   async _handleBinanceOrderTradeUpdate(botId, evt) {
     try {
       const e = evt?.e || evt?.eventType;
-      if (e !== 'ORDER_TRADE_UPDATE') return;
+      if (e !== 'ORDER_TRADE_UPDATE') {
+        logger.debug(`[EntryOrderMonitor] Ignoring non-ORDER_TRADE_UPDATE event: ${e}`);
+        return;
+      }
 
       const o = evt.o || evt.order || {};
       const orderId = o.i ?? o.orderId; // i: orderId in futures stream
@@ -111,12 +115,21 @@ export class EntryOrderMonitor {
       const filledQtyStr = o.z ?? o.cumQty ?? o.filledQty ?? null;
       const filledQty = filledQtyStr ? Number(filledQtyStr) : NaN;
 
-      if (!orderId || !symbol) return;
+      if (!orderId || !symbol) {
+        logger.debug(`[EntryOrderMonitor] Missing orderId or symbol in ORDER_TRADE_UPDATE event: orderId=${orderId}, symbol=${symbol}`);
+        return;
+      }
 
-      // Update order status cache for ALL orders (entry, TP, SL)
+      // CRITICAL: Update order status cache for ALL orders (entry, TP, SL)
+      // This enables PositionService to detect TP/SL fills without REST API calls
       // Get exchange from bot (this is Binance handler, but use bot.exchange for consistency)
       const bot = this.bots.get(botId);
+      if (!bot) {
+        logger.warn(`[EntryOrderMonitor] Bot ${botId} not found in bots map, using default exchange 'binance'`);
+      }
       const exchange = (bot?.exchange || 'binance').toLowerCase();
+      
+      // Update cache with normalized data
       orderStatusCache.updateOrderStatus(orderId, {
         status: status,
         filled: filledQty,
@@ -127,30 +140,42 @@ export class EntryOrderMonitor {
       const isFilled = status === 'FILLED';
       const isCanceled = status === 'CANCELED' || status === 'CANCELLED' || status === 'EXPIRED';
 
-      // Handle entry orders
+      // Handle entry orders first (highest priority)
       const entry = await EntryOrder.findOpenByBotAndOrder(botId, orderId);
       if (entry) {
         if (isFilled) {
           // Confirmed filled → create Position and mark entry_orders as filled
+          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) FILLED via WebSocket. Creating Position...`);
           await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
         } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
           // Cancelled/expired without fill → mark as canceled
           await EntryOrder.markCanceled(entry.id, status === 'EXPIRED' ? 'expired' : 'canceled');
-          logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) canceled/expired on Binance (user-data WS).`);
+          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) ${status} via WebSocket.`);
+        } else if (status === 'PARTIALLY_FILLED') {
+          logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) PARTIALLY_FILLED: ${filledQty}`);
         }
         return; // Entry order handled
       }
 
-      // TP/SL orders: Update cache and log for debugging
+      // TP/SL orders: Cache already updated above
       // PositionService.updatePosition will detect TP/SL fills via cache on next monitor cycle
-      // This avoids O(N) DB scan on every TP/SL fill event
+      // This avoids O(N) DB scan on every TP/SL fill event (performance optimization)
       if (isFilled) {
-        logger.info(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) FILLED via WebSocket. Cache updated. PositionService will detect on next cycle.`);
+        logger.info(
+          `[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) FILLED via WebSocket. ` +
+          `Cache updated. PositionService will detect on next cycle.`
+        );
       } else if (isCanceled) {
         logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) ${status} via WebSocket. Cache updated.`);
+      } else if (status === 'PARTIALLY_FILLED') {
+        logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) PARTIALLY_FILLED: ${filledQty}`);
       }
     } catch (error) {
-      logger.error('[EntryOrderMonitor] Error in _handleBinanceOrderTradeUpdate:', error?.message || error);
+      logger.error(
+        `[EntryOrderMonitor] Error in _handleBinanceOrderTradeUpdate for bot ${botId}:`,
+        error?.message || error,
+        error?.stack
+      );
     }
   }
 

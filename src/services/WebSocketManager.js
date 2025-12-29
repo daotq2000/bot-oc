@@ -12,6 +12,7 @@ class WebSocketManager {
     this.priceCache = new Map(); // symbol -> { price, lastAccess }
     this._priceHandlers = new Set(); // listeners for price ticks
     this.klineOpenCache = new Map(); // key: symbol|interval|bucketStart -> { open, lastUpdate }
+    this.klineCloseCache = new Map(); // key: symbol|interval|bucketStart -> { close, lastUpdate }
 
     this.baseUrl = 'wss://fstream.binance.com/stream?streams=';
     this.maxStreamsPerConn = 180; // keep well below 200 limit and URL length issues
@@ -98,6 +99,16 @@ class WebSocketManager {
     return cached.open;
   }
 
+  _storeKlineClose(symbol, interval, close, startTime) {
+    if (!Number.isFinite(close) || close <= 0 || !startTime) return;
+    const sym = String(symbol).toUpperCase();
+    const key = `${sym}|${interval}|${startTime}`;
+    this.klineCloseCache.set(key, {
+      close,
+      lastUpdate: Date.now()
+    });
+  }
+
   _storeKlineOpen(symbol, interval, open, startTime) {
     if (!Number.isFinite(open) || open <= 0 || !startTime) return;
     const sym = String(symbol).toUpperCase();
@@ -106,6 +117,24 @@ class WebSocketManager {
       open,
       lastUpdate: Date.now()
     });
+  }
+
+  /**
+   * Get cached kline CLOSE price for a given symbol/interval/bucket.
+   * @param {string} symbol - e.g. 'BTCUSDT'
+   * @param {string} interval - e.g. '1m' or '5m'
+   * @param {number} bucketStart - bucket start timestamp (ms)
+   * @returns {number|null}
+   */
+  getKlineClose(symbol, interval, bucketStart) {
+    const sym = String(symbol).toUpperCase();
+    const key = `${sym}|${interval}|${bucketStart}`;
+    const cached = this.klineCloseCache.get(key);
+    if (!cached || !Number.isFinite(cached.close) || cached.close <= 0) {
+      return null;
+    }
+    cached.lastUpdate = Date.now();
+    return cached.close;
   }
 
   // Subscribe a list of symbols (normalized like BTCUSDT)
@@ -262,6 +291,15 @@ class WebSocketManager {
           const open = parseFloat(openStr);
           if (Number.isFinite(open) && open > 0 && startTime > 0 && (interval === '1m' || interval === '5m')) {
             this._storeKlineOpen(symbol, interval, open, startTime);
+          }
+
+          // Store CLOSE when candle is closed (k.x === true)
+          const isClosed = Boolean(k.x);
+          if (isClosed) {
+            const close = parseFloat(k.c);
+            if (Number.isFinite(close) && close > 0 && startTime > 0 && (interval === '1m' || interval === '5m')) {
+              this._storeKlineClose(symbol, interval, close, startTime);
+            }
           }
         }
       } catch (_) {}

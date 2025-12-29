@@ -35,28 +35,45 @@ export class PositionService {
     };
 
     try {
+      // Helper function to get exchange name (normalized to lowercase for cache key consistency)
+      const getExchange = () => {
+        return (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
+      };
+
       // PRIORITY CHECK 1: Check order status from WebSocket cache (no REST API call)
       // This detects when TP/SL orders are filled via WebSocket ORDER_TRADE_UPDATE events
+      // CRITICAL: Cache check is O(1) and avoids rate limits from REST API calls
+      const exchange = getExchange();
+      
       if (position.exit_order_id) {
-        // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
-        // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
-        const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
         const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
         
-        // Debug logging for cache miss
+        // Debug logging for cache miss (only at debug level to reduce noise)
         if (!cachedTpStatus) {
           logger.debug(`[TP/SL Check] TP order ${position.exit_order_id} for position ${position.id} not found in cache (exchange: ${exchange})`);
         }
         // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
         if (cachedTpStatus && cachedTpStatus.status === 'closed') {
           // TP order has been filled - position is already closed on exchange
-          logger.info(`[TP/SL Check] TP order ${position.exit_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
+          logger.info(
+            `[TP/SL Check] ✅ TP order ${position.exit_order_id} for position ${position.id} filled (from WebSocket cache). ` +
+            `Fill price: ${cachedTpStatus.avgPrice || 'N/A'}, symbol: ${position.symbol}. Closing position in DB.`
+          );
           
-          // Get fill price from cache or current price
-          const fillPrice = cachedTpStatus.avgPrice || await this.exchangeService.getTickerPrice(position.symbol);
-          const currentPrice = fillPrice || await this.exchangeService.getTickerPrice(position.symbol);
+          // Get fill price from cache (preferred) or current price (fallback)
+          const fillPrice = cachedTpStatus.avgPrice;
+          let currentPrice = fillPrice;
           
-          if (currentPrice) {
+          if (!currentPrice || currentPrice <= 0) {
+            // Fallback to current market price if cache doesn't have fill price
+            try {
+              currentPrice = await this.exchangeService.getTickerPrice(position.symbol);
+            } catch (priceError) {
+              logger.warn(`[TP/SL Check] Failed to get current price for ${position.symbol}: ${priceError?.message || priceError}`);
+            }
+          }
+          
+          if (currentPrice && currentPrice > 0) {
             const pnl = calculatePnL(
               position.entry_price,
               currentPrice,
@@ -64,14 +81,13 @@ export class PositionService {
               position.side
             );
             return await this.closePosition(position, currentPrice, pnl, 'tp_hit');
+          } else {
+            logger.warn(`[TP/SL Check] Cannot close position ${position.id}: no valid price available`);
           }
         }
       }
 
       if (position.sl_order_id) {
-        // Get exchange from exchangeService (fallback to 'binance' for backward compatibility)
-        // CRITICAL FIX: Normalize exchange name to lowercase to match cache key format
-        const exchange = (this.exchangeService?.exchange || this.exchangeService?.bot?.exchange || 'binance').toLowerCase();
         const cachedSlStatus = orderStatusCache.getOrderStatus(position.sl_order_id, exchange);
         
         // Debug logging for cache miss
@@ -81,13 +97,25 @@ export class PositionService {
         // CRITICAL FIX: _normalizeStatus() returns 'closed' for FILLED, not 'FILLED'
         if (cachedSlStatus && cachedSlStatus.status === 'closed') {
           // SL order has been filled - position is already closed on exchange
-          logger.info(`[TP/SL Check] SL order ${position.sl_order_id} for position ${position.id} filled (from WebSocket cache). Closing position in DB.`);
+          logger.info(
+            `[TP/SL Check] ✅ SL order ${position.sl_order_id} for position ${position.id} filled (from WebSocket cache). ` +
+            `Fill price: ${cachedSlStatus.avgPrice || 'N/A'}, symbol: ${position.symbol}. Closing position in DB.`
+          );
           
-          // Get fill price from cache or current price
-          const fillPrice = cachedSlStatus.avgPrice || await this.exchangeService.getTickerPrice(position.symbol);
-          const currentPrice = fillPrice || await this.exchangeService.getTickerPrice(position.symbol);
+          // Get fill price from cache (preferred) or current price (fallback)
+          const fillPrice = cachedSlStatus.avgPrice;
+          let currentPrice = fillPrice;
           
-          if (currentPrice) {
+          if (!currentPrice || currentPrice <= 0) {
+            // Fallback to current market price if cache doesn't have fill price
+            try {
+              currentPrice = await this.exchangeService.getTickerPrice(position.symbol);
+            } catch (priceError) {
+              logger.warn(`[TP/SL Check] Failed to get current price for ${position.symbol}: ${priceError?.message || priceError}`);
+            }
+          }
+          
+          if (currentPrice && currentPrice > 0) {
             const pnl = calculatePnL(
               position.entry_price,
               currentPrice,
@@ -95,6 +123,8 @@ export class PositionService {
               position.side
             );
             return await this.closePosition(position, currentPrice, pnl, 'sl_hit');
+          } else {
+            logger.warn(`[TP/SL Check] Cannot close position ${position.id}: no valid price available`);
           }
         }
       }
@@ -114,13 +144,14 @@ export class PositionService {
           let closeReason = null;
           let verifiedFillPrice = null;
           
-          // Check TP order status first
+          // Check TP order status first (prefer cache, fallback to REST API)
           if (position.exit_order_id) {
             const cachedTpStatus = orderStatusCache.getOrderStatus(position.exit_order_id, exchange);
             // CRITICAL FIX: Only close if order status is 'closed' (FILLED), not 'canceled'
             if (cachedTpStatus?.status === 'closed') {
               closeReason = 'tp_hit';
               verifiedFillPrice = cachedTpStatus.avgPrice;
+              logger.debug(`[TP/SL Check] TP order ${position.exit_order_id} verified FILLED from cache`);
             } else {
               // Fallback to REST API only if cache miss
               try {
@@ -130,13 +161,14 @@ export class PositionService {
                 if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
                   closeReason = 'tp_hit';
                   verifiedFillPrice = tpOrderStatus.raw?.avgPrice || tpOrderStatus.avgPrice || null;
-                  // Update cache for future use
+                  // Update cache for future use (performance optimization)
                   orderStatusCache.updateOrderStatus(position.exit_order_id, {
                     status: tpOrderStatus.status,
                     filled: tpOrderStatus.filled || 0,
                     avgPrice: verifiedFillPrice,
                     symbol: position.symbol
                   }, exchange);
+                  logger.debug(`[TP/SL Check] TP order ${position.exit_order_id} verified FILLED via REST API, cache updated`);
                 } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
                   // Order was cancelled, not filled - DO NOT close position
                   logger.warn(
@@ -159,6 +191,7 @@ export class PositionService {
             if (cachedSlStatus?.status === 'closed') {
               closeReason = 'sl_hit';
               verifiedFillPrice = cachedSlStatus.avgPrice;
+              logger.debug(`[TP/SL Check] SL order ${position.sl_order_id} verified FILLED from cache`);
             } else {
               // Fallback to REST API only if cache miss
               try {
@@ -168,13 +201,14 @@ export class PositionService {
                 if (normalizedStatus === 'closed' || normalizedStatus === 'filled') {
                   closeReason = 'sl_hit';
                   verifiedFillPrice = slOrderStatus.raw?.avgPrice || slOrderStatus.avgPrice || null;
-                  // Update cache for future use
+                  // Update cache for future use (performance optimization)
                   orderStatusCache.updateOrderStatus(position.sl_order_id, {
                     status: slOrderStatus.status,
                     filled: slOrderStatus.filled || 0,
                     avgPrice: verifiedFillPrice,
                     symbol: position.symbol
                   }, exchange);
+                  logger.debug(`[TP/SL Check] SL order ${position.sl_order_id} verified FILLED via REST API, cache updated`);
                 } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
                   // Order was cancelled, not filled - DO NOT close position
                   logger.warn(
