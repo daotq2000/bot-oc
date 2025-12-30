@@ -1865,26 +1865,17 @@ export class BinanceDirectClient {
       side: orderSide,
       type: 'STOP_MARKET',
       stopPrice: String(finalStop),
-      closePosition: 'true'
+      closePosition: 'true',
+      timeInForce: 'GTC',
+      workingType: 'MARK_PRICE' // Use MARK_PRICE for better trigger accuracy
     };
 
     if (dualSide) params.positionSide = positionSide;
 
-    // CRITICAL FIX: Testnet still supports /fapi/v1/order, but mainnet requires /fapi/v1/algoOrder
-    // Binance mainnet requires TAKE_PROFIT_MARKET and STOP_MARKET to use /fapi/v1/algoOrder (since Dec 9, 2025)
-    // Testnet continues to work with the old endpoint /fapi/v1/order
-    const endpoint = this.isTestnet ? '/fapi/v1/order' : '/fapi/v1/algoOrder';
-    
-    // For Algo Order API, add required parameters: algotype and workingType
-    if (!this.isTestnet) {
-      params.algotype = 'STOP_MARKET'; // Mandatory parameter for Algo Order API
-      params.workingType = 'CONTRACT_PRICE'; // Default working type (MARK_PRICE or CONTRACT_PRICE)
-      params.timeInForce = 'GTC'; // Required for Algo Order API
-    } else {
-      params.timeInForce = 'GTC'; // Keep for testnet compatibility
-    }
-    
-    return await this.makeRequestWithRetry(endpoint, 'POST', params, true);
+    // CRITICAL FIX: TP/SL orders use standard /fapi/v1/order endpoint
+    // DO NOT use algoOrder endpoint or algoType parameter for regular TP/SL orders
+    // algoOrder endpoint is only for OCO, trailing stop, etc.
+    return await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
   }
 
   /**
@@ -1922,26 +1913,17 @@ export class BinanceDirectClient {
       side: orderSide,
       type: 'TAKE_PROFIT_MARKET',
       stopPrice: String(finalStop),
-      closePosition: 'true'
+      closePosition: 'true',
+      timeInForce: 'GTC',
+      workingType: 'MARK_PRICE' // Use MARK_PRICE for better trigger accuracy
     };
 
     if (dualSide) params.positionSide = positionSide;
 
-    // CRITICAL FIX: Testnet still supports /fapi/v1/order, but mainnet requires /fapi/v1/algoOrder
-    // Binance mainnet requires TAKE_PROFIT_MARKET and STOP_MARKET to use /fapi/v1/algoOrder (since Dec 9, 2025)
-    // Testnet continues to work with the old endpoint /fapi/v1/order
-    const endpoint = this.isTestnet ? '/fapi/v1/order' : '/fapi/v1/algoOrder';
-    
-    // For Algo Order API, add required parameters: algotype and workingType
-    if (!this.isTestnet) {
-      params.algotype = 'TAKE_PROFIT_MARKET'; // Mandatory parameter for Algo Order API
-      params.workingType = 'CONTRACT_PRICE'; // Default working type (MARK_PRICE or CONTRACT_PRICE)
-      params.timeInForce = 'GTC'; // Required for Algo Order API
-    } else {
-      params.timeInForce = 'GTC'; // Keep for testnet compatibility
-    }
-    
-    return await this.makeRequestWithRetry(endpoint, 'POST', params, true);
+    // CRITICAL FIX: TP/SL orders use standard /fapi/v1/order endpoint
+    // DO NOT use algoOrder endpoint or algoType parameter for regular TP/SL orders
+    // algoOrder endpoint is only for OCO, trailing stop, etc.
+    return await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
   }
 
   async cancelOrder(symbol, orderId) {

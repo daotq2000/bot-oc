@@ -1,11 +1,10 @@
-import cron from 'node-cron';
 import { Position } from '../models/Position.js';
 import { Strategy } from '../models/Strategy.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { PositionService } from '../services/PositionService.js';
 import { OrderService } from '../services/OrderService.js';
 import { TelegramService } from '../services/TelegramService.js';
-import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
+import { SCAN_INTERVALS } from '../config/constants.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
 
@@ -939,12 +938,20 @@ export class PositionMonitor {
    * Start the cron job
    */
   start() {
-    const pattern = DEFAULT_CRON_PATTERNS.POSITION_MONITOR;
+    // Get interval from config or use default 30 seconds
+    // Changed from cron (1 minute) to setInterval (30 seconds) for faster TP order updates
+    const intervalMs = Number(configService.getNumber('POSITION_MONITOR_INTERVAL_MS', SCAN_INTERVALS.POSITION_MONITOR));
     
-    cron.schedule(pattern, async () => {
-      await this.monitorAllPositions();
+    // Run immediately on start
+    this.monitorAllPositions().catch(err => {
+      logger.error('[PositionMonitor] Error in initial monitor run:', err);
     });
+    
+    // Then run every intervalMs
+    setInterval(async () => {
+      await this.monitorAllPositions();
+    }, intervalMs);
 
-    logger.info(`PositionMonitor started with pattern: ${pattern}`);
+    logger.info(`PositionMonitor started with interval: ${intervalMs}ms (${intervalMs / 1000}s)`);
   }
 }

@@ -134,6 +134,7 @@ async function start() {
       await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.co', 'MEXC Futures REST base URL (using .co domain for better connectivity)');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
+      await AppConfig.set('POSITION_MONITOR_INTERVAL_MS', '25000', 'Delay between subscribe batches (ms)');
 
       // REST ticker fallbacks when WS has no price
       await AppConfig.set('BINANCE_TICKER_REST_FALLBACK', 'false', 'Enable REST fallback for Binance ticker price when WS has no price');

@@ -239,12 +239,16 @@ export class ExitOrderManager {
     );
 
     // 4) Place NEW order FIRST (atomic replace)
+    // CRITICAL FIX: Map orderType correctly - TAKE_PROFIT -> TAKE_PROFIT_MARKET, STOP -> STOP_MARKET
     let res;
     let newOrderId = null;
     try {
-      if (orderType === 'STOP' || orderType === 'STOP_MARKET') {
+      // Map internal type to Binance API type
+      const isStopOrder = orderType === 'STOP' || orderType === 'STOP_MARKET';
+      if (isStopOrder) {
         res = await this.exchangeService.createCloseStopMarket(position.symbol, side, stopPrice);
       } else {
+        // orderType is 'TAKE_PROFIT' or 'TAKE_PROFIT_MARKET' - both map to TAKE_PROFIT_MARKET
         res = await this.exchangeService.createCloseTakeProfitMarket(position.symbol, side, stopPrice);
       }
 
