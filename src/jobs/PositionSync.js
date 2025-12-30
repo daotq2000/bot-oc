@@ -1,9 +1,8 @@
-import cron from 'node-cron';
 import { Position } from '../models/Position.js';
 import { Strategy } from '../models/Strategy.js';
 import { EntryOrder } from '../models/EntryOrder.js';
 import { ExchangeService } from '../services/ExchangeService.js';
-import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
+import { SCAN_INTERVALS } from '../config/constants.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
 import pool from '../config/database.js';
@@ -678,22 +677,21 @@ export class PositionSync {
       return;
     }
 
-    const intervalMinutes = Number(configService.getNumber('POSITION_SYNC_INTERVAL_MINUTES', 5));
-    const cronPattern = `*/${intervalMinutes} * * * *`; // Every N minutes
-
-    this.task = cron.schedule(cronPattern, async () => {
-      await this.syncPositions();
-    }, {
-      scheduled: true,
-      timezone: 'UTC'
-    });
-
-    logger.info(`[PositionSync] Started sync job (every ${intervalMinutes} minutes)`);
+    // Get interval from config or use default 40 seconds
+    // Changed from cron (minutes) to setInterval (seconds) for faster position sync
+    const intervalMs = Number(configService.getNumber('POSITION_SYNC_INTERVAL_MS', SCAN_INTERVALS.POSITION_SYNC));
     
     // Run immediately on start
     this.syncPositions().catch(err => {
       logger.error('[PositionSync] Error in initial sync:', err);
     });
+    
+    // Then run every intervalMs
+    this.task = setInterval(async () => {
+      await this.syncPositions();
+    }, intervalMs);
+
+    logger.info(`[PositionSync] Started sync job with interval: ${intervalMs}ms (${intervalMs / 1000}s)`);
   }
 
   /**
@@ -701,7 +699,7 @@ export class PositionSync {
    */
   stop() {
     if (this.task) {
-      this.task.stop();
+      clearInterval(this.task); // Clear setInterval timer
       this.task = null;
       logger.info('[PositionSync] Stopped sync job');
     }
