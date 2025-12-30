@@ -239,10 +239,12 @@ class ExchangeInfoService {
       try {
       await mexc.fetchMarkets({ 'type': 'swap' });
       } catch (fetchError) {
-        // Handle 404 or other API errors gracefully
+        // CRITICAL FIX: Don't return early on 404 - let outer catch handle fallback to contract API
+        // This ensures we can still update symbols even if CCXT API fails
         if (fetchError?.code === 404 || fetchError?.message?.includes('404') || fetchError?.message?.includes('Not Found')) {
-          this.logger.warn(`[MEXC] 404 error fetching swap markets (API endpoint may have changed): ${fetchError?.message || fetchError}. Skipping MEXC filter update.`);
-          return; // Skip update if API endpoint is not available
+          this.logger.warn(`[MEXC] 404 error fetching swap markets via CCXT (API endpoint may have changed): ${fetchError?.message || fetchError}. Will fallback to contract API.`);
+          // Throw error to trigger outer catch block which will handle fallback
+          throw fetchError;
         }
         throw fetchError; // Re-throw other errors
       }
@@ -441,15 +443,12 @@ class ExchangeInfoService {
         return;
       }
 
-      // Get current symbols from DB for this exchange
-      const currentDbSymbols = await this.symbolFilterDAO.getSymbolsByExchange('mexc');
+      // Get exchange symbols list
       const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
 
-      // Delete symbols that are no longer available on exchange
-      const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols('mexc', exchangeSymbols);
-      if (deletedCount > 0) {
-        this.logger.info(`Deleted ${deletedCount} delisted/unavailable MEXC symbols from database (contract API).`);
-      }
+      // CRITICAL FIX: Use helper to sync delisted symbols (query BEFORE delete)
+      // This prevents deleting symbols that have open positions
+      await this.syncDelistedSymbols('mexc', exchangeSymbols);
 
       await this.symbolFilterDAO.bulkUpsert(filtersToSave);
       this.logger.info(`Successfully updated ${filtersToSave.length} MEXC symbol filters from contract API.`);

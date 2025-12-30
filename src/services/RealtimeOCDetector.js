@@ -160,7 +160,10 @@ export class RealtimeOCDetector {
     const ex = (exchange || '').toLowerCase();
     const raw = String(symbol || '').toUpperCase().replace(/[\/:_]/g, '');
     const base = raw.endsWith('USDT') ? raw.slice(0, -4) : raw;
-    if (ex === 'mexc' || ex === 'gate') return `${base}/USDT:USDT`;
+    // MEXC swap uses simple format: BASE/USDT (not BASE/USDT:USDT)
+    // The :USDT suffix is for perpetual futures, but MEXC swap uses different format
+    if (ex === 'mexc') return `${base}/USDT`;
+    if (ex === 'gate') return `${base}/USDT:USDT`;
     if (ex === 'binance') return `${base}/USDT`;
     return `${base}/USDT`;
   }
@@ -592,10 +595,21 @@ export class RealtimeOCDetector {
         timestamp: new Date().toISOString()
       };
       
-      logger.warn(
-        `[RealtimeOCDetector] ❌ Failed to fetch REST OPEN for ${ex.toUpperCase()} ${sym} ${interval}: ${result.error.message || 'Unknown error'}`,
-        errorInfo
-      );
+      // Don't log warning for "does not have market symbol" - this is normal for symbols that don't exist on the exchange
+      const errorMsg = result.error.message || String(result.error);
+      const isSymbolNotFound = errorMsg.includes('does not have market symbol') || 
+                              errorMsg.includes('symbol') && errorMsg.includes('not found');
+      
+      if (isSymbolNotFound) {
+        logger.debug(
+          `[RealtimeOCDetector] Symbol ${sym} not available on ${ex.toUpperCase()} (this is normal): ${errorMsg}`
+        );
+      } else {
+        logger.warn(
+          `[RealtimeOCDetector] ❌ Failed to fetch REST OPEN for ${ex.toUpperCase()} ${sym} ${interval}: ${errorMsg}`,
+          errorInfo
+        );
+      }
       
       // Apply safe fallback if within window
       const elapsedInBucket = timestamp - bucketStart;

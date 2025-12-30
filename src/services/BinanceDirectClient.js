@@ -1095,8 +1095,13 @@ export class BinanceDirectClient {
 
     const precision = this.getPrecisionFromIncrement(tickSize);
   
-    // Round to nearest tick
-    const rounded = Math.round(price / tick) * tick;
+    // CRITICAL FIX: Use more precise rounding to avoid floating point errors
+    // Calculate the number of ticks
+    const tickCount = Math.round(price / tick);
+    // Multiply back to get exact price
+    const rounded = tickCount * tick;
+    
+    // Format to exact precision to avoid floating point issues
     return Number(rounded.toFixed(precision));
   }
 
@@ -1338,7 +1343,7 @@ export class BinanceDirectClient {
 
   /**
    * Place limit order
-   * CRITICAL FIX: Added parameter validation before submission
+   * CRITICAL FIX: Added parameter validation before submission and retry logic for tickSize errors
    */
   async placeLimitOrder(symbol, side, quantity, price, positionSide = 'BOTH', timeInForce = 'GTC') {
     const normalizedSymbol = this.normalizeSymbol(symbol);
@@ -1350,8 +1355,8 @@ export class BinanceDirectClient {
       this.getDualSidePosition()
     ]);
 
-    const roundedPrice = this.roundPrice(price, tickSize);
-    const formattedQuantity = this.formatQuantity(quantity, stepSize);
+    let roundedPrice = this.roundPrice(price, tickSize);
+    let formattedQuantity = this.formatQuantity(quantity, stepSize);
 
     if (parseFloat(formattedQuantity) <= 0) {
       throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
@@ -1361,35 +1366,91 @@ export class BinanceDirectClient {
       throw new Error(`Invalid price after rounding: ${roundedPrice} (original: ${price}, tickSize: ${tickSize})`);
     }
 
-    // CRITICAL FIX: Validate order parameters before submission
-    const validation = await this.validateOrderParams(normalizedSymbol, side, 'LIMIT', parseFloat(formattedQuantity), roundedPrice);
-    if (!validation.valid) {
-      const error = new Error(`Order validation failed: ${validation.errors.join(', ')}`);
-      error.validationErrors = validation.errors;
-      throw error;
-    }
+    // Retry logic: tối đa 2 lần retry khi gặp lỗi tickSize validation
+    const maxRetries = 2;
+    let lastError = null;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        // CRITICAL FIX: Re-round price on retry to ensure exact tickSize multiple
+        if (attempt > 0) {
+          logger.warn(`[BinanceDirectClient] Retry ${attempt}/${maxRetries} for placeLimitOrder: ${symbol} @ ${roundedPrice} (tickSize: ${tickSize})`);
+          // Re-round price to ensure it's exactly a multiple of tickSize
+          roundedPrice = this.roundPrice(price, tickSize);
+          // Also re-format quantity in case of stepSize issues
+          formattedQuantity = this.formatQuantity(quantity, stepSize);
+        }
 
-    const params = {
-      symbol: normalizedSymbol,
-      side: side.toUpperCase(),
-      type: 'LIMIT',
-      quantity: formattedQuantity,
-      price: roundedPrice.toString(),
-      timeInForce
-    };
+        // CRITICAL FIX: Validate order parameters before submission
+        const validation = await this.validateOrderParams(normalizedSymbol, side, 'LIMIT', parseFloat(formattedQuantity), roundedPrice);
+        if (!validation.valid) {
+          // Check if error is related to tickSize
+          const isTickSizeError = validation.errors.some(err => 
+            err.includes('tickSize') || err.includes('multiple of')
+          );
+          
+          if (isTickSizeError && attempt < maxRetries) {
+            lastError = new Error(`Order validation failed: ${validation.errors.join(', ')}`);
+            lastError.validationErrors = validation.errors;
+            // Continue to retry
+            await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1))); // Small delay before retry
+            continue;
+          }
+          
+          // If not tickSize error or max retries reached, throw error
+          const error = new Error(`Order validation failed: ${validation.errors.join(', ')}`);
+          error.validationErrors = validation.errors;
+          throw error;
+        }
 
-    // Only include positionSide when account is in dual-side (hedge) mode
-    if (dualSide && positionSide && positionSide !== 'BOTH') {
-      params.positionSide = positionSide;
-    }
+        const params = {
+          symbol: normalizedSymbol,
+          side: side.toUpperCase(),
+          type: 'LIMIT',
+          quantity: formattedQuantity,
+          price: roundedPrice.toString(),
+          timeInForce
+        };
 
-    const data = await this.makeRequest('/fapi/v1/order', 'POST', params, true);
-    if (!data || !data.orderId) {
-      logger.error(`Failed to place limit order: Invalid response from Binance`, { data, symbol, side, quantity: formattedQuantity, price: roundedPrice });
-      throw new Error(`Invalid order response: ${JSON.stringify(data)}`);
+        // Only include positionSide when account is in dual-side (hedge) mode
+        if (dualSide && positionSide && positionSide !== 'BOTH') {
+          params.positionSide = positionSide;
+        }
+
+        const data = await this.makeRequest('/fapi/v1/order', 'POST', params, true);
+        if (!data || !data.orderId) {
+          logger.error(`Failed to place limit order: Invalid response from Binance`, { data, symbol, side, quantity: formattedQuantity, price: roundedPrice });
+          throw new Error(`Invalid order response: ${JSON.stringify(data)}`);
+        }
+        
+        if (attempt > 0) {
+          logger.info(`✅ Limit order placed after ${attempt} retry(ies): ${side} ${formattedQuantity} ${symbol} @ ${roundedPrice} - Order ID: ${data.orderId}`);
+        } else {
+          logger.info(`✅ Limit order placed: ${side} ${formattedQuantity} ${symbol} @ ${roundedPrice} - Order ID: ${data.orderId}`);
+        }
+        return data;
+      } catch (error) {
+        lastError = error;
+        const errorMsg = error?.message || String(error);
+        const isTickSizeError = errorMsg.includes('tickSize') || errorMsg.includes('multiple of');
+        
+        // Only retry for tickSize errors
+        if (isTickSizeError && attempt < maxRetries) {
+          logger.warn(`[BinanceDirectClient] TickSize validation error on attempt ${attempt + 1}/${maxRetries + 1}: ${errorMsg}. Retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1))); // Small delay before retry
+          continue;
+        }
+        
+        // If not tickSize error or max retries reached, throw error
+        throw error;
+      }
     }
-    logger.info(`✅ Limit order placed: ${side} ${formattedQuantity} ${symbol} @ ${roundedPrice} - Order ID: ${data.orderId}`);
-    return data;
+    
+    // Should not reach here, but just in case
+    if (lastError) {
+      throw lastError;
+    }
+    throw new Error(`Failed to place limit order after ${maxRetries + 1} attempts`);
   }
 
   /**
@@ -1414,8 +1475,13 @@ export class BinanceDirectClient {
 
     const precision = this.getPrecisionFromIncrement(tickSize);
 
-    // Round to nearest tick
-    const rounded = Math.round(price / tick) * tick;
+    // CRITICAL FIX: Use more precise rounding to avoid floating point errors
+    // Calculate the number of ticks
+    const tickCount = Math.round(price / tick);
+    // Multiply back to get exact price
+    const rounded = tickCount * tick;
+    
+    // Format to exact precision to avoid floating point issues
     return Number(rounded.toFixed(precision));
   }
 

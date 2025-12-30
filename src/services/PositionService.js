@@ -538,7 +538,7 @@ export class PositionService {
       // CRITICAL FIX: Use soft lock to prevent race condition with PositionSync
       let lockAcquired = false;
       try {
-        const { pool } = await import('../config/database.js');
+        const pool = (await import('../config/database.js')).default;
         // Try to acquire lock before updating
         const [lockResult] = await pool.execute(
           `UPDATE positions 
@@ -583,7 +583,7 @@ export class PositionService {
         // Always release lock if acquired
         if (lockAcquired) {
           try {
-            const { pool } = await import('../config/database.js');
+            const pool = (await import('../config/database.js')).default;
             await pool.execute(
               `UPDATE positions SET is_processing = 0 WHERE id = ?`,
               [position.id]

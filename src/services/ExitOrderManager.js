@@ -50,15 +50,15 @@ export class ExitOrderManager {
       // LONG: TP must be ABOVE entry (profit zone)
       // exit > entry → TAKE_PROFIT_MARKET (profit zone)
       // exit <= entry → STOP_MARKET (loss/breakeven zone)
-      return exit > entry ? 'TAKE_PROFIT' : 'STOP';
+      return exit > entry ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
     }
     
     // SHORT: TP must be BELOW entry (profit zone)
-    // exit < entry → TAKE_PROFIT (profit zone)
-    // exit >= entry → STOP (loss/breakeven zone)
+    // exit < entry → TAKE_PROFIT_MARKET (profit zone)
+    // exit >= entry → STOP_MARKET (loss/breakeven zone)
     // CRITICAL: If TP crosses entry (exit >= entry), it's no longer a profit target
     // This can happen with trailing TP that moves towards entry
-    return exit < entry ? 'TAKE_PROFIT' : 'STOP';
+    return exit < entry ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
   }
 
   _isValidStopVsMarket(type, side, stopPrice, currentPrice) {
@@ -68,17 +68,17 @@ export class ExitOrderManager {
 
     if (side === 'long') {
       // LONG closes with SELL
-      // TAKE_PROFIT: stopPrice must be ABOVE current price
-      // STOP:        stopPrice must be BELOW current price
-      if (type === 'TAKE_PROFIT') return stop > cur;
-      return stop < cur; // STOP
+      // TAKE_PROFIT_MARKET: stopPrice must be ABOVE current price
+      // STOP_MARKET:        stopPrice must be BELOW current price
+      if (type === 'TAKE_PROFIT_MARKET') return stop > cur;
+      return stop < cur; // STOP_MARKET
     }
 
     // SHORT closes with BUY
-    // TAKE_PROFIT: stopPrice must be BELOW current price
-    // STOP:        stopPrice must be ABOVE current price
-    if (type === 'TAKE_PROFIT') return stop < cur;
-    return stop > cur; // STOP
+    // TAKE_PROFIT_MARKET: stopPrice must be BELOW current price
+    // STOP_MARKET:        stopPrice must be ABOVE current price
+    if (type === 'TAKE_PROFIT_MARKET') return stop < cur;
+    return stop > cur; // STOP_MARKET
   }
 
   _nudgeStopPrice(type, side, currentPrice) {
@@ -88,9 +88,9 @@ export class ExitOrderManager {
 
     // push stop to the nearest valid side of market
     if (side === 'long') {
-      return type === 'TAKE_PROFIT' ? cur * (1 + pct) : cur * (1 - pct);
+      return type === 'TAKE_PROFIT_MARKET' ? cur * (1 + pct) : cur * (1 - pct);
     }
-    return type === 'TAKE_PROFIT' ? cur * (1 - pct) : cur * (1 + pct);
+    return type === 'TAKE_PROFIT_MARKET' ? cur * (1 - pct) : cur * (1 + pct);
   }
 
   async placeOrReplaceExitOrder(position, desiredExitPrice) {
