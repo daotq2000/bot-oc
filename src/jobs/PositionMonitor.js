@@ -92,6 +92,12 @@ export class PositionMonitor {
       // Update position (checks TP/SL and updates dynamic SL)
       const updated = await positionService.updatePosition(position);
 
+      // positionService.updatePosition() may return null/undefined on failure (e.g., network timeout)
+      if (!updated) {
+        logger.warn(`Position ${position.id}: updatePosition returned null/undefined (skipping status check)`);
+        return;
+      }
+
       // Notification is now handled within PositionService.closePosition to ensure correct PNL
       if (updated.status === 'closed' && updated.close_reason) {
         logger.info(`Position ${position.id} was closed with reason: ${updated.close_reason}. Notification handled by PositionService.`);

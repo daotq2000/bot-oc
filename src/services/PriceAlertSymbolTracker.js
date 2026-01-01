@@ -146,7 +146,7 @@ export class PriceAlertSymbolTracker {
                 logger.info(`[PriceAlertSymbolTracker] Config ${config.id} (${exchange}): Tracking 0 symbols (no symbols in config, fallback disabled)`);
             }
           } catch (e) {
-            logger.error(`[PriceAlertSymbolTracker] Config ${config.id} (${exchange}): Failed to load symbols from symbol_filters: ${e?.message || e}`);
+            logger.error(`[PriceAlertSymbolTracker] Config ${config.id} (${exchange}): Failed to load symbols from symbol_filters:`, { message: e?.message, stack: e?.stack });
               logger.info(`[PriceAlertSymbolTracker] Config ${config.id} (${exchange}): Tracking ${exchangeSymbols.size} unique symbols (fallback failed)`);
           }
         }
@@ -166,7 +166,7 @@ export class PriceAlertSymbolTracker {
 
       return this.trackingSymbols;
     } catch (error) {
-      logger.error('[PriceAlertSymbolTracker] Refresh failed:', error?.message || error);
+      logger.error('[PriceAlertSymbolTracker] Refresh failed:', { message: error?.message, stack: error?.stack });
         // Return existing tracking symbols on error (cache preserved)
       return this.trackingSymbols;
     } finally {
@@ -190,7 +190,7 @@ export class PriceAlertSymbolTracker {
     if (autoRefresh && this.needsRefresh()) {
       // Trigger refresh in background (non-blocking)
       this.refresh().catch(err => {
-        logger.error('[PriceAlertSymbolTracker] Auto refresh failed in getSymbolsForExchange:', err?.message || err);
+        logger.error('[PriceAlertSymbolTracker] Auto refresh failed in getSymbolsForExchange:', { message: err?.message, stack: err?.stack });
       });
     }
 
@@ -212,7 +212,7 @@ export class PriceAlertSymbolTracker {
     if (autoRefresh && this.needsRefresh()) {
       // Trigger refresh in background (non-blocking)
       this.refresh().catch(err => {
-        logger.error('[PriceAlertSymbolTracker] Auto refresh failed in getAllSymbols:', err?.message || err);
+        logger.error('[PriceAlertSymbolTracker] Auto refresh failed in getAllSymbols:', { message: err?.message, stack: err?.stack });
       });
     }
 
@@ -236,7 +236,7 @@ export class PriceAlertSymbolTracker {
     if (autoRefresh && this.needsRefresh()) {
       // Trigger refresh in background (non-blocking)
       this.refresh().catch(err => {
-        logger.error('[PriceAlertSymbolTracker] Auto refresh failed in isTracked:', err?.message || err);
+        logger.error('[PriceAlertSymbolTracker] Auto refresh failed in isTracked:', { message: err?.message, stack: err?.stack });
       });
     }
 

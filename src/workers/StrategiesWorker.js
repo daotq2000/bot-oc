@@ -90,7 +90,7 @@ export class StrategiesWorker {
       const checkInterval = configService.getNumber('STRATEGIES_CHECK_INTERVAL_MS', 30000);
       this.checkInterval = setInterval(() => {
         this.checkAndSubscribe().catch(error => {
-          logger.error('[StrategiesWorker] Failed to check strategies:', error?.message || error);
+          logger.error('[StrategiesWorker] Failed to check strategies:', { message: error?.message, stack: error?.stack });
         });
       }, checkInterval);
 
@@ -138,7 +138,7 @@ export class StrategiesWorker {
         }
       }
     } catch (error) {
-      logger.error('[StrategiesWorker] Error checking strategies:', error?.message || error);
+      logger.error('[StrategiesWorker] Error checking strategies:', { message: error?.message, stack: error?.stack });
     }
   }
 

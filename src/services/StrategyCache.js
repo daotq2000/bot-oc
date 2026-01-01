@@ -171,7 +171,7 @@ export class StrategyCache {
 
       return this.cache;
     } catch (error) {
-      logger.error('[StrategyCache] Failed to refresh cache:', error?.message || error);
+      logger.error('[StrategyCache] Failed to refresh cache:', { message: error?.message, stack: error?.stack });
         // Return existing cache on error (cache is not cleared)
       return this.cache;
     } finally {
@@ -196,7 +196,7 @@ export class StrategyCache {
     if (autoRefresh && this.needsRefresh()) {
       // Trigger refresh in background (non-blocking)
       this.refresh().catch(err => {
-        logger.error('[StrategyCache] Auto refresh failed in getStrategies:', err?.message || err);
+        logger.error('[StrategyCache] Auto refresh failed in getStrategies:', { message: err?.message, stack: err?.stack });
       });
     }
 
