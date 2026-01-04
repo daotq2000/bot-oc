@@ -89,11 +89,31 @@ class OrderStatusCache {
       updatedAt: Date.now()
     });
 
-    // Log important status changes (FILLED orders) at info level for debugging
+    // Log important status changes with detailed information
     if (normalizedStatus === 'closed') {
-      logger.info(`[OrderStatusCache] ✅ Order ${orderId} (${exchange}) FILLED: filled=${filled}, avgPrice=${avgPrice || 'N/A'}, symbol=${symbol || 'N/A'}`);
+      logger.info(
+        `[OrderStatusCache] ✅ Order FILLED | ` +
+        `orderId=${orderId} | exchange=${exchange} | ` +
+        `filled=${filled} | avgPrice=${avgPrice || 'N/A'} | ` +
+        `symbol=${symbol || 'N/A'} | ` +
+        `cacheKey=${cacheKey}`
+      );
+    } else if (normalizedStatus === 'canceled') {
+      logger.info(
+        `[OrderStatusCache] ❌ Order CANCELED | ` +
+        `orderId=${orderId} | exchange=${exchange} | ` +
+        `status=${normalizedStatus} | filled=${filled} | ` +
+        `symbol=${symbol || 'N/A'} | ` +
+        `cacheKey=${cacheKey}`
+      );
     } else {
-      logger.debug(`[OrderStatusCache] Updated order ${orderId} (${exchange}): status=${normalizedStatus}, filled=${filled}, avgPrice=${avgPrice}`);
+      logger.debug(
+        `[OrderStatusCache] Updated order | ` +
+        `orderId=${orderId} | exchange=${exchange} | ` +
+        `status=${normalizedStatus} | filled=${filled} | ` +
+        `avgPrice=${avgPrice || 'N/A'} | ` +
+        `symbol=${symbol || 'N/A'}`
+      );
     }
   }
 

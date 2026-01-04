@@ -280,7 +280,11 @@ async function start() {
           priceAlertWorker.start();
           logger.info('✅ Price Alert Worker started successfully');
         } catch (error) {
-          logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
+          const errorMessage = error?.message || String(error) || 'Unknown error';
+          logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', errorMessage);
+          if (error?.stack) {
+            logger.error('Stack trace:', error.stack);
+          }
           logger.error('Price Alert system is critical - application will continue but alerts may not work');
         }
       }, 3000); // Delay 3 seconds
@@ -304,7 +308,11 @@ async function start() {
         // Strategies worker will auto-start when active strategies are detected
         logger.info('✅ Strategies Worker initialized (will start when active strategies are detected)');
       } catch (error) {
-        logger.error('❌ Failed to initialize Strategies Worker:', error?.message || error);
+        const errorMessage = error?.message || String(error) || 'Unknown error';
+        logger.error('❌ Failed to initialize Strategies Worker:', errorMessage);
+        if (error?.stack) {
+          logger.error('Stack trace:', error.stack);
+        }
         logger.error('Strategies system failed - Price Alert will continue to work independently');
       }
     }, 5000); // Delay 5 seconds
@@ -330,7 +338,11 @@ async function start() {
         positionSyncJob.start();
         logger.info('✅ Position Sync Job started successfully');
       } catch (error) {
-        logger.error('❌ Failed to start Position Sync Job:', error?.message || error);
+        const errorMessage = error?.message || String(error) || 'Unknown error';
+        logger.error('❌ Failed to start Position Sync Job:', errorMessage);
+        if (error?.stack) {
+          logger.error('Stack trace:', error.stack);
+        }
         logger.error('Position sync will not run - positions may become inconsistent');
       }
     }, 8000); // Delay 8 seconds
@@ -344,7 +356,11 @@ async function start() {
       memoryMonitor.start();
       logger.info('✅ Memory Monitor started successfully');
     } catch (error) {
-      logger.error('❌ Failed to start Memory Monitor:', error?.message || error);
+      const errorMessage = error?.message || String(error) || 'Unknown error';
+      logger.error('❌ Failed to start Memory Monitor:', errorMessage);
+      if (error?.stack) {
+        logger.error('Stack trace:', error.stack);
+      }
       // Don't exit - memory monitoring is optional
     }
 
@@ -364,7 +380,8 @@ async function start() {
         try {
           priceAlertWorker.stop();
         } catch (error) {
-          logger.error('Error stopping Price Alert Worker:', error?.message || error);
+          const errorMessage = error?.message || String(error) || 'Unknown error';
+          logger.error('Error stopping Price Alert Worker:', errorMessage);
         }
       }
       
@@ -373,7 +390,8 @@ async function start() {
         try {
           strategiesWorker.stop();
         } catch (error) {
-          logger.error('Error stopping Strategies Worker:', error?.message || error);
+          const errorMessage = error?.message || String(error) || 'Unknown error';
+          logger.error('Error stopping Strategies Worker:', errorMessage);
         }
       }
       
@@ -382,7 +400,8 @@ async function start() {
         try {
           positionSyncJob.stop();
         } catch (error) {
-          logger.error('Error stopping Position Sync Job:', error?.message || error);
+          const errorMessage = error?.message || String(error) || 'Unknown error';
+          logger.error('Error stopping Position Sync Job:', errorMessage);
         }
       }
       
@@ -427,7 +446,8 @@ async function start() {
         try {
           priceAlertWorker.stop();
         } catch (error) {
-          logger.error('Error stopping Price Alert Worker:', error?.message || error);
+          const errorMessage = error?.message || String(error) || 'Unknown error';
+          logger.error('Error stopping Price Alert Worker:', errorMessage);
         }
       }
       
@@ -436,7 +456,8 @@ async function start() {
         try {
           strategiesWorker.stop();
         } catch (error) {
-          logger.error('Error stopping Strategies Worker:', error?.message || error);
+          const errorMessage = error?.message || String(error) || 'Unknown error';
+          logger.error('Error stopping Strategies Worker:', errorMessage);
         }
       }
       
@@ -445,7 +466,8 @@ async function start() {
         try {
           positionSyncJob.stop();
         } catch (error) {
-          logger.error('Error stopping Position Sync Job:', error?.message || error);
+          const errorMessage = error?.message || String(error) || 'Unknown error';
+          logger.error('Error stopping Position Sync Job:', errorMessage);
         }
       }
       

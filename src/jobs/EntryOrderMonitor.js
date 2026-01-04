@@ -114,11 +114,39 @@ export class EntryOrderMonitor {
       const avgPrice = avgPriceStr ? Number(avgPriceStr) : NaN;
       const filledQtyStr = o.z ?? o.cumQty ?? o.filledQty ?? null;
       const filledQty = filledQtyStr ? Number(filledQtyStr) : NaN;
+      
+      // Extract additional order details for logging
+      const orderType = (o.o ?? o.orderType) || 'UNKNOWN'; // LIMIT, MARKET, STOP_MARKET, etc.
+      const side = (o.S ?? o.side) || 'UNKNOWN'; // BUY, SELL
+      const price = o.p ?? o.price ?? null; // Limit price
+      const quantity = o.q ?? o.origQty ?? o.quantity ?? null; // Original quantity
+      const timeInForce = o.f ?? o.timeInForce ?? null; // GTC, IOC, FOK
+      const positionSide = o.ps ?? o.positionSide ?? null; // LONG, SHORT, BOTH
+      const reduceOnly = o.R ?? o.reduceOnly ?? false; // true for TP/SL orders
+      const closePosition = o.cp ?? o.closePosition ?? false; // true for close position orders
+      const stopPrice = o.sp ?? o.stopPrice ?? null; // Stop price for STOP orders
+      const clientOrderId = o.c ?? o.clientOrderId ?? null; // Client order ID
+      const updateTime = o.T ?? o.updateTime ?? Date.now(); // Event time
 
       if (!orderId || !symbol) {
         logger.debug(`[EntryOrderMonitor] Missing orderId or symbol in ORDER_TRADE_UPDATE event: orderId=${orderId}, symbol=${symbol}`);
         return;
       }
+      
+      // ✅ NEW: Log full ORDER_TRADE_UPDATE event details
+      logger.info(
+        `[ORDER_TRADE_UPDATE] 📋 Order Update Received | ` +
+        `orderId=${orderId} | symbol=${symbol} | status=${status} | ` +
+        `type=${orderType} | side=${side} | ` +
+        `filled=${filledQty} | avgPrice=${avgPrice || 'N/A'} | ` +
+        `price=${price || 'N/A'} | quantity=${quantity || 'N/A'} | ` +
+        `reduceOnly=${reduceOnly} | closePosition=${closePosition} | ` +
+        `positionSide=${positionSide || 'N/A'} | ` +
+        `stopPrice=${stopPrice || 'N/A'} | ` +
+        `clientOrderId=${clientOrderId || 'N/A'} | ` +
+        `botId=${botId} | ` +
+        `rawEvent=${JSON.stringify(evt)}`
+      );
 
       // CRITICAL: Update order status cache for ALL orders (entry, TP, SL)
       // This enables PositionService to detect TP/SL fills without REST API calls
@@ -145,14 +173,34 @@ export class EntryOrderMonitor {
       if (entry) {
         if (isFilled) {
           // Confirmed filled → create Position and mark entry_orders as filled
-          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) FILLED via WebSocket. Creating Position...`);
+          logger.info(
+            `[ORDER_TRADE_UPDATE] ✅ CREATE POSITION | ` +
+            `Entry order ${entry.id} (orderId=${orderId}, ${symbol}) FILLED via WebSocket | ` +
+            `filled=${filledQty} | avgPrice=${avgPrice || 'N/A'} | ` +
+            `Creating Position...`
+          );
           await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
         } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
           // Cancelled/expired without fill → mark as canceled
           await EntryOrder.markCanceled(entry.id, status === 'EXPIRED' ? 'expired' : 'canceled');
-          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) ${status} via WebSocket.`);
+          logger.info(
+            `[ORDER_TRADE_UPDATE] ❌ CANCEL ORDER | ` +
+            `Entry order ${entry.id} (orderId=${orderId}, ${symbol}) ${status} via WebSocket | ` +
+            `reason=${status === 'EXPIRED' ? 'expired' : 'canceled'} | ` +
+            `filled=${filledQty}`
+          );
         } else if (status === 'PARTIALLY_FILLED') {
-          logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) PARTIALLY_FILLED: ${filledQty}`);
+          logger.info(
+            `[ORDER_TRADE_UPDATE] ⚠️ PARTIAL FILL | ` +
+            `Entry order ${entry.id} (orderId=${orderId}, ${symbol}) PARTIALLY_FILLED | ` +
+            `filled=${filledQty} | avgPrice=${avgPrice || 'N/A'}`
+          );
+        } else if (status === 'NEW') {
+          logger.info(
+            `[ORDER_TRADE_UPDATE] 📝 CREATE ORDER | ` +
+            `Entry order ${entry.id} (orderId=${orderId}, ${symbol}) NEW via WebSocket | ` +
+            `type=${orderType} | side=${side} | price=${price || 'N/A'} | quantity=${quantity || 'N/A'}`
+          );
         }
         return; // Entry order handled
       }
@@ -162,13 +210,33 @@ export class EntryOrderMonitor {
       // This avoids O(N) DB scan on every TP/SL fill event (performance optimization)
       if (isFilled) {
         logger.info(
-          `[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) FILLED via WebSocket. ` +
+          `[ORDER_TRADE_UPDATE] 🎯 CLOSE POSITION | ` +
+          `TP/SL order ${orderId} (${symbol}) FILLED via WebSocket | ` +
+          `filled=${filledQty} | avgPrice=${avgPrice || 'N/A'} | ` +
+          `reduceOnly=${reduceOnly} | closePosition=${closePosition} | ` +
           `Cache updated. PositionService will detect on next cycle.`
         );
       } else if (isCanceled) {
-        logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) ${status} via WebSocket. Cache updated.`);
+        logger.info(
+          `[ORDER_TRADE_UPDATE] ❌ CANCEL TP/SL | ` +
+          `TP/SL order ${orderId} (${symbol}) ${status} via WebSocket | ` +
+          `reason=${status} | filled=${filledQty} | ` +
+          `Cache updated.`
+        );
       } else if (status === 'PARTIALLY_FILLED') {
-        logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) PARTIALLY_FILLED: ${filledQty}`);
+        logger.info(
+          `[ORDER_TRADE_UPDATE] ⚠️ PARTIAL FILL TP/SL | ` +
+          `TP/SL order ${orderId} (${symbol}) PARTIALLY_FILLED | ` +
+          `filled=${filledQty} | avgPrice=${avgPrice || 'N/A'}`
+        );
+      } else if (status === 'NEW') {
+        logger.info(
+          `[ORDER_TRADE_UPDATE] 📝 CREATE TP/SL | ` +
+          `TP/SL order ${orderId} (${symbol}) NEW via WebSocket | ` +
+          `type=${orderType} | side=${side} | ` +
+          `stopPrice=${stopPrice || price || 'N/A'} | ` +
+          `reduceOnly=${reduceOnly} | closePosition=${closePosition}`
+        );
       }
     } catch (error) {
       logger.error(

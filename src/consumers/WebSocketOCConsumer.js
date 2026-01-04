@@ -4,6 +4,7 @@ import { OrderService } from '../services/OrderService.js';
 import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import { webSocketManager } from '../services/WebSocketManager.js';
 import { configService } from '../services/ConfigService.js';
+import { trendFilterService } from '../services/TrendFilterService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -428,6 +429,39 @@ export class WebSocketOCConsumer {
           );
           return;
         }
+      }
+
+      // FORCE EMA200 4H trend filter (fail-close)
+      try {
+        const ema200_4h = await trendFilterService.getEMA(strategy.symbol, '4h', 200);
+
+        if (ema200_4h && Number.isFinite(ema200_4h)) {
+          const pass =
+            (side === 'long' && currentPrice > ema200_4h) ||
+            (side === 'short' && currentPrice < ema200_4h);
+
+          logger.info(
+            `[EMA200-4H] strat=${strategy.id} ${strategy.symbol} side=${side} ` +
+            `price=${currentPrice} ema200_4h=${ema200_4h} pass=${pass}`
+          );
+
+          if (!pass) {
+            logger.warn(
+              `[WebSocketOCConsumer] ❌ EMA200-4H filter reject strategy ${strategy.id} ` +
+              `(${strategy.symbol}) side=${side} price=${currentPrice} ema200_4h=${ema200_4h}`
+            );
+            return;
+          }
+        } else {
+          logger.warn(
+            `[WebSocketOCConsumer] ⚠️ EMA200-4H unavailable for ${strategy.symbol}, ` +
+            `SKIP order to be safe.`
+          );
+          return;
+        }
+      } catch (e) {
+        logger.error(`[WebSocketOCConsumer] EMA200-4H filter error for ${strategy.symbol}:`, e?.message || e);
+        return;
       }
 
       logger.info(`[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ${signal.side} @ ${currentPrice}, OC=${oc.toFixed(2)}%`);

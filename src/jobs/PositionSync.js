@@ -2,6 +2,7 @@ import { Position } from '../models/Position.js';
 import { Strategy } from '../models/Strategy.js';
 import { EntryOrder } from '../models/EntryOrder.js';
 import { ExchangeService } from '../services/ExchangeService.js';
+import { PositionService } from '../services/PositionService.js';
 import { SCAN_INTERVALS } from '../config/constants.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
@@ -284,16 +285,12 @@ export class PositionSync {
             );
             
             if (lockResult.affectedRows > 0) {
-              // Lock acquired, proceed with update
+              // Lock acquired, proceed with close via PositionService
               try {
                 logger.warn(
-                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, marking as closed`
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, closing via PositionService`
                 );
-                await Position.update(dbPos.id, {
-                  status: 'closed',
-                  close_reason: 'sync_not_on_exchange',
-                  closed_at: new Date()
-                });
+                await this._closePositionProperly(dbPos, exchangeService, 'sync_not_on_exchange');
                 closedCount++;
               } finally {
                 // Always release lock in finally block
@@ -315,13 +312,9 @@ export class PositionSync {
             logger.debug(`[PositionSync] Could not acquire lock for position ${dbPos.id}: ${lockError?.message || lockError}`);
             try {
               logger.warn(
-                `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, marking as closed`
+                `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, closing via PositionService`
               );
-              await Position.update(dbPos.id, {
-                status: 'closed',
-                close_reason: 'sync_not_on_exchange',
-                closed_at: new Date()
-              });
+              await this._closePositionProperly(dbPos, exchangeService, 'sync_not_on_exchange');
               closedCount++;
             } catch (updateError) {
               logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, updateError?.message || updateError);
@@ -592,14 +585,10 @@ export class PositionSync {
           );
           
           if (lockResult.affectedRows > 0) {
-            // Lock acquired, proceed with update
+            // Lock acquired, proceed with close via PositionService
             try {
-        logger.warn(`[PositionSync] Position ${dbPos.id} is open in DB but closed on exchange, marking as closed`);
-        await Position.update(dbPos.id, {
-          status: 'closed',
-          close_reason: 'sync_exchange_closed',
-          closed_at: new Date()
-        });
+        logger.warn(`[PositionSync] Position ${dbPos.id} is open in DB but closed on exchange, closing via PositionService`);
+        await this._closePositionProperly(dbPos, exchangeService, 'sync_exchange_closed', exPos);
             } finally {
               // Always release lock in finally block
               try {
@@ -618,11 +607,7 @@ export class PositionSync {
         } catch (lockError) {
           // If is_processing column doesn't exist, proceed without lock (backward compatibility)
           logger.debug(`[PositionSync] Could not acquire lock for position ${dbPos.id}: ${lockError?.message || lockError}`);
-          await Position.update(dbPos.id, {
-            status: 'closed',
-            close_reason: 'sync_exchange_closed',
-            closed_at: new Date()
-          });
+          await this._closePositionProperly(dbPos, exchangeService, 'sync_exchange_closed', exPos);
         }
         return;
       }
@@ -702,6 +687,79 @@ export class PositionSync {
       clearInterval(this.task); // Clear setInterval timer
       this.task = null;
       logger.info('[PositionSync] Stopped sync job');
+    }
+  }
+
+  /**
+   * Close position properly via PositionService (ensures notification and proper PnL calculation)
+   * @param {Object} dbPos - Database position
+   * @param {ExchangeService} exchangeService - Exchange service instance
+   * @param {string} reason - Close reason
+   * @param {Object} exPos - Optional exchange position data (for current price)
+   */
+  async _closePositionProperly(dbPos, exchangeService, reason, exPos = null) {
+    try {
+      // Get current price from exchange position or fetch from exchange
+      let currentPrice = null;
+      if (exPos) {
+        currentPrice = parseFloat(exPos.markPrice || exPos.info?.markPrice || exPos.entryPrice || 0);
+      }
+      
+      // If no price from exPos, try to get from exchange
+      if (!currentPrice || currentPrice <= 0) {
+        try {
+          currentPrice = await exchangeService.getTickerPrice(dbPos.symbol);
+        } catch (e) {
+          logger.warn(`[PositionSync] Failed to get current price for ${dbPos.symbol}, using entry_price: ${e?.message || e}`);
+          currentPrice = parseFloat(dbPos.entry_price || 0);
+        }
+      }
+      
+      // Fallback to entry_price if still no price
+      if (!currentPrice || currentPrice <= 0) {
+        currentPrice = parseFloat(dbPos.entry_price || 0);
+        logger.warn(`[PositionSync] Using entry_price as fallback for position ${dbPos.id}: ${currentPrice}`);
+      }
+      
+      if (!currentPrice || currentPrice <= 0) {
+        logger.error(`[PositionSync] Cannot close position ${dbPos.id}: no valid price available`);
+        return;
+      }
+      
+      // Create PositionService instance for this bot
+      const bot = exchangeService.bot;
+      if (!bot) {
+        logger.error(`[PositionSync] Cannot close position ${dbPos.id}: ExchangeService has no bot`);
+        return;
+      }
+      
+      const positionService = new PositionService(bot, exchangeService);
+      
+      // Calculate PnL (PositionService will recalculate, but we need initial value)
+      const { calculatePnL } = await import('../utils/calculator.js');
+      const pnl = calculatePnL(
+        parseFloat(dbPos.entry_price || 0),
+        currentPrice,
+        parseFloat(dbPos.amount || 0),
+        dbPos.side
+      );
+      
+      // Close via PositionService (this will send notification and properly update DB)
+      await positionService.closePosition(dbPos, currentPrice, pnl, reason);
+      logger.info(`[PositionSync] ✅ Successfully closed position ${dbPos.id} via PositionService (reason: ${reason})`);
+    } catch (error) {
+      logger.error(`[PositionSync] Failed to close position ${dbPos.id} via PositionService:`, error?.message || error, error?.stack);
+      // Fallback to direct DB update if PositionService fails
+      try {
+        logger.warn(`[PositionSync] Falling back to direct DB update for position ${dbPos.id}`);
+        await Position.update(dbPos.id, {
+          status: 'closed',
+          close_reason: reason,
+          closed_at: new Date()
+        });
+      } catch (fallbackError) {
+        logger.error(`[PositionSync] Fallback DB update also failed for position ${dbPos.id}:`, fallbackError?.message || fallbackError);
+      }
     }
   }
 }

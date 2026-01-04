@@ -925,6 +925,12 @@ export class PositionService {
    */
   async sendTelegramCloseNotification(closedPosition) {
     try {
+      // CRITICAL FIX: Check if closedPosition is null or invalid
+      if (!closedPosition || !closedPosition.id) {
+        logger.warn(`[Notification] Invalid closedPosition provided to sendTelegramCloseNotification: ${closedPosition}`);
+        return;
+      }
+      
       if (!this.telegramService?.sendCloseSummaryAlert) {
         logger.warn(`[Notification] TelegramService not available, skipping close summary alert for position ${closedPosition.id}`);
         logger.warn(`[Notification] telegramService: ${!!this.telegramService}, sendCloseSummaryAlert: ${!!this.telegramService?.sendCloseSummaryAlert}`);
@@ -1144,7 +1150,12 @@ export class PositionService {
         logger.warn(`[Close Position] Failed to clean up open orders for ${position.symbol} after closing: ${e?.message || e}`);
       }
 
-      await this.sendTelegramCloseNotification(closed);
+      // CRITICAL FIX: Check if closed is null before sending notification
+      if (closed) {
+        await this.sendTelegramCloseNotification(closed);
+      } else {
+        logger.warn(`[Close Position] Position.close() returned null for position ${position.id}, skipping notification`);
+      }
 
       return closed;
     } catch (error) {

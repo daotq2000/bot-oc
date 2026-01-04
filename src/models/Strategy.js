@@ -11,7 +11,7 @@ export class Strategy {
    * @returns {Promise<Array>}
    */
   static async findAll(botId = null, activeOnly = false) {
-    let query = 'SELECT s.*, b.bot_name, b.exchange, b.is_reverse_strategy, b.max_amount_per_coin FROM strategies s';
+    let query = 'SELECT s.*, b.bot_name, b.exchange, b.is_reverse_strategy, b.max_amount_per_coin, b.max_concurrent_trades FROM strategies s';
     query += ' JOIN bots b ON s.bot_id = b.id';
     
     const conditions = [];
@@ -47,7 +47,7 @@ export class Strategy {
    */
   static async findById(id) {
     const [rows] = await pool.execute(
-      `SELECT s.*, b.bot_name, b.exchange, b.is_reverse_strategy, b.max_amount_per_coin 
+      `SELECT s.*, b.bot_name, b.exchange, b.is_reverse_strategy, b.max_amount_per_coin, b.max_concurrent_trades 
        FROM strategies s 
        JOIN bots b ON s.bot_id = b.id 
        WHERE s.id = ?`,

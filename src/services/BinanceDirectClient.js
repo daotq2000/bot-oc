@@ -1028,6 +1028,27 @@ export class BinanceDirectClient {
   }
 
   /**
+   * Get maxQty (maximum quantity) for a symbol
+   * @param {string} symbol - Trading symbol
+   * @returns {Promise<number|null>} Maximum quantity or null if not found
+   */
+  async getMaxQty(symbol) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    
+    // Try to get from cache first (if ExchangeInfoService supports it)
+    // Note: ExchangeInfoService may not cache maxQty, so we'll fallback to API
+    
+    // Fallback to REST API
+    logger.debug(`[Binance] getMaxQty for ${normalizedSymbol}, fetching from REST API`);
+    const exchangeInfo = await this.getTradingExchangeSymbol(symbol);
+    if (!exchangeInfo || !exchangeInfo.filters) return null;
+    const lotSizeFilter = exchangeInfo.filters.find(f => f.filterType === 'LOT_SIZE');
+    const val = lotSizeFilter?.maxQty;
+    const num = parseFloat(val);
+    return Number.isFinite(num) && num > 0 ? num : null;
+  }
+
+  /**
    * Get maximum leverage for a symbol
    * @param {string} symbol - Trading symbol
    * @returns {Promise<number|null>} Maximum leverage or null if not found

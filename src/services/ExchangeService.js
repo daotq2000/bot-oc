@@ -362,6 +362,18 @@ export class ExchangeService {
         }
         const notional = Number(amount); // USDT-margined futures: price * qty = amount
 
+        // CRITICAL FIX: Validate maxQty BEFORE formatting to prevent "Quantity greater than max quantity" error
+        const maxQty = await this.binanceDirectClient.getMaxQty(normalizedSymbol);
+        if (maxQty !== null && Number.isFinite(maxQty) && quantity > maxQty) {
+          // Calculate maximum allowed amount based on maxQty
+          const maxAllowedAmount = maxQty * Number(currentPrice);
+          const errorMsg = `Quantity ${quantity.toFixed(8)} exceeds maximum ${maxQty} for ${normalizedSymbol}. ` +
+            `Amount ${amount} USDT would require ${quantity.toFixed(8)} contracts, but max is ${maxQty}. ` +
+            `Maximum allowed amount: ${maxAllowedAmount.toFixed(2)} USDT.`;
+          logger.error(`[OrderService] ${errorMsg}`);
+          throw new Error(errorMsg);
+        }
+
         // Configure margin type and leverage per symbol (cached to avoid redundant API calls)
         try {
           const { configService } = await import('./ConfigService.js');

@@ -3,6 +3,7 @@ import logger from '../utils/logger.js';
 import ccxt from 'ccxt';
 import { configService } from './ConfigService.js';
 import { LRUCache } from '../utils/LRUCache.js';
+import { marketRegimeService } from './MarketRegimeService.js';
 
 /**
  * RealtimeOCDetector
@@ -67,6 +68,9 @@ export class RealtimeOCDetector {
     this._ocMatchStateCache = new LRUCache(5000);
     this.ocReverseRetraceRatio = Number(configService.getNumber('OC_REVERSE_RETRACE_RATIO', 0.2)); // 20% retrace from peak
     this.ocReverseStallMs = Number(configService.getNumber('OC_REVERSE_STALL_MS', 4000)); // 4s without new peak
+    
+    // ✅ NEW: Market regime service for risk management
+    this.regimeEnabled = configService.getBoolean('OC_REGIME_ENABLED', true); // Enable by default
     
     // Alert functionality (optional, merged from OcAlertScanner)
     this.telegramService = null;
@@ -867,7 +871,8 @@ export class RealtimeOCDetector {
             normalizedSymbol,
             openPricesMap.get(strategy.interval || '1m'),
             currentPrice,
-            timestamp
+            timestamp,
+            normalizedExchange // Pass exchange for regime detection
           ))
         );
         
@@ -946,13 +951,14 @@ export class RealtimeOCDetector {
    * @param {number|null} openPrice - Open price (null nếu không có)
    * @param {number} currentPrice - Current price
    * @param {number} timestamp - Timestamp
+   * @param {string} exchange - Exchange name (for regime detection)
    * @returns {Object|null} Match object hoặc null
    */
-  _checkStrategy(strategy, symbol, openPrice, currentPrice, timestamp) {
+  _checkStrategy(strategy, symbol, openPrice, currentPrice, timestamp, exchange = 'mexc') {
     if (!openPrice || !Number.isFinite(openPrice) || openPrice <= 0) return null;
 
     const interval = strategy.interval || '1m';
-    const ocThreshold = Number(strategy.oc || 0);
+    let ocThreshold = Number(strategy.oc || 0);
     if (ocThreshold <= 0) return null;
 
     const oc = this.calculateOC(openPrice, currentPrice);
@@ -961,6 +967,69 @@ export class RealtimeOCDetector {
 
     // Identify reverse flag (from bot)
     const isReverse = Boolean(strategy.bot?.is_reverse_strategy);
+    
+    // ✅ NEW: Market regime risk management
+    let regimeParams = null;
+    if (this.regimeEnabled) {
+      try {
+        // Get regime (pass ocThreshold for scaling)
+        const regime = marketRegimeService.getRegime(exchange, symbol, interval, absOC, timestamp, ocThreshold);
+        
+        // Check hard OC cap (fail-safe rule)
+        if (absOC >= marketRegimeService.hardOCCap) {
+          const botName = strategy.bot?.name || strategy.bot_name || 'N/A';
+          logger.warn(
+            `[RealtimeOCDetector] 🚨 HARD OC CAP triggered: ${symbol} | OC=${absOC.toFixed(2)}% >= ${marketRegimeService.hardOCCap}% | ` +
+            `Strategy ${strategy.id} (Bot ${strategy.bot_id}:${botName}) | ` +
+            `${isReverse ? 'Disabling reverse' : 'Reducing trend size'}`
+          );
+          
+          // Hard cap rules: disable reverse, reduce trend size
+          if (isReverse) {
+            logger.debug(`[RealtimeOCDetector] ⏭️ Strategy ${strategy.id} SKIPPED: Hard OC cap, reverse disabled`);
+            return null;
+          }
+          // For trend-follow, continue but size will be reduced by regime params
+        }
+        
+        // Check if strategy should be skipped
+        if (marketRegimeService.shouldSkipStrategy(regime, isReverse)) {
+          const botName = strategy.bot?.name || strategy.bot_name || 'N/A';
+          logger.debug(
+            `[RealtimeOCDetector] ⏭️ Strategy ${strategy.id} (Bot ${strategy.bot_id}:${botName}) ` +
+            `SKIPPED: Regime=${regime}, isReverse=${isReverse}, symbol=${symbol}`
+          );
+          return null;
+        }
+        
+        // Get regime-specific parameters (pass isReverse for size multiplier adjustment)
+        regimeParams = marketRegimeService.getRegimeParams(regime, {
+          ocThreshold,
+          retraceRatio: this.ocReverseRetraceRatio,
+          stallMs: this.ocReverseStallMs,
+          sizeMultiplier: 1.0
+        }, isReverse);
+        
+        // Adjust threshold based on regime
+        ocThreshold = regimeParams.ocThreshold;
+        
+        // Log regime detection (throttled)
+        if (!this._regimeLogCount) this._regimeLogCount = new Map();
+        const logKey = `${exchange}|${symbol}|${interval}`;
+        const lastLog = this._regimeLogCount.get(logKey) || 0;
+        if (timestamp - lastLog > 60000) { // Log every 60s per symbol
+          logger.info(
+            `[RealtimeOCDetector] 📊 Regime=${regime} for ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+            `| OC=${absOC.toFixed(2)}% | Threshold=${ocThreshold.toFixed(2)}% ` +
+            `| Strategy=${strategy.id} (isReverse=${isReverse})`
+          );
+          this._regimeLogCount.set(logKey, timestamp);
+        }
+      } catch (error) {
+        logger.debug(`[RealtimeOCDetector] Regime detection failed: ${error?.message || error}`);
+        // Continue without regime filtering (fail-safe)
+      }
+    }
 
     // Build state key per bucket
     const bucketStart = this.getBucketStart(interval, timestamp);
@@ -973,17 +1042,94 @@ export class RealtimeOCDetector {
 
     // TREND-FOLLOW (isReverse = false): fire at first cross >= threshold
     if (!isReverse) {
+      // ✅ NEW: Delay fire for NEWS_SPIKE regime
+      if (regimeParams?.delayFire && absOC >= ocThreshold) {
+        // Delay fire by delayFire ms (e.g., 2000ms for news spike)
+        const delayKey = `${stateKey}_delay`;
+        const delayState = this._ocMatchStateCache.get(delayKey);
+        if (!delayState || !delayState.scheduled) {
+          // Schedule delayed fire
+          setTimeout(() => {
+            // Re-check if still valid
+            const currentOC = this.calculateOC(openPrice, currentPrice);
+            const currentAbsOC = Math.abs(currentOC);
+            if (currentAbsOC >= ocThreshold && !st.fired) {
+              st.fired = true;
+              logger.info(
+                `[RealtimeOCDetector] ✅ Delayed fire for ${symbol} | Strategy ${strategy.id} | ` +
+                `OC=${currentAbsOC.toFixed(2)}% (after ${regimeParams.delayFire}ms delay)`
+              );
+            }
+          }, regimeParams.delayFire);
+          
+          if (!delayState) {
+            this._ocMatchStateCache.set(delayKey, { scheduled: true, timestamp });
+          } else {
+            delayState.scheduled = true;
+            delayState.timestamp = timestamp;
+          }
+        }
+        return null; // Don't fire immediately
+      }
+      
       if (!st.fired && absOC >= ocThreshold) {
+        // Apply delay fire for VOL_EXPANSION
+        if (regimeParams?.delayFire && regimeParams.delayFire > 0 && regimeParams.delayFire < 2000) {
+          // Small delay (300ms for VOL_EXPANSION) - use setTimeout
+          const delayKey = `${stateKey}_delay`;
+          const delayState = this._ocMatchStateCache.get(delayKey);
+          if (!delayState || !delayState.scheduled) {
+            setTimeout(() => {
+              if (!st.fired && absOC >= ocThreshold) {
+                st.fired = true;
+                // Lock regime after fire
+                if (this.regimeEnabled) {
+                  marketRegimeService.lockRegime(exchange, symbol, interval, Date.now());
+                }
+                logger.info(
+                  `[RealtimeOCDetector] ✅ Delayed fire for ${symbol} | Strategy ${strategy.id} | ` +
+                  `OC=${absOC.toFixed(2)}% (after ${regimeParams.delayFire}ms delay)`
+                );
+              }
+            }, regimeParams.delayFire);
+            
+            if (!delayState) {
+              this._ocMatchStateCache.set(delayKey, { scheduled: true, timestamp });
+            } else {
+              delayState.scheduled = true;
+              delayState.timestamp = timestamp;
+            }
+            return null; // Don't fire immediately
+          }
+        }
+        
         st.fired = true;
-        return { strategy, oc, absOC, direction, openPrice, currentPrice, interval, timestamp };
+        
+        // Lock regime after fire (prevent immediate flip)
+        if (this.regimeEnabled) {
+          marketRegimeService.lockRegime(exchange, symbol, interval, timestamp);
+        }
+        
+        // Add sizeMultiplier to match result for downstream use
+        return { 
+          strategy, 
+          oc, 
+          absOC, 
+          direction, 
+          openPrice, 
+          currentPrice, 
+          interval, 
+          timestamp,
+          sizeMultiplier: regimeParams?.sizeMultiplier ?? 1.0
+        };
       }
       return null;
     }
 
     // REVERSE logic (peak-hold + retracement)
     const now = timestamp;
-    const retraceRatio = this.ocReverseRetraceRatio;
-    const stallMs = this.ocReverseStallMs;
+    const retraceRatio = regimeParams?.retraceRatio ?? this.ocReverseRetraceRatio;
+    const stallMs = regimeParams?.stallMs ?? this.ocReverseStallMs;
 
     if (!st.armed) {
       if (absOC >= ocThreshold) {
@@ -1004,11 +1150,55 @@ export class RealtimeOCDetector {
 
     // retrace condition
     const retracedEnough = absOC <= st.peakAbs * (1 - retraceRatio);
-    const stalled = now - st.peakTs >= stallMs;
+    const stalled = stallMs > 0 && (now - st.peakTs >= stallMs);
 
-    if (!st.fired && (retracedEnough || stalled)) {
-      st.fired = true;
-      return { strategy, oc, absOC, direction, openPrice, currentPrice, interval, timestamp };
+    // ✅ NEW: Regime-specific fire conditions
+    if (!st.fired) {
+      if (regimeParams?.requireRetraceOnly) {
+        // Only fire on retrace, not on stall
+        if (retracedEnough) {
+          st.fired = true;
+          
+          // Lock regime after fire
+          if (this.regimeEnabled) {
+            marketRegimeService.lockRegime(exchange, symbol, interval, timestamp);
+          }
+          
+          return { 
+            strategy, 
+            oc, 
+            absOC, 
+            direction, 
+            openPrice, 
+            currentPrice, 
+            interval, 
+            timestamp,
+            sizeMultiplier: regimeParams?.sizeMultiplier ?? 1.0
+          };
+        }
+      } else {
+        // Original logic: fire on retrace OR stall
+        if (retracedEnough || stalled) {
+          st.fired = true;
+          
+          // Lock regime after fire
+          if (this.regimeEnabled) {
+            marketRegimeService.lockRegime(exchange, symbol, interval, timestamp);
+          }
+          
+          return { 
+            strategy, 
+            oc, 
+            absOC, 
+            direction, 
+            openPrice, 
+            currentPrice, 
+            interval, 
+            timestamp,
+            sizeMultiplier: regimeParams?.sizeMultiplier ?? 1.0
+          };
+        }
+      }
     }
     return null;
   }

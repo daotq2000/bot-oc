@@ -114,8 +114,15 @@ export class OrderService {
       // Central log: attempt
       await this.sendCentralLog(`Order Attempt | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} entry=${entryPrice} amt=${amount} tp=${tpPrice ?? 'n/a'} sl=${slPrice ?? 'n/a'} oc=${signal?.oc ?? 'n/a'}`);
 
+      // Ensure bot info is loaded for max_concurrent_trades check
+      if (!strategy.bot && strategy.bot_id) {
+        const { Bot } = await import('../models/Bot.js');
+        strategy.bot = await Bot.findById(strategy.bot_id);
+      }
+
       // Simple position limit check (with cache)
-      const maxPositions = strategy.bot?.max_concurrent_trades || 100;
+      // Try: strategy.bot.max_concurrent_trades -> strategy.max_concurrent_trades -> default 100
+      const maxPositions = strategy.bot?.max_concurrent_trades || strategy.max_concurrent_trades || 100;
       
       // Only check if limit is set and reasonable
       if (maxPositions > 0 && maxPositions < 10000) {
