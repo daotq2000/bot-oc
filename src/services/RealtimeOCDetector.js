@@ -923,7 +923,7 @@ export class RealtimeOCDetector {
     if (missing.length > 0) {
       const fetchPromises = missing.map(({ interval, bucketStart }) =>
         this.getAccurateOpen(exchange, symbol, interval, currentPrice, timestamp)
-          .then(open => ({ interval, open }))
+          .then(({ open }) => ({ interval, open }))
           .catch(() => ({ interval, open: null }))
       );
       
@@ -1319,7 +1319,7 @@ export class RealtimeOCDetector {
         
         for (const interval of w.intervals) {
           const bucketStart = this.getBucketStart(interval, ts);
-          const open = await this.getAccurateOpen(w.exchange, sym, interval, p, ts);
+          const { open, error: openErr } = await this.getAccurateOpen(w.exchange, sym, interval, p, ts);
           
           if (!Number.isFinite(open) || open <= 0) continue;
 
@@ -1525,7 +1525,7 @@ export class RealtimeOCDetector {
           if (!Number.isFinite(Number(currentPrice))) continue;
 
           for (const interval of intervals) {
-            const open = await this.getAccurateOpen(exchange, sym, interval, Number(currentPrice));
+            const { open, error: openErr } = await this.getAccurateOpen(exchange, sym, interval, Number(currentPrice));
             
             if (!Number.isFinite(open) || open <= 0) continue;
 
