@@ -364,6 +364,49 @@ export class EntryOrderMonitor {
 
       logger.debug(`[EntryOrderMonitor] ✅ Confirmed entry order ${entry.id} as Position ${position.id} (${entry.symbol}) at entry=${effectiveEntryPrice}`);
 
+      // NEW: Place TP immediately after entry is filled (do not wait for PositionMonitor interval)
+      // This anchors a TP on the exchange ASAP to reduce risk in highly volatile markets.
+      try {
+        const exchangeService = this.exchangeServices.get(botId);
+
+        // Only attempt if we have a valid TP price (strategy.take_profit might be 0/disabled)
+        if (exchangeService && tpPrice && Number.isFinite(tpPrice) && tpPrice > 0) {
+          const { ExitOrderManager } = await import('../services/ExitOrderManager.js');
+          const mgr = new ExitOrderManager(exchangeService);
+
+          logger.info(
+            `[EntryOrderMonitor] 🚀 Immediate TP placement after fill | pos=${position.id} ` +
+            `symbol=${position.symbol} side=${position.side} tpPrice=${tpPrice} entry=${effectiveEntryPrice}`
+          );
+
+          const placed = await mgr.placeOrReplaceExitOrder(position, tpPrice);
+          const tpOrderId = placed?.orderId ? String(placed.orderId) : null;
+
+          if (tpOrderId) {
+            await Position.update(position.id, { exit_order_id: tpOrderId });
+            // Keep tp_sl_pending=true so PositionMonitor can still place SL and also verify/recreate TP later if needed
+            logger.info(
+              `[EntryOrderMonitor] ✅ Immediate TP placed | pos=${position.id} exit_order_id=${tpOrderId} ` +
+              `type=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice || tpPrice}`
+            );
+          } else {
+            logger.warn(
+              `[EntryOrderMonitor] ⚠️ Immediate TP placement returned null | pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}`
+            );
+          }
+        } else {
+          logger.debug(
+            `[EntryOrderMonitor] Immediate TP not placed (no exchangeService or invalid tpPrice) | ` +
+            `pos=${position?.id || 'n/a'} botId=${botId} tpPrice=${tpPrice}`
+          );
+        }
+      } catch (tpErr) {
+        logger.error(
+          `[EntryOrderMonitor] ❌ Immediate TP placement failed | pos=${position?.id || 'n/a'} ` +
+          `error=${tpErr?.message || tpErr}`
+        );
+      }
+
       // CRITICAL FIX: Enable Telegram notification when entry order is filled
       // This alerts user when position is opened
       try {

@@ -213,37 +213,33 @@ export function calculateNextTrailingTakeProfit(prevTP, entryPrice, initialTP, r
   const initial = Number(initialTP);
   const reduce = Number(reducePercent);
   const minutes = Number(minutesElapsed) || 1;
-  
+
   // Input validation
   if (!Number.isFinite(prev) || !Number.isFinite(entry) || !Number.isFinite(initial) || !Number.isFinite(reduce) || reduce <= 0) {
     return prev; // Return previous TP if inputs are invalid
   }
-  
+
   // Total distance from initial TP → entry
   const totalRange = Math.abs(initial - entry);
-  
+
   // Step per minute: reducePercent% of total range
-  // Example: range = 100, reduce = 40 → stepPerMinute = 40
   const stepPerMinute = totalRange * (reduce / 100);
-  
+
   // Total step for elapsed time
   const step = stepPerMinute * minutes;
-  
+
   if (side === 'long') {
     // LONG: TP moves DOWN (decreases) from initial TP towards entry
-    // newTP = prevTP - step (but don't go below entry)
     const newTP = prev - step;
     return Math.max(newTP, entry); // Don't go below entry
-  } else {
-    // SHORT: TP moves UP (increases) from initial TP towards entry
-    // newTP = prevTP + step
-    // CRITICAL FIX: Allow TP to cross entry for early loss-cutting when price moves against position
-    // This protects account from large losses when price moves strongly against SHORT position
-    const newTP = prev + step;
-    // Allow TP to exceed entry (no Math.min limit) to enable early exit when price rises above entry
-    // This is intentional: if price moves against SHORT (above entry), trailing TP will trigger earlier to minimize loss
-    return newTP;
   }
+
+  // SHORT (per requirement): TP moves UP (increases) from initial TP towards entry over time.
+  // Example: entry=90k, initialTP=80k -> 80k -> 90k -> ... (continue increasing if needed).
+  // This is an early-exit-by-time mechanism: when price moves against position (rises),
+  // the TP will be closer to market and can be hit sooner to cut loss / preserve capital.
+  const newTP = prev + step;
+  return newTP;
 }
 
 /**
