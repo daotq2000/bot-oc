@@ -123,6 +123,9 @@ async function start() {
       await AppConfig.set('SL_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger SL update');
       await AppConfig.set('TP_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger TP update');
       await AppConfig.set('TP_SL_PLACEMENT_DELAY_MS', '1000', 'Delay (ms) between TP and SL order placements to avoid rate limits');
+      await AppConfig.set('WS_TICK_MIN_INTERVAL_MS', '50', 'Delay (ms) between TP and SL order placements to avoid rate limits');
+      await AppConfig.set('WS_TICK_BATCH_SIZE', '150', 'Delay (ms) between TP and SL order placements to avoid rate limits');
+      await AppConfig.set('WS_TICK_CONCURRENCY', '20', 'Delay (ms) between TP and SL order placements to avoid rate limits');
 
       // WebSocket and connection configs
       await AppConfig.set('BINANCE_TESTNET_WS_BASE', 'wss://stream.binancefuture.com/ws', 'Binance testnet WebSocket base URL');
