@@ -570,13 +570,15 @@ export class RealtimeOCDetector {
     }
 
     // 2) Fallback: REST OHLCV open (with queue to avoid throttle)
-    // ✅ FIX A: For Binance 1m/5m, DO NOT rely on REST open (too slow / rate-limited / causes missed OC).
-    // Require WebSocket kline OPEN to be available. If not available yet, skip OC for this tick.
+    // ✅ OPTION A: Unified OPEN logic across exchanges
+    // Prefer WS kline OPEN when available (Binance), otherwise fallback to REST OHLCV.
+    // This keeps behavior consistent while still benefiting from WS accuracy/latency.
+    // NOTE: For high symbol counts, REST fallback can be slow/rate-limited; callers must handle open=null.
     if (ex === 'binance' && (interval === '1m' || interval === '5m')) {
+      // Keep a debug hint, but DO allow REST fallback as a last resort for unified behavior.
       logger.debug(
-        `[RealtimeOCDetector] Binance WS kline open not ready for ${sym} ${interval} (bucketStart=${bucketStart}) → skip (no REST fallback)`
+        `[RealtimeOCDetector] Binance WS kline open not ready for ${sym} ${interval} (bucketStart=${bucketStart}) → will try REST fallback (unified logic)`
       );
-      return { open: null, error: new Error('Binance 1m/5m requires WebSocket kline open') };
     }
 
     // ✅ FIX C: Handle the result object from fetchOpenFromRest
