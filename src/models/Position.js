@@ -244,15 +244,20 @@ export class Position {
   }
 
   /**
-   * Get bot-level stats: wins (tp_hit), loses (sl_hit), total pnl
+   * Get bot-level stats.
+   *
+   * WIN:  pnl > 0
+   * LOSE: pnl < 0
+   * (pnl === 0 is not counted as win/lose)
+   *
    * @param {number} botId
    * @returns {Promise<{wins:number,loses:number,total_pnl:number}>}
    */
   static async getBotStats(botId) {
     const [rows] = await pool.execute(
       `SELECT 
-         SUM(CASE WHEN p.close_reason='tp_hit' THEN 1 ELSE 0 END) AS wins,
-         SUM(CASE WHEN p.close_reason='sl_hit' THEN 1 ELSE 0 END) AS loses,
+         SUM(CASE WHEN COALESCE(p.pnl,0) > 0 THEN 1 ELSE 0 END) AS wins,
+         SUM(CASE WHEN COALESCE(p.pnl,0) < 0 THEN 1 ELSE 0 END) AS loses,
          SUM(COALESCE(p.pnl,0)) AS total_pnl
        FROM positions p
        JOIN strategies s ON p.strategy_id = s.id
