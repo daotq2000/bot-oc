@@ -14,24 +14,33 @@ module.exports = {
     }
 
     // 2. Add columns tp_order_id, tp_price, row_version
-    await queryInterface.addColumn('positions', 'tp_order_id', {
-      type: Sequelize.BIGINT,
-      allowNull: true,
-      after: 'exit_order_id', // for MySQL; ignored by others
-    });
+    // Idempotent: skip if column already exists (fixes "Duplicate column" errors)
+    const table = await queryInterface.describeTable('positions');
 
-    await queryInterface.addColumn('positions', 'tp_price', {
-      type: Sequelize.DECIMAL(30, 8),
-      allowNull: true,
-      after: 'tp_order_id',
-    });
+    if (!table.tp_order_id) {
+      await queryInterface.addColumn('positions', 'tp_order_id', {
+        type: Sequelize.BIGINT,
+        allowNull: true,
+        after: 'exit_order_id', // for MySQL; ignored by others
+      });
+    }
 
-    await queryInterface.addColumn('positions', 'row_version', {
-      type: Sequelize.BIGINT,
-      allowNull: false,
-      defaultValue: 0,
-      after: 'tp_price',
-    });
+    if (!table.tp_price) {
+      await queryInterface.addColumn('positions', 'tp_price', {
+        type: Sequelize.DECIMAL(30, 8),
+        allowNull: true,
+        after: 'tp_order_id',
+      });
+    }
+
+    if (!table.row_version) {
+      await queryInterface.addColumn('positions', 'row_version', {
+        type: Sequelize.BIGINT,
+        allowNull: false,
+        defaultValue: 0,
+        after: 'tp_price',
+      });
+    }
   },
 
   down: async (queryInterface, Sequelize) => {

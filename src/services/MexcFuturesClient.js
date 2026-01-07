@@ -26,7 +26,7 @@ export class MexcFuturesClient {
   constructor(bot, ccxtExchange) {
     this.bot = bot;
     this.exchange = ccxtExchange; // CCXT driver (fallback)
-    this.baseURL = configService.getString('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.com');
+    this.baseURL = configService.getString('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.co');
     this.recvWindow = Number(configService.getNumber('MEXC_RECV_WINDOW_MS', 60000));
     this.enableDirect = configService.getBoolean('MEXC_FUTURES_DIRECT', false);
     this.verbose = false; // can be enabled by script (--verbose)

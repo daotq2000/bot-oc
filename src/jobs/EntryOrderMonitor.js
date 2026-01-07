@@ -314,6 +314,40 @@ export class EntryOrderMonitor {
         );
         // Mark entry as filled even if Position already exists (idempotent operation)
         await EntryOrder.markFilled(entry.id);
+        
+        // ✅ CRITICAL: Nếu Position đã tồn tại nhưng chưa có TP (exit_order_id = null), tạo TP ngay lập tức
+        // Điều này xử lý trường hợp Position được tạo từ nguồn khác (ví dụ: PositionMonitor) nhưng chưa có TP
+        if (existing.status === 'open' && !existing.exit_order_id) {
+          try {
+            const exchangeService = this.exchangeServices.get(botId);
+            if (exchangeService) {
+              const { Position } = await import('../models/Position.js');
+              const existingPosition = await Position.findById(existing.id);
+              if (existingPosition && existingPosition.take_profit_price && Number.isFinite(existingPosition.take_profit_price) && existingPosition.take_profit_price > 0) {
+                const { ExitOrderManager } = await import('../services/ExitOrderManager.js');
+                const mgr = new ExitOrderManager(exchangeService);
+                logger.info(
+                  `[EntryOrderMonitor] 🚀 Creating TP for existing position without TP | pos=${existing.id} ` +
+                  `symbol=${existingPosition.symbol} tpPrice=${existingPosition.take_profit_price}`
+                );
+                const placed = await mgr.placeOrReplaceExitOrder(existingPosition, existingPosition.take_profit_price);
+                const tpOrderId = placed?.orderId ? String(placed.orderId) : null;
+                if (tpOrderId) {
+                  await Position.update(existing.id, { 
+                    exit_order_id: tpOrderId,
+                    tp_sl_pending: false
+                  });
+                  logger.info(`[EntryOrderMonitor] ✅ TP created for existing position ${existing.id} exit_order_id=${tpOrderId}`);
+                }
+              }
+            }
+          } catch (tpErr) {
+            logger.error(
+              `[EntryOrderMonitor] ❌ Failed to create TP for existing position ${existing.id}:`,
+              tpErr?.message || tpErr
+            );
+          }
+        }
         return;
       }
 
@@ -383,15 +417,21 @@ export class EntryOrderMonitor {
           const tpOrderId = placed?.orderId ? String(placed.orderId) : null;
 
           if (tpOrderId) {
-            await Position.update(position.id, { exit_order_id: tpOrderId });
-            // Keep tp_sl_pending=true so PositionMonitor can still place SL and also verify/recreate TP later if needed
+            // ✅ CRITICAL: Update position với exit_order_id ngay lập tức để tránh PositionMonitor tạo duplicate TP
+            // ✅ Set tp_sl_pending=false vì TP đã được tạo, chỉ còn SL cần tạo
+            await Position.update(position.id, { 
+              exit_order_id: tpOrderId,
+              tp_sl_pending: false // TP đã được tạo, chỉ còn SL cần PositionMonitor tạo
+            });
             logger.info(
               `[EntryOrderMonitor] ✅ Immediate TP placed | pos=${position.id} exit_order_id=${tpOrderId} ` +
               `type=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice || tpPrice}`
             );
           } else {
+            // ⚠️ Nếu TP placement failed, giữ tp_sl_pending=true để PositionMonitor retry
             logger.warn(
-              `[EntryOrderMonitor] ⚠️ Immediate TP placement returned null | pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}`
+              `[EntryOrderMonitor] ⚠️ Immediate TP placement returned null | pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}. ` +
+              `PositionMonitor will retry on next cycle.`
             );
           }
         } else {

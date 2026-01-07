@@ -20,7 +20,7 @@
 
 **Thay đổi:**
 - **MEXC_FUTURES_WS_URL**: `wss://contract.mexc.com/edge` → `wss://contract.mexc.co/edge`
-- **MEXC_FUTURES_REST_BASE**: `https://contract.mexc.com` → `https://contract.mexc.co`
+- **MEXC_FUTURES_REST_BASE**: `https://contract.mexc.co` → `https://contract.mexc.co`
 
 **Lý do:**
 - Endpoint `.co` có khả năng kết nối tốt hơn từ một số khu vực

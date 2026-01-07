@@ -83,7 +83,7 @@ async function start() {
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '5', 'Minutes before auto-cancel unfilled entry LIMIT orders (applies to all LIMIT entry orders including extend-miss). You can change this in app_configs');
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
-      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '500', 'Price alert scanner job interval in milliseconds');
+      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '100', 'Price alert scanner job interval in milliseconds');
       await AppConfig.set('PRICE_ALERT_MODULE_ENABLED', 'true', 'Enable/Disable the entire Price Alert module (workers, scanners, alerts)');
       await AppConfig.set('PRICE_ALERT_CHECK_ENABLED', 'true', 'Enable price alert checking for MEXC and other exchanges');
       await AppConfig.set('PRICE_ALERT_SYMBOL_REFRESH_INTERVAL_MS', '30000', 'Interval to refresh Price Alert symbols from config/DB (ms)');
@@ -96,9 +96,9 @@ async function start() {
       // WebSocket OC high-performance configs
       await AppConfig.set('WS_MATCH_CONCURRENCY', '50', 'Max concurrency for processing matched strategies per tick (higher = faster entries, more CPU/API usage)');
       await AppConfig.set('PRICE_ALERTS_STRATEGY_FIRST', 'false', 'If true: when there are active strategies, PriceAlertScanner yields to SignalScanner (strategy-first). If false: always run standalone price alerts.');
-      await AppConfig.set('OC_ALERT_SCAN_INTERVAL_MS', '3000', 'Interval for OC alert scan (ms)');
+      await AppConfig.set('OC_ALERT_SCAN_INTERVAL_MS', '1000', 'Interval for OC alert scan (ms)');
       await AppConfig.set('OC_ALERT_TICK_MIN_INTERVAL_MS', '0', 'Min interval per symbol/interval between alerts on WS tick (ms)');
-      await AppConfig.set('PRICE_ALERT_MIN_INTERVAL_MS', '7000', 'Min interval per symbol/interval between alerts (ms)');
+      await AppConfig.set('PRICE_ALERT_MIN_INTERVAL_MS', '400', 'Min interval per symbol/interval between alerts (ms)');
       await AppConfig.set('PRICE_ALERT_USE_SYMBOL_FILTERS', 'true', 'Use symbol_filters table for price alerts when symbols not specified');
       await AppConfig.set('PRICE_ALERT_MAX_SYMBOLS', '5000', 'Max number of symbols to scan per exchange for price alerts');
 
@@ -154,9 +154,14 @@ async function start() {
       await AppConfig.set('MEXC_FUTURES_ONLY', 'true', 'Futures-only mode for MEXC: disable all spot fallbacks');
       await AppConfig.set('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED', 'Default margin type for Binance (ISOLATED or CROSSED)');
       await AppConfig.set('BINANCE_DEFAULT_LEVERAGE', '5', 'Default leverage for Binance positions');
+      await AppConfig.set('PRICE_ALERT_USE_SCANNER', 'true', 'Default leverage for Binance positions');
+      await AppConfig.set('PRICE_ALERT_USE_WEBSOCKET', 'false', 'Default leverage for Binance positions');
+      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '50', 'Default leverage for Binance positions');
+      await AppConfig.set('PRICE_ALERT_CONFIG_BATCH_SIZE', '10', 'Default leverage for Binance positions');
+      await AppConfig.set('PRICE_ALERT_SYMBOL_BATCH_SIZE', '20', 'Default leverage for Binance positions');
 
       // Logging configs
-      await AppConfig.set('LOG_LEVEL', 'error', 'Log level: error, warn, info, debug, verbose (default: error)');
+      await AppConfig.set('LOG_LEVEL', 'info', 'Log level: error, warn, info, debug, verbose (default: error)');
       await AppConfig.set('LOG_FILE_MAX_SIZE_MB', '10', 'Maximum size (MB) for each log file before rotation');
       await AppConfig.set('LOG_FILE_MAX_FILES', '5', 'Maximum number of rotated log files to keep');
 
@@ -251,7 +256,7 @@ async function start() {
       const wsStatus = webSocketManager.getStatus();
       logger.info(`[Binance-WS] Status: ${wsStatus.connectedCount}/${wsStatus.totalConnections} connections open, ${wsStatus.totalStreams} total streams`);
       
-      const mexcWsStatus = mexcPriceWs?.ws?.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED';
+      const mexcWsStatus = mexcPriceWs?.getStatus?.()?.connected ? 'CONNECTED' : 'DISCONNECTED';
       const mexcSubscribed = mexcPriceWs?.subscribed?.size || 0;
       logger.info(`[MEXC-WS] Status: ${mexcWsStatus}, subscribed symbols: ${mexcSubscribed}`);
     }, 2000);
@@ -356,6 +361,15 @@ async function start() {
       logger.info(`Server started on port ${PORT}`);
       logger.info(`API available at http://localhost:${PORT}/api`);
       logger.info('Bot trading system is running...');
+    }).on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        logger.error(`❌ Port ${PORT} is already in use. Please stop the existing process or use a different port.`);
+        logger.error(`   To find and kill the process: lsof -ti:${PORT} | xargs kill -9`);
+        process.exit(1);
+      } else {
+        logger.error(`❌ Failed to start server on port ${PORT}:`, err?.message || err);
+        process.exit(1);
+      }
     });
 
     // Graceful shutdown

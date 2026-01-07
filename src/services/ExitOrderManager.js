@@ -30,7 +30,7 @@ export class ExitOrderManager {
     try {
       await this.exchangeService.cancelOrder(String(position.exit_order_id), position.symbol);
     } catch (e) {
-      logger.warn(`[ExitOrderManager] Failed to cancel existing exit order ${position.exit_order_id} for pos=${position.id}: ${e?.message || e}`);
+      logger.error(`[ExitOrderManager] Failed to cancel existing exit order ${position.exit_order_id} for pos=${position.id}: ${e?.message || e}`);
     }
 
 
@@ -132,17 +132,17 @@ export class ExitOrderManager {
           
           // If we have an exit_order_id in DB, check if it exists on exchange
           if (dbOrderId && existingIds.includes(dbOrderId)) {
-            logger.debug(
-              `[ExitOrderManager] ✅ Found existing exit order ${dbOrderId} on exchange | pos=${position.id} ` +
-              `(will replace if price changed) timestamp=${timestamp}`
-            );
+            // logger.debug(
+            //   `[ExitOrderManager] ✅ Found existing exit order ${dbOrderId} on exchange | pos=${position.id} ` +
+            //   `(will replace if price changed) timestamp=${timestamp}`
+            // );
           } else if (existingExits.length > 0) {
             // Found exit orders on exchange but not in DB (race condition or orphaned orders)
-            logger.warn(
-              `[ExitOrderManager] ⚠️ Found ${existingExits.length} exit order(s) on exchange not in DB | pos=${position.id} ` +
-              `existingIds=${existingIds.join(', ')} dbOrderId=${dbOrderId || 'null'} ` +
-              `(will cancel orphaned orders and create new one) timestamp=${timestamp}`
-            );
+            // logger.warn(
+            //   `[ExitOrderManager] ⚠️ Found ${existingExits.length} exit order(s) on exchange not in DB | pos=${position.id} ` +
+            //   `existingIds=${existingIds.join(', ')} dbOrderId=${dbOrderId || 'null'} ` +
+            //   `(will cancel orphaned orders and create new one) timestamp=${timestamp}`
+            // );
             
             // Cancel orphaned orders (except the one in DB if it exists)
             for (const order of existingExits) {
@@ -150,12 +150,12 @@ export class ExitOrderManager {
               if (orderId && orderId !== dbOrderId) {
                 try {
                   await this.exchangeService.cancelOrder(orderId, position.symbol);
-                  logger.info(
-                    `[ExitOrderManager] 🗑️ Cancelled orphaned exit order ${orderId} | pos=${position.id} ` +
-                    `type=${order?.type} timestamp=${timestamp}`
-                  );
+                  // logger.debug(
+                  //   `[ExitOrderManager] 🗑️ Cancelled orphaned exit order ${orderId} | pos=${position.id} ` +
+                  //   `type=${order?.type} timestamp=${timestamp}`
+                  // );
                 } catch (cancelError) {
-                  logger.warn(
+                  logger.error(
                     `[ExitOrderManager] ⚠️ Failed to cancel orphaned order ${orderId} | pos=${position.id} ` +
                     `error=${cancelError?.message || cancelError}`
                   );
@@ -167,7 +167,7 @@ export class ExitOrderManager {
       }
     } catch (checkError) {
       // Non-critical: if we can't check existing orders, continue with creation
-      logger.debug(
+      logger.error(
         `[ExitOrderManager] Could not check existing orders (non-critical) | pos=${position.id} ` +
         `error=${checkError?.message || checkError} (will continue with order creation)`
       );
@@ -176,11 +176,11 @@ export class ExitOrderManager {
     // ATOMIC REPLACE PATTERN: Create new order FIRST, then cancel old order
     // This eliminates the dangerous gap where no exit order exists
 
-    logger.info(
-      `[ExitOrderManager] 🔄 START atomic replace | pos=${position.id} symbol=${position.symbol} side=${side} ` +
-      `entry=${entry.toFixed(8)} desiredExit=${Number(desiredExitPrice).toFixed(8)} ` +
-      `oldOrderId=${position?.exit_order_id || 'null'} timestamp=${timestamp}`
-    );
+    // logger.debug(
+    //   `[ExitOrderManager] 🔄 START atomic replace | pos=${position.id} symbol=${position.symbol} side=${side} ` +
+    //   `entry=${entry.toFixed(8)} desiredExit=${Number(desiredExitPrice).toFixed(8)} ` +
+    //   `oldOrderId=${position?.exit_order_id || 'null'} timestamp=${timestamp}`
+    // );
 
     // 1) Decide order type based on TP price vs entry (profit zone vs loss zone)
     // CRITICAL FIX: For trailing TP, allow TP to cross entry and use STOP in loss zone
@@ -194,17 +194,17 @@ export class ExitOrderManager {
     const isInLossZone = (side === 'long' && desiredExit <= entry) || (side === 'short' && desiredExit >= entry);
     
     if (isInLossZone) {
-      logger.info(
-        `[ExitOrderManager] 📊 TP in loss zone (crossed entry) | pos=${position.id} side=${side} ` +
-        `entry=${entry.toFixed(8)} desiredExit=${desiredExit.toFixed(8)} orderType=${orderType} ` +
-        `(will use STOP for loss zone) time=${typeDecisionTime - startTime}ms`
-      );
+      // logger.debug(
+      //   `[ExitOrderManager] 📊 TP in loss zone (crossed entry) | pos=${position.id} side=${side} ` +
+      //   `entry=${entry.toFixed(8)} desiredExit=${desiredExit.toFixed(8)} orderType=${orderType} ` +
+      //   `(will use STOP for loss zone) time=${typeDecisionTime - startTime}ms`
+      // );
     } else {
-      logger.info(
-        `[ExitOrderManager] 📊 TP in profit zone | pos=${position.id} side=${side} ` +
-        `entry=${entry.toFixed(8)} desiredExit=${desiredExit.toFixed(8)} orderType=${orderType} ` +
-        `time=${typeDecisionTime - startTime}ms`
-      );
+      // logger.debug(
+      //   `[ExitOrderManager] 📊 TP in profit zone | pos=${position.id} side=${side} ` +
+      //   `entry=${entry.toFixed(8)} desiredExit=${desiredExit.toFixed(8)} orderType=${orderType} ` +
+      //   `time=${typeDecisionTime - startTime}ms`
+      // );
     }
 
     // 2) validate stopPrice vs market and nudge if needed
@@ -213,18 +213,18 @@ export class ExitOrderManager {
     let stopPrice = Number(desiredExitPrice); // Use original exit price (no clamping for trailing TP)
     const priceCheckTime = Date.now() - priceCheckStart;
 
-    logger.debug(
-      `[ExitOrderManager] 💹 Market price check: ${currentPrice.toFixed(8)} | pos=${position.id} ` +
-      `desiredStop=${stopPrice.toFixed(8)} time=${priceCheckTime}ms`
-    );
+    // logger.debug(
+    //   `[ExitOrderManager] 💹 Market price check: ${currentPrice.toFixed(8)} | pos=${position.id} ` +
+    //   `desiredStop=${stopPrice.toFixed(8)} time=${priceCheckTime}ms`
+    // );
 
     if (!this._isValidStopVsMarket(orderType, side, stopPrice, currentPrice)) {
       const nudgedPrice = this._nudgeStopPrice(orderType, side, currentPrice);
-      logger.warn(
-        `[ExitOrderManager] ⚠️ Price nudged: pos=${position.id} type=${orderType} side=${side} ` +
-        `desired=${desiredExitPrice.toFixed(8)} current=${currentPrice.toFixed(8)} ` +
-        `nudged=${nudgedPrice.toFixed(8)} (invalid vs market)`
-      );
+      // logger.warn(
+      //   `[ExitOrderManager] ⚠️ Price nudged: pos=${position.id} type=${orderType} side=${side} ` +
+      //   `desired=${desiredExitPrice.toFixed(8)} current=${currentPrice.toFixed(8)} ` +
+      //   `nudged=${nudgedPrice.toFixed(8)} (invalid vs market)`
+      // );
       stopPrice = nudgedPrice;
     }
 
@@ -232,11 +232,11 @@ export class ExitOrderManager {
     const oldOrderId = position?.exit_order_id ? String(position.exit_order_id) : null;
     const createStartTime = Date.now();
 
-    logger.info(
-      `[ExitOrderManager] 🆕 STEP 1: Creating NEW order | pos=${position.id} ` +
-      `type=${orderType} stopPrice=${stopPrice.toFixed(8)} oldOrderId=${oldOrderId || 'null'} ` +
-      `timestamp=${new Date().toISOString()}`
-    );
+    // logger.debug(
+    //   `[ExitOrderManager] 🆕 STEP 1: Creating NEW order | pos=${position.id} ` +
+    //   `type=${orderType} stopPrice=${stopPrice.toFixed(8)} oldOrderId=${oldOrderId || 'null'} ` +
+    //   `timestamp=${new Date().toISOString()}`
+    // );
 
     // 4) Place NEW order FIRST (atomic replace)
     // CRITICAL FIX: Map orderType correctly - TAKE_PROFIT -> TAKE_PROFIT_MARKET, STOP -> STOP_MARKET
@@ -258,11 +258,11 @@ export class ExitOrderManager {
       newOrderId = res?.orderId ? String(res.orderId) : null;
       if (newOrderId) {
         position.exit_order_id = newOrderId;
-        logger.info(
-          `[ExitOrderManager] ✅ STEP 1 SUCCESS: New order created | pos=${position.id} ` +
-          `newOrderId=${newOrderId} type=${orderType} stopPrice=${stopPrice.toFixed(8)} ` +
-          `duration=${createDuration}ms timestamp=${new Date().toISOString()}`
-        );
+        // logger.debug(
+        //   `[ExitOrderManager] ✅ STEP 1 SUCCESS: New order created | pos=${position.id} ` +
+        //   `newOrderId=${newOrderId} type=${orderType} stopPrice=${stopPrice.toFixed(8)} ` +
+        //   `duration=${createDuration}ms timestamp=${new Date().toISOString()}`
+        // );
       } else {
         logger.error(
           `[ExitOrderManager] ❌ STEP 1 FAILED: No orderId in response | pos=${position.id} ` +
@@ -278,20 +278,20 @@ export class ExitOrderManager {
       // This happens when stopPrice is already crossed by market price
       // Fallback: Close position immediately with MARKET order
       if (errorMessage.includes('-2021') || errorMessage.includes('would immediately trigger')) {
-        logger.warn(
-          `[ExitOrderManager] ⚠️ Order would immediately trigger (-2021) | pos=${position.id} ` +
-          `type=${orderType} stopPrice=${stopPrice.toFixed(8)} currentPrice=${currentPrice?.toFixed(8) || 'unknown'} ` +
-          `(falling back to MARKET close) duration=${createDuration}ms`
-        );
+        // logger.warn(
+        //   `[ExitOrderManager] ⚠️ Order would immediately trigger (-2021) | pos=${position.id} ` +
+        //   `type=${orderType} stopPrice=${stopPrice.toFixed(8)} currentPrice=${currentPrice?.toFixed(8) || 'unknown'} ` +
+        //   `(falling back to MARKET close) duration=${createDuration}ms`
+        // );
         
         try {
           // Close position immediately with MARKET order
           // Pass null for amount to let closePosition auto-detect from exchange
           const marketCloseResult = await this.exchangeService.closePosition(position.symbol, side, null);
-          logger.info(
-            `[ExitOrderManager] ✅ FALLBACK SUCCESS: Position closed with MARKET order | pos=${position.id} ` +
-            `symbol=${position.symbol} side=${side} result=${JSON.stringify(marketCloseResult)}`
-          );
+          // logger.debug(
+          //   `[ExitOrderManager] ✅ FALLBACK SUCCESS: Position closed with MARKET order | pos=${position.id} ` +
+          //   `symbol=${position.symbol} side=${side} result=${JSON.stringify(marketCloseResult)}`
+          // );
           // Return null to indicate position was closed (no exit order needed)
           return null;
         } catch (fallbackError) {
@@ -318,11 +318,11 @@ export class ExitOrderManager {
     // CRITICAL FIX: Enable cancel old orders to prevent duplicate orders accumulation
     if (oldOrderId && oldOrderId !== newOrderId) {
       const cancelStartTime = Date.now();
-      logger.info(
-        `[ExitOrderManager] 🗑️ STEP 2: Cancelling OLD order | pos=${position.id} ` +
-        `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
-        `timestamp=${new Date().toISOString()}`
-      );
+      // logger.debug(
+      //   `[ExitOrderManager] 🗑️ STEP 2: Cancelling OLD order | pos=${position.id} ` +
+      //   `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
+      //   `timestamp=${new Date().toISOString()}`
+      // );
 
       try {
         await this.exchangeService.cancelOrder(oldOrderId, position.symbol);
@@ -330,58 +330,58 @@ export class ExitOrderManager {
         const cancelDuration = cancelEndTime - cancelStartTime;
         const totalDuration = cancelEndTime - startTime;
 
-        logger.info(
-          `[ExitOrderManager] ✅ STEP 2 SUCCESS: Old order cancelled | pos=${position.id} ` +
-          `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
-          `cancelDuration=${cancelDuration}ms totalDuration=${totalDuration}ms ` +
-          `timestamp=${new Date().toISOString()}`
-        );
+        // logger.debug(
+        //   `[ExitOrderManager] ✅ STEP 2 SUCCESS: Old order cancelled | pos=${position.id} ` +
+        //   `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
+        //   `cancelDuration=${cancelDuration}ms totalDuration=${totalDuration}ms ` +
+        //   `timestamp=${new Date().toISOString()}`
+        // );
       } catch (cancelError) {
         const cancelEndTime = Date.now();
         const cancelDuration = cancelEndTime - cancelStartTime;
         const totalDuration = cancelEndTime - startTime;
         
         // Non-critical: old order might already be filled or cancelled
-        logger.warn(
-          `[ExitOrderManager] ⚠️ STEP 2 WARNING: Cancel failed (non-critical) | pos=${position.id} ` +
-          `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
-          `cancelDuration=${cancelDuration}ms totalDuration=${totalDuration}ms ` +
-          `error=${cancelError?.message || cancelError} ` +
-          `(Old order may already be filled/cancelled. New order ${newOrderId} is active.) ` +
-          `timestamp=${new Date().toISOString()}`
-        );
+        // logger.warn(
+        //   `[ExitOrderManager] ⚠️ STEP 2 WARNING: Cancel failed (non-critical) | pos=${position.id} ` +
+        //   `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
+        //   `cancelDuration=${cancelDuration}ms totalDuration=${totalDuration}ms ` +
+        //   `error=${cancelError?.message || cancelError} ` +
+        //   `(Old order may already be filled/cancelled. New order ${newOrderId} is active.) ` +
+        //   `timestamp=${new Date().toISOString()}`
+        // );
       }
     } else {
       const totalDuration = Date.now() - startTime;
       if (oldOrderId && oldOrderId !== newOrderId) {
-        logger.info(
-          `[ExitOrderManager] ⚠️ STEP 2 DISABLED (DEBUG MODE): Old order NOT cancelled | pos=${position.id} ` +
-          `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
-          `(Both orders will exist on exchange for debugging) ` +
-          `totalDuration=${totalDuration}ms timestamp=${new Date().toISOString()}`
-        );
+        // logger.debug(
+        //   `[ExitOrderManager] ⚠️ STEP 2 DISABLED (DEBUG MODE): Old order NOT cancelled | pos=${position.id} ` +
+        //   `oldOrderId=${oldOrderId} newOrderId=${newOrderId} ` +
+        //   `(Both orders will exist on exchange for debugging) ` +
+        //   `totalDuration=${totalDuration}ms timestamp=${new Date().toISOString()}`
+        // );
       } else if (!oldOrderId) {
-        logger.info(
-          `[ExitOrderManager] ℹ️ STEP 2 SKIP: No old order to cancel | pos=${position.id} ` +
-          `newOrderId=${newOrderId} (first time placement) totalDuration=${totalDuration}ms ` +
-          `timestamp=${new Date().toISOString()}`
-        );
+        // logger.debug(
+        //   `[ExitOrderManager] ℹ️ STEP 2 SKIP: No old order to cancel | pos=${position.id} ` +
+        //   `newOrderId=${newOrderId} (first time placement) totalDuration=${totalDuration}ms ` +
+        //   `timestamp=${new Date().toISOString()}`
+        // );
       } else if (oldOrderId === newOrderId) {
-        logger.warn(
-          `[ExitOrderManager] ⚠️ STEP 2 SKIP: Old order ID same as new | pos=${position.id} ` +
-          `orderId=${oldOrderId} (unexpected, should not happen) totalDuration=${totalDuration}ms ` +
-          `timestamp=${new Date().toISOString()}`
-        );
+        // logger.warn(
+        //   `[ExitOrderManager] ⚠️ STEP 2 SKIP: Old order ID same as new | pos=${position.id} ` +
+        //   `orderId=${oldOrderId} (unexpected, should not happen) totalDuration=${totalDuration}ms ` +
+        //   `timestamp=${new Date().toISOString()}`
+        // );
       }
     }
 
     const totalDuration = Date.now() - startTime;
-    logger.info(
-      `[ExitOrderManager] ✅ COMPLETE: Atomic replace finished | pos=${position.id} ` +
-      `oldOrderId=${oldOrderId || 'null'} newOrderId=${newOrderId || 'null'} ` +
-      `type=${orderType} stopPrice=${stopPrice.toFixed(8)} ` +
-      `totalDuration=${totalDuration}ms timestamp=${new Date().toISOString()}`
-    );
+    // logger.debug(
+    //   `[ExitOrderManager] ✅ COMPLETE: Atomic replace finished | pos=${position.id} ` +
+    //   `oldOrderId=${oldOrderId || 'null'} newOrderId=${newOrderId || 'null'} ` +
+    //   `type=${orderType} stopPrice=${stopPrice.toFixed(8)} ` +
+    //   `totalDuration=${totalDuration}ms timestamp=${new Date().toISOString()}`
+    // );
 
     return { orderType, stopPrice, orderId: newOrderId };
   }

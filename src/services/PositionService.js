@@ -318,7 +318,7 @@ export class PositionService {
         useTimeBasedCalculation = false;
       }
       
-      const prevMinutes = Number(position.minutes_elapsed || 0);
+      let prevMinutes = Number(position.minutes_elapsed || 0);
       let actualMinutesElapsed;
       let minutesToProcess = 1; // Default: process 1 minute per call
       
@@ -326,6 +326,29 @@ export class PositionService {
         const now = Date.now();
         const totalMinutesElapsed = Math.floor((now - openedAt) / (60 * 1000)); // Total minutes since position opened
         logger.debug(`[TP Trail] pos=${position.id} Timing check: opened_at=${position.opened_at} openedAt=${openedAt} now=${now} totalMinutesElapsed=${totalMinutesElapsed} prevMinutes=${prevMinutes} timeDiff=${now - openedAt}ms (${Math.floor((now - openedAt) / 1000)}s)`);
+        
+        // SAFETY CHECK: Reset prevMinutes if gap exceeds 30 minutes to prevent stuck positions
+        const minutesGap = totalMinutesElapsed - prevMinutes;
+        if (minutesGap > 30) {
+          logger.warn(
+            `[TP Trail] ⚠️ Large gap detected for position ${position.id}: ` +
+            `prevMinutes=${prevMinutes}, totalMinutes=${totalMinutesElapsed}, ` +
+            `gap=${minutesGap} minutes (>30). ` +
+            `Resetting to process only 1 minute to avoid position being stuck or deeper losses.`
+          );
+          // Reset prevMinutes to totalMinutesElapsed - 1 so that minutesToProcess will be 1
+          // This ensures we only process 1 minute incrementally, not the entire gap
+          const adjustedPrevMinutes = totalMinutesElapsed - 1;
+          // Update prevMinutes in memory for this calculation
+          prevMinutes = adjustedPrevMinutes;
+          // Also update in DB to prevent this from happening again
+          try {
+            await Position.update(position.id, { minutes_elapsed: adjustedPrevMinutes });
+            logger.info(`[TP Trail] ✅ Reset minutes_elapsed to ${adjustedPrevMinutes} for position ${position.id}`);
+          } catch (updateError) {
+            logger.warn(`[TP Trail] Failed to reset minutes_elapsed in DB for position ${position.id}: ${updateError?.message || updateError}`);
+          }
+        }
         
         // Only update TP if actual minutes have increased (ensures exactly once per minute)
         if (totalMinutesElapsed <= prevMinutes) {
@@ -607,7 +630,7 @@ export class PositionService {
           const entryPrice = Number(position.entry_price || 0);
           const newTP = Number(desiredTP || 0);
           
-          logger.debug(`[TP Replace] _maybeReplaceTpOrder called: pos=${position.id} prevTP=${prevTP.toFixed(2)} desiredTP=${newTP.toFixed(2)} entryPrice=${entryPrice.toFixed(2)} side=${position.side}`);
+          // logger.debug(`[TP Replace] _maybeReplaceTpOrder called: pos=${position.id} prevTP=${prevTP.toFixed(2)} desiredTP=${newTP.toFixed(2)} entryPrice=${entryPrice.toFixed(2)} side=${position.side}`);
           
           // Note: TP→SL conversion is now handled in the main TP trail logic
           // This function only handles TP order replacement when TP is still in profit zone
@@ -621,7 +644,7 @@ export class PositionService {
           }
           const tickTP = parseFloat(tickSizeStrTP || '0') || 0;
           
-          logger.debug(`[TP Replace] Threshold check: tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP} prevTP=${prevTP.toFixed(2)} newTP=${newTP.toFixed(2)}`);
+          // logger.debug(`[TP Replace] Threshold check: tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP} prevTP=${prevTP.toFixed(2)} newTP=${newTP.toFixed(2)}`);
           
           if (tickTP > 0 && newTP > 0 && prevTP > 0) {
             const movedTP = Math.abs(newTP - prevTP);
@@ -634,14 +657,14 @@ export class PositionService {
             const minPriceChange = avgPrice * (minPriceChangePercent / 100);
             const priceChangePercent = (movedTP / avgPrice) * 100;
             
-            logger.info(
-              `[TP Replace] 🔍 Movement check | pos=${position.id} ` +
-              `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
-              `movedTP=${movedTP.toFixed(8)} effectiveThreshold=${effectiveThreshold.toFixed(8)} ` +
-              `minPriceChange=${minPriceChange.toFixed(8)} (${minPriceChangePercent}%) ` +
-              `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
-              `tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP}`
-            );
+            // logger.info(
+            //   `[TP Replace] 🔍 Movement check | pos=${position.id} ` +
+            //   `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
+            //   `movedTP=${movedTP.toFixed(8)} effectiveThreshold=${effectiveThreshold.toFixed(8)} ` +
+            //   `minPriceChange=${minPriceChange.toFixed(8)} (${minPriceChangePercent}%) ` +
+            //   `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
+            //   `tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP}`
+            // );
             
             // Replace only if BOTH conditions are met:
             // 1. Movement >= tick-based threshold (precision requirement)
@@ -649,32 +672,32 @@ export class PositionService {
             const tickThresholdMet = movedTP >= effectiveThreshold;
             const priceChangeThresholdMet = movedTP >= minPriceChange;
             
-            logger.info(
-              `[TP Replace] 🔍 Threshold check result | pos=${position.id} ` +
-              `tickThresholdMet=${tickThresholdMet} (${movedTP.toFixed(8)} >= ${effectiveThreshold.toFixed(8)}) ` +
-              `priceChangeThresholdMet=${priceChangeThresholdMet} (${movedTP.toFixed(8)} >= ${minPriceChange.toFixed(8)}) ` +
-              `willReplace=${tickThresholdMet && priceChangeThresholdMet}`
-            );
+            // logger.info(
+            //   `[TP Replace] 🔍 Threshold check result | pos=${position.id} ` +
+            //   `tickThresholdMet=${tickThresholdMet} (${movedTP.toFixed(8)} >= ${effectiveThreshold.toFixed(8)}) ` +
+            //   `priceChangeThresholdMet=${priceChangeThresholdMet} (${movedTP.toFixed(8)} >= ${minPriceChange.toFixed(8)}) ` +
+            //   `willReplace=${tickThresholdMet && priceChangeThresholdMet}`
+            // );
             
             if (tickThresholdMet && priceChangeThresholdMet) {
               const replaceStartTime = Date.now();
               const timestamp = new Date().toISOString();
               
-              logger.info(
-                `[TP Replace] 🎯 THRESHOLD MET: Proceeding with TP order replacement | pos=${position.id} ` +
-                `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
-                `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
-                `priceChangePercent=${priceChangePercent.toFixed(3)}% timestamp=${timestamp}`
-              );
+              // logger.info(
+              //   `[TP Replace] 🎯 THRESHOLD MET: Proceeding with TP order replacement | pos=${position.id} ` +
+              //   `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
+              //   `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
+              //   `priceChangePercent=${priceChangePercent.toFixed(3)}% timestamp=${timestamp}`
+              // );
               
               // NOTE: ExitOrderManager.placeOrReplaceExitOrder now uses atomic replace pattern:
               // Creates new order FIRST, then cancels old order. No delay needed.
               
               const qty = getCachedClosableQty ? await getCachedClosableQty() : await this.exchangeService.getClosableQuantity(position.symbol, position.side);
-              logger.debug(
-                `[TP Replace] Quantity check | pos=${position.id} qty=${qty} ` +
-                `symbol=${position.symbol} side=${position.side}`
-              );
+              // logger.debug(
+              //   `[TP Replace] Quantity check | pos=${position.id} qty=${qty} ` +
+              //   `symbol=${position.symbol} side=${position.side}`
+              // );
               
               if (qty > 0) {
                 // CRITICAL FIX: Allow TP to cross entry for SHORT positions (early loss-cutting)
@@ -694,28 +717,28 @@ export class PositionService {
                   }
                 }
                 
-                logger.debug(
-                  `[TP Replace] Validation check | pos=${position.id} ` +
-                  `entryPrice=${entryPrice.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
-                  `side=${position.side} isValidTP=${isValidTP}`
-                );
+                // logger.debug(
+                //   `[TP Replace] Validation check | pos=${position.id} ` +
+                //   `entryPrice=${entryPrice.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
+                //   `side=${position.side} isValidTP=${isValidTP}`
+                // );
                 
                 if (isValidTP) {
                   try {
                     const oldExitOrderId = position.exit_order_id || null;
                     
-                    logger.info(
-                      `[TP Replace] 🚀 CALLING ExitOrderManager | pos=${position.id} ` +
-                      `symbol=${position.symbol} side=${position.side} ` +
-                      `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
-                      `oldExitOrderId=${oldExitOrderId || 'null'} timestamp=${new Date().toISOString()}`
-                    );
+                    // logger.info(
+                    //   `[TP Replace] 🚀 CALLING ExitOrderManager | pos=${position.id} ` +
+                    //   `symbol=${position.symbol} side=${position.side} ` +
+                    //   `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
+                    //   `oldExitOrderId=${oldExitOrderId || 'null'} timestamp=${new Date().toISOString()}`
+                    // );
                     
                     if (position.side !== 'long' && position.side !== 'short') {
-                      logger.error(
-                        `[TP Replace] ⚠️ INVALID position.side: ${position.side} for position ${position.id}. ` +
-                        `Expected 'long' or 'short'.`
-                      );
+                      // logger.error(
+                      //   `[TP Replace] ⚠️ INVALID position.side: ${position.side} for position ${position.id}. ` +
+                      //   `Expected 'long' or 'short'.`
+                      // );
                     }
                     
                     // ✅ Unified exit order: type switches based on profit/loss zone (STOP_MARKET <-> TAKE_PROFIT_MARKET)
@@ -727,12 +750,12 @@ export class PositionService {
                     const replaceDuration = replaceEndTime - replaceStartTime;
                     const newExitOrderId = placed?.orderId ? String(placed.orderId) : null;
                     
-                    logger.info(
-                      `[TP Replace] ✅ ExitOrderManager returned | pos=${position.id} ` +
-                      `newExitOrderId=${newExitOrderId || 'null'} oldExitOrderId=${oldExitOrderId || 'null'} ` +
-                      `orderType=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice?.toFixed(8) || newTP.toFixed(8)} ` +
-                      `replaceDuration=${replaceDuration}ms timestamp=${new Date().toISOString()}`
-                    );
+                    // logger.info(
+                    //   `[TP Replace] ✅ ExitOrderManager returned | pos=${position.id} ` +
+                    //   `newExitOrderId=${newExitOrderId || 'null'} oldExitOrderId=${oldExitOrderId || 'null'} ` +
+                    //   `orderType=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice?.toFixed(8) || newTP.toFixed(8)} ` +
+                    //   `replaceDuration=${replaceDuration}ms timestamp=${new Date().toISOString()}`
+                    // );
 
                     const updatePayload = { 
                       take_profit_price: newTP,
@@ -745,69 +768,69 @@ export class PositionService {
                     await Position.update(position.id, updatePayload);
                     const dbUpdateDuration = Date.now() - dbUpdateStart;
                     
-                    logger.info(
-                      `[TP Replace] ✅ DB UPDATED | pos=${position.id} ` +
-                      `exit_order_id=${newExitOrderId || 'null'} take_profit_price=${newTP.toFixed(8)} ` +
-                      `tp_synced=${updatePayload.tp_synced || 'N/A'} ` +
-                      `dbUpdateDuration=${dbUpdateDuration}ms totalDuration=${Date.now() - replaceStartTime}ms ` +
-                      `timestamp=${new Date().toISOString()}`
-                    );
+                    // logger.info(
+                    //   `[TP Replace] ✅ DB UPDATED | pos=${position.id} ` +
+                    //   `exit_order_id=${newExitOrderId || 'null'} take_profit_price=${newTP.toFixed(8)} ` +
+                    //   `tp_synced=${updatePayload.tp_synced || 'N/A'} ` +
+                    //   `dbUpdateDuration=${dbUpdateDuration}ms totalDuration=${Date.now() - replaceStartTime}ms ` +
+                    //   `timestamp=${new Date().toISOString()}`
+                    // );
                   } catch (tpError) {
                     const replaceEndTime = Date.now();
                     const replaceDuration = replaceEndTime - replaceStartTime;
                     
-                    logger.error(
-                      `[TP Replace] ❌ FAILED: ExitOrderManager error | pos=${position.id} ` +
-                      `newTP=${newTP.toFixed(8)} oldExitOrderId=${position.exit_order_id || 'null'} ` +
-                      `replaceDuration=${replaceDuration}ms error=${tpError?.message || tpError} ` +
-                      `stack=${tpError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
-                    );
+                    // logger.error(
+                    //   `[TP Replace] ❌ FAILED: ExitOrderManager error | pos=${position.id} ` +
+                    //   `newTP=${newTP.toFixed(8)} oldExitOrderId=${position.exit_order_id || 'null'} ` +
+                    //   `replaceDuration=${replaceDuration}ms error=${tpError?.message || tpError} ` +
+                    //   `stack=${tpError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
+                    // );
                     
                     // If TP order creation fails, still update take_profit_price in DB
                     // This allows trailing TP to continue working even if orders can't be placed
                     // Mark as not synced so PositionMonitor can retry later
-                    logger.warn(
-                      `[TP Replace] ⚠️ FALLBACK: Updating DB only (order not placed) | pos=${position.id} ` +
-                      `take_profit_price=${newTP.toFixed(8)} tp_synced=false ` +
-                      `(will retry later via PositionMonitor) timestamp=${new Date().toISOString()}`
-                    );
+                    // logger.warn(
+                    //   `[TP Replace] ⚠️ FALLBACK: Updating DB only (order not placed) | pos=${position.id} ` +
+                    //   `take_profit_price=${newTP.toFixed(8)} tp_synced=false ` +
+                    //   `(will retry later via PositionMonitor) timestamp=${new Date().toISOString()}`
+                    // );
                     
                     await Position.update(position.id, { 
                       take_profit_price: newTP,
                       ...(Position?.rawAttributes?.tp_synced ? { tp_synced: false } : {}) // Mark as not synced for retry (if supported)
                     });
                     
-                    logger.debug(
-                      `[TP Replace] ✅ DB updated (fallback) | pos=${position.id} ` +
-                      `take_profit_price=${newTP.toFixed(8)} timestamp=${new Date().toISOString()}`
-                    );
+                    // logger.debug(
+                    //   `[TP Replace] ✅ DB updated (fallback) | pos=${position.id} ` +
+                    //   `take_profit_price=${newTP.toFixed(8)} timestamp=${new Date().toISOString()}`
+                    // );
                   }
                 } else {
-                  logger.warn(
-                    `[TP Replace] ⚠️ SKIP: Invalid TP for LONG position | pos=${position.id} ` +
-                    `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
-                    `(must be >= entry, will be handled by SL conversion) timestamp=${new Date().toISOString()}`
-                  );
+                  // logger.warn(
+                  //   `[TP Replace] ⚠️ SKIP: Invalid TP for LONG position | pos=${position.id} ` +
+                  //   `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
+                  //   `(must be >= entry, will be handled by SL conversion) timestamp=${new Date().toISOString()}`
+                  // );
                 }
               } else {
-                logger.warn(
-                  `[TP Replace] ⚠️ SKIP: Invalid quantity | pos=${position.id} ` +
-                  `qty=${qty} symbol=${position.symbol} side=${position.side} ` +
-                  `timestamp=${new Date().toISOString()}`
-                );
+                // logger.warn(
+                //   `[TP Replace] ⚠️ SKIP: Invalid quantity | pos=${position.id} ` +
+                //   `qty=${qty} symbol=${position.symbol} side=${position.side} ` +
+                //   `timestamp=${new Date().toISOString()}`
+                // );
               }
             } else {
-              logger.warn(
-                `[TP Replace] ⚠️ THRESHOLD NOT MET: Skipping TP order replacement | pos=${position.id} ` +
-                `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
-                `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
-                `tickThresholdMet=${tickThresholdMet} priceChangeThresholdMet=${priceChangeThresholdMet} ` +
-                `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
-                `(Order will NOT be replaced, but DB take_profit_price will be updated)`
-              );
+              // logger.warn(
+              //   `[TP Replace] ⚠️ THRESHOLD NOT MET: Skipping TP order replacement | pos=${position.id} ` +
+              //   `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
+              //   `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
+              //   `tickThresholdMet=${tickThresholdMet} priceChangeThresholdMet=${priceChangeThresholdMet} ` +
+              //   `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
+              //   `(Order will NOT be replaced, but DB take_profit_price will be updated)`
+              // );
             }
           } else {
-            logger.warn(`[TP Replace] Invalid tickTP (${tickTP}) or TP values (prevTP=${prevTP} newTP=${newTP}), skipping TP order replacement`);
+            // logger.warn(`[TP Replace] Invalid tickTP (${tickTP}) or TP values (prevTP=${prevTP} newTP=${newTP}), skipping TP order replacement`);
           }
         } catch (e) {
       logger.warn(`[TP Replace] Error processing TP replace: ${e?.message || e}`);

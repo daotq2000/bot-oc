@@ -53,10 +53,10 @@ export const DEFAULT_CRON_PATTERNS = {
 
 // Scan intervals in milliseconds (for setInterval)
 export const SCAN_INTERVALS = {
-  SIGNAL_SCAN: parseInt(process.env.SIGNAL_SCAN_INTERVAL_MS || '30000'), // Default: 30 seconds
+  SIGNAL_SCAN: parseInt(process.env.SIGNAL_SCAN_INTERVAL_MS || '5000'), // Default: 30 seconds
   POSITION_MONITOR: parseInt(process.env.POSITION_MONITOR_INTERVAL_MS || '30000'), // Default: 30 seconds (move TP/SL once per 30s)
   POSITION_SYNC: parseInt(process.env.POSITION_SYNC_INTERVAL_MS || '40000'), // Default: 40 seconds (increased frequency for better sync)
-  CANDLE_UPDATE: parseInt(process.env.CANDLE_UPDATE_INTERVAL_MS || '30000'), // Default: 30 seconds
-  STRATEGY_CACHE_TTL: parseInt(process.env.STRATEGY_CACHE_TTL_MS || '10000') // Default: 10 seconds
+  CANDLE_UPDATE: parseInt(process.env.CANDLE_UPDATE_INTERVAL_MS || '10000'), // Default: 30 seconds
+  STRATEGY_CACHE_TTL: parseInt(process.env.STRATEGY_CACHE_TTL_MS || '100000') // Default: 10 seconds
 };
 

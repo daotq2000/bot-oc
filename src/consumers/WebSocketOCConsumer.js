@@ -70,7 +70,9 @@ export class WebSocketOCConsumer {
 
       // Setup periodic cache cleanup
       this.cleanupInterval = setInterval(() => {
-        realtimeOCDetector.cleanup();
+        if (realtimeOCDetector && typeof realtimeOCDetector.cleanup === 'function') {
+          realtimeOCDetector.cleanup();
+        }
       }, 300000); // Every 5 minutes
 
       // Register WebSocket price handlers (register before start to ensure handlers are set up)

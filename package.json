@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "node --watch src/app.js",
-    "migrate": "node src/database/migrate.js",
+    "migrate": "npx --yes sequelize-cli db:migrate", 
     "populate-filters": "node src/scripts/populateSymbolFilters.js",
     "force-close-api": "node src/scripts/forceCloseAllPositionsFromAPI.js",
     "test": "NODE_ENV=test NODE_OPTIONS=--experimental-vm-modules jest",

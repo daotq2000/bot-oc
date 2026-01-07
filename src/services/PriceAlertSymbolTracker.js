@@ -122,7 +122,7 @@ export class PriceAlertSymbolTracker {
             if (useFilters) {
                 // CRITICAL FIX: Cache DB query per exchange to avoid N+1
                 if (!symbolsFromDbByExchange.has(exchange)) {
-              const maxSymbols = Number(configService.getNumber('PRICE_ALERT_MAX_SYMBOLS', 5000));
+              const maxSymbols = Number(configService.getNumber('PRICE_ALERT_MAX_SYMBOLS', 200));
               const dbSymbols = await exchangeInfoService.getSymbolsFromDB(exchange, true, maxSymbols);
                   symbolsFromDbByExchange.set(exchange, dbSymbols);
                   logger.info(`[PriceAlertSymbolTracker] Loaded ${dbSymbols.length} symbols from symbol_filters for ${exchange} (cached for other configs)`);

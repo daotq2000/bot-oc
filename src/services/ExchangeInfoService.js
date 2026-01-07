@@ -182,7 +182,9 @@ class ExchangeInfoService {
       }
 
       // Get exchange symbols list
-      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+      let exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+
+      // Get exchange symbols list
 
       // CRITICAL FIX: Use helper to sync delisted symbols (query BEFORE delete)
       await this.syncDelistedSymbols('binance', exchangeSymbols);
@@ -334,7 +336,17 @@ class ExchangeInfoService {
       }
 
       // Get exchange symbols list
-      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+      let exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+
+      // ✅ HARD-CODE DELISTED SYMBOLS (MEXC futures)
+      // XUSDT has been delisted on MEXC futures but still appears in some sources.
+      // Remove it proactively so it never ends up in symbol_filters.
+      exchangeSymbols = exchangeSymbols.filter(s => s !== 'XUSDT');
+      for (let i = filtersToSave.length - 1; i >= 0; i--) {
+        if (String(filtersToSave[i]?.symbol || '').toUpperCase() === 'XUSDT') {
+          filtersToSave.splice(i, 1);
+        }
+      }
 
       // CRITICAL FIX: Use helper to sync delisted symbols (query BEFORE delete)
       await this.syncDelistedSymbols('mexc', exchangeSymbols);
@@ -444,10 +456,23 @@ class ExchangeInfoService {
       }
 
       // Get exchange symbols list
-      const exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
+      let exchangeSymbols = filtersToSave.map(f => f.symbol.toUpperCase());
 
-      // CRITICAL FIX: Use helper to sync delisted symbols (query BEFORE delete)
-      // This prevents deleting symbols that have open positions
+      // ✅ Hard delist overrides (manual)
+      // Mark these symbols deleted=true (soft-delete) and prevent them from being re-inserted.
+      const hardDelisted = ['XUSDT'];
+      if (hardDelisted.length > 0) {
+        exchangeSymbols = exchangeSymbols.filter(s => !hardDelisted.includes(s));
+        for (let i = filtersToSave.length - 1; i >= 0; i--) {
+          const sym = String(filtersToSave[i]?.symbol || '').toUpperCase();
+          if (hardDelisted.includes(sym)) {
+            filtersToSave.splice(i, 1);
+          }
+        }
+      }
+
+      // CRITICAL FIX: Use helper to sync delisted symbols (soft delete)
+      // This prevents deleted symbols from being re-synced.
       await this.syncDelistedSymbols('mexc', exchangeSymbols);
 
       await this.symbolFilterDAO.bulkUpsert(filtersToSave);
@@ -540,7 +565,7 @@ class ExchangeInfoService {
   async syncDelistedSymbols(exchange, exchangeSymbols) {
     try {
       // CRITICAL: Query DB symbols BEFORE deletion to identify delisted symbols
-      const dbSymbolsBefore = await this.symbolFilterDAO.getSymbolsByExchange(exchange);
+      const dbSymbolsBefore = await this.symbolFilterDAO.getSymbolsByExchange(exchange, { includeDeleted: true });
       
       // Normalize exchange symbols to uppercase for comparison
       const normalizedExchangeSymbols = exchangeSymbols.map(s => String(s).toUpperCase());
@@ -549,6 +574,13 @@ class ExchangeInfoService {
       const delistedSymbols = dbSymbolsBefore.filter(dbSymbol => 
         !normalizedExchangeSymbols.includes(dbSymbol.toUpperCase())
       );
+
+      // ✅ Hard delist overrides (manual)
+      // Symbols that we never want to re-sync even if they still appear upstream.
+      const hardDelisted = ['XUSDT'];
+      for (const s of hardDelisted) {
+        if (!delistedSymbols.includes(s)) delistedSymbols.push(s);
+      }
       
       if (delistedSymbols.length === 0) {
         this.logger.debug(`No delisted symbols found for ${exchange}`);
@@ -557,10 +589,18 @@ class ExchangeInfoService {
       
       this.logger.info(`Found ${delistedSymbols.length} delisted symbols for ${exchange}: ${delistedSymbols.slice(0, 5).join(', ')}${delistedSymbols.length > 5 ? '...' : ''}`);
       
-      // Delete delisted symbols from symbol_filters
+      // Mark delisted symbols in symbol_filters (soft delete)
+      // deleteByExchangeAndSymbols() now marks deleted=TRUE for rows not in normalizedExchangeSymbols.
       const deletedCount = await this.symbolFilterDAO.deleteByExchangeAndSymbols(exchange, normalizedExchangeSymbols);
       if (deletedCount > 0) {
-        this.logger.info(`Deleted ${deletedCount} delisted symbols from symbol_filters for ${exchange}`);
+        this.logger.info(`Marked ${deletedCount} delisted symbols as deleted in symbol_filters for ${exchange}`);
+      }
+
+      // Apply hard delist overrides explicitly
+      for (const sym of hardDelisted) {
+        try {
+          await this.symbolFilterDAO.markDeleted(exchange, sym);
+        } catch (_) {}
       }
       
       // Delete strategies for delisted symbols

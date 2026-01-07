@@ -15,7 +15,7 @@
 
 ### 1. Cập Nhật Database Config
 - **MEXC_FUTURES_WS_URL**: `wss://contract.mexc.com/edge` → `wss://contract.mexc.co/edge`
-- **MEXC_FUTURES_REST_BASE**: `https://contract.mexc.com` → `https://contract.mexc.co`
+- **MEXC_FUTURES_REST_BASE**: `https://contract.mexc.co` → `https://contract.mexc.co`
 
 ### 2. Cập Nhật Code
 - **app.js**: Thay đổi default endpoint sang `.co`

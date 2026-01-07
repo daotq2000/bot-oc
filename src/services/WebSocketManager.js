@@ -249,7 +249,13 @@ class WebSocketManager {
     try {
       conn.ws = new WebSocket(conn.url);
     } catch (e) {
-      logger.error('[Binance-WS] Failed to construct WebSocket:', e?.message || e);
+      logger.error('[Binance-WS] Failed to construct WebSocket:', {
+        error: e?.message || String(e),
+        code: e?.code || 'unknown',
+        url: conn.url?.substring(0, 100),
+        streams: conn.streams.size
+      });
+      this._scheduleReconnect(conn);
       return;
     }
 
@@ -305,14 +311,38 @@ class WebSocketManager {
       } catch (_) {}
     });
 
-    conn.ws.on('close', () => {
-      logger.warn('[Binance-WS] Closed');
+    conn.ws.on('close', (code, reason) => {
+      const reasonStr = reason?.toString() || 'none';
+      const codeStr = code || 'unknown';
+      logger.warn(`[Binance-WS] Connection closed (code: ${codeStr}, reason: ${reasonStr}, streams: ${conn.streams.size})`);
       this._scheduleReconnect(conn);
     });
 
     conn.ws.on('error', (err) => {
-      logger.error('[Binance-WS] Error:', err?.message || err);
-      this._scheduleReconnect(conn);
+      // Log detailed error information
+      const errorInfo = {
+        message: err?.message || String(err),
+        code: err?.code || 'unknown',
+        readyState: conn.ws?.readyState || 'unknown',
+        streams: conn.streams.size,
+        url: conn.url?.substring(0, 100) || 'unknown'
+      };
+      
+      // Only log if not a common "closed before connection" error to avoid spam
+      const isCommonError = err?.message?.includes('closed before') || 
+                          err?.message?.includes('ECONNREFUSED') ||
+                          err?.code === 'ECONNREFUSED';
+      
+      if (isCommonError) {
+        logger.debug(`[Binance-WS] Connection error (will retry): ${errorInfo.message} (code: ${errorInfo.code}, state: ${errorInfo.readyState})`);
+      } else {
+        logger.error(`[Binance-WS] Error:`, errorInfo);
+      }
+      
+      // Only schedule reconnect if not already closed
+      if (conn.ws?.readyState !== WebSocket.CLOSED && conn.ws?.readyState !== WebSocket.CLOSING) {
+        this._scheduleReconnect(conn);
+      }
     });
   }
 

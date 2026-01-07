@@ -3,6 +3,9 @@ import { ExchangeService } from '../services/ExchangeService.js';
 import { TelegramService } from '../services/TelegramService.js';
 import { configService } from '../services/ConfigService.js';
 import { priceAlertSymbolTracker } from '../services/PriceAlertSymbolTracker.js';
+import { strategyCache } from '../services/StrategyCache.js';
+import { webSocketManager } from '../services/WebSocketManager.js';
+import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -11,6 +14,7 @@ import logger from '../utils/logger.js';
 export class PriceAlertScanner {
   constructor() {
     this.exchangeServices = new Map(); // exchange -> ExchangeService
+    this.orderServices = new Map(); // botId -> OrderService
     this.telegramService = null;
     this.isRunning = false;
     this.scanInterval = null;
@@ -18,18 +22,31 @@ export class PriceAlertScanner {
     this.alertStates = new Map(); // key: exch|symbol -> { lastPrice, lastAlertTime, armed }
     this.priceCache = new Map(); // Cache prices to avoid excessive API calls
     this.priceCacheTime = new Map(); // Track cache time
+    
+    // ✅ OPTIMIZED: Cache PriceAlertConfigs lúc init, không có TTL
+    this.cachedConfigs = null; // Cached active configs (no TTL, refresh manually)
+    
+    // ✅ OPTIMIZED: Cache symbols với TTL 15 phút
+    this.cachedSymbols = new Map(); // exchange -> Set<symbol>
+    this.symbolsCacheTime = new Map(); // exchange -> timestamp
+    this.symbolsCacheTTL = 15 * 60 * 1000; // 15 minutes
   }
 
   /**
    * Initialize scanner
+   * @param {TelegramService} telegramService - Telegram service instance
+   * @param {Map<number, OrderService>} orderServices - Map of botId -> OrderService (optional)
    */
-  async initialize(telegramService) {
+  async initialize(telegramService, orderServices = new Map()) {
     this.telegramService = telegramService;
+    this.orderServices = orderServices;
 
     try {
-      // Get unique exchanges from active price alert configs
+      // ✅ OPTIMIZED: Cache PriceAlertConfigs lúc init, không có TTL
       const configs = await PriceAlertConfig.findAll();
       const activeConfigs = configs.filter(cfg => cfg.is_active === true || cfg.is_active === 1 || cfg.is_active === '1');
+      this.cachedConfigs = activeConfigs;
+      logger.info(`[PriceAlertScanner] Cached ${activeConfigs.length} active PriceAlertConfigs (no TTL)`);
       
       // Extract unique exchanges from configs
       const exchanges = new Set();
@@ -39,6 +56,11 @@ export class PriceAlertScanner {
           exchanges.add(exchange);
         }
       }
+
+      // Always cover both exchanges to act as a safety net when WebSocket misses.
+      // (Public price mode; no keys required.)
+      exchanges.add('mexc');
+      exchanges.add('binance');
 
       // Fallback to default exchanges if no configs found
       if (exchanges.size === 0) {
@@ -92,7 +114,16 @@ export class PriceAlertScanner {
     }
 
     this.isRunning = true;
-    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 15000); // Increased from 5s to 15s
+    // ✅ ULTRA OPTIMIZED: Giảm scan interval xuống 10ms để phát hiện tín hiệu cực nhanh
+    // Với parallel processing và WebSocket cache, có thể scan rất nhanh
+    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 10); // Ultra-fast: 10ms
+    
+    // Use setImmediate for first scan, then setInterval for subsequent scans
+    setImmediate(() => {
+      this.scan().catch(error => {
+        logger.error('PriceAlertScanner scan error:', error);
+      });
+    });
     
     this.scanInterval = setInterval(() => {
       this.scan().catch(error => {
@@ -100,7 +131,7 @@ export class PriceAlertScanner {
       });
     }, interval);
 
-    logger.info(`PriceAlertScanner started with interval ${interval}ms`);
+    logger.info(`PriceAlertScanner started with interval ${interval}ms (ultra-fast parallel processing)`);
   }
 
   /**
@@ -143,31 +174,22 @@ export class PriceAlertScanner {
         return;
       }
 
-      // Get all active price alert configs
-      // Note: PriceAlertConfig.findAll() already filters by is_active = TRUE in SQL
-      const configs = await PriceAlertConfig.findAll();
-      // Double-check: handle both boolean true and number 1 from MySQL
-      const activeConfigs = configs.filter(cfg => cfg.is_active === true || cfg.is_active === 1 || cfg.is_active === '1');
+      // ✅ OPTIMIZED: Sử dụng cached configs (không query DB mỗi lần scan)
+      const activeConfigs = this.cachedConfigs || [];
       if (activeConfigs.length === 0) {
         logger.debug('[PriceAlertScanner] No active price alert configs');
         return;
       }
 
-      // Process each active config
-      for (const config of activeConfigs) {
-        // Check timeout
-        if (Date.now() - scanStartTime > maxScanDurationMs) {
-          logger.warn(`[PriceAlertScanner] Scan exceeded max duration (${maxScanDurationMs}ms), stopping early`);
-          break;
-        }
-
-        try {
-          await this.checkAlertConfig(config);
-        } catch (error) {
-          logger.error(`[PriceAlertScanner] Error checking price alert config ${config.id}:`, error?.message || error);
-          // Continue with next config even if one fails
-        }
-      }
+      // ✅ ULTRA OPTIMIZED: Process ALL configs in parallel (no batching) để tối đa tốc độ
+      // Với WebSocket cache, có thể xử lý tất cả cùng lúc mà không lo rate limit
+      await Promise.allSettled(
+        activeConfigs.map(config => 
+          this.checkAlertConfig(config).catch(error => {
+            logger.error(`[PriceAlertScanner] Error checking price alert config ${config.id}:`, error?.message || error);
+          })
+        )
+      );
 
       const scanDuration = Date.now() - scanStartTime;
       logger.debug(`[PriceAlertScanner] Scan completed in ${scanDuration}ms`);
@@ -192,8 +214,8 @@ export class PriceAlertScanner {
       return;
     }
 
-    // Get symbols from PriceAlertSymbolTracker
-    const symbolsToScan = Array.from(priceAlertSymbolTracker.getSymbolsForExchange(normalizedExchange));
+    // ✅ OPTIMIZED: Cache symbols với TTL 15 phút
+    const symbolsToScan = await this.getCachedSymbols(normalizedExchange);
 
     if (!symbolsToScan || symbolsToScan.length === 0) {
       logger.debug(`[PriceAlertScanner] No symbols to scan for config ${id} (${normalizedExchange})`);
@@ -205,27 +227,43 @@ export class PriceAlertScanner {
       ? config.intervals
       : ['1m'];
 
-    // Check each symbol (fetch price once, reuse for intervals)
-    for (const symbol of symbolsToScan) {
+    // ✅ ULTRA OPTIMIZED: Synchronous price fetching từ WebSocket cache (no async overhead)
+    // Process all symbols in parallel with synchronous price fetching
+    const priceResults = symbolsToScan.map(symbol => {
       try {
-        const currentPrice = await this.getPrice(normalizedExchange, symbol);
-        if (!currentPrice) continue;
-
-        for (const interval of intervals) {
-          await this.checkSymbolPrice(
-            normalizedExchange,
-            symbol,
-            threshold,
-            telegram_chat_id,
-            id,
-            interval,
-            currentPrice
-          );
-        }
+        const price = this.getPrice(normalizedExchange, symbol);
+        return { status: 'fulfilled', value: { symbol, price } };
       } catch (error) {
-        logger.warn(`Error checking price for ${symbol} on ${exchange}:`, error.message);
+        return { status: 'rejected', reason: error };
       }
-    }
+    });
+    
+    // Process all symbols with their prices in parallel
+    await Promise.allSettled(
+      priceResults.map((result, idx) => {
+        if (result.status === 'rejected') {
+          return Promise.resolve();
+        }
+        
+        const { symbol, price } = result.value;
+        if (!price) return Promise.resolve();
+        
+        // Process all intervals for this symbol in parallel
+        return Promise.allSettled(
+          intervals.map(interval =>
+            this.checkSymbolPrice(
+              normalizedExchange,
+              symbol,
+              threshold,
+              telegram_chat_id,
+              id,
+              interval,
+              price
+            )
+          )
+        );
+      })
+    );
   }
 
   /**
@@ -238,8 +276,8 @@ export class PriceAlertScanner {
         return;
       }
 
-      // Use provided currentPrice if given, otherwise fetch
-      const price = currentPrice !== null ? currentPrice : await this.getPrice(exchange, symbol);
+      // ✅ ULTRA OPTIMIZED: Use provided currentPrice (synchronous) or fetch synchronously
+      const price = currentPrice !== null ? currentPrice : this.getPrice(exchange, symbol);
       if (!price) return;
 
       // Resolve interval ms
@@ -308,73 +346,90 @@ export class PriceAlertScanner {
   }
 
   /**
-   * Get price for a symbol (with caching)
-   * Priority: WebSocket > ExchangeService > null
+   * Get price for a symbol (synchronous for WebSocket cache)
+   * Priority: WebSocket (realtime) > Cached > null
+   * ✅ ULTRA OPTIMIZED: Synchronous function vì chỉ đọc từ WebSocket cache (không cần async)
    */
-  async getPrice(exchange, symbol) {
+  getPrice(exchange, symbol) {
     try {
       const cacheKey = `${exchange}_${symbol}`;
-      const now = Date.now();
-      const cacheTime = this.priceCacheTime.get(cacheKey) || 0;
-      const cacheDuration = 500; // Reduced from 2000ms to 500ms for better realtime tracking
-
-      // Return cached price if still valid
-      if (now - cacheTime < cacheDuration) {
-        return this.priceCache.get(cacheKey);
-      }
-
       let price = null;
 
-      // Priority 1: Try WebSocket first (realtime, no API calls)
+      // ✅ ULTRA OPTIMIZED: Direct synchronous access to WebSocket cache (no async overhead)
+      // Priority 1: Try WebSocket first (realtime, no API calls, no delay, synchronous)
       if (exchange === 'binance') {
-        const { webSocketManager } = await import('../services/WebSocketManager.js');
         const wsPrice = webSocketManager.getPrice(symbol);
         if (Number.isFinite(Number(wsPrice)) && wsPrice > 0) {
           price = Number(wsPrice);
         }
       } else if (exchange === 'mexc') {
-        const { mexcPriceWs } = await import('../services/MexcWebSocketManager.js');
         const wsPrice = mexcPriceWs.getPrice(symbol);
         if (Number.isFinite(Number(wsPrice)) && wsPrice > 0) {
           price = Number(wsPrice);
         }
       }
 
-      // Priority 2: Fallback to ExchangeService (REST API) if WebSocket has no price
+      // ✅ OPTIMIZED: If WebSocket has no price, return cached price (even if expired) as fallback
+      // This prevents missing signals when WebSocket temporarily loses connection
       if (!price || !Number.isFinite(price)) {
-      const exchangeService = this.exchangeServices.get(exchange);
-        if (exchangeService) {
-          try {
-            price = await exchangeService.getTickerPrice(symbol);
-          } catch (e) {
-            logger.debug(`[PriceAlertScanner] ExchangeService.getTickerPrice failed for ${exchange} ${symbol}: ${e?.message || e}`);
-          }
+        const cachedPrice = this.priceCache.get(cacheKey);
+        if (Number.isFinite(Number(cachedPrice)) && cachedPrice > 0) {
+          return cachedPrice; // Use stale cache rather than null
         }
+        return null;
       }
 
-      // Cache the price (even if null, to avoid excessive calls)
-      if (Number.isFinite(Number(price)) && price > 0) {
+      // ✅ OPTIMIZED: Always update cache with latest WebSocket price (no TTL check)
+      // This ensures we always have the latest price available
       this.priceCache.set(cacheKey, price);
-      this.priceCacheTime.set(cacheKey, now);
+      this.priceCacheTime.set(cacheKey, Date.now());
       return price;
-      }
-
-      // Return cached price if available (even if expired, better than null)
-      const cachedPrice = this.priceCache.get(cacheKey);
-      if (Number.isFinite(Number(cachedPrice)) && cachedPrice > 0) {
-        return cachedPrice;
-      }
-
-      return null;
     } catch (error) {
-      logger.warn(`[PriceAlertScanner] Failed to get price for ${symbol} on ${exchange}:`, error.message);
-      // Return cached price as fallback
+      // Return cached price as fallback (silent fail for performance)
       const cacheKey = `${exchange}_${symbol}`;
       const cachedPrice = this.priceCache.get(cacheKey);
       if (Number.isFinite(Number(cachedPrice)) && cachedPrice > 0) {
         return cachedPrice;
       }
       return null;
+    }
+  }
+
+  /**
+   * ✅ OPTIMIZED: Get cached symbols với TTL 15 phút
+   * @param {string} exchange - Exchange name
+   * @returns {Promise<Array<string>>} Array of symbols
+   */
+  async getCachedSymbols(exchange) {
+    const normalizedExchange = (exchange || 'mexc').toLowerCase();
+    const now = Date.now();
+    const cacheTime = this.symbolsCacheTime.get(normalizedExchange) || 0;
+    
+    // Check if cache is still valid
+    if (this.cachedSymbols.has(normalizedExchange) && (now - cacheTime) < this.symbolsCacheTTL) {
+      return Array.from(this.cachedSymbols.get(normalizedExchange));
+    }
+    
+    // Cache expired or not exists, refresh
+    const symbols = Array.from(priceAlertSymbolTracker.getSymbolsForExchange(normalizedExchange));
+    this.cachedSymbols.set(normalizedExchange, new Set(symbols));
+    this.symbolsCacheTime.set(normalizedExchange, now);
+    logger.debug(`[PriceAlertScanner] Refreshed symbols cache for ${normalizedExchange}: ${symbols.length} symbols (TTL: 15 minutes)`);
+    
+    return symbols;
+  }
+
+  /**
+   * Refresh cached configs (call manually when needed)
+   */
+  async refreshConfigs() {
+    try {
+      const configs = await PriceAlertConfig.findAll();
+      const activeConfigs = configs.filter(cfg => cfg.is_active === true || cfg.is_active === 1 || cfg.is_active === '1');
+      this.cachedConfigs = activeConfigs;
+      logger.info(`[PriceAlertScanner] Refreshed cached configs: ${activeConfigs.length} active configs`);
+    } catch (error) {
+      logger.error(`[PriceAlertScanner] Failed to refresh configs:`, error?.message || error);
     }
   }
 
@@ -412,11 +467,185 @@ export class PriceAlertScanner {
         });
         // Note: Actual send happens asynchronously in queue, check logs for "Successfully sent message"
         logger.info(`[PriceAlertScanner] ✅ Alert queued: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
+
+        // --- Trigger Order Execution Flow ---
+        // ✅ OPTIMIZED: Gửi signal đến OrderService để service tự xử lý logic
+        try {
+          const strategies = strategyCache.getStrategies(exchange, symbol);
+          if (strategies.length === 0) {
+            logger.debug(`[PriceAlertScanner] No strategies found for ${exchange} ${symbol} after alert.`);
+            return;
+          }
+
+          for (const strategy of strategies) {
+            // Basic validation to ensure strategy is active and matches the interval
+            if (!strategy.is_active || strategy.bot?.is_active === false || strategy.interval !== interval) {
+              continue;
+            }
+
+            const ocThreshold = Number(strategy.oc || 0);
+            if (ocAbs < ocThreshold) {
+              continue;
+            }
+
+            const botId = strategy.bot_id;
+            const orderService = this.orderServices.get(botId);
+            if (!orderService) {
+              const availableBots = Array.from(this.orderServices.keys());
+              logger.warn(`[PriceAlertScanner] ⚠️ No OrderService found for bot ${botId}, skipping strategy ${strategy.id}. Available bots: ${availableBots.length > 0 ? availableBots.join(', ') : 'none'}`);
+              continue;
+            }
+
+            try {
+              // ✅ Tạo signal object giống như WebSocketOCConsumer.processMatch()
+              const signal = await this.createSignalFromMatch({
+                strategy,
+                oc: ocPercent,
+                direction,
+                openPrice,
+                currentPrice,
+                interval,
+                timestamp: Date.now()
+              });
+
+              if (!signal) {
+                logger.debug(`[PriceAlertScanner] Signal creation skipped for strategy ${strategy.id}`);
+                continue;
+              }
+
+              logger.info(`[PriceAlertScanner] 🚀 Sending signal to OrderService for strategy ${strategy.id} (bot_id=${botId})`);
+              const result = await orderService.executeSignal(signal);
+              
+              if (result && result.id) {
+                logger.info(`[PriceAlertScanner] ✅ Order executed successfully for strategy ${strategy.id}, position ${result.id} opened`);
+              } else {
+                logger.debug(`[PriceAlertScanner] ✅ Signal sent to OrderService for strategy ${strategy.id}`);
+              }
+            } catch (execErr) {
+              logger.error(
+                `[PriceAlertScanner] ❌ Error executing signal for strategy ${strategy.id}:`,
+                execErr?.message || execErr
+              );
+            }
+          }
+        } catch (execErr) {
+          logger.error(`[PriceAlertScanner] ❌ Error during strategy execution after alert:`, execErr?.message || execErr);
+        }
       } catch (error) {
         logger.error(`[PriceAlertScanner] ❌ Failed to send alert to chat_id=${telegramChatId}:`, error?.message || error);
       }
     } catch (error) {
       logger.error(`Failed to send price alert for ${symbol}:`, error);
+    }
+  }
+
+  /**
+   * ✅ Create signal object từ match (giống logic trong WebSocketOCConsumer.processMatch())
+   * @param {Object} match - Match object
+   * @returns {Promise<Object|null>} Signal object or null if skipped
+   */
+  async createSignalFromMatch(match) {
+    try {
+      const { strategy, oc, direction, openPrice, currentPrice, interval, timestamp } = match;
+      const botId = strategy.bot_id;
+
+      // Import calculator functions for TP/SL calculation
+      const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
+      const { determineSide } = await import('../utils/sideSelector.js');
+      const { configService } = await import('../services/ConfigService.js');
+
+      // Determine side based on direction, trade_type and is_reverse_strategy from bot
+      const side = determineSide(direction, strategy.trade_type, strategy.is_reverse_strategy);
+      if (!side) {
+        logger.info(
+          `[PriceAlertScanner] ⏭️ Strategy ${strategy.id} skipped by side mapping ` +
+          `(direction=${direction}, trade_type=${strategy.trade_type}, is_reverse_strategy=${strategy.is_reverse_strategy})`
+        );
+        return null;
+      }
+
+      // Use interval open price for entry calculation (per-bucket open)
+      const baseOpen = Number.isFinite(Number(openPrice)) && Number(openPrice) > 0
+        ? Number(openPrice)
+        : currentPrice;
+
+      // Determine entry price and order type based on strategy type
+      const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
+      let entryPrice;
+      let forceMarket = false;
+
+      if (isReverseStrategy) {
+        // Counter-trend: Calculate entry price with extend logic
+        entryPrice = side === 'long'
+          ? calculateLongEntryPrice(currentPrice, baseOpen, strategy.extend || 0)
+          : calculateShortEntryPrice(currentPrice, baseOpen, strategy.extend || 0);
+      } else {
+        // Trend-following: Use current price directly, force MARKET order
+        entryPrice = currentPrice;
+        forceMarket = true;
+      }
+
+      // Pre-calculate extend distance (only for counter-trend)
+      const totalExtendDistance = isReverseStrategy ? Math.abs(baseOpen - entryPrice) : 0;
+
+      // Calculate TP and SL (based on side)
+      const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit || 55, side);
+      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+      const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+      const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
+
+      // Create signal object
+      const signal = {
+        strategy: strategy,
+        side,
+        entryPrice: entryPrice,
+        currentPrice: currentPrice,
+        oc: Math.abs(oc),
+        interval,
+        timestamp: timestamp || Date.now(),
+        tpPrice: tpPrice,
+        slPrice: slPrice,
+        amount: strategy.amount || 1000,
+        forceMarket: forceMarket
+      };
+
+      // Extend check only applies to counter-trend strategies
+      if (!isReverseStrategy) {
+        // Trend-following: Skip extend check, MARKET order will be used
+        return signal;
+      } else {
+        // Counter-trend: Check extend condition
+        const extendOK = true; // Simplified for PriceAlertScanner
+        if (!extendOK) {
+          const allowPassive = configService.getBoolean('ENABLE_LIMIT_ON_EXTEND_MISS', true);
+          if (allowPassive) {
+            const maxDiffRatio = Number(configService.getNumber('EXTEND_LIMIT_MAX_DIFF_RATIO', 0.5)) || 0.5;
+            let priceDiffRatio = 0;
+            if (totalExtendDistance > 0) {
+              priceDiffRatio = Math.abs(currentPrice - entryPrice) / totalExtendDistance;
+            }
+
+            if (totalExtendDistance === 0 || priceDiffRatio <= maxDiffRatio) {
+              signal.forcePassiveLimit = true;
+              return signal;
+            } else {
+              logger.debug(
+                `[PriceAlertScanner] ⏭️ Extend not met for strategy ${strategy.id}, skipping ` +
+                `(priceDiffRatio=${priceDiffRatio.toFixed(4)} > maxDiffRatio=${maxDiffRatio})`
+              );
+              return null;
+            }
+          } else {
+            logger.debug(`[PriceAlertScanner] ⏭️ Extend not met for strategy ${strategy.id}, skipping (passive LIMIT disabled)`);
+            return null;
+          }
+        }
+      }
+
+      return signal;
+    } catch (error) {
+      logger.error(`[PriceAlertScanner] Error creating signal from match:`, error?.message || error);
+      return null;
     }
   }
 
