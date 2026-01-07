@@ -93,6 +93,34 @@ export class Position {
    * @param {string} symbol - Trading symbol
    * @returns {Promise<Array>}
    */
+  static async findOpenByExitOrderId(botId, exitOrderId) {
+    const [rows] = await pool.execute(
+      `SELECT p.*, s.symbol, s.\`interval\`, s.oc, s.take_profit,
+              s.reduce, s.up_reduce, s.stoploss, s.bot_id, b.bot_name, b.exchange, b.telegram_chat_id, b.telegram_alert_channel_id
+       FROM positions p
+       JOIN strategies s ON p.strategy_id = s.id
+       JOIN bots b ON p.bot_id = b.id
+       WHERE p.bot_id = ? AND p.status = 'open' AND p.exit_order_id = ?
+       LIMIT 1`,
+      [botId, exitOrderId]
+    );
+    return rows[0] || null;
+  }
+
+  static async findOpenBySlOrderId(botId, slOrderId) {
+    const [rows] = await pool.execute(
+      `SELECT p.*, s.symbol, s.\`interval\`, s.oc, s.take_profit,
+              s.reduce, s.up_reduce, s.stoploss, s.bot_id, b.bot_name, b.exchange, b.telegram_chat_id, b.telegram_alert_channel_id
+       FROM positions p
+       JOIN strategies s ON p.strategy_id = s.id
+       JOIN bots b ON p.bot_id = b.id
+       WHERE p.bot_id = ? AND p.status = 'open' AND p.sl_order_id = ?
+       LIMIT 1`,
+      [botId, slOrderId]
+    );
+    return rows[0] || null;
+  }
+
   static async findOpenBySymbol(symbol) {
     const [rows] = await pool.execute(
       `SELECT p.*, s.oc, s.take_profit, s.reduce, s.up_reduce, s.stoploss

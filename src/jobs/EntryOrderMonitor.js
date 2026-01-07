@@ -157,14 +157,13 @@ export class EntryOrderMonitor {
         return; // Entry order handled
       }
 
-      // TP/SL orders: Cache already updated above
-      // PositionService.updatePosition will detect TP/SL fills via cache on next monitor cycle
-      // This avoids O(N) DB scan on every TP/SL fill event (performance optimization)
+      // TP/SL orders: Cache already updated above.
+      // CRITICAL CHANGE:
+      // Close position in DB + send Telegram ONLY when WebSocket confirms exit order FILLED.
+      // Do NOT rely on PositionService.updatePosition inference.
       if (isFilled) {
-        logger.info(
-          `[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) FILLED via WebSocket. ` +
-          `Cache updated. PositionService will detect on next cycle.`
-        );
+        logger.info(`[EntryOrderMonitor] Exit order ${orderId} (${symbol}) FILLED via WebSocket. Will close matching DB position + notify.`);
+        await this._closePositionFromExitFill(botId, orderId, symbol, avgPrice);
       } else if (isCanceled) {
         logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) ${status} via WebSocket. Cache updated.`);
       } else if (status === 'PARTIALLY_FILLED') {
@@ -177,6 +176,67 @@ export class EntryOrderMonitor {
         error?.stack
       );
     }
+  }
+
+  /**
+   * Close DB position and notify when an exit order (TP/SL) is FILLED via WebSocket.
+   * This is the ONLY allowed path to mark a position closed + send Telegram close alert.
+   */
+  async _closePositionFromExitFill(botId, exitOrderId, symbol, avgPrice) {
+    try {
+      const dbPos = await Position.findOpenByExitOrderId(botId, exitOrderId);
+      if (!dbPos) {
+        // Might be SL order
+        const dbPosSl = await Position.findOpenBySlOrderId(botId, exitOrderId);
+        if (!dbPosSl) {
+          logger.warn(`[EntryOrderMonitor] No open DB position found for exitOrderId=${exitOrderId} bot=${botId} symbol=${symbol}`);
+          return;
+        }
+        return await this._finalizeDbClose(botId, dbPosSl, avgPrice, exitOrderId);
+      }
+      return await this._finalizeDbClose(botId, dbPos, avgPrice, exitOrderId);
+    } catch (e) {
+      logger.error(`[EntryOrderMonitor] Failed to close DB position from exit fill | bot=${botId} orderId=${exitOrderId} symbol=${symbol}: ${e?.message || e}`);
+    }
+  }
+
+  async _finalizeDbClose(botId, position, avgPrice, exitOrderId) {
+    // Determine reason
+    const reason = (String(exitOrderId) === String(position.exit_order_id)) ? 'tp_hit' : 'sl_hit';
+    const closePrice = Number.isFinite(Number(avgPrice)) && Number(avgPrice) > 0 ? Number(avgPrice) : Number(position.take_profit_price || position.stoploss_price || position.entry_price);
+
+    const { calculatePnL } = await import('../utils/calculator.js');
+    const pnl = calculatePnL(position.entry_price, closePrice, position.amount, position.side);
+
+    // Close in DB
+    const closed = await Position.close(position.id, closePrice, pnl, reason);
+    logger.info(`[EntryOrderMonitor] ✅ Closed DB position ${position.id} via WS exit fill | reason=${reason} closePrice=${closePrice} pnl=${pnl}`);
+
+    // Telegram notify
+    try {
+      const positionService = await this._getPositionServiceForBot(botId);
+      if (positionService?.sendTelegramCloseNotification) {
+        await positionService.sendTelegramCloseNotification(closed);
+      } else {
+        // fallback direct telegram
+        if (this.telegramService?.sendCloseSummaryAlert) {
+          const stats = await Position.getBotStats(closed.bot_id);
+          await this.telegramService.sendCloseSummaryAlert(closed, stats);
+        }
+      }
+    } catch (notifyErr) {
+      logger.error(`[EntryOrderMonitor] Failed to send Telegram close alert for position ${position.id}: ${notifyErr?.message || notifyErr}`);
+    }
+
+    return closed;
+  }
+
+  async _getPositionServiceForBot(botId) {
+    // Lazy import to avoid circular deps
+    const { PositionService } = await import('../services/PositionService.js');
+    const exchangeService = this.exchangeServices.get(botId);
+    if (!exchangeService) return null;
+    return new PositionService(exchangeService, this.telegramService);
   }
 
   /**
