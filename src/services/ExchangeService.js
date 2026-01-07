@@ -356,10 +356,22 @@ export class ExchangeService {
         if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
           throw new Error(`Invalid amount (USDT) for ${normalizedSymbol}: ${amount}`);
         }
-        const quantity = Number(amount) / Number(currentPrice);
+        let quantity = Number(amount) / Number(currentPrice);
         if (!Number.isFinite(quantity) || quantity <= 0) {
           throw new Error(`Computed quantity invalid for ${normalizedSymbol}: amount=${amount}, price=${currentPrice}`);
         }
+
+        // CRITICAL FIX (-4005): Validate and clamp quantity against maxQty from LOT_SIZE filter
+        const lotSizeFilter = symbolInfo.filters.find(f => f.filterType === 'LOT_SIZE');
+        const maxQty = lotSizeFilter ? parseFloat(lotSizeFilter.maxQty) : null;
+
+        if (maxQty && Number.isFinite(maxQty) && quantity > maxQty) {
+          logger.warn(
+            `[MaxQty] Quantity ${quantity} for ${normalizedSymbol} exceeds maxQty ${maxQty}. Clamping to maxQty.`
+          );
+          quantity = maxQty;
+        }
+
         const notional = Number(amount); // USDT-margined futures: price * qty = amount
 
         // Configure margin type and leverage per symbol (cached to avoid redundant API calls)

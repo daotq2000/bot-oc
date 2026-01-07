@@ -12,6 +12,9 @@ export class PositionService {
   constructor(exchangeService, telegramService = null) {
     this.exchangeService = exchangeService;
     this.telegramService = telegramService;
+    // A) Memory map for cross-entry exit deduplication
+    this.crossEntryExitPending = new Map(); // position.id -> timestamp
+    this.crossEntryExitTTL = 60 * 1000; // 60 seconds cooldown
   }
 
   /**
@@ -325,19 +328,116 @@ export class PositionService {
               
               if (hasCrossedEntry) {
                 // Case 2: TP has crossed entry.
-                // CRITICAL CHANGE: Do NOT auto-close position or update DB/Telegram based on local calculation.
-                // Only update DB and send close alert when exchange confirms closure via WebSocket (ORDER_TRADE_UPDATE/ACCOUNT_UPDATE).
-                logger.warn(
-                  `[TP Trail] 🚫 TP crossed entry detected (NO AUTO-CLOSE) | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
-                  `entry=${entryPrice.toFixed(8)} prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} market=${marketPrice.toFixed(8)} ` +
-                  `note=waiting_for_exchange_ws_close_event`
-                );
+                // NEW BEHAVIOR (A): Try to exit as soon as possible based on PnL,
+                // but NEVER close DB / send Telegram here. DB/Telegram is WS-driven only.
 
-                // Optional: still persist trailing TP value for audit/debug
-                try {
-                  await Position.update(position.id, { take_profit_price: newTP });
-                } catch (e) {
-                  logger.warn(`[TP Trail] Failed to persist take_profit_price (no auto-close) | pos=${position.id}: ${e?.message || e}`);
+                // Dedupe: avoid spamming exit attempts
+                const lastAttemptAt = this.crossEntryExitPending.get(position.id) || 0;
+                const nowAttempt = Date.now();
+                if (nowAttempt - lastAttemptAt < this.crossEntryExitTTL) {
+                  logger.debug(`[TP Trail] ⏳ Cross-entry exit pending (dedupe) | pos=${position.id} lastAttemptAt=${lastAttemptAt}`);
+                } else {
+                  this.crossEntryExitPending.set(position.id, nowAttempt);
+
+                  logger.warn(
+                    `[TP Trail] ⚠️ TP crossed entry -> attempt fast exit (WS-driven close) | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
+                    `entry=${entryPrice.toFixed(8)} prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} market=${marketPrice.toFixed(8)}`
+                  );
+
+                  // Persist trailing TP value for audit/debug
+                  try {
+                    await Position.update(position.id, { take_profit_price: newTP });
+                  } catch (e) {
+                    logger.warn(`[TP Trail] Failed to persist take_profit_price (cross-entry) | pos=${position.id}: ${e?.message || e}`);
+                  }
+
+                  try {
+                    // Compute current pnl using marketPrice
+                    const currentPnl = calculatePnL(position.entry_price, marketPrice, position.amount, position.side);
+
+                    // Helper to detect Binance "would immediately trigger" errors
+                    const isImmediateTriggerError = (msg) => {
+                      const m = String(msg || '').toLowerCase();
+                      return m.includes('-2021') || m.includes('would immediately trigger');
+                    };
+
+                    if (currentPnl > 0) {
+                      // pnl > 0: try TAKE_PROFIT_MARKET with buffer retries, then fallback to MARKET
+                      const buffers = [0.001, 0.002, 0.003]; // 0.1%, 0.2%, 0.3%
+                      let placed = false;
+
+                      for (let i = 0; i < buffers.length; i++) {
+                        const b = buffers[i];
+                        // Round stopPrice to tickSize to avoid precision errors
+                        const tickSizeStr = exchangeInfoService.getTickSize(position.symbol) || await this.exchangeService.getTickSize(position.symbol);
+                        const tickSize = String(tickSizeStr || '0.01');
+                        const rawStopPrice = position.side === 'long'
+                          ? marketPrice * (1 + b)
+                          : marketPrice * (1 - b);
+                        const stopPrice = (this.exchangeService?.binanceDirectClient?.formatPrice)
+                          ? this.exchangeService.binanceDirectClient.formatPrice(rawStopPrice, tickSize)
+                          : Number(rawStopPrice);
+
+                        try {
+                          await this.exchangeService.createCloseTakeProfitMarket(position.symbol, position.side, stopPrice);
+                          logger.info(
+                            `[TP Trail] ✅ Cross-entry TP_MARKET placed | pos=${position.id} stopPrice=${stopPrice} buffer=${(b * 100).toFixed(2)}% tickSize=${tickSize}`
+                          );
+                          placed = true;
+                          break;
+                        } catch (e) {
+                          const em = e?.message || e;
+                          logger.warn(
+                            `[TP Trail] TP_MARKET retry ${i + 1}/3 failed | pos=${position.id} stopPrice=${stopPrice} err=${em}`
+                          );
+                          if (!isImmediateTriggerError(em)) {
+                            // Non-trigger error: break early and fallback to MARKET
+                            break;
+                          }
+                          // else: continue retry with larger buffer
+                        }
+                      }
+
+                      if (!placed) {
+                        logger.warn(`[TP Trail] ⚠️ Cross-entry TP_MARKET failed -> fallback MARKET close | pos=${position.id}`);
+                        try {
+                          await this.exchangeService.closePosition(position.symbol, position.side, position.amount);
+                          logger.info(`[TP Trail] ✅ Cross-entry MARKET close sent | pos=${position.id}`);
+                        } catch (e) {
+                          logger.error(`[TP Trail] ❌ Cross-entry MARKET close failed | pos=${position.id}: ${e?.message || e}`);
+                        }
+                      }
+                    } else {
+                      // pnl <= 0: for loss zone, STOP_MARKET is the semantically correct conditional order type.
+                      // However, our goal here is to exit ASAP. We'll try STOP_MARKET once (with correct side),
+                      // and fallback to MARKET reduceOnly.
+                      logger.warn(`[TP Trail] ⚠️ Cross-entry pnl<=0 -> try STOP_MARKET then fallback MARKET | pos=${position.id} pnl=${currentPnl}`);
+
+                      try {
+                        const tickSizeStr = exchangeInfoService.getTickSize(position.symbol) || await this.exchangeService.getTickSize(position.symbol);
+                        const tickSize = String(tickSizeStr || '0.01');
+                        const rawStopPrice = position.side === 'long'
+                          ? marketPrice * (1 - 0.001) // 0.1% below market
+                          : marketPrice * (1 + 0.001); // 0.1% above market
+                        const stopPrice = (this.exchangeService?.binanceDirectClient?.formatPrice)
+                          ? this.exchangeService.binanceDirectClient.formatPrice(rawStopPrice, tickSize)
+                          : Number(rawStopPrice);
+
+                        await this.exchangeService.createCloseStopMarket(position.symbol, position.side, stopPrice);
+                        logger.info(`[TP Trail] ✅ Cross-entry STOP_MARKET placed | pos=${position.id} stopPrice=${stopPrice} tickSize=${tickSize}`);
+                      } catch (e) {
+                        logger.warn(`[TP Trail] STOP_MARKET failed -> fallback MARKET close | pos=${position.id}: ${e?.message || e}`);
+                        try {
+                          await this.exchangeService.closePosition(position.symbol, position.side, position.amount);
+                          logger.info(`[TP Trail] ✅ Cross-entry MARKET close sent | pos=${position.id}`);
+                        } catch (e2) {
+                          logger.error(`[TP Trail] ❌ Cross-entry MARKET close failed | pos=${position.id}: ${e2?.message || e2}`);
+                        }
+                      }
+                    }
+                  } catch (e) {
+                    logger.error(`[TP Trail] Error attempting cross-entry exit | pos=${position.id}: ${e?.message || e}`);
+                  }
                 }
               } else {
                 // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
