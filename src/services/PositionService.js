@@ -1010,10 +1010,41 @@ export class PositionService {
           hasExposure = qty && qty > 0;
           
           if (!hasExposure) {
-            // Position has no exposure - it's already closed on exchange
-            // This is safe to close in DB and send alert
+            // Position has no exposure - likely closed on exchange, but closableQty can be 0 due to rounding/mode mismatch.
+            // CRITICAL: Double-check the real exchange position before declaring closed.
+            let exchangePositions = null;
+            try {
+              exchangePositions = await this.exchangeService.getOpenPositions(position.symbol);
+            } catch (posErr) {
+              logger.warn(`[CloseGuard] Failed to fetch open positions for verification: ${posErr?.message || posErr}`);
+            }
+
+            const normalizedSymbol = (this.exchangeService?.binanceDirectClient?.normalizeSymbol && this.exchangeService.binanceDirectClient.normalizeSymbol(position.symbol)) || position.symbol;
+            const expectedPositionSide = position.side === 'long' ? 'LONG' : 'SHORT';
+            const stillOpen = Array.isArray(exchangePositions)
+              ? exchangePositions.some(p => {
+                  const symOk = (p.symbol === normalizedSymbol || p.symbol === position.symbol);
+                  if (!symOk) return false;
+
+                  // Hedge-mode aware: if exchange returns positionSide, ensure it matches our position side.
+                  if (p.positionSide && String(p.positionSide).toUpperCase() !== expectedPositionSide) return false;
+
+                  const amt = Math.abs(parseFloat(p.positionAmt ?? p.contracts ?? 0));
+                  return amt > 0;
+                })
+              : false;
+
+            if (stillOpen) {
+              // Position still exists on exchange -> do NOT close in DB
+              logger.error(
+                `[CloseGuard] ❌ BLOCKED: getClosableQuantity=0 but exchange still reports open position for ${position.symbol}. ` +
+                `Will NOT close position ${position.id} to prevent false alert.`
+              );
+              throw new Error(`Exchange still has open position for ${position.symbol}. Blocking DB close.`);
+            }
+
             verifiedClose = true;
-            logger.info(`[CloseGuard] ✅ Position ${position.id} (${position.symbol}) has no exchange exposure - verified closed on exchange`);
+            logger.info(`[CloseGuard] ✅ Position ${position.id} (${position.symbol}) verified closed on exchange (no exposure + no open position)`);
           } else {
             // Position still has exposure - verify order was FILLED before closing
             // Check order status from cache or REST API
@@ -1090,9 +1121,13 @@ export class PositionService {
             throw e;
           }
           logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
-          // For other errors, continue to close in DB (backward compatibility)
-          // But log warning that verification failed
-          logger.warn(`[CloseGuard] ⚠️ Verification failed but continuing to close position ${position.id} (backward compatibility)`);
+          // CRITICAL CHANGE: Do NOT close in DB when verification fails.
+          // This was causing false "close position" alerts while position is still open on exchange.
+          // Fail-safe: keep position open in DB and let PositionSync reconcile later.
+          logger.error(
+            `[CloseGuard] ❌ BLOCKED: Verification failed; will NOT close position ${position.id} in DB to prevent mismatch.`
+          );
+          throw new Error(`CloseGuard verification failed for position ${position.id}. Blocking DB close to prevent false alert.`);
         }
       }
       

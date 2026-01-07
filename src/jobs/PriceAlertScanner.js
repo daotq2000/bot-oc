@@ -20,6 +20,10 @@ export class PriceAlertScanner {
     this.scanInterval = null;
     this.isScanning = false; // prevent overlapping scans
     this.alertStates = new Map(); // key: exch|symbol|interval -> state
+
+    // ✅ DEDUPE: prevent multiple signals for same (exchange|symbol|interval|strategy) within the same candle bucket
+    this.signalStates = new Map(); // key: exch|symbol|interval|strategyId -> { bucket, lastSentAt }
+    this.signalMinIntervalMs = 15000; // safety: at most 1 signal per 15s even if bucket calc is jittery
     this.priceCache = new Map(); // Cache prices to avoid excessive API calls
     this.priceCacheTime = new Map(); // Track cache time
 
@@ -323,13 +327,27 @@ export class PriceAlertScanner {
       const oc = ((price - openPrice) / openPrice) * 100; // signed
       const ocAbs = Math.abs(oc);
 
+      // 1) ALWAYS execute signal for any OC (no threshold gate)
+      // Execute is independent from Telegram success/fail.
+      await this.executeStrategiesForOC({
+        exchange,
+        symbol,
+        openPrice,
+        currentPrice: price,
+        oc,
+        interval
+      });
+
+      // 2) Telegram volatility alert is optional and rate-limited (still uses config.threshold)
+      // Keep existing behaviour to avoid spamming Telegram.
       const nowMs = now;
       const minAlertInterval = 60000; // 1 minute between alerts
 
       if (ocAbs >= threshold) {
         const timeSinceLastAlert = nowMs - state.lastAlertTime;
         if (!state.alerted || timeSinceLastAlert >= minAlertInterval) {
-          await this.sendPriceAlert(
+          // Fire-and-forget: do not block strategy execution
+          this.sendPriceAlert(
             exchange,
             symbol,
             openPrice,
@@ -338,7 +356,9 @@ export class PriceAlertScanner {
             interval,
             telegramChatId,
             configId
-          );
+          ).catch((e) => {
+            logger.warn(`[PriceAlertScanner] Failed to send volatility alert for ${exchange} ${symbol} ${interval}: ${e?.message || e}`);
+          });
           state.lastAlertTime = nowMs;
           state.alerted = true;
         }
@@ -467,6 +487,15 @@ export class PriceAlertScanner {
         this.priceCache.delete(key);
       }
     }
+
+    // Cleanup signalStates (dedupe cache)
+    // Remove entries older than stateMaxIdleMs to prevent memory growth
+    for (const [key, v] of this.signalStates.entries()) {
+      const lastSentAt = v?.lastSentAt || 0;
+      if (now - lastSentAt > this.stateMaxIdleMs) {
+        this.signalStates.delete(key);
+      }
+    }
   }
 
   /**
@@ -492,6 +521,106 @@ export class PriceAlertScanner {
   }
 
   /**
+   * Execute strategies for any OC movement (no threshold)
+   * @private
+   */
+  async executeStrategiesForOC({ exchange, symbol, openPrice, currentPrice, oc, interval }) {
+    // Standardize interval format (e.g., '5M' -> '5m')
+    const normalizedInterval = this.normalizeInterval(interval);
+    if (!normalizedInterval) {
+      logger.warn(`[PriceAlertScanner] Invalid interval format: ${interval} for ${exchange} ${symbol}`);
+      return;
+    }
+
+    // DEDUPE bucket is based on interval
+    const intervalMs = this.getIntervalMs(normalizedInterval);
+    if (!intervalMs) {
+      logger.warn(`[PriceAlertScanner] Unsupported interval ${normalizedInterval} for ${exchange} ${symbol} (dedupe)`);
+      return;
+    }
+    const now = Date.now();
+    const bucket = Math.floor(now / intervalMs);
+
+    const strategies = strategyCache.getStrategies(exchange, symbol);
+    if (!strategies || strategies.length === 0) {
+      return; // No strategies for this symbol
+    }
+
+    const ocAbs = Math.abs(oc);
+    const direction = oc >= 0 ? 'bullish' : 'bearish';
+
+    for (const strategy of strategies) {
+      // Skip if strategy is not active or interval doesn't match exactly
+      if (!strategy.is_active ||
+          strategy.bot?.is_active === false ||
+          this.normalizeInterval(strategy.interval) !== normalizedInterval) {
+        continue;
+      }
+
+      // Skip if OC doesn't meet strategy threshold (strategy.oc is in %)
+      const strategyOcThreshold = Number(strategy.oc || 0);
+      if (ocAbs < strategyOcThreshold) {
+        continue;
+      }
+
+      // ✅ DEDUPE: only one signal per (exchange|symbol|interval|strategy) per bucket
+      const dedupeKey = `${exchange}|${symbol}|${normalizedInterval}|${strategy.id}`;
+      const prev = this.signalStates.get(dedupeKey);
+      if (prev?.bucket === bucket) {
+        // same candle bucket => already sent
+        continue;
+      }
+      if (prev?.lastSentAt && (now - prev.lastSentAt) < this.signalMinIntervalMs) {
+        // extra safety against jitter/multiple workers
+        continue;
+      }
+
+      const orderService = this.orderServices.get(strategy.bot_id);
+      if (!orderService) {
+        logger.warn(`[PriceAlertScanner] No OrderService for bot ${strategy.bot_id}`);
+        continue;
+      }
+
+      // mark as sent BEFORE execute to prevent concurrent duplicate fires
+      this.signalStates.set(dedupeKey, { bucket, lastSentAt: now });
+
+      try {
+        const signal = await this.createSignalFromMatch({
+          strategy,
+          oc,
+          direction,
+          openPrice,
+          currentPrice,
+          interval: normalizedInterval,
+          timestamp: now
+        });
+
+        if (signal) {
+          logger.info(`[PriceAlertScanner] 🚀 Sending signal to OrderService for strategy ${strategy.id} (${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%)`);
+          await orderService.executeSignal(signal);
+        }
+      } catch (error) {
+        // allow re-send on next tick if execute failed
+        this.signalStates.delete(dedupeKey);
+        logger.error(`[PriceAlertScanner] Error executing strategy ${strategy.id}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Normalize interval string to standard format (e.g., '5M' -> '5m')
+   * @private
+   */
+  normalizeInterval(interval) {
+    if (!interval) return null;
+    // Convert to lowercase and remove any non-alphanumeric characters
+    const normalized = String(interval).toLowerCase().replace(/[^a-z0-9]/g, '');
+    // Only allow specific intervals
+    const validIntervals = ['1m', '5m', '15m', '30m'];
+    return validIntervals.includes(normalized) ? normalized : null;
+  }
+
+  /**
    * Send price alert via Telegram
    */
   async sendPriceAlert(exchange, symbol, openPrice, currentPrice, ocPercent, interval, telegramChatId, configId) {
@@ -511,80 +640,18 @@ export class PriceAlertScanner {
       const direction = bullish ? 'bullish' : 'bearish';
 
       // Use compact line format via TelegramService
-      const ocAbs = Math.abs(ocPercent);
       logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
 
       try {
         await this.telegramService.sendVolatilityAlert(telegramChatId, {
           symbol,
-          interval: interval || '1m',
+          interval: this.normalizeInterval(interval) || '1m',
           oc: ocPercent,
           open: openPrice,
           currentPrice,
           direction
         });
         logger.info(`[PriceAlertScanner] ✅ Alert queued: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
-
-        // --- Trigger Order Execution Flow ---
-        try {
-          const strategies = strategyCache.getStrategies(exchange, symbol);
-          if (strategies.length === 0) {
-            logger.debug(`[PriceAlertScanner] No strategies found for ${exchange} ${symbol} after alert.`);
-            return;
-          }
-
-          for (const strategy of strategies) {
-            if (!strategy.is_active || strategy.bot?.is_active === false || strategy.interval !== interval) {
-              continue;
-            }
-
-            const ocThreshold = Number(strategy.oc || 0);
-            if (ocAbs < ocThreshold) {
-              continue;
-            }
-
-            const botId = strategy.bot_id;
-            const orderService = this.orderServices.get(botId);
-            if (!orderService) {
-              const availableBots = Array.from(this.orderServices.keys());
-              logger.warn(`[PriceAlertScanner] ⚠️ No OrderService found for bot ${botId}, skipping strategy ${strategy.id}. Available bots: ${availableBots.length > 0 ? availableBots.join(', ') : 'none'}`);
-              continue;
-            }
-
-            try {
-              const signal = await this.createSignalFromMatch({
-                strategy,
-                oc: ocPercent,
-                direction,
-                openPrice,
-                currentPrice,
-                interval,
-                timestamp: Date.now()
-              });
-
-              if (!signal) {
-                logger.debug(`[PriceAlertScanner] Signal creation skipped for strategy ${strategy.id}`);
-                continue;
-              }
-
-              logger.info(`[PriceAlertScanner] 🚀 Sending signal to OrderService for strategy ${strategy.id} (bot_id=${botId})`);
-              const result = await orderService.executeSignal(signal);
-
-              if (result && result.id) {
-                logger.info(`[PriceAlertScanner] ✅ Order executed successfully for strategy ${strategy.id}, position ${result.id} opened`);
-              } else {
-                logger.debug(`[PriceAlertScanner] ✅ Signal sent to OrderService for strategy ${strategy.id}`);
-              }
-            } catch (execErr) {
-              logger.error(
-                `[PriceAlertScanner] ❌ Error executing signal for strategy ${strategy.id}:`,
-                execErr?.message || execErr
-              );
-            }
-          }
-        } catch (execErr) {
-          logger.error(`[PriceAlertScanner] ❌ Error during strategy execution after alert:`, execErr?.message || execErr);
-        }
       } catch (error) {
         logger.error(`[PriceAlertScanner] ❌ Failed to send alert to chat_id=${telegramChatId}:`, error?.message || error);
       }
