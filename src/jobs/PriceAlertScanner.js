@@ -27,6 +27,10 @@ export class PriceAlertScanner {
     this.priceCache = new Map(); // Cache prices to avoid excessive API calls
     this.priceCacheTime = new Map(); // Track cache time
 
+    // ✅ PERF: skip processing when price hasn't changed (per exchange|symbol)
+    this.lastProcessedPrice = new Map(); // key: exchange|symbol -> price
+    this.lastProcessedPriceTime = new Map(); // key: exchange|symbol -> timestamp
+
     // ✅ OPTIMIZED: Cache PriceAlertConfigs (refresh định kỳ để bắt config mới mà không query mỗi scan)
     this.cachedConfigs = null;
     this.configCacheTime = 0;
@@ -241,21 +245,37 @@ export class PriceAlertScanner {
     }
 
     // Determine intervals from config; default to ['1m'] if empty
-    const intervals = Array.isArray(config.intervals) && config.intervals.length > 0
+    // Normalize and keep only supported intervals (1m, 5m, 15m, 30m)
+    const rawIntervals = Array.isArray(config.intervals) && config.intervals.length > 0
       ? config.intervals
       : ['1m'];
 
-    // ✅ PERFORMANCE: tránh Promise fan-out theo symbols*intervals.
-    // Duyệt tuần tự + yield nhẹ để giảm CPU/GC, nhưng vẫn realtime vì giá đọc từ WS cache.
-    const symbolBatchSize = Number(configService.getNumber('PRICE_ALERT_SYMBOL_BATCH_SIZE', 200));
+    const intervals = rawIntervals
+      .map((x) => this.normalizeInterval(x))
+      .filter(Boolean);
 
-    for (let i = 0; i < symbolsToScan.length; i++) {
-      const symbol = symbolsToScan[i];
+    if (intervals.length === 0) {
+      logger.warn(`[PriceAlertScanner] Config ${id} has no valid intervals. Expected one of: 1m, 5m, 15m, 30m`);
+      return;
+    }
+
+    // ✅ PERF: parallelize per-symbol processing with concurrency limiter
+    const symbolConcurrency = Number(configService.getNumber('PRICE_ALERT_SYMBOL_SCAN_CONCURRENCY', 200));
+
+    await this.runWithConcurrency(symbolsToScan, symbolConcurrency, async (symbol) => {
       const price = this.getPrice(normalizedExchange, symbol);
-      if (!price) continue;
+      if (!price) return;
+
+      // ✅ PERF: skip if price hasn't changed recently (per exchange|symbol)
+      const priceKey = `${normalizedExchange}|${symbol}`;
+      const lastPrice = this.lastProcessedPrice.get(priceKey);
+      if (Number.isFinite(Number(lastPrice)) && Number(lastPrice) === Number(price)) {
+        return;
+      }
+      this.lastProcessedPrice.set(priceKey, Number(price));
+      this.lastProcessedPriceTime.set(priceKey, Date.now());
 
       for (const interval of intervals) {
-        // checkSymbolPrice có thể await gửi telegram / execute order khi trigger
         await this.checkSymbolPrice(
           normalizedExchange,
           symbol,
@@ -266,12 +286,7 @@ export class PriceAlertScanner {
           price
         );
       }
-
-      // yield to event loop every batch to keep process responsive
-      if (symbolBatchSize > 0 && i > 0 && i % symbolBatchSize === 0) {
-        await new Promise(resolve => setImmediate(resolve));
-      }
-    }
+    });
   }
 
   /**
@@ -494,6 +509,14 @@ export class PriceAlertScanner {
       const lastSentAt = v?.lastSentAt || 0;
       if (now - lastSentAt > this.stateMaxIdleMs) {
         this.signalStates.delete(key);
+      }
+    }
+
+    // Cleanup lastProcessedPrice cache (price-unchanged optimization)
+    for (const [key, t] of this.lastProcessedPriceTime.entries()) {
+      if (now - (t || 0) > this.priceCacheMaxIdleMs) {
+        this.lastProcessedPriceTime.delete(key);
+        this.lastProcessedPrice.delete(key);
       }
     }
   }
