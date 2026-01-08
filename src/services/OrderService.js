@@ -115,7 +115,9 @@ export class OrderService {
       await this.sendCentralLog(`Order Attempt | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} entry=${entryPrice} amt=${amount} tp=${tpPrice ?? 'n/a'} sl=${slPrice ?? 'n/a'} oc=${signal?.oc ?? 'n/a'}`);
 
       // Simple position limit check (with cache)
-      const maxPositions = strategy.bot?.max_concurrent_trades || 100;
+      // max_concurrent_trades MUST come from bots table (JOINed into strategy as a top-level field)
+      // Do not rely on strategy.bot here because strategy objects are often plain rows.
+      const maxPositions = Number(strategy?.bot ?? strategy?.bot?.max_concurrent_trades ?? 100);
       
       // Only check if limit is set and reasonable
       if (maxPositions > 0 && maxPositions < 10000) {

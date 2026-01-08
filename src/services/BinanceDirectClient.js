@@ -286,6 +286,9 @@ export class BinanceDirectClient {
         const minQty = parseFloat(filters.minQty || '0');
         const maxQty = parseFloat(filters.maxQty || '999999999');
 
+        // Store for formatter helper
+        filters._parsed = { stepSize, minQty, maxQty };
+
         if (qty < minQty) {
           errors.push(`Quantity ${qty} is below minimum ${minQty}`);
         }
@@ -1240,6 +1243,66 @@ export class BinanceDirectClient {
   }
 
   /**
+   * Format order quantity to comply with exchange rules
+   * @param {string} symbol - Trading symbol
+   * @param {number|string} quantity - Desired quantity
+   * @returns {Promise<{quantity: string, minQty: number, maxQty: number, stepSize: number}>} Formatted quantity and limits
+   */
+  async formatOrderQuantity(symbol, quantity) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    
+    // Get symbol info with caching
+    let symbolInfo;
+    try {
+      symbolInfo = await this.getTradingExchangeSymbol(normalizedSymbol);
+    } catch (e) {
+      logger.warn(`[Binance] Failed to get symbol info for ${normalizedSymbol}, using raw quantity: ${e?.message || e}`);
+      return {
+        quantity: quantity.toString(),
+        minQty: 0,
+        maxQty: Number.MAX_SAFE_INTEGER,
+        stepSize: 0.00000001
+      };
+    }
+
+    // Get LOT_SIZE filter
+    const lotSizeFilter = symbolInfo.filters?.find(f => f.filterType === 'LOT_SIZE');
+    if (!lotSizeFilter) {
+      logger.warn(`[Binance] No LOT_SIZE filter for ${normalizedSymbol}, using raw quantity`);
+      return {
+        quantity: quantity.toString(),
+        minQty: 0,
+        maxQty: Number.MAX_SAFE_INTEGER,
+        stepSize: 0.00000001
+      };
+    }
+
+    // Parse filter values
+    const stepSize = parseFloat(lotSizeFilter.stepSize);
+    const minQty = parseFloat(lotSizeFilter.minQty);
+    const maxQty = parseFloat(lotSizeFilter.maxQty);
+    
+    // Round to step size
+    let formattedQty = Math.floor(quantity / stepSize) * stepSize;
+    
+    // Clamp to min/max
+    formattedQty = Math.max(minQty, Math.min(maxQty, formattedQty));
+    
+    // Format to avoid scientific notation and trailing zeros
+    const precision = this.getPrecisionFromIncrement(stepSize);
+    const formattedStr = formattedQty.toFixed(precision).replace(/\.?0+$/, '');
+    
+    logger.debug(`[Binance] Formatted quantity: ${quantity} -> ${formattedStr} for ${normalizedSymbol} (min: ${minQty}, max: ${maxQty}, step: ${stepSize})`);
+    
+    return {
+      quantity: formattedStr,
+      minQty,
+      maxQty,
+      stepSize
+    };
+  }
+
+  /**
    * Get account balance
    */
   async getBalance() {
@@ -1299,7 +1362,8 @@ export class BinanceDirectClient {
       throw new Error(`Could not retrieve price for ${normalizedSymbol} to place market order.`);
     }
 
-    const formattedQuantity = this.formatQuantity(quantity, stepSize);
+    // CRITICAL FIX: Format quantity to comply with Binance LOT_SIZE (minQty/maxQty/stepSize)
+    const { quantity: formattedQuantity, maxQty } = await this.formatOrderQuantity(normalizedSymbol, quantity);
     if (parseFloat(formattedQuantity) <= 0) {
       throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
     }
@@ -1349,17 +1413,19 @@ export class BinanceDirectClient {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
     // Get precision and account mode
-    const [tickSize, stepSize, dualSide] = await Promise.all([
+    const [tickSize, dualSide] = await Promise.all([
       this.getTickSize(normalizedSymbol),
-      this.getStepSize(normalizedSymbol),
       this.getDualSidePosition()
     ]);
 
     let roundedPrice = this.roundPrice(price, tickSize);
-    let formattedQuantity = this.formatQuantity(quantity, stepSize);
+    
+    // CRITICAL FIX: Format quantity to comply with Binance LOT_SIZE (minQty/maxQty/stepSize)
+    const { quantity: initialFormattedQuantity } = await this.formatOrderQuantity(normalizedSymbol, quantity);
+    let formattedQuantity = initialFormattedQuantity;
 
     if (parseFloat(formattedQuantity) <= 0) {
-      throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity}, stepSize: ${stepSize})`);
+      throw new Error(`Invalid quantity after formatting: ${formattedQuantity} (original: ${quantity})`);
     }
 
     if (roundedPrice <= 0) {

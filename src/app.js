@@ -83,7 +83,6 @@ async function start() {
       await AppConfig.set('ENTRY_ORDER_TTL_MINUTES', '5', 'Minutes before auto-cancel unfilled entry LIMIT orders (applies to all LIMIT entry orders including extend-miss). You can change this in app_configs');
       await AppConfig.set('SIGNAL_SCAN_INTERVAL_MS', '5000', 'Signal scanner job interval in milliseconds');
       await AppConfig.set('NON_BINANCE_TICKER_CACHE_MS', '1500', 'Cache lifetime for non-Binance ticker REST calls (ms)');
-      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '100', 'Price alert scanner job interval in milliseconds');
       await AppConfig.set('PRICE_ALERT_MODULE_ENABLED', 'true', 'Enable/Disable the entire Price Alert module (workers, scanners, alerts)');
       await AppConfig.set('PRICE_ALERT_CHECK_ENABLED', 'true', 'Enable price alert checking for MEXC and other exchanges');
       await AppConfig.set('PRICE_ALERT_SYMBOL_REFRESH_INTERVAL_MS', '30000', 'Interval to refresh Price Alert symbols from config/DB (ms)');
@@ -156,7 +155,7 @@ async function start() {
       await AppConfig.set('BINANCE_DEFAULT_LEVERAGE', '5', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_USE_SCANNER', 'true', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_USE_WEBSOCKET', 'false', 'Default leverage for Binance positions');
-      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '50', 'Default leverage for Binance positions');
+      await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '100', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_CONFIG_BATCH_SIZE', '10', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_SYMBOL_BATCH_SIZE', '20', 'Default leverage for Binance positions');
 
@@ -432,7 +431,11 @@ async function start() {
         logger.warn('Failed to stop Memory Monitor:', e?.message || e);
       }
       
-      await telegramBot.stop();
+      if (telegramBot) {
+        if (telegramBot) {
+        await telegramBot.stop();
+      }
+      }
       process.exit(0);
     });
 

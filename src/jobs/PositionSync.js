@@ -148,7 +148,7 @@ export class PositionSync {
         let closedCount = 0;
         for (const dbPos of dbPositions) {
           try {
-            const { pool } = await import('../config/database.js');
+            const pool = (await import('../config/database.js')).default;
             const [lockResult] = await pool.execute(
               `UPDATE positions 
                SET is_processing = 1 
@@ -273,7 +273,7 @@ export class PositionSync {
         if (!matchedDbPositionIds.has(dbPos.id) && dbPos.status === 'open') {
           // This position exists in DB but not on exchange - close it
           try {
-            const { pool } = await import('../config/database.js');
+            const pool = (await import('../config/database.js')).default;
             // Try to acquire lock before updating
             const [lockResult] = await pool.execute(
               `UPDATE positions 
@@ -581,7 +581,7 @@ export class PositionSync {
       // CRITICAL FIX: Use soft lock to prevent race condition with PositionMonitor
       if (contracts <= 0 && dbPos.status === 'open') {
         try {
-          const { pool } = await import('../config/database.js');
+          const pool = (await import('../config/database.js')).default;
           // Try to acquire lock before updating
           const [lockResult] = await pool.execute(
             `UPDATE positions 

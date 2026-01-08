@@ -361,45 +361,77 @@ export class PositionService {
                       return m.includes('-2021') || m.includes('would immediately trigger');
                     };
 
-                    if (currentPnl > 0) {
-                      // pnl > 0: try TAKE_PROFIT_MARKET with buffer retries, then fallback to MARKET
-                      const buffers = [0.001, 0.002, 0.003]; // 0.1%, 0.2%, 0.3%
-                      let placed = false;
+                    // CRITICAL: Ensure only ONE exit order exists per position.
+                    // When TP has crossed entry, we must NOT create a second order type (TP_MARKET/STOP_MARKET)
+                    // alongside an existing SL/TP order. Use ExitOrderManager to atomically replace the existing
+                    // exit_order_id (cancel old after creating new) and auto-switch order type by zone.
+                    try {
+                      const { ExitOrderManager } = await import('./ExitOrderManager.js');
+                      const mgr = new ExitOrderManager(this.exchangeService);
 
+                      // Decide desiredExitPrice based on zone:
+                      // - Profit zone (pnl > 0): place conditional order on the profit side of market (TAKE_PROFIT_MARKET)
+                      // - Loss/breakeven zone (pnl <= 0): place conditional order on the loss side of market (STOP_MARKET)
+                      const currentPnl = calculatePnL(position.entry_price, marketPrice, position.amount, position.side);
+
+                      const tickSizeStr = exchangeInfoService.getTickSize(position.symbol) || await this.exchangeService.getTickSize(position.symbol);
+                      const tickSize = String(tickSizeStr || '0.01');
+
+                      const buffers = currentPnl > 0
+                        ? [0.001, 0.002, 0.003] // Profit zone: try a few buffers to avoid -2021
+                        : [0.001]; // Loss zone: one attempt is enough; fallback handled inside ExitOrderManager
+
+                      let placed = false;
                       for (let i = 0; i < buffers.length; i++) {
                         const b = buffers[i];
-                        // Round stopPrice to tickSize to avoid precision errors
-                        const tickSizeStr = exchangeInfoService.getTickSize(position.symbol) || await this.exchangeService.getTickSize(position.symbol);
-                        const tickSize = String(tickSizeStr || '0.01');
-                        const rawStopPrice = position.side === 'long'
-                          ? marketPrice * (1 + b)
-                          : marketPrice * (1 - b);
-                        const stopPrice = (this.exchangeService?.binanceDirectClient?.formatPrice)
-                          ? this.exchangeService.binanceDirectClient.formatPrice(rawStopPrice, tickSize)
-                          : Number(rawStopPrice);
+
+                        // Compute a desired exit price on the correct side of market.
+                        // ExitOrderManager will decide STOP vs TAKE_PROFIT by comparing desiredExitPrice vs entry.
+                        const rawDesiredExit = (() => {
+                          if (currentPnl > 0) {
+                            // Profit zone: put stop on profit side of market
+                            return position.side === 'long'
+                              ? marketPrice * (1 + b)
+                              : marketPrice * (1 - b);
+                          }
+                          // Loss/breakeven zone: put stop on loss side of market
+                          return position.side === 'long'
+                            ? marketPrice * (1 - b)
+                            : marketPrice * (1 + b);
+                        })();
+
+                        const desiredExitPrice = (this.exchangeService?.binanceDirectClient?.formatPrice)
+                          ? this.exchangeService.binanceDirectClient.formatPrice(rawDesiredExit, tickSize)
+                          : Number(rawDesiredExit);
 
                         try {
-                          await this.exchangeService.createCloseTakeProfitMarket(position.symbol, position.side, stopPrice);
+                          const res = await mgr.placeOrReplaceExitOrder(position, Number(desiredExitPrice));
                           logger.info(
-                            `[TP Trail] ✅ Cross-entry TP_MARKET placed | pos=${position.id} stopPrice=${stopPrice} buffer=${(b * 100).toFixed(2)}% tickSize=${tickSize}`
+                            `[TP Trail] ✅ Cross-entry exit order replaced (single-exit) | pos=${position.id} ` +
+                            `desiredExit=${desiredExitPrice} pnl=${currentPnl} buffer=${(b * 100).toFixed(2)}% ` +
+                            `orderType=${res?.orderType || 'n/a'} orderId=${res?.orderId || 'n/a'}`
                           );
                           placed = true;
+
+                          // Persist new exit order id if returned
+                          if (res?.orderId) {
+                            try {
+                              await Position.update(position.id, { exit_order_id: String(res.orderId) });
+                            } catch (dbErr) {
+                              logger.warn(`[TP Trail] Failed to persist exit_order_id (cross-entry) | pos=${position.id}: ${dbErr?.message || dbErr}`);
+                            }
+                          }
+
                           break;
                         } catch (e) {
                           const em = e?.message || e;
-                          logger.warn(
-                            `[TP Trail] TP_MARKET retry ${i + 1}/3 failed | pos=${position.id} stopPrice=${stopPrice} err=${em}`
-                          );
-                          if (!isImmediateTriggerError(em)) {
-                            // Non-trigger error: break early and fallback to MARKET
-                            break;
-                          }
-                          // else: continue retry with larger buffer
+                          logger.warn(`[TP Trail] Cross-entry replace retry ${i + 1}/${buffers.length} failed | pos=${position.id} desiredExit=${desiredExitPrice} err=${em}`);
+                          if (!isImmediateTriggerError(em)) break;
                         }
                       }
 
                       if (!placed) {
-                        logger.warn(`[TP Trail] ⚠️ Cross-entry TP_MARKET failed -> fallback MARKET close | pos=${position.id}`);
+                        logger.warn(`[TP Trail] ⚠️ Cross-entry replace failed -> fallback MARKET close | pos=${position.id}`);
                         try {
                           await this.exchangeService.closePosition(position.symbol, position.side, position.amount);
                           logger.info(`[TP Trail] ✅ Cross-entry MARKET close sent | pos=${position.id}`);
@@ -407,33 +439,8 @@ export class PositionService {
                           logger.error(`[TP Trail] ❌ Cross-entry MARKET close failed | pos=${position.id}: ${e?.message || e}`);
                         }
                       }
-                    } else {
-                      // pnl <= 0: for loss zone, STOP_MARKET is the semantically correct conditional order type.
-                      // However, our goal here is to exit ASAP. We'll try STOP_MARKET once (with correct side),
-                      // and fallback to MARKET reduceOnly.
-                      logger.warn(`[TP Trail] ⚠️ Cross-entry pnl<=0 -> try STOP_MARKET then fallback MARKET | pos=${position.id} pnl=${currentPnl}`);
-
-                      try {
-                        const tickSizeStr = exchangeInfoService.getTickSize(position.symbol) || await this.exchangeService.getTickSize(position.symbol);
-                        const tickSize = String(tickSizeStr || '0.01');
-                        const rawStopPrice = position.side === 'long'
-                          ? marketPrice * (1 - 0.001) // 0.1% below market
-                          : marketPrice * (1 + 0.001); // 0.1% above market
-                        const stopPrice = (this.exchangeService?.binanceDirectClient?.formatPrice)
-                          ? this.exchangeService.binanceDirectClient.formatPrice(rawStopPrice, tickSize)
-                          : Number(rawStopPrice);
-
-                        await this.exchangeService.createCloseStopMarket(position.symbol, position.side, stopPrice);
-                        logger.info(`[TP Trail] ✅ Cross-entry STOP_MARKET placed | pos=${position.id} stopPrice=${stopPrice} tickSize=${tickSize}`);
-                      } catch (e) {
-                        logger.warn(`[TP Trail] STOP_MARKET failed -> fallback MARKET close | pos=${position.id}: ${e?.message || e}`);
-                        try {
-                          await this.exchangeService.closePosition(position.symbol, position.side, position.amount);
-                          logger.info(`[TP Trail] ✅ Cross-entry MARKET close sent | pos=${position.id}`);
-                        } catch (e2) {
-                          logger.error(`[TP Trail] ❌ Cross-entry MARKET close failed | pos=${position.id}: ${e2?.message || e2}`);
-                        }
-                      }
+                    } catch (e) {
+                      logger.error(`[TP Trail] Error attempting cross-entry single-exit replace | pos=${position.id}: ${e?.message || e}`);
                     }
                   } catch (e) {
                     logger.error(`[TP Trail] Error attempting cross-entry exit | pos=${position.id}: ${e?.message || e}`);
