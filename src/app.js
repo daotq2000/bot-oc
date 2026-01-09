@@ -19,10 +19,18 @@ dotenv.config();
 
 // Global error handlers to avoid silent stalls (especially under pm2)
 process.on('unhandledRejection', (reason) => {
+  // Ignore EPIPE errors (pipe closed) - these are non-critical and happen when stdout/stderr is closed
+  if (reason && typeof reason === 'object' && (reason.code === 'EPIPE' || reason.errno === -32)) {
+    return; // Silently ignore EPIPE errors
+  }
   logger.error('[GLOBAL] Unhandled Rejection:', reason);
 });
 
 process.on('uncaughtException', (err) => {
+  // Ignore EPIPE errors (pipe closed) - these are non-critical and happen when stdout/stderr is closed
+  if (err && (err.code === 'EPIPE' || err.errno === -32 || err.syscall === 'write')) {
+    return; // Silently ignore EPIPE errors
+  }
   logger.error('[GLOBAL] Uncaught Exception:', err);
   // Do not exit here; pm2 can be configured to restart if needed.
 });
@@ -193,14 +201,8 @@ async function start() {
       // Symbols refresh configs
       await AppConfig.set('ENABLE_SYMBOLS_REFRESH', 'true', 'Enable periodic symbols/filters refresh for exchanges');
       await AppConfig.set('SYMBOLS_REFRESH_CRON', '*/15 * * * *', 'Cron for symbols refresh job (default every 15 minutes)');
-      await AppConfig.set('TREND_FILTER_SEED_ENABLED', 'true', '');
-      await AppConfig.set('TREND_FILTER_SEED_TIMEFRAME', '1h', '');
-      await AppConfig.set('TREND_FILTER_SEED_LIMIT', '100', '');
-      await AppConfig.set('TREND_FILTER_SEED_TTL_MS', '600000', '10 minutes');
-      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_ENABLED', 'true', '');
-      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_MAX_SYMBOLS', '3', '');
-      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_INTERVAL_MS', '400', '');
-      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_TTL_MS', '15000', '');
+      // NOTE: TREND_FILTER configs are now read from bot.config_filter (JSON column in bots table)
+      // These AppConfig values are kept as fallback defaults if bot.config_filter is not set
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);
     }

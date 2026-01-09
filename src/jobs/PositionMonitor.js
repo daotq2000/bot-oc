@@ -208,9 +208,11 @@ export class PositionMonitor {
     if (isTPSLPending && position.exit_order_id && (!needsSl || position.sl_order_id)) {
       // Both orders exist, clear pending flag (only if column exists)
       try {
-        if (Position?.rawAttributes?.tp_sl_pending) {
-      await Position.update(position.id, { tp_sl_pending: false });
-      logger.debug(`[Place TP/SL] Cleared tp_sl_pending flag for position ${position.id} (both TP and SL exist)`);
+        // Use a more reliable check for the column's existence
+        const positionColumns = Object.keys(Position.getAttributes());
+        if (positionColumns.includes('tp_sl_pending')) {
+          await Position.update(position.id, { tp_sl_pending: false });
+          logger.debug(`[Place TP/SL] Cleared tp_sl_pending flag for position ${position.id} (both TP and SL exist)`);
         } else {
           logger.debug(`[Place TP/SL] Skipped clearing tp_sl_pending (column not supported) for position ${position.id}`);
         }
@@ -379,9 +381,17 @@ export class PositionMonitor {
               updateData.initial_tp_price = tpPrice; // Only set if not already set
             }
             
-            // Only set tp_sl_pending if Position model supports it (check rawAttributes)
-            if (Position?.rawAttributes?.tp_sl_pending) {
-              updateData.tp_sl_pending = false; // Clear pending flag after successful EXIT placement
+            // Clear pending flag if column exists (Position model is not Sequelize here)
+            try {
+              const { pool } = await import('../config/database.js');
+              const [cols] = await pool.execute(
+                `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'positions' AND COLUMN_NAME = 'tp_sl_pending' LIMIT 1`
+              );
+              if (Array.isArray(cols) && cols.length > 0) {
+                updateData.tp_sl_pending = false;
+              }
+            } catch (_) {
+              // ignore
             }
             
             logger.info(
@@ -540,15 +550,27 @@ export class PositionMonitor {
           if (slOrderId) {
             // Clear tp_sl_pending flag if both TP and SL are now placed
             const currentPosition = await Position.findById(position.id);
-            const hasTP = currentPosition?.exit_order_id && currentPosition.exit_order_id.trim() !== '';
+            const hasTP = currentPosition?.exit_order_id && String(currentPosition.exit_order_id).trim() !== '';
             const updateData = { 
               sl_order_id: slOrderId, 
               stop_loss_price: slPrice 
             };
-            // Clear pending flag if both TP and SL are placed (only if column exists)
-            if (hasTP && Position?.rawAttributes?.tp_sl_pending) {
-              updateData.tp_sl_pending = false;
+
+            // Clear pending flag if both TP and SL are placed and column exists (Position model is not Sequelize here)
+            if (hasTP) {
+              try {
+                const { pool } = await import('../config/database.js');
+                const [cols] = await pool.execute(
+                  `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'positions' AND COLUMN_NAME = 'tp_sl_pending' LIMIT 1`
+                );
+                if (Array.isArray(cols) && cols.length > 0) {
+                  updateData.tp_sl_pending = false;
+                }
+              } catch (_) {
+                // ignore
+              }
             }
+
             await Position.update(position.id, updateData);
             logger.debug(`[Place TP/SL] ✅ Placed SL order ${slOrderId} for position ${position.id} @ ${slPrice}`);
             

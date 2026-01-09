@@ -36,20 +36,46 @@ const logger = winston.createLogger({
     winston.format.json()
   ),
   defaultMeta: { service: 'bot-oc' },
+  // Ignore EPIPE errors silently (pipe closed errors are non-critical)
+  exitOnError: false,
   transports: [
     // Write all logs to console
-    new winston.transports.Console({
-      handleExceptions: true,
-      handleRejections: true,
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.printf(({ timestamp, level, message, ...meta }) => {
-          let msg = `${timestamp} [${level}]: ${message}`;
-          const rest = Object.keys(meta || {}).length > 0 ? ` ${typeof meta === 'string' ? meta : JSON.stringify(meta)}` : '';
-          return msg + rest;
-        })
-      )
-    }),
+    (() => {
+      const consoleTransport = new winston.transports.Console({
+        handleExceptions: true,
+        handleRejections: true,
+        format: winston.format.combine(
+          winston.format.colorize(),
+          winston.format.printf(({ timestamp, level, message, ...meta }) => {
+            let msg = `${timestamp} [${level}]: ${message}`;
+            const rest = Object.keys(meta || {}).length > 0 ? ` ${typeof meta === 'string' ? meta : JSON.stringify(meta)}` : '';
+            return msg + rest;
+          })
+        )
+      });
+      
+      // Wrap log method to silently handle EPIPE errors (pipe closed when stdout/stderr is closed by PM2)
+      const originalLog = consoleTransport.log.bind(consoleTransport);
+      consoleTransport.log = function(info, callback) {
+        try {
+          originalLog(info, (err) => {
+            // Ignore EPIPE errors (non-critical - happens when stdout/stderr pipe is closed)
+            if (err && (err.code === 'EPIPE' || err.errno === -32 || err.syscall === 'write')) {
+              return; // Silently ignore
+            }
+            if (callback) callback(err);
+          });
+        } catch (err) {
+          // Ignore EPIPE errors in try-catch as well
+          if (err && (err.code === 'EPIPE' || err.errno === -32 || err.syscall === 'write')) {
+            return; // Silently ignore
+          }
+          if (callback) callback(err);
+        }
+      };
+      
+      return consoleTransport;
+    })(),
     // Error file (only errors)
     new winston.transports.File({
       filename: path.join(LOG_DIR, 'error.log'),

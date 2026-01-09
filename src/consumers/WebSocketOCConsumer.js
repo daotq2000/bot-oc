@@ -352,6 +352,18 @@ export class WebSocketOCConsumer {
       const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
       if (!isReverseStrategy) {
         const { trendContext } = await import('../utils/TrendContext.js');
+        const { Bot } = await import('../models/Bot.js');
+
+        // Load bot if not already loaded to get config_filter
+        if (!strategy.bot && strategy.bot_id) {
+          strategy.bot = await Bot.findById(strategy.bot_id);
+        }
+
+        // Get bot config_filter, add bot_id for state key separation
+        const botConfig = strategy.bot?.config_filter ? {
+          ...strategy.bot.config_filter,
+          _botId: strategy.bot_id
+        } : null;
 
         // Update trend context from this tick/match (in-memory only)
         trendContext.updateFromTick({
@@ -359,7 +371,8 @@ export class WebSocketOCConsumer {
           currentPrice,
           ocAbs: Math.abs(oc),
           direction,
-          timestamp: match.timestamp
+          timestamp: match.timestamp,
+          botConfig
         });
 
         // Apply filters
@@ -369,7 +382,8 @@ export class WebSocketOCConsumer {
           openPrice: baseOpen,
           direction,
           ocAbs: Math.abs(oc),
-          ocThreshold: Math.abs(Number(strategy.oc || strategy.open_change || oc || 0))
+          ocThreshold: Math.abs(Number(strategy.oc || strategy.open_change || oc || 0)),
+          botConfig
         });
 
         if (!v.ok) {
@@ -384,7 +398,8 @@ export class WebSocketOCConsumer {
               trendContext.maybeWarmupOnInsufficientData({
                 symbol: strategy.symbol,
                 exchangeService,
-                direction
+                direction,
+                botConfig
               }).catch(e => {
                 logger.warn(`[TREND-WARMUP] Failed to trigger warmup for ${strategy.symbol}: ${e?.message || e}`);
               });

@@ -6,7 +6,33 @@ import logger from '../utils/logger.js';
  */
 export class Bot {
   /**
-   * Get all bots
+   * Parse bot row from database, converting config_filter JSON string to object
+   * @param {Object} row - Raw database row
+   * @returns {Object} Parsed bot object with config_filter as object
+   */
+  static _parseBotRow(row) {
+    if (!row) return row;
+    
+    // Parse config_filter from JSON string to object
+    if (row.config_filter !== null && row.config_filter !== undefined) {
+      try {
+        if (typeof row.config_filter === 'string') {
+          row.config_filter = JSON.parse(row.config_filter);
+        }
+        // If already an object, keep it as is
+      } catch (e) {
+        logger.warn(`[Bot] Failed to parse config_filter for bot ${row.id}: ${e?.message || e}`);
+        row.config_filter = {}; // Fallback to empty object
+      }
+    } else {
+      row.config_filter = {}; // Default to empty object if null
+    }
+    
+    return row;
+  }
+
+  /**
+   * Get all bots (with parsed config_filter)
    * @param {boolean} activeOnly - Only return active bots
    * @returns {Promise<Array>}
    */
@@ -18,11 +44,11 @@ export class Bot {
     query += ' ORDER BY created_at DESC';
     
     const [rows] = await pool.execute(query);
-    return rows;
+    return rows.map(row => this._parseBotRow(row));
   }
 
   /**
-   * Get bot by ID
+   * Get bot by ID (with parsed config_filter)
    * @param {number} id - Bot ID
    * @returns {Promise<Object|null>}
    */
@@ -31,7 +57,7 @@ export class Bot {
       'SELECT * FROM bots WHERE id = ?',
       [id]
     );
-    return rows[0] || null;
+    return rows[0] ? this._parseBotRow(rows[0]) : null;
   }
 
   /**
@@ -60,8 +86,15 @@ export class Bot {
       binance_testnet = null,
       concurrency_lock_timeout = null,
       is_active = true,
-      is_reverse_strategy = true // Default to reverse strategy
+      is_reverse_strategy = true, // Default to reverse strategy
+      config_filter = null // Default to {} in DB, but allow override
     } = data;
+
+    // Parse config_filter to JSON string if provided as object
+    let configFilterValue = null;
+    if (config_filter !== null && config_filter !== undefined) {
+      configFilterValue = typeof config_filter === 'string' ? config_filter : JSON.stringify(config_filter);
+    }
 
     const [result] = await pool.execute(
       `INSERT INTO bots (
@@ -69,14 +102,14 @@ export class Bot {
         telegram_chat_id, future_balance_target, spot_transfer_threshold,
         transfer_frequency, withdraw_enabled, withdraw_address,
         withdraw_network, spot_balance_threshold, max_concurrent_trades,
-        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active, is_reverse_strategy
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active, is_reverse_strategy, config_filter
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         bot_name, exchange, uid, access_key, secret_key, proxy,
         telegram_chat_id, future_balance_target, spot_transfer_threshold,
         transfer_frequency, withdraw_enabled, withdraw_address,
         withdraw_network, spot_balance_threshold, max_concurrent_trades,
-        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active, is_reverse_strategy
+        telegram_alert_channel_id, binance_testnet, concurrency_lock_timeout, is_active, is_reverse_strategy, configFilterValue
       ]
     );
 
@@ -95,8 +128,14 @@ export class Bot {
 
     Object.keys(data).forEach(key => {
       if (data[key] !== undefined) {
-        fields.push(`${key} = ?`);
-        values.push(data[key]);
+        // Special handling for config_filter: convert object to JSON string
+        if (key === 'config_filter' && typeof data[key] === 'object') {
+          fields.push(`${key} = ?`);
+          values.push(JSON.stringify(data[key]));
+        } else {
+          fields.push(`${key} = ?`);
+          values.push(data[key]);
+        }
       }
     });
 
@@ -166,7 +205,6 @@ export class Bot {
       'SELECT * FROM bots WHERE exchange = ? AND is_active = TRUE',
       [exchange]
     );
-    return rows;
+    return rows.map(row => this._parseBotRow(row));
   }
 }
-

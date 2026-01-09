@@ -15,12 +15,44 @@ import { configService } from '../services/ConfigService.js';
  * - Binance-only REST ticker warmup polling (short TTL) when WS misses ticks
  */
 export class TrendContext {
-  _getWarmupCfg() {
+  /**
+   * Get config value from botConfig (priority) or fallback to global config
+   * @param {Object|null} botConfig - Bot's config_filter object
+   * @param {string} key - Config key (e.g., 'TREND_FILTER_SEED_TIMEFRAME')
+   * @param {Function} getter - ConfigService getter function (getString, getNumber, getBoolean)
+   * @param {*} defaultValue - Default value if not found
+   * @returns {*} Config value
+   */
+  _getConfigValue(botConfig, key, getter, defaultValue) {
+    if (botConfig && botConfig[key] !== undefined && botConfig[key] !== null) {
+      return getter === configService.getString ? String(botConfig[key]) :
+             getter === configService.getNumber ? Number(botConfig[key]) :
+             getter === configService.getBoolean ? Boolean(botConfig[key]) :
+             botConfig[key];
+    }
+    return getter(key, defaultValue);
+  }
+
+  _getWarmupCfg(botConfig = null) {
     return {
-      enabled: Boolean(configService.getBoolean('TREND_FILTER_WARMUP_TICKER_ENABLED', false)),
-      intervalMs: Number(configService.getNumber('TREND_FILTER_WARMUP_TICKER_INTERVAL_MS', 400)),
-      ttlMs: Number(configService.getNumber('TREND_FILTER_WARMUP_TICKER_TTL_MS', 15000)),
-      maxSymbols: Number(configService.getNumber('TREND_FILTER_WARMUP_TICKER_MAX_SYMBOLS', 5))
+      enabled: this._getConfigValue(botConfig, 'TREND_FILTER_WARMUP_TICKER_ENABLED', configService.getBoolean, false),
+      intervalMs: this._getConfigValue(botConfig, 'TREND_FILTER_WARMUP_TICKER_INTERVAL_MS', configService.getNumber, 400),
+      ttlMs: this._getConfigValue(botConfig, 'TREND_FILTER_WARMUP_TICKER_TTL_MS', configService.getNumber, 15000),
+      maxSymbols: this._getConfigValue(botConfig, 'TREND_FILTER_WARMUP_TICKER_MAX_SYMBOLS', configService.getNumber, 5)
+    };
+  }
+
+  /**
+   * Get seeding config from botConfig or global config
+   * @param {Object|null} botConfig - Bot's config_filter object
+   * @returns {Object} Seeding config
+   */
+  _getSeedingConfig(botConfig = null) {
+    return {
+      enabled: this._getConfigValue(botConfig, 'TREND_FILTER_SEED_ENABLED', configService.getBoolean, true),
+      timeframe: this._getConfigValue(botConfig, 'TREND_FILTER_SEED_TIMEFRAME', configService.getString, '1m'),
+      limit: this._getConfigValue(botConfig, 'TREND_FILTER_SEED_LIMIT', configService.getNumber, 120),
+      ttlMs: this._getConfigValue(botConfig, 'TREND_FILTER_SEED_TTL_MS', configService.getNumber, 10 * 60 * 1000)
     };
   }
 
@@ -86,29 +118,35 @@ export class TrendContext {
    * Seed EMA history from recent OHLCV close prices.
    * - Uses ExchangeService.fetchOHLCV (REST) (NO DB candles)
    * - Per-symbol TTL to avoid repeated REST calls
+   * @param {string} symbol - Trading symbol
+   * @param {Object} exchangeService - Exchange service instance
+   * @param {Object|null} botConfig - Bot's config_filter object (optional)
    */
-  async ensureSeeded(symbol, exchangeService) {
-    if (!this.enableSeeding) return false;
+  async ensureSeeded(symbol, exchangeService, botConfig = null) {
+    const seedingConfig = this._getSeedingConfig(botConfig);
+    if (!seedingConfig.enabled) return false;
     if (!symbol || !exchangeService) return false;
 
+    // Use symbol+botId as key if botConfig provided to separate state per bot
+    const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
     const now = Date.now();
-    const lastSeeded = this._seededAt.get(symbol) || 0;
-    if (lastSeeded && (now - lastSeeded) < this.seedTtlMs) {
+    const lastSeeded = this._seededAt.get(stateKey) || 0;
+    if (lastSeeded && (now - lastSeeded) < seedingConfig.ttlMs) {
       return true;
     }
 
     // de-dupe concurrent seeding
-    if (this._seedInFlight.has(symbol)) {
-      return await this._seedInFlight.get(symbol);
+    if (this._seedInFlight.has(stateKey)) {
+      return await this._seedInFlight.get(stateKey);
     }
 
     const seedPromise = (async () => {
       try {
-        logger.info(`[TREND-SEED-START] symbol=${symbol} tf=${this.seedTimeframe} limit=${this.seedLimit}`);
+        logger.info(`[TREND-SEED-START] symbol=${symbol} tf=${seedingConfig.timeframe} limit=${seedingConfig.limit} botConfig=${botConfig ? 'yes' : 'no'}`);
 
-        const candles = await exchangeService.fetchOHLCV(symbol, this.seedTimeframe, this.seedLimit);
+        const candles = await exchangeService.fetchOHLCV(symbol, seedingConfig.timeframe, seedingConfig.limit);
         if (!Array.isArray(candles) || candles.length === 0) {
-          logger.warn(`[TREND-SEED-EMPTY] symbol=${symbol} tf=${this.seedTimeframe} limit=${this.seedLimit}`);
+          logger.warn(`[TREND-SEED-EMPTY] symbol=${symbol} tf=${seedingConfig.timeframe} limit=${seedingConfig.limit}`);
           return false;
         }
 
@@ -142,11 +180,12 @@ export class TrendContext {
         }
 
         s.ema = s.emaHistory.length ? s.emaHistory[s.emaHistory.length - 1] : s.ema;
-        this._seededAt.set(symbol, now);
+        this._seededAt.set(stateKey, now);
 
         logger.info(
           `[TREND-SEED-DONE] symbol=${symbol} closes=${closes.length} emaHist=${s.emaHistory.length} ` +
-          `emaReady=${s.emaHistory.length >= (this.slopeLookback + 1)} ema=${Number.isFinite(Number(s.ema)) ? Number(s.ema).toFixed(8) : 'n/a'}`
+          `emaReady=${s.emaHistory.length >= (this.slopeLookback + 1)} ema=${Number.isFinite(Number(s.ema)) ? Number(s.ema).toFixed(8) : 'n/a'} ` +
+          `tf=${seedingConfig.timeframe} botConfig=${botConfig ? 'yes' : 'no'}`
         );
 
         return true;
@@ -154,17 +193,23 @@ export class TrendContext {
         logger.warn(`[TREND-SEED-FAIL] symbol=${symbol} err=${e?.message || e}`);
         return false;
       } finally {
-        this._seedInFlight.delete(symbol);
+        this._seedInFlight.delete(stateKey);
       }
     })();
 
-    this._seedInFlight.set(symbol, seedPromise);
+    this._seedInFlight.set(stateKey, seedPromise);
     return await seedPromise;
   }
 
-  updateFromTick({ symbol, currentPrice, ocAbs, direction, timestamp }) {
+  /**
+   * Update EMA from tick data
+   * @param {Object} params - { symbol, currentPrice, ocAbs, direction, timestamp, botConfig? }
+   */
+  updateFromTick({ symbol, currentPrice, ocAbs, direction, timestamp, botConfig = null }) {
     if (!symbol) return;
-    const s = this._get(symbol);
+    // Use symbol+botId as key if botConfig provided to separate state per bot
+    const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
+    const s = this._get(stateKey);
 
     // EMA update
     s.ema = this._updateEma(s.ema, currentPrice);
@@ -203,13 +248,15 @@ export class TrendContext {
     }
   }
 
-  getEma(symbol) {
-    const s = this._get(symbol);
+  getEma(symbol, botConfig = null) {
+    const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
+    const s = this._get(stateKey);
     return Number.isFinite(s?.ema) ? s.ema : null;
   }
 
-  getEmaSlopePct(symbol) {
-    const s = this._get(symbol);
+  getEmaSlopePct(symbol, botConfig = null) {
+    const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
+    const s = this._get(stateKey);
     const hist = s?.emaHistory || [];
     const lookback = this.slopeLookback;
 
@@ -223,10 +270,11 @@ export class TrendContext {
     return ((emaNow - emaThen) / emaThen) * 100;
   }
 
-  _checkEmaSlope({ symbol, direction }) {
-    const slopePct = this.getEmaSlopePct(symbol);
+  _checkEmaSlope({ symbol, direction, botConfig = null }) {
+    const slopePct = this.getEmaSlopePct(symbol, botConfig);
     if (slopePct === null) {
-      const s = this._get(symbol);
+      const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
+      const s = this._get(stateKey);
       return {
         ok: false,
         reason: 'ema_slope_insufficient_data',
@@ -252,8 +300,9 @@ export class TrendContext {
       : { ok: false, reason: 'ema_slope', meta: { slopePct, thr } };
   }
 
-  _checkOcContinuity({ symbol, direction, ocAbs, threshold }) {
-    const s = this._get(symbol);
+  _checkOcContinuity({ symbol, direction, ocAbs, threshold, botConfig = null }) {
+    const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
+    const s = this._get(stateKey);
     const hist = s.ocHistory || [];
 
     // Need at least previous point in same direction
@@ -280,8 +329,8 @@ export class TrendContext {
     };
   }
 
-  _checkPricePosition({ symbol, direction, currentPrice, openPrice }) {
-    const ema = this.getEma(symbol);
+  _checkPricePosition({ symbol, direction, currentPrice, openPrice, botConfig = null }) {
+    const ema = this.getEma(symbol, botConfig);
     if (ema === null) {
       return { ok: false, reason: 'price_position_insufficient_data', meta: { ema: null } };
     }
@@ -302,8 +351,8 @@ export class TrendContext {
       : { ok: false, reason: 'price_position', meta: { ema, cur, open } };
   }
 
-  async _startWarmupForSymbol({ symbol, exchangeService, directionHint = null }) {
-    const cfg = this._getWarmupCfg();
+  async _startWarmupForSymbol({ symbol, exchangeService, directionHint = null, botConfig = null }) {
+    const cfg = this._getWarmupCfg(botConfig);
     if (!cfg.enabled) return false;
     if (!symbol || !exchangeService) return false;
 
@@ -311,36 +360,39 @@ export class TrendContext {
     const exName = String(exchangeService?.bot?.exchange || exchangeService?.bot?.exchangeName || '').toLowerCase();
     if (exName && exName !== 'binance') return false;
 
+    // Use stateKey for warmup tracking to separate per bot
+    const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
+    
     // Already running
-    if (this._warmupRunning.has(symbol)) return true;
+    if (this._warmupRunning.has(stateKey)) return true;
 
     // Concurrency limit
     if (this._warmupRunning.size >= cfg.maxSymbols) {
-      if (!this._warmupQueue.includes(symbol)) {
-        this._warmupQueue.push(symbol);
-        logger.info(`[TREND-WARMUP-QUEUE] symbol=${symbol} running=${this._warmupRunning.size}/${cfg.maxSymbols}`);
+      if (!this._warmupQueue.includes(stateKey)) {
+        this._warmupQueue.push(stateKey);
+        logger.info(`[TREND-WARMUP-QUEUE] symbol=${symbol} stateKey=${stateKey} running=${this._warmupRunning.size}/${cfg.maxSymbols}`);
       }
       return false;
     }
 
-    const s = this._get(symbol);
+    const s = this._get(stateKey);
     const endsAt = Date.now() + cfg.ttlMs;
-    this._warmupRunning.add(symbol);
+    this._warmupRunning.add(stateKey);
 
-    logger.info(`[TREND-WARMUP-START] symbol=${symbol} intervalMs=${cfg.intervalMs} ttlMs=${cfg.ttlMs}`);
+    logger.info(`[TREND-WARMUP-START] symbol=${symbol} stateKey=${stateKey} intervalMs=${cfg.intervalMs} ttlMs=${cfg.ttlMs} botConfig=${botConfig ? 'yes' : 'no'}`);
 
     const tick = async () => {
       try {
         // Stop if TTL reached
         if (Date.now() >= endsAt) {
-          this._stopWarmup(symbol, 'ttl');
+          this._stopWarmup(stateKey, 'ttl');
           return;
         }
 
         // Stop early if EMA slope is ready
         const emaHistLen = s.emaHistory?.length || 0;
         if (emaHistLen >= (this.slopeLookback + 1)) {
-          this._stopWarmup(symbol, 'ema_ready');
+          this._stopWarmup(stateKey, 'ema_ready');
           return;
         }
 
@@ -352,7 +404,8 @@ export class TrendContext {
             currentPrice: Number(price),
             ocAbs: 0,
             direction: directionHint || 'bullish',
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            botConfig
           });
         }
       } catch (e) {
@@ -363,21 +416,21 @@ export class TrendContext {
     // Kick once immediately, then interval
     await tick();
     const timer = setInterval(tick, Math.max(100, cfg.intervalMs));
-    this._warmupTimers.set(symbol, { timer, endsAt });
+    this._warmupTimers.set(stateKey, { timer, endsAt });
 
     return true;
   }
 
-  _stopWarmup(symbol, reason) {
-    const t = this._warmupTimers.get(symbol);
+  _stopWarmup(stateKey, reason) {
+    const t = this._warmupTimers.get(stateKey);
     if (t?.timer) {
       try { clearInterval(t.timer); } catch (_) {}
     }
-    this._warmupTimers.delete(symbol);
+    this._warmupTimers.delete(stateKey);
 
-    if (this._warmupRunning.has(symbol)) {
-      this._warmupRunning.delete(symbol);
-      logger.info(`[TREND-WARMUP-STOP] symbol=${symbol} reason=${reason} running=${this._warmupRunning.size}`);
+    if (this._warmupRunning.has(stateKey)) {
+      this._warmupRunning.delete(stateKey);
+      logger.info(`[TREND-WARMUP-STOP] stateKey=${stateKey} reason=${reason} running=${this._warmupRunning.size}`);
     }
 
     // Note: we don't auto-start queued symbol here because we don't have exchangeService reference.
@@ -389,19 +442,22 @@ export class TrendContext {
    * Strategy:
    * 1) Try OHLCV seed first (fast, fewer REST calls)
    * 2) If still not enough, start short REST ticker warmup polling (Binance-only)
+   * @param {Object} params - { symbol, exchangeService, direction, botConfig? }
    */
-  async maybeWarmupOnInsufficientData({ symbol, exchangeService, direction }) {
-    const cfg = this._getWarmupCfg();
+  async maybeWarmupOnInsufficientData({ symbol, exchangeService, direction, botConfig = null }) {
+    const cfg = this._getWarmupCfg(botConfig);
+    const seedingConfig = this._getSeedingConfig(botConfig);
 
-    const s = this._get(symbol);
+    const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
+    const s = this._get(stateKey);
     const need = this.slopeLookback + 1;
 
     // If already ready, nothing to do
     if ((s.emaHistory?.length || 0) >= need) return false;
 
     // Try seed first
-    if (this.enableSeeding) {
-      await this.ensureSeeded(symbol, exchangeService);
+    if (seedingConfig.enabled) {
+      await this.ensureSeeded(symbol, exchangeService, botConfig);
     }
 
     // After seeding, check again
@@ -410,24 +466,25 @@ export class TrendContext {
     // If warmup disabled, stop here
     if (!cfg.enabled) return false;
 
-    return await this._startWarmupForSymbol({ symbol, exchangeService, directionHint: direction });
+    return await this._startWarmupForSymbol({ symbol, exchangeService, directionHint: direction, botConfig });
   }
 
   /**
    * Validate trend for trend-following only.
    * Returns { ok, reason, meta }
+   * @param {Object} params - { symbol, currentPrice, openPrice, direction, ocAbs, ocThreshold, botConfig? }
    */
-  isValidTrend({ symbol, currentPrice, openPrice, direction, ocAbs, ocThreshold }) {
+  isValidTrend({ symbol, currentPrice, openPrice, direction, ocAbs, ocThreshold, botConfig = null }) {
     if (!this.isEnabled()) return { ok: true, reason: null, meta: { disabled: true } };
 
     const checks = [
-      this._checkEmaSlope({ symbol, direction }),
-      this._checkOcContinuity({ symbol, direction, ocAbs, threshold: ocThreshold }),
-      this._checkPricePosition({ symbol, direction, currentPrice, openPrice })
+      this._checkEmaSlope({ symbol, direction, botConfig }),
+      this._checkOcContinuity({ symbol, direction, ocAbs, threshold: ocThreshold, botConfig }),
+      this._checkPricePosition({ symbol, direction, currentPrice, openPrice, botConfig })
     ];
 
     const fail = checks.find(c => !c.ok);
-    if (!fail) return { ok: true, reason: null, meta: { ema: this.getEma(symbol), slopePct: this.getEmaSlopePct(symbol) } };
+    if (!fail) return { ok: true, reason: null, meta: { ema: this.getEma(symbol, botConfig), slopePct: this.getEmaSlopePct(symbol, botConfig) } };
 
     return fail;
   }
