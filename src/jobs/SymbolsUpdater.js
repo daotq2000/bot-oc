@@ -27,7 +27,7 @@ export class SymbolsUpdater {
       mexc: { count: 0, lastFailure: 0 }
     };
     this._maxFailuresBeforeBackoff = Number(configService.getNumber('SYMBOLS_UPDATE_MAX_FAILURES', 3));
-    this._backoffDurationMs = Number(configService.getNumber('SYMBOLS_UPDATE_BACKOFF_MS', 30 * 60 * 1000)); // 30 minutes
+    this._backoffDurationMs = Number(configService.getNumber('SYMBOLS_UPDATE_BACKOFF_MS', 60 * 60 * 1000)); // 60 minutes (reduce periodic load)
   }
 
   async initialize() {
@@ -109,8 +109,23 @@ export class SymbolsUpdater {
     }
     this.isRunning = true;
 
+    const withTimeout = async (promise, timeoutMs, label) => {
+      let t = null;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise((_, reject) => {
+            t = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs);
+          })
+        ]);
+      } finally {
+        if (t) clearTimeout(t);
+      }
+    };
+
     // CRITICAL FIX: Watchdog timeout to prevent isRunning lock forever
     const { enabled, watchdogTimeoutMs } = this.getConfig();
+    const perExchangeTimeoutMs = Number(configService.getNumber('SYMBOLS_UPDATE_EXCHANGE_TIMEOUT_MS', 60000)); // 1 minute (reduce resource usage)
     this._watchdogTimer = setTimeout(() => {
       logger.error(`[SymbolsUpdater] Watchdog timeout after ${watchdogTimeoutMs}ms, forcing unlock`);
       this.isRunning = false;
@@ -128,38 +143,46 @@ export class SymbolsUpdater {
 
       logger.info('[SymbolsUpdater] Refreshing Binance and MEXC symbol filters...');
 
+      // Per-exchange enable flags to reduce load (configurable via app_configs)
+      const enableBinance = configService.getBoolean('SYMBOLS_UPDATE_BINANCE_ENABLED', true);
+      const enableMexc = configService.getBoolean('SYMBOLS_UPDATE_MEXC_ENABLED', true);
+
       // CRITICAL FIX: Check backoff before updating
-      const shouldSkipBinance = this._shouldSkipExchange('binance');
-      const shouldSkipMexc = this._shouldSkipExchange('mexc');
+      const shouldSkipBinance = !enableBinance || this._shouldSkipExchange('binance');
+      const shouldSkipMexc = !enableMexc || this._shouldSkipExchange('mexc');
 
       // CRITICAL FIX: Run updates in parallel for better performance
       const updatePromises = [];
       
       if (!shouldSkipBinance) {
         updatePromises.push(
-          exchangeInfoService.updateFiltersFromExchange()
-            .then(() => {
+          (async () => {
+            const start = Date.now();
+            try {
+              await withTimeout(exchangeInfoService.updateFiltersFromExchange(), perExchangeTimeoutMs, '[SymbolsUpdater] Binance update');
               this._recordExchangeSuccess('binance');
-        logger.info('[SymbolsUpdater] Binance symbol filters updated');
-            })
-            .catch((e) => {
+              logger.info(`[SymbolsUpdater] Binance symbol filters updated (${Date.now() - start}ms)`);
+            } catch (e) {
               this._recordExchangeFailure('binance');
-        logger.error('[SymbolsUpdater] Binance update failed:', e?.message || e);
-            })
+              logger.error(`[SymbolsUpdater] Binance update failed (${Date.now() - start}ms):`, e?.message || e);
+            }
+          })()
         );
       }
 
       if (!shouldSkipMexc) {
         updatePromises.push(
-          exchangeInfoService.updateMexcFiltersFromExchange()
-            .then(() => {
+          (async () => {
+            const start = Date.now();
+            try {
+              await withTimeout(exchangeInfoService.updateMexcFiltersFromExchange(), perExchangeTimeoutMs, '[SymbolsUpdater] MEXC update');
               this._recordExchangeSuccess('mexc');
-        logger.info('[SymbolsUpdater] MEXC symbol filters updated');
-            })
-            .catch((e) => {
+              logger.info(`[SymbolsUpdater] MEXC symbol filters updated (${Date.now() - start}ms)`);
+            } catch (e) {
               this._recordExchangeFailure('mexc');
-        logger.error('[SymbolsUpdater] MEXC update failed:', e?.message || e);
-            })
+              logger.error(`[SymbolsUpdater] MEXC update failed (${Date.now() - start}ms):`, e?.message || e);
+            }
+          })()
         );
       }
 

@@ -17,6 +17,16 @@ import { webSocketManager } from './services/WebSocketManager.js';
 // Load environment variables
 dotenv.config();
 
+// Global error handlers to avoid silent stalls (especially under pm2)
+process.on('unhandledRejection', (reason) => {
+  logger.error('[GLOBAL] Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('[GLOBAL] Uncaught Exception:', err);
+  // Do not exit here; pm2 can be configured to restart if needed.
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -183,6 +193,14 @@ async function start() {
       // Symbols refresh configs
       await AppConfig.set('ENABLE_SYMBOLS_REFRESH', 'true', 'Enable periodic symbols/filters refresh for exchanges');
       await AppConfig.set('SYMBOLS_REFRESH_CRON', '*/15 * * * *', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('TREND_FILTER_SEED_ENABLED', 'true', '');
+      await AppConfig.set('TREND_FILTER_SEED_TIMEFRAME', '1h', '');
+      await AppConfig.set('TREND_FILTER_SEED_LIMIT', '100', '');
+      await AppConfig.set('TREND_FILTER_SEED_TTL_MS', '600000', '10 minutes');
+      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_ENABLED', 'true', '');
+      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_MAX_SYMBOLS', '3', '');
+      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_INTERVAL_MS', '400', '');
+      await AppConfig.set('TREND_FILTER_WARMUP_TICKER_TTL_MS', '15000', '');
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);
     }
@@ -355,6 +373,14 @@ async function start() {
       // Don't exit - memory monitoring is optional
     }
 
+    // Heartbeat (helps detect event-loop stalls / job stops)
+    setInterval(() => {
+      try {
+        const mem = process.memoryUsage();
+        logger.info(`[Heartbeat] alive pid=${process.pid} rssMB=${Math.round(mem.rss / 1024 / 1024)} heapMB=${Math.round(mem.heapUsed / 1024 / 1024)}`);
+      } catch (_) {}
+    }, 60000);
+
     // Start HTTP server
     app.listen(PORT, () => {
       logger.info(`Server started on port ${PORT}`);
@@ -507,6 +533,22 @@ async function start() {
     process.exit(1);
   }
 }
+
+// Global error handlers to prevent hard crashes on transient network/DNS issues
+process.on('unhandledRejection', (reason) => {
+  logger.error('[Global] unhandledRejection:', reason?.message || reason, reason?.stack);
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('[Global] uncaughtException:', err?.message || err, err?.stack);
+
+  // If it's a known transient network/DNS error, exit so PM2 can restart cleanly.
+  const code = err?.code;
+  if (code === 'EAI_AGAIN' || code === 'ETIMEDOUT') {
+    logger.warn(`[Global] Transient network error (${code}). Exiting for PM2 restart.`);
+    process.exit(1);
+  }
+});
 
 // Start the application
 start();

@@ -117,7 +117,10 @@ export class OrderService {
       // Simple position limit check (with cache)
       // max_concurrent_trades MUST come from bots table (JOINed into strategy as a top-level field)
       // Do not rely on strategy.bot here because strategy objects are often plain rows.
-      const maxPositions = Number(strategy?.bot ?? strategy?.bot?.max_concurrent_trades ?? 100);
+      // Position limit: prefer the bot config (strategy.bot.max_concurrent_trades)
+      // NOTE: The previous code used `strategy?.bot` which is an object; Number(object) => NaN,
+      // causing fallback/default behavior and wrong limits.
+      const maxPositions = Number(strategy?.bot?.max_concurrent_trades ?? strategy?.max_concurrent_trades ?? 100);
       
       // Only check if limit is set and reasonable
       if (maxPositions > 0 && maxPositions < 10000) {

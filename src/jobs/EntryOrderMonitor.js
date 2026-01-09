@@ -57,7 +57,16 @@ export class EntryOrderMonitor {
       this.exchangeServices.set(bot.id, exchangeService);
 
       // Binance-only: start user-data WebSocket for ORDER_TRADE_UPDATE
-      if ((bot.exchange || '').toLowerCase() === 'binance' && exchangeService.binanceDirectClient) {
+      // IMPORTANT: Skip WS user-data stream for bots missing API credentials to avoid listenKey retry storms
+      // (which can spam logs, waste CPU, and indirectly affect other bots)
+      const isBinance = (bot.exchange || '').toLowerCase() === 'binance';
+      const hasApiCreds = !!(bot?.access_key && String(bot.access_key).trim()) && !!(bot?.secret_key && String(bot.secret_key).trim());
+
+      if (isBinance && !hasApiCreds) {
+        logger.warn(`[EntryOrderMonitor] Bot ${bot.id} is Binance but missing access_key/secret_key. Skipping user-data WebSocket initialization.`);
+      }
+
+      if (isBinance && hasApiCreds && exchangeService.binanceDirectClient) {
         const restMakeRequest = exchangeService.binanceDirectClient.makeRequest.bind(exchangeService.binanceDirectClient);
         const isTestnet = !!exchangeService.binanceDirectClient.isTestnet;
         const wsClient = new PositionWebSocketClient(restMakeRequest, isTestnet);

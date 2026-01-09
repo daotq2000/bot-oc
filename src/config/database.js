@@ -1,16 +1,37 @@
 import mysql from 'mysql2/promise';
-import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 
-dotenv.config();
+// Determine the environment
+const env = process.env.NODE_ENV || 'development';
+
+// Construct the path to config.json
+// Assuming the project root is two levels up from src/config
+const configPath = path.join(process.cwd(), 'config', 'config.json');
+
+let dbConfig;
+try {
+  const configFile = fs.readFileSync(configPath, 'utf8');
+  const config = JSON.parse(configFile);
+  dbConfig = config[env];
+} catch (error) {
+  console.error('Failed to read or parse database configuration from config/config.json:', error);
+  process.exit(1);
+}
+
+if (!dbConfig) {
+  console.error(`Database configuration for environment '${env}' not found in config/config.json.`);
+  process.exit(1);
+}
 
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '3306'),
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'bot_oc',
+  host: dbConfig.host || 'localhost',
+  port: parseInt(dbConfig.port || '3306'),
+  user: dbConfig.username || 'root',
+  password: dbConfig.password || '',
+  database: dbConfig.database,
   waitForConnections: true,
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '30'), // Increased from 15 to 30 for high-frequency WebSocket processing
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '30'),
   queueLimit: 0,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
@@ -33,4 +54,3 @@ export async function testConnection() {
 }
 
 export default pool;
-

@@ -13,6 +13,7 @@ class WebSocketManager {
     this._priceHandlers = new Set(); // listeners for price ticks
     this.klineOpenCache = new Map(); // key: symbol|interval|bucketStart -> { open, lastUpdate }
     this.klineCloseCache = new Map(); // key: symbol|interval|bucketStart -> { close, lastUpdate }
+    this.maxKlineCacheSize = Number(process.env.BINANCE_WS_MAX_KLINE_CACHE || 50000);
 
     this.baseUrl = 'wss://fstream.binance.com/stream?streams=';
     this.maxStreamsPerConn = 180; // keep well below 200 limit and URL length issues
@@ -31,6 +32,7 @@ class WebSocketManager {
   _cleanupPriceCache() {
     const now = Date.now();
     const maxAge = 5 * 60 * 1000; // Remove entries older than 5 minutes (reduced from 10 minutes)
+    const klineMaxAge = Number(process.env.BINANCE_WS_KLINE_TTL_MS || (15 * 60 * 1000));
     let removed = 0;
 
     // Remove old entries
@@ -38,6 +40,21 @@ class WebSocketManager {
       if (now - data.lastAccess > maxAge) {
         this.priceCache.delete(symbol);
         removed++;
+      }
+    }
+
+    // Also clean old kline cache entries (TTL-based) to avoid constant size-evictions
+    let klineRemoved = 0;
+    for (const [key, v] of this.klineOpenCache.entries()) {
+      if (!v?.lastUpdate || (now - v.lastUpdate) > klineMaxAge) {
+        this.klineOpenCache.delete(key);
+        klineRemoved++;
+      }
+    }
+    for (const [key, v] of this.klineCloseCache.entries()) {
+      if (!v?.lastUpdate || (now - v.lastUpdate) > klineMaxAge) {
+        this.klineCloseCache.delete(key);
+        klineRemoved++;
       }
     }
 
@@ -54,6 +71,14 @@ class WebSocketManager {
 
     if (removed > 0) {
       logger.debug(`[Binance-WS] Cleaned up ${removed} price cache entries. Current size: ${this.priceCache.size}`);
+    }
+    if (klineRemoved > 0) {
+      // Throttle this log to avoid spam
+      const last = this._lastKlineCleanupLog || 0;
+      if (now - last > 60000) {
+        this._lastKlineCleanupLog = now;
+        logger.info(`[Binance-WS] Cleaned ${klineRemoved} kline cache entries by TTL. open=${this.klineOpenCache.size} close=${this.klineCloseCache.size}`);
+      }
     }
   }
 
@@ -103,6 +128,21 @@ class WebSocketManager {
     if (!Number.isFinite(close) || close <= 0 || !startTime) return;
     const sym = String(symbol).toUpperCase();
     const key = `${sym}|${interval}|${startTime}`;
+
+    if (this.klineCloseCache.size >= this.maxKlineCacheSize && !this.klineCloseCache.has(key)) {
+      const keys = Array.from(this.klineCloseCache.keys());
+      const drop = Math.max(1, Math.floor(this.maxKlineCacheSize * 0.05));
+      for (let i = 0; i < Math.min(drop, keys.length); i++) {
+        this.klineCloseCache.delete(keys[i]);
+      }
+      const now = Date.now();
+      const last = this._lastKlineEvictLogClose || 0;
+      if (now - last > 60000) {
+        this._lastKlineEvictLogClose = now;
+        logger.warn(`[Binance-WS] Kline CLOSE cache overflow (>${this.maxKlineCacheSize}). Evicted ${Math.min(drop, keys.length)} entries.`);
+      }
+    }
+
     this.klineCloseCache.set(key, {
       close,
       lastUpdate: Date.now()
@@ -113,6 +153,21 @@ class WebSocketManager {
     if (!Number.isFinite(open) || open <= 0 || !startTime) return;
     const sym = String(symbol).toUpperCase();
     const key = `${sym}|${interval}|${startTime}`;
+
+    if (this.klineOpenCache.size >= this.maxKlineCacheSize && !this.klineOpenCache.has(key)) {
+      const keys = Array.from(this.klineOpenCache.keys());
+      const drop = Math.max(1, Math.floor(this.maxKlineCacheSize * 0.05));
+      for (let i = 0; i < Math.min(drop, keys.length); i++) {
+        this.klineOpenCache.delete(keys[i]);
+      }
+      const now = Date.now();
+      const last = this._lastKlineEvictLogOpen || 0;
+      if (now - last > 60000) {
+        this._lastKlineEvictLogOpen = now;
+        logger.warn(`[Binance-WS] Kline OPEN cache overflow (>${this.maxKlineCacheSize}). Evicted ${Math.min(drop, keys.length)} entries.`);
+      }
+    }
+
     this.klineOpenCache.set(key, {
       open,
       lastUpdate: Date.now()

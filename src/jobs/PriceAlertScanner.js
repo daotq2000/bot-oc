@@ -15,6 +15,7 @@ export class PriceAlertScanner {
   constructor() {
     this.exchangeServices = new Map(); // exchange -> ExchangeService
     this.orderServices = new Map(); // botId -> OrderService
+    this.exchangeServicesByBotId = new Map(); // botId -> ExchangeService (from OrderService)
     this.telegramService = null;
     this.isRunning = false;
     this.scanInterval = null;
@@ -56,6 +57,17 @@ export class PriceAlertScanner {
   async initialize(telegramService, orderServices = new Map()) {
     this.telegramService = telegramService;
     this.orderServices = orderServices;
+
+    // Build botId -> ExchangeService map from provided OrderServices (reliable for warmup/seed)
+    this.exchangeServicesByBotId = new Map();
+    try {
+      for (const [botId, os] of (orderServices || new Map()).entries()) {
+        if (os?.exchangeService) this.exchangeServicesByBotId.set(botId, os.exchangeService);
+      }
+      logger.info(`[PriceAlertScanner] Mapped ${this.exchangeServicesByBotId.size} ExchangeServices by bot_id for trend warmup`);
+    } catch (e) {
+      logger.warn(`[PriceAlertScanner] Failed to build exchangeServicesByBotId map: ${e?.message || e}`);
+    }
 
     try {
       // ✅ OPTIMIZED: Cache PriceAlertConfigs lúc init (sẽ refresh định kỳ theo TTL)
@@ -710,6 +722,53 @@ export class PriceAlertScanner {
         : currentPrice;
 
       const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
+
+      // ✅ Trend filter (ONLY for trend-following / is_reverse_strategy=false)
+      if (!isReverseStrategy) {
+        const { trendContext } = await import('../utils/TrendContext.js');
+
+        trendContext.updateFromTick({
+          symbol: strategy.symbol,
+          currentPrice,
+          ocAbs: Math.abs(oc),
+          direction,
+          timestamp
+        });
+
+        const v = trendContext.isValidTrend({
+          symbol: strategy.symbol,
+          currentPrice,
+          openPrice: baseOpen,
+          direction,
+          ocAbs: Math.abs(oc),
+          ocThreshold: Math.abs(Number(strategy.oc || strategy.open_change || oc || 0))
+        });
+
+        if (!v.ok) {
+          trendContext.logBlock({ reason: v.reason, symbol: strategy.symbol, direction, meta: v.meta });
+
+          // ✅ Trigger warmup polling if block is due to insufficient EMA data
+          if (v.reason === 'ema_slope_insufficient_data') {
+            // Try to get ExchangeService instance for this bot (binance only warmup)
+            const exchangeService = this.exchangeServicesByBotId?.get(strategy.bot_id);
+            if (exchangeService) {
+              logger.info(`[TREND-WARMUP-TRIGGER] source=PriceAlertScanner botId=${strategy.bot_id} symbol=${strategy.symbol} exchange=${exchangeService?.bot?.exchange || 'unknown'}`);
+              trendContext.maybeWarmupOnInsufficientData({
+                symbol: strategy.symbol,
+                exchangeService,
+                direction
+              }).catch(e => {
+                logger.warn(`[TREND-WARMUP] Failed to trigger warmup for ${strategy.symbol}: ${e?.message || e}`);
+              });
+            } else {
+              logger.warn(`[TREND-WARMUP-TRIGGER] source=PriceAlertScanner botId=${strategy.bot_id} symbol=${strategy.symbol} missing_exchangeService=true`);
+            }
+          }
+
+          return null; // BLOCK ENTRY (trend-follow only)
+        }
+      }
+
       let entryPrice;
       let forceMarket = false;
 

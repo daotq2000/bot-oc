@@ -21,6 +21,7 @@ import logger from '../utils/logger.js';
 export class WebSocketOCConsumer {
   constructor() {
     this.orderServices = new Map(); // botId -> OrderService
+    this.exchangeServicesByBotId = new Map(); // botId -> ExchangeService (from OrderService)
     this.isRunning = false;
     this.subscriptionInterval = null;
     this.cleanupInterval = null;
@@ -52,6 +53,17 @@ export class WebSocketOCConsumer {
     try {
       this.orderServices = orderServices;
       
+      // Build botId -> ExchangeService map from provided OrderServices (reliable for warmup/seed)
+      this.exchangeServicesByBotId = new Map();
+      try {
+        for (const [botId, os] of (orderServices || new Map()).entries()) {
+          if (os?.exchangeService) this.exchangeServicesByBotId.set(botId, os.exchangeService);
+        }
+        logger.info(`[WebSocketOCConsumer] Mapped ${this.exchangeServicesByBotId.size} ExchangeServices by bot_id for trend warmup`);
+      } catch (e) {
+        logger.warn(`[WebSocketOCConsumer] Failed to build exchangeServicesByBotId map: ${e?.message || e}`);
+      }
+
       logger.info(`[WebSocketOCConsumer] Initializing with ${orderServices.size} OrderServices: ${Array.from(orderServices.keys()).join(', ')}`);
 
       // Refresh strategy cache
@@ -70,8 +82,15 @@ export class WebSocketOCConsumer {
 
       // Setup periodic cache cleanup
       this.cleanupInterval = setInterval(() => {
-        if (realtimeOCDetector && typeof realtimeOCDetector.cleanup === 'function') {
-          realtimeOCDetector.cleanup();
+        try {
+          // Use the already-imported singleton to avoid module export shape issues
+          if (realtimeOCDetector && typeof realtimeOCDetector.cleanup === 'function') {
+            realtimeOCDetector.cleanup();
+          } else {
+            logger.warn('[WebSocketOCConsumer] realtimeOCDetector.cleanup is not available');
+          }
+        } catch (e) {
+          logger.error(`[WebSocketOCConsumer] Error during periodic cleanup: ${e?.message || e}`);
         }
       }, 300000); // Every 5 minutes
 
@@ -151,7 +170,14 @@ export class WebSocketOCConsumer {
         return; // Skip - too soon
       }
 
-      // ✅ OPTIMIZED: Add to batch queue
+      // ✅ OPTIMIZED: Add to batch queue (with hard cap to prevent OOM)
+      const maxQueue = Number(configService.getNumber('WS_TICK_MAX_QUEUE', 50000));
+      if (this._tickQueue.length >= maxQueue) {
+        // Drop oldest ticks to keep the newest ones (better for realtime)
+        const drop = Math.max(1, Math.floor(maxQueue * 0.2));
+        this._tickQueue.splice(0, drop);
+        logger.warn(`[WebSocketOCConsumer] Tick queue overflow (>${maxQueue}). Dropped ${drop} oldest ticks.`);
+      }
       this._tickQueue.push({ exchange, symbol, price, timestamp });
 
       // Process batch nếu đủ size
@@ -321,10 +347,59 @@ export class WebSocketOCConsumer {
         ? Number(match.openPrice)
         : currentPrice;
 
+      // ✅ Trend filter (ONLY for trend-following / is_reverse_strategy=false)
+      // HARD RULE: Do NOT affect reverse strategy.
+      const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
+      if (!isReverseStrategy) {
+        const { trendContext } = await import('../utils/TrendContext.js');
+
+        // Update trend context from this tick/match (in-memory only)
+        trendContext.updateFromTick({
+          symbol: strategy.symbol,
+          currentPrice,
+          ocAbs: Math.abs(oc),
+          direction,
+          timestamp: match.timestamp
+        });
+
+        // Apply filters
+        const v = trendContext.isValidTrend({
+          symbol: strategy.symbol,
+          currentPrice,
+          openPrice: baseOpen,
+          direction,
+          ocAbs: Math.abs(oc),
+          ocThreshold: Math.abs(Number(strategy.oc || strategy.open_change || oc || 0))
+        });
+
+        if (!v.ok) {
+          trendContext.logBlock({ reason: v.reason, symbol: strategy.symbol, direction, meta: v.meta });
+
+          // ✅ Trigger warmup polling if block is due to insufficient EMA data
+          if (v.reason === 'ema_slope_insufficient_data') {
+            // Non-blocking call to start the warmup process
+            const exchangeService = this.exchangeServicesByBotId?.get(strategy.bot_id);
+            if (exchangeService) {
+              logger.info(`[TREND-WARMUP-TRIGGER] source=WebSocketOCConsumer botId=${strategy.bot_id} symbol=${strategy.symbol} exchange=${exchangeService?.bot?.exchange || 'unknown'}`);
+              trendContext.maybeWarmupOnInsufficientData({
+                symbol: strategy.symbol,
+                exchangeService,
+                direction
+              }).catch(e => {
+                logger.warn(`[TREND-WARMUP] Failed to trigger warmup for ${strategy.symbol}: ${e?.message || e}`);
+              });
+            } else {
+              logger.warn(`[TREND-WARMUP-TRIGGER] source=WebSocketOCConsumer botId=${strategy.bot_id} symbol=${strategy.symbol} missing_exchangeService=true`);
+            }
+          }
+
+          return; // BLOCK ENTRY (trend-follow only)
+        }
+      }
+
       // Determine entry price and order type based on strategy type:
       // - Counter-trend (is_reverse_strategy = true): Use extend logic with LIMIT order
       // - Trend-following (is_reverse_strategy = false): Use current price with MARKET order
-      const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
       let entryPrice;
       let forceMarket = false;
 

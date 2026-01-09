@@ -25,6 +25,34 @@
 
 ---
 
+## 🤖 System Features (Bot-OC)
+
+👉 **[SYSTEM_FEATURES_REPORT.md](SYSTEM_FEATURES_REPORT.md)**
+- Tổng quan toàn bộ tính năng của bot (trading flow, services, workers, DB)
+- Mô tả các module chính: ExchangeService, OrderService, PositionService, ExitOrderManager, Telegram
+
+👉 **Core trading flow & strategy logic**
+- **[OC_FLOW_DESCRIPTION.md](OC_FLOW_DESCRIPTION.md)** – Luồng OC từ detect → signal → order
+- **[OC_DETECTION_ALGORITHM.md](OC_DETECTION_ALGORITHM.md)** – Thuật toán detect OC
+- **[IS_REVERSE_STRATEGY_IMPLEMENTATION.md](IS_REVERSE_STRATEGY_IMPLEMENTATION.md)** – Đánh xuôi/đánh ngược (is_reverse_strategy)
+- **[TP_TRAILING_REPORT.md](TP_TRAILING_REPORT.md)** / **[TP_TRAILING_DETAILED_REPORT.txt](../TP_TRAILING_DETAILED_REPORT.txt)** – Trailing TP & các case quan trọng
+- **[BINANCE_TRIGGER_ORDERS.md](BINANCE_TRIGGER_ORDERS.md)** – TAKE_PROFIT/STOP, điều kiện trigger
+
+👉 **Reliability / Consistency**
+- **[WEBSOCKET_ORDER_TRACKING_ANALYSIS.md](WEBSOCKET_ORDER_TRACKING_ANALYSIS.md)** / **[WEBSOCKET_ORDER_TRACKING_FIX_SUMMARY.md](WEBSOCKET_ORDER_TRACKING_FIX_SUMMARY.md)** – WS-driven close & tracking
+- **[POSITION_SYNC_FIX.md](POSITION_SYNC_FIX.md)** – PositionSync đồng bộ DB ↔ exchange
+- **[LOCKING_ANALYSIS_REPORT.md](LOCKING_ANALYSIS_REPORT.md)** / **[OPTIMISTIC_LOCK_IMPLEMENTATION.md](OPTIMISTIC_LOCK_IMPLEMENTATION.md)** – chống race condition
+
+👉 **Risk controls**
+- **[POSITION_LIMIT_SERVICE_IMPLEMENTATION.md](POSITION_LIMIT_SERVICE_IMPLEMENTATION.md)** – giới hạn theo coin (max_amount_per_coin)
+- **[BUG_FIX_MAX_AMOUNT_PER_COIN.md](BUG_FIX_MAX_AMOUNT_PER_COIN.md)** – ghi chú fix liên quan
+
+👉 **Performance / Rate limit**
+- **[RATE_LIMIT_FIX.md](RATE_LIMIT_FIX.md)** – rate limit strategy
+- **[PERFORMANCE_OPTIMIZATION_SUMMARY.md](PERFORMANCE_OPTIMIZATION_SUMMARY.md)** – tối ưu CPU/RAM/scan loop
+
+---
+
 ## 📖 Detailed Documentation
 
 ### API Reference

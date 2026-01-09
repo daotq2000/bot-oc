@@ -638,17 +638,30 @@ export class PositionSync {
         return;
       }
 
-      // 3. Check size mismatch (warn if significant difference)
+      // 3. Check and sync size mismatch (USDT notional value)
       const dbAmount = parseFloat(dbPos.amount || 0);
-      const exAmount = contracts * parseFloat(exPos.markPrice || exPos.info?.markPrice || dbPos.entry_price || 0);
-      const sizeDiffPercent = dbAmount > 0 ? Math.abs((exAmount - dbAmount) / dbAmount) * 100 : 0;
-      
-      if (sizeDiffPercent > 10) { // More than 10% difference
-        logger.warn(
-          `[PositionSync] Size mismatch for position ${dbPos.id}: ` +
-          `DB=${dbAmount.toFixed(2)}, Exchange=${exAmount.toFixed(2)}, diff=${sizeDiffPercent.toFixed(2)}%`
+      const markPrice = parseFloat(exPos.markPrice || exPos.info?.markPrice || dbPos.entry_price || 0);
+
+      // Ensure markPrice is valid before calculating exAmount
+      if (markPrice > 0) {
+        const exAmount = contracts * markPrice;
+        const sizeDiffPercent = dbAmount > 0 ? Math.abs((exAmount - dbAmount) / dbAmount) * 100 : (exAmount > 0 ? 100 : 0);
+
+        // Always sync amount from exchange -> DB (exchange is source of truth)
+        // NOTE: `amount` is treated as USDT notional in this system.
+        logger.info(
+          `[PositionSync] Syncing size for position ${dbPos.id}: ` +
+          `DB=${dbAmount.toFixed(2)}, Exchange=${exAmount.toFixed(2)} (diff=${sizeDiffPercent.toFixed(2)}%). Updating DB.`
         );
+        try {
+          await Position.update(dbPos.id, { amount: exAmount });
+        } catch (updateError) {
+          logger.error(`[PositionSync] Failed to update amount for position ${dbPos.id}:`, updateError);
+        }
+      } else {
+        logger.warn(`[PositionSync] Could not verify size for position ${dbPos.id}: Invalid markPrice from exchange data.`);
       }
+
 
       // 4. Check entry price mismatch (warn if significant difference)
       const exEntryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || 0);
