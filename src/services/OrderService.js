@@ -424,8 +424,16 @@ export class OrderService {
 
       // Send entry trade alert to central channel
       try {
+        // Ensure bot info is loaded before sending alert
+        if (!strategy.bot && strategy.bot_id) {
+          const { Bot } = await import('../models/Bot.js');
+          strategy.bot = await Bot.findById(strategy.bot_id);
+          logger.debug(`[OrderService] Loaded bot info for strategy ${strategy.id}: bot_id=${strategy.bot?.id}, exchange=${strategy.bot?.exchange}`);
+        }
+        
+        logger.info(`[OrderService] Sending entry trade alert for position ${position.id} (symbol=${position.symbol}, bot_id=${strategy.bot_id})`);
         await this.telegramService.sendEntryTradeAlert(position, strategy, signal.oc);
-        logger.debug(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
+        logger.info(`[OrderService] ✅ Entry trade alert sent successfully for position ${position.id}`);
       } catch (e) {
         logger.error(`[OrderService] Failed to send entry trade channel alert for position ${position.id}:`, e);
         logger.error(`[OrderService] Error stack:`, e?.stack);

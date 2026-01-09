@@ -68,13 +68,18 @@ export class TelegramService {
         logger.warn('TELEGRAM_BOT_TOKEN_SEND_ALERT_BINANCE not configured');
       }
 
-      // Fallback to default token if no exchange-specific tokens configured
-      if (this.bots.size === 0) {
-        const defaultToken = configService.getString('TELEGRAM_BOT_TOKEN');
-        if (defaultToken) {
+      // Always add default token as fallback (even if exchange-specific tokens exist)
+      // This ensures backward compatibility and handles unknown exchanges
+      const defaultToken = configService.getString('TELEGRAM_BOT_TOKEN');
+      if (defaultToken) {
+        // Only add if not already exists (avoid duplicate)
+        if (!this.bots.has('default')) {
           this.bots.set('default', new Telegraf(defaultToken));
-          logger.info('Telegram bot initialized with default token');
-        } else {
+          logger.info('Telegram bot initialized with default token (fallback)');
+        }
+      } else {
+        // If no exchange-specific tokens AND no default token, fail initialization
+        if (this.bots.size === 0) {
           logger.warn('No Telegram bot tokens configured');
           return false;
         }
@@ -100,8 +105,9 @@ export class TelegramService {
    * @returns {Telegraf|null} Bot instance or null
    */
   _getBot(exchange) {
-    if (!exchange) return this.bots.get('default') || Array.from(this.bots.values())[0] || null;
-    const normalized = (exchange || '').toLowerCase();
+    // Normalize exchange to 'default' if empty/null
+    const normalized = (exchange || '').toLowerCase() || 'default';
+    // Try exchange-specific bot first, then default, then any available bot
     return this.bots.get(normalized) || this.bots.get('default') || Array.from(this.bots.values())[0] || null;
   }
 
@@ -227,8 +233,8 @@ export class TelegramService {
       return;
     }
 
-    // Extract exchange from options or default to null
-    const exchange = (options?.exchange || '').toLowerCase() || null;
+    // Extract exchange from options and normalize to 'default' if empty/null
+    const exchange = (options?.exchange || '').toLowerCase() || 'default';
     
     // Get or create queue for this exchange
     if (!this._queues.has(exchange)) {
@@ -244,8 +250,9 @@ export class TelegramService {
     this._processQueue(exchange).catch(() => {});
   }
 
-  async _processQueue(exchange = null) {
-    const queueKey = exchange || 'default';
+  async _processQueue(exchange = 'default') {
+    // Normalize exchange to 'default' if empty/null
+    const queueKey = (exchange || '').toLowerCase() || 'default';
     if (this._processing.get(queueKey)) return;
     this._processing.set(queueKey, true);
     
@@ -415,12 +422,16 @@ Strategy: ${strategy.interval} | OC: ${strategy.oc}%
         return;
       }
       
-      // Get exchange from bot or strategy
-      const exchange = (strategy?.bot?.exchange || position?.exchange || '').toLowerCase() || null;
+      // Get exchange from bot or strategy and normalize to 'default' if empty/null
+      const exchange = (strategy?.bot?.exchange || position?.exchange || '').toLowerCase() || 'default';
+      logger.debug(`[Entry Alert] Exchange resolved: strategy.bot.exchange=${strategy?.bot?.exchange || 'NULL'}, position.exchange=${position?.exchange || 'NULL'}, final=${exchange}`);
 
       const channelId = (strategy?.bot?.telegram_alert_channel_id) || this.alertChannelId;
+      logger.debug(`[Entry Alert] Channel ID resolved: strategy.bot.telegram_alert_channel_id=${strategy?.bot?.telegram_alert_channel_id || 'NULL'}, this.alertChannelId=${this.alertChannelId || 'NULL'}, final=${channelId || 'NULL'}`);
+      
       if (!channelId) {
         logger.warn(`[Entry Alert] Alert channel ID not configured, skipping alert for position ${position?.id}`);
+        logger.warn(`[Entry Alert] Debug info: strategy.bot=${!!strategy?.bot}, strategy.bot_id=${strategy?.bot_id || 'NULL'}, position.bot_id=${position?.bot_id || 'NULL'}`);
         return;
       }
 
@@ -479,10 +490,11 @@ Amount: ${amountStr} (100%)`.trim();
         return;
       }
 
-      // Get exchange from position or bot
-      const exchange = (position?.exchange || position?.bot?.exchange || '').toLowerCase() || null;
+      // Get exchange from position or bot and normalize to 'default' if empty/null
+      const exchange = (position?.exchange || position?.bot?.exchange || '').toLowerCase() || 'default';
+      logger.debug(`[CloseSummaryAlert] Exchange resolved: position.exchange=${position?.exchange || 'NULL'}, position.bot.exchange=${position?.bot?.exchange || 'NULL'}, final=${exchange}`);
       
-      logger.info(`[CloseSummaryAlert] Sending alert for position ${position.id} to channel ${channelId} (exchange=${exchange || 'default'})`);
+      logger.info(`[CloseSummaryAlert] Sending alert for position ${position.id} to channel ${channelId} (exchange=${exchange})`);
 
       const symbol = this.formatSymbolUnderscore(position.symbol);
       const pnlVal = Number(position.pnl || 0);
@@ -776,10 +788,10 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
 └ ${formatPrice(open)} → ${formatPrice(currentPrice)}
     `.trim();
 
-    // Extract exchange from alertData to use correct bot token
-    const exchange = (alertData?.exchange || '').toLowerCase() || null;
+    // Extract exchange from alertData to use correct bot token and normalize to 'default' if empty/null
+    const exchange = (alertData?.exchange || '').toLowerCase() || 'default';
     
-    logger.info(`[VolatilityAlert] Queuing alert to ${chatId} (exchange=${exchange || 'default'}): ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
+    logger.info(`[VolatilityAlert] Queuing alert to ${chatId} (exchange=${exchange}): ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
     
     // sendMessage is queue-based, so we queue it and let the queue processor handle it
     // The actual send status will be logged by _processQueue
@@ -823,8 +835,8 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
         return;
       }
       
-      // Get exchange from bot or strategy
-      const exchange = (strategy?.bot?.exchange || '').toLowerCase() || null;
+      // Get exchange from bot or strategy and normalize to 'default' if empty/null
+      const exchange = (strategy?.bot?.exchange || '').toLowerCase() || 'default';
 
       let bot = strategy.bot || {};
       let chatId = bot.telegram_alert_channel_id || bot.telegram_chat_id || this.alertChannelId;
