@@ -329,7 +329,8 @@ export class RealtimeOCDetector {
             if (this.telegramService) {
               this.telegramService.sendVolatilityAlert(w.chatId, {
                 symbol: sym, interval, oc, open, currentPrice: p,
-                direction: oc >= 0 ? 'bullish' : 'bearish'
+                direction: oc >= 0 ? 'bullish' : 'bearish',
+                exchange: exchange // Pass exchange to use correct bot token
               }).catch(e => logger.error(`[Telegram] Failed to send alert to ${w.chatId}:`, e));
             }
             state.lastAlertTime = Date.now();

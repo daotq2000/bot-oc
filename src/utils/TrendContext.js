@@ -166,7 +166,8 @@ export class TrendContext {
         }
 
         // Build EMA series from oldest -> newest
-        const s = this._get(symbol);
+        // Use stateKey (with botId) to ensure state separation per bot
+        const s = this._get(stateKey);
         s.emaHistory = [];
         let ema = null;
         for (const close of closes) {

@@ -674,6 +674,9 @@ export class PriceAlertScanner {
       const bullish = Number(currentPrice) >= Number(openPrice);
       const direction = bullish ? 'bullish' : 'bearish';
 
+      // Normalize exchange name for bot token selection
+      const normalizedExchange = (exchange || 'mexc').toLowerCase();
+
       // Use compact line format via TelegramService
       logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
 
@@ -684,7 +687,8 @@ export class PriceAlertScanner {
           oc: ocPercent,
           open: openPrice,
           currentPrice,
-          direction
+          direction,
+          exchange: normalizedExchange // Pass exchange to use correct bot token
         });
         logger.info(`[PriceAlertScanner] ✅ Alert queued: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
       } catch (error) {
