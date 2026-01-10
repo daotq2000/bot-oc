@@ -133,8 +133,8 @@ export class Bot {
           fields.push(`${key} = ?`);
           values.push(JSON.stringify(data[key]));
         } else {
-          fields.push(`${key} = ?`);
-          values.push(data[key]);
+        fields.push(`${key} = ?`);
+        values.push(data[key]);
         }
       }
     });

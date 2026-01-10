@@ -40,11 +40,11 @@ export class ExitOrderManager {
   _decideExitType(side, entryPrice, desiredExitPrice) {
     const entry = Number(entryPrice);
     const exit = Number(desiredExitPrice);
-
+    
     if (side === 'long') {
       return exit > entry ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
     }
-
+    
     return exit < entry ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
   }
 
@@ -76,7 +76,7 @@ export class ExitOrderManager {
   async placeOrReplaceExitOrder(position, desiredExitPrice) {
     const startTime = Date.now();
     const timestamp = new Date().toISOString();
-
+    
     if (!position || position.status !== 'open') {
       logger.warn(
         `[ExitOrderManager] ⚠️ SKIP: position not open. pos=${position?.id} status=${position?.status} timestamp=${timestamp}`
@@ -97,7 +97,7 @@ export class ExitOrderManager {
       if (Array.isArray(openOrders) && openOrders.length > 0) {
         const exitTypes = new Set(['STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET']);
         const positionSide = side === 'long' ? 'LONG' : 'SHORT';
-
+        
         const existingExits = openOrders.filter(o => {
           const type = String(o?.type || '').toUpperCase();
           const isExitType = exitTypes.has(type);
@@ -107,21 +107,21 @@ export class ExitOrderManager {
           const matchesPositionSide = !ps || ps === positionSide;
           return isExitType && (isReduceOnly || isClosePosition) && matchesPositionSide;
         });
-
+        
         if (existingExits.length > 0) {
           const existingIds = existingExits.map(o => String(o?.orderId || '')).filter(Boolean);
           const dbOrderId = position?.exit_order_id ? String(position.exit_order_id) : null;
-
+          
           // Cancel orphaned exit orders
-          for (const order of existingExits) {
-            const orderId = String(order?.orderId || '');
-            if (orderId && orderId !== dbOrderId) {
-              try {
-                await this.exchangeService.cancelOrder(orderId, position.symbol);
-              } catch (cancelError) {
-                logger.error(
+            for (const order of existingExits) {
+              const orderId = String(order?.orderId || '');
+              if (orderId && orderId !== dbOrderId) {
+                try {
+                  await this.exchangeService.cancelOrder(orderId, position.symbol);
+                } catch (cancelError) {
+                  logger.error(
                   `[ExitOrderManager] ⚠️ Failed to cancel orphaned order ${orderId} | pos=${position.id} error=${cancelError?.message || cancelError}`
-                );
+                  );
               }
             }
           }
@@ -170,7 +170,7 @@ export class ExitOrderManager {
       }
     } catch (createError) {
       const errorMessage = createError?.message || String(createError);
-
+      
       // Handle -2021: immediate trigger → fallback MARKET close
       if (errorMessage.includes('-2021') || errorMessage.includes('would immediately trigger')) {
         try {
@@ -184,7 +184,7 @@ export class ExitOrderManager {
           return { orderType: 'MARKET_CLOSE_FAILED', stopPrice: null, orderId: null };
         }
       }
-
+      
       logger.error(
         `[ExitOrderManager] ❌ Create error | pos=${position.id} type=${orderType} stopPrice=${stopPrice.toFixed(8)} oldOrderId=${oldOrderId || 'null'} error=${errorMessage} stack=${createError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
       );

@@ -363,7 +363,7 @@ export class TrendContext {
 
     // Use stateKey for warmup tracking to separate per bot
     const stateKey = botConfig ? `${symbol}_bot_${botConfig._botId || 'default'}` : symbol;
-    
+
     // Already running
     if (this._warmupRunning.has(stateKey)) return true;
 

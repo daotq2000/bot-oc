@@ -172,11 +172,14 @@ export class EntryOrderMonitor {
       // Do NOT rely on PositionService.updatePosition inference.
       if (isFilled) {
         logger.info(`[EntryOrderMonitor] Exit order ${orderId} (${symbol}) FILLED via WebSocket. Will close matching DB position + notify.`);
-        await this._closePositionFromExitFill(botId, orderId, symbol, avgPrice);
+        logger.debug(`[EntryOrderMonitor] Searching for position with exit_order_id=${orderId} or sl_order_id=${orderId} for bot=${botId}`);
+        await this._closePositionFromExitFill(botId, orderId, symbol, avgPrice, filledQty);
       } else if (isCanceled) {
         logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) ${status} via WebSocket. Cache updated.`);
       } else if (status === 'PARTIALLY_FILLED') {
         logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) PARTIALLY_FILLED: ${filledQty}`);
+      } else {
+        logger.debug(`[EntryOrderMonitor] Order ${orderId} (${symbol}) status=${status}, not an entry order, not FILLED/CANCELED. Skipping.`);
       }
     } catch (error) {
       logger.error(
@@ -191,21 +194,88 @@ export class EntryOrderMonitor {
    * Close DB position and notify when an exit order (TP/SL) is FILLED via WebSocket.
    * This is the ONLY allowed path to mark a position closed + send Telegram close alert.
    */
-  async _closePositionFromExitFill(botId, exitOrderId, symbol, avgPrice) {
+  async _closePositionFromExitFill(botId, exitOrderId, symbol, avgPrice, filledQty = null) {
     try {
+      logger.debug(`[EntryOrderMonitor] _closePositionFromExitFill: botId=${botId}, exitOrderId=${exitOrderId}, symbol=${symbol}, avgPrice=${avgPrice}`);
+      
       const dbPos = await Position.findOpenByExitOrderId(botId, exitOrderId);
       if (!dbPos) {
+        logger.debug(`[EntryOrderMonitor] No position found with exit_order_id=${exitOrderId}, trying sl_order_id...`);
         // Might be SL order
         const dbPosSl = await Position.findOpenBySlOrderId(botId, exitOrderId);
         if (!dbPosSl) {
-          logger.warn(`[EntryOrderMonitor] No open DB position found for exitOrderId=${exitOrderId} bot=${botId} symbol=${symbol}`);
+          logger.warn(`[EntryOrderMonitor] ❌ No open DB position found for exitOrderId=${exitOrderId} bot=${botId} symbol=${symbol}`);
+          logger.warn(`[EntryOrderMonitor] Searched: exit_order_id=${exitOrderId} (type: ${typeof exitOrderId}) and sl_order_id=${exitOrderId} (type: ${typeof exitOrderId})`);
+          
+          // Try to find any open position for this symbol to help debug
+          try {
+            const openPositions = await Position.findOpen();
+            const symbolPositions = openPositions.filter(p => 
+              p.bot_id === botId && 
+              (p.symbol === symbol || p.symbol === symbol.replace('USDT', '') || symbol.includes(p.symbol))
+            );
+            
+            logger.warn(`[EntryOrderMonitor] Found ${symbolPositions.length} open positions for bot=${botId} symbol=${symbol}`);
+            
+            if (symbolPositions.length > 0) {
+              symbolPositions.forEach(pos => {
+                logger.warn(`[EntryOrderMonitor] Position ${pos.id}: exit_order_id=${pos.exit_order_id} (type: ${typeof pos.exit_order_id}), sl_order_id=${pos.sl_order_id} (type: ${typeof pos.sl_order_id}), status=${pos.status}`);
+              });
+              
+              // Try to match with type conversion
+              const matchingPos = symbolPositions.find(p => 
+                String(p.exit_order_id) === String(exitOrderId) || 
+                String(p.sl_order_id) === String(exitOrderId) ||
+                Number(p.exit_order_id) === Number(exitOrderId) ||
+                Number(p.sl_order_id) === Number(exitOrderId)
+              );
+              
+              if (matchingPos) {
+                logger.warn(`[EntryOrderMonitor] ✅ Found matching position ${matchingPos.id} after type conversion!`);
+                return await this._finalizeDbClose(botId, matchingPos, avgPrice, exitOrderId);
+              }
+            } else {
+              // Check if position was already closed
+              const { pool } = await import('../config/database.js');
+              const [closedRows] = await pool.execute(
+                `SELECT id, exit_order_id, sl_order_id, status, closed_at FROM positions WHERE bot_id = ? AND symbol = ? ORDER BY closed_at DESC LIMIT 5`,
+                [botId, symbol]
+              );
+              if (closedRows.length > 0) {
+                logger.warn(`[EntryOrderMonitor] Found ${closedRows.length} closed positions for bot=${botId} symbol=${symbol}`);
+                closedRows.forEach(pos => {
+                  logger.warn(`[EntryOrderMonitor] Closed position ${pos.id}: exit_order_id=${pos.exit_order_id}, sl_order_id=${pos.sl_order_id}, closed_at=${pos.closed_at}`);
+                });
+              }
+            }
+          } catch (debugErr) {
+            logger.error(`[EntryOrderMonitor] Debug query failed: ${debugErr?.message || debugErr}`, debugErr?.stack);
+          }
+          
+          // CRITICAL: Always send Telegram alert for WS-filled exit orders, even if DB position not found
+          // This ensures we don't miss any exit order fills from WebSocket
+          try {
+            if (this.telegramService?.sendWsExitFilledAlert) {
+              const bot = this.bots.get(botId);
+              const exchange = (bot?.exchange || 'binance').toLowerCase();
+              await this.telegramService.sendWsExitFilledAlert(botId, exitOrderId, symbol, avgPrice, filledQty, exchange);
+              logger.info(`[EntryOrderMonitor] ✅ Sent WS exit filled alert for order ${exitOrderId} (position not found in DB)`);
+            } else {
+              logger.warn(`[EntryOrderMonitor] TelegramService.sendWsExitFilledAlert not available, cannot send alert for order ${exitOrderId}`);
+            }
+          } catch (alertErr) {
+            logger.error(`[EntryOrderMonitor] Failed to send WS exit filled alert for order ${exitOrderId}: ${alertErr?.message || alertErr}`);
+          }
+          
           return;
         }
+        logger.info(`[EntryOrderMonitor] Found position ${dbPosSl.id} with sl_order_id=${exitOrderId}`);
         return await this._finalizeDbClose(botId, dbPosSl, avgPrice, exitOrderId);
       }
+      logger.info(`[EntryOrderMonitor] Found position ${dbPos.id} with exit_order_id=${exitOrderId}`);
       return await this._finalizeDbClose(botId, dbPos, avgPrice, exitOrderId);
     } catch (e) {
-      logger.error(`[EntryOrderMonitor] Failed to close DB position from exit fill | bot=${botId} orderId=${exitOrderId} symbol=${symbol}: ${e?.message || e}`);
+      logger.error(`[EntryOrderMonitor] ❌ Failed to close DB position from exit fill | bot=${botId} orderId=${exitOrderId} symbol=${symbol}: ${e?.message || e}`, e?.stack);
     }
   }
 

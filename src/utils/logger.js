@@ -42,16 +42,16 @@ const logger = winston.createLogger({
     // Write all logs to console
     (() => {
       const consoleTransport = new winston.transports.Console({
-        handleExceptions: true,
-        handleRejections: true,
-        format: winston.format.combine(
-          winston.format.colorize(),
-          winston.format.printf(({ timestamp, level, message, ...meta }) => {
-            let msg = `${timestamp} [${level}]: ${message}`;
-            const rest = Object.keys(meta || {}).length > 0 ? ` ${typeof meta === 'string' ? meta : JSON.stringify(meta)}` : '';
-            return msg + rest;
-          })
-        )
+      handleExceptions: true,
+      handleRejections: true,
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.printf(({ timestamp, level, message, ...meta }) => {
+          let msg = `${timestamp} [${level}]: ${message}`;
+          const rest = Object.keys(meta || {}).length > 0 ? ` ${typeof meta === 'string' ? meta : JSON.stringify(meta)}` : '';
+          return msg + rest;
+        })
+      )
       });
       
       // Wrap log method to silently handle EPIPE errors (pipe closed when stdout/stderr is closed by PM2)

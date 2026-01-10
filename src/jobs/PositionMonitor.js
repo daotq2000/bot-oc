@@ -211,8 +211,8 @@ export class PositionMonitor {
         // Use a more reliable check for the column's existence
         const positionColumns = Object.keys(Position.getAttributes());
         if (positionColumns.includes('tp_sl_pending')) {
-          await Position.update(position.id, { tp_sl_pending: false });
-          logger.debug(`[Place TP/SL] Cleared tp_sl_pending flag for position ${position.id} (both TP and SL exist)`);
+      await Position.update(position.id, { tp_sl_pending: false });
+      logger.debug(`[Place TP/SL] Cleared tp_sl_pending flag for position ${position.id} (both TP and SL exist)`);
         } else {
           logger.debug(`[Place TP/SL] Skipped clearing tp_sl_pending (column not supported) for position ${position.id}`);
         }
@@ -564,8 +564,8 @@ export class PositionMonitor {
                   `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'positions' AND COLUMN_NAME = 'tp_sl_pending' LIMIT 1`
                 );
                 if (Array.isArray(cols) && cols.length > 0) {
-                  updateData.tp_sl_pending = false;
-                }
+              updateData.tp_sl_pending = false;
+            }
               } catch (_) {
                 // ignore
               }

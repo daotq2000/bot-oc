@@ -130,9 +130,9 @@ export class PositionWebSocketClient extends EventEmitter {
           await this.stop();
         } else {
           // For temporary errors, log and schedule a reconnect
-          logger.error('[WS] Failed to create listenKey, will retry:', e?.message || e);
-          this.state = 'idle';
-          this.reconnect(true);
+        logger.error('[WS] Failed to create listenKey, will retry:', e?.message || e);
+        this.state = 'idle';
+        this.reconnect(true);
         }
         return; // Exit the connect attempt
       }
