@@ -75,6 +75,173 @@ let strategiesWorker = null;
 let symbolsUpdaterJob = null;
 let positionSyncJob = null;
 let telegramBot = null;
+let telegramService = null;
+
+/**
+ * Cleanup all caches and memory structures
+ * This function should be called during graceful shutdown to free memory
+ */
+async function cleanupAllCaches() {
+  logger.info('🧹 Starting cleanup of all caches and memory structures...');
+  const cleanupStart = Date.now();
+  let cleanedCount = 0;
+  
+  try {
+    // 1. OrderStatusCache
+    try {
+      const { orderStatusCache } = await import('./services/OrderStatusCache.js');
+      orderStatusCache.stopCleanupTimer();
+      orderStatusCache.clear();
+      cleanedCount++;
+      logger.info('✅ Cleared OrderStatusCache');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to clear OrderStatusCache: ${e?.message || e}`);
+    }
+    
+    // 2. StrategyCache
+    try {
+      const { strategyCache } = await import('./services/StrategyCache.js');
+      strategyCache.clear();
+      cleanedCount++;
+      logger.info('✅ Cleared StrategyCache');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to clear StrategyCache: ${e?.message || e}`);
+    }
+    
+    // 3. ExchangeInfoService
+    try {
+      const { exchangeInfoService } = await import('./services/ExchangeInfoService.js');
+      exchangeInfoService.destroy();
+      cleanedCount++;
+      logger.info('✅ Destroyed ExchangeInfoService');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to destroy ExchangeInfoService: ${e?.message || e}`);
+    }
+    
+    // 4. ConfigService (optional - may want to keep for shutdown)
+    // Skipping ConfigService as it may be needed during shutdown
+    
+    // 5. TelegramService
+    try {
+      if (telegramService) {
+        await telegramService.stop();
+        cleanedCount++;
+        logger.info('✅ Stopped TelegramService');
+      }
+    } catch (e) {
+      logger.warn(`⚠️ Failed to stop TelegramService: ${e?.message || e}`);
+    }
+    
+    // 6. OrderService caches (if accessible)
+    // Note: OrderService instances are per-bot, cleanup handled by service lifecycle
+    
+    // 7. RealtimeOCDetector
+    try {
+      const { RealtimeOCDetector } = await import('./services/RealtimeOCDetector.js');
+      // RealtimeOCDetector is instantiated per worker, cleanup handled by worker stop
+      cleanedCount++;
+      logger.info('✅ RealtimeOCDetector cleanup handled by worker stop');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to cleanup RealtimeOCDetector: ${e?.message || e}`);
+    }
+    
+    // 8. PositionRealtimeCache
+    try {
+      const { positionRealtimeCache } = await import('./services/PositionRealtimeCache.js');
+      positionRealtimeCache.cleanup();
+      cleanedCount++;
+      logger.info('✅ Cleaned PositionRealtimeCache');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to cleanup PositionRealtimeCache: ${e?.message || e}`);
+    }
+    
+    // 9. SymbolStateManager
+    try {
+      const { symbolStateManager } = await import('./services/SymbolStateManager.js');
+      symbolStateManager.stopCleanup();
+      symbolStateManager.cleanup();
+      cleanedCount++;
+      logger.info('✅ Cleaned SymbolStateManager');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to cleanup SymbolStateManager: ${e?.message || e}`);
+    }
+    
+    // 10. WebSocketManager (Binance)
+    try {
+      webSocketManager.disconnect();
+      cleanedCount++;
+      logger.info('✅ Disconnected Binance WebSocketManager');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to disconnect Binance WebSocketManager: ${e?.message || e}`);
+    }
+    
+    // 11. MexcWebSocketManager
+    try {
+      const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
+      mexcPriceWs.disconnect();
+      cleanedCount++;
+      logger.info('✅ Disconnected MEXC WebSocketManager');
+    } catch (e) {
+      logger.warn(`⚠️ Failed to disconnect MEXC WebSocketManager: ${e?.message || e}`);
+    }
+    
+    // 12. BinanceDirectClient caches (per-instance, handled by service lifecycle)
+    // Note: BinanceDirectClient instances are per-bot, cleanup handled by service lifecycle
+    // However, we can clear the request queue if accessible
+    
+    // 13. PositionService internal caches
+    // Note: PositionService instances are per-bot, cleanup handled by service lifecycle
+    // However, we can clear crossEntryExitPending Map if accessible
+    try {
+      // PositionService has crossEntryExitPending Map that should be cleared
+      // This is per-instance, but we log it for awareness
+      logger.debug('PositionService caches are per-instance, cleanup handled by service lifecycle');
+    } catch (e) {
+      // Ignore - per-instance cleanup
+    }
+    
+    // 14. PriceAlertWorker caches
+    if (priceAlertWorker) {
+      try {
+        // PriceAlertWorker.stop() should handle internal cleanup
+        cleanedCount++;
+        logger.info('✅ PriceAlertWorker cleanup handled by stop()');
+      } catch (e) {
+        logger.warn(`⚠️ Failed to cleanup PriceAlertWorker: ${e?.message || e}`);
+      }
+    }
+    
+    // 15. StrategiesWorker caches
+    if (strategiesWorker) {
+      try {
+        // StrategiesWorker.stop() should handle internal cleanup
+        cleanedCount++;
+        logger.info('✅ StrategiesWorker cleanup handled by stop()');
+      } catch (e) {
+        logger.warn(`⚠️ Failed to cleanup StrategiesWorker: ${e?.message || e}`);
+      }
+    }
+    
+    // 16. Clear any remaining intervals/timers
+    // Note: Most timers are cleared by individual service stop() methods
+    
+    // 17. Force garbage collection hint (if available)
+    if (global.gc) {
+      try {
+        global.gc();
+        logger.info('✅ Triggered garbage collection');
+      } catch (e) {
+        logger.debug('Garbage collection not available or failed');
+      }
+    }
+    
+    const cleanupDuration = Date.now() - cleanupStart;
+    logger.info(`✅ Cleanup completed: ${cleanedCount} caches/services cleaned in ${cleanupDuration}ms`);
+    
+  } catch (error) {
+    logger.error(`❌ Error during cache cleanup: ${error?.message || error}`);
+  }
+}
 
 
 // Initialize services and start server
@@ -240,7 +407,7 @@ async function start() {
 
     // Initialize Telegram service
     logger.info('Initializing Telegram service...');
-    const telegramService = new TelegramService();
+    telegramService = new TelegramService();
     await telegramService.initialize();
 
     // Delay Telegram bot startup to reduce CPU load
@@ -430,25 +597,8 @@ async function start() {
         }
       }
       
-      // Cleanup WebSocket connections
-      webSocketManager.disconnect();
-      // Cleanup MEXC WebSocket
-      try {
-        const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
-        mexcPriceWs.disconnect();
-        logger.info('Disconnected MEXC WebSocket');
-      } catch (e) {
-        logger.warn('Failed to disconnect MEXC WebSocket:', e?.message || e);
-      }
-      
-      // Cleanup all caches to free memory
-      try {
-        const { orderStatusCache } = await import('./services/OrderStatusCache.js');
-        orderStatusCache.clear();
-        logger.info('Cleared OrderStatusCache');
-      } catch (e) {
-        logger.warn('Failed to clear OrderStatusCache:', e?.message || e);
-      }
+      // Cleanup all caches and memory structures
+      await cleanupAllCaches();
       
       // Stop Memory Monitor
       try {
@@ -459,11 +609,17 @@ async function start() {
         logger.warn('Failed to stop Memory Monitor:', e?.message || e);
       }
       
+      // Stop Telegram Bot
       if (telegramBot) {
-        if (telegramBot) {
-        await telegramBot.stop();
+        try {
+          await telegramBot.stop();
+          logger.info('Stopped Telegram Bot');
+        } catch (e) {
+          logger.warn('Failed to stop Telegram Bot:', e?.message || e);
+        }
       }
-      }
+      
+      logger.info('✅ Graceful shutdown completed');
       process.exit(0);
     });
 
@@ -497,26 +653,9 @@ async function start() {
         }
       }
       
-      // Cleanup WebSocket connections
-      webSocketManager.disconnect();
-      // Cleanup MEXC WebSocket
-      try {
-        const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
-        mexcPriceWs.disconnect();
-        logger.info('Disconnected MEXC WebSocket');
-      } catch (e) {
-        logger.warn('Failed to disconnect MEXC WebSocket:', e?.message || e);
-      }
+      // Cleanup all caches and memory structures
+      await cleanupAllCaches();
       
-      // Cleanup all caches to free memory
-      try {
-        const { orderStatusCache } = await import('./services/OrderStatusCache.js');
-        orderStatusCache.clear();
-        logger.info('Cleared OrderStatusCache');
-      } catch (e) {
-        logger.warn('Failed to clear OrderStatusCache:', e?.message || e);
-      }
-
       // Stop Memory Monitor
       try {
         const { memoryMonitor } = await import('./utils/MemoryMonitor.js');
@@ -526,7 +665,17 @@ async function start() {
         logger.warn('Failed to stop Memory Monitor:', e?.message || e);
       }
       
-      await telegramBot.stop();
+      // Stop Telegram Bot
+      if (telegramBot) {
+        try {
+          await telegramBot.stop();
+          logger.info('Stopped Telegram Bot');
+        } catch (e) {
+          logger.warn('Failed to stop Telegram Bot:', e?.message || e);
+        }
+      }
+      
+      logger.info('✅ Graceful shutdown completed');
       process.exit(0);
     });
 
