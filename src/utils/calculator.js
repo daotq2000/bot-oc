@@ -189,6 +189,62 @@ export function calculateInitialStopLoss(entryPrice, stoploss, side) {
 }
 
 /**
+ * Calculate initial stop loss price based on entry price, quantity, and stoploss amount in USDT
+ * This calculates the SL price such that when price reaches SL, the loss equals stoplossAmount USDT
+ * 
+ * Formula:
+ * - LONG: SL price = Entry - (stoplossAmount / quantity)
+ * - SHORT: SL price = Entry + (stoplossAmount / quantity)
+ * 
+ * @param {number} entryPrice - Entry price
+ * @param {number} quantity - Position quantity (number of coins/contracts)
+ * @param {number} stoplossAmount - Stop loss amount in USDT (e.g., 100 = 100 USDT loss when SL hit)
+ * @param {'long'|'short'} side - Position side
+ * @returns {number|null} Stop loss price, or null if inputs are invalid
+ */
+export function calculateInitialStopLossByAmount(entryPrice, quantity, stoplossAmount, side) {
+  const entry = Number(entryPrice);
+  const qty = Number(quantity);
+  const slAmount = Number(stoplossAmount);
+  
+  // Validate inputs
+  if (!Number.isFinite(entry) || entry <= 0) {
+    return null;
+  }
+  
+  if (!Number.isFinite(qty) || qty <= 0) {
+    return null;
+  }
+  
+  if (!Number.isFinite(slAmount) || slAmount <= 0) {
+    return null;
+  }
+  
+  // Calculate price difference needed to achieve the loss amount
+  // Loss = |SL - Entry| * quantity
+  // So: |SL - Entry| = slAmount / quantity
+  const priceDiff = slAmount / qty;
+  
+  if (side === 'long') {
+    // LONG: SL < Entry, so SL = Entry - priceDiff
+    const slPrice = entry - priceDiff;
+    // Safety check: SL must be positive and less than entry
+    if (slPrice <= 0 || slPrice >= entry) {
+      return null;
+    }
+    return slPrice;
+  } else {
+    // SHORT: SL > Entry, so SL = Entry + priceDiff
+    const slPrice = entry + priceDiff;
+    // Safety check: SL must be greater than entry
+    if (slPrice <= entry) {
+      return null;
+    }
+    return slPrice;
+  }
+}
+
+/**
  * Calculate next trailing take profit price - moves from initial TP towards entry
  * 
  * IMPORTANT: Trailing TP is TIME-BASED ONLY, not price-based.

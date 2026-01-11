@@ -297,7 +297,7 @@ export class WebSocketOCConsumer {
       logger.info(`[WebSocketOCConsumer] ✅ Strategy ${strategy.id} has no open position, proceeding...`);
 
       // Import calculator functions for TP/SL calculation
-      const { calculateTakeProfit, calculateInitialStopLoss, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
+      const { calculateTakeProfit, calculateInitialStopLoss, calculateInitialStopLossByAmount, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
       const { determineSide } = await import('../utils/sideSelector.js');
 
       // Determine side based on direction, trade_type and is_reverse_strategy from bot
@@ -363,9 +363,21 @@ export class WebSocketOCConsumer {
       // Calculate TP and SL (based on side)
       const tpPrice = calculateTakeProfit(entryPrice, strategy.take_profit || 55, side);
       // Only compute SL when strategy.stoploss > 0. No fallback to reduce/up_reduce
+      // NEW: stoploss is now in USDT (not percentage), need quantity to calculate SL price
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
-      const slPrice = isStoplossValid ? calculateInitialStopLoss(entryPrice, rawStoploss, side) : null;
+      
+      // Calculate quantity from amount and entry price for SL calculation
+      const amount = strategy.amount || 1000; // Default amount if not set
+      let slPrice = null;
+      if (isStoplossValid) {
+        const estimatedQuantity = entryPrice > 0 ? amount / entryPrice : 0;
+        if (estimatedQuantity > 0) {
+          slPrice = calculateInitialStopLossByAmount(entryPrice, estimatedQuantity, rawStoploss, side);
+        } else {
+          logger.warn(`[WebSocketOCConsumer] Cannot calculate SL: invalid quantity (amount=${amount}, entry=${entryPrice})`);
+        }
+      }
 
       // Create signal object - OrderService.executeSignal expects strategy object
       const signal = {
@@ -378,7 +390,7 @@ export class WebSocketOCConsumer {
         timestamp: match.timestamp,
         tpPrice: tpPrice,
         slPrice: slPrice,
-        amount: strategy.amount || 1000, // Default amount if not set
+        amount: amount,
         forceMarket: forceMarket // Force MARKET order for trend-following strategies
       };
 

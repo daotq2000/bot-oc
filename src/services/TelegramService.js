@@ -7,39 +7,191 @@ import { configService } from './ConfigService.js';
  */
 export class TelegramService {
   constructor() {
-    this.bot = null;
+    // Separate clients for different alert types
+    this.clients = new Map(); // alertType -> { bot: Telegraf, chatId: string }
     this.initialized = false;
-    this.alertChannelId = null;
 
-    // Lightweight send queue to avoid blocking and to apply rate-limits
-    this._queue = [];
-    this._processing = false;
-    this._lastSendAt = 0; // global throttle
-    this._perChatLastSend = new Map(); // chatId -> ts
-    // Default throttles (Telegram 30 msg/sec global, 1 msg/sec per chat is safer)
-    this._minGapGlobalMs = 200;   // 5 msgs/sec global
-    this._perChatMinGapMs = 1000; // 1 msg/sec per chat to avoid 429
+    // Queues and rate-limiting per client
+    this._queues = new Map(); // alertType -> queue[]
+    this._processing = new Map(); // alertType -> boolean
+    this._lastSendAt = new Map(); // alertType -> timestamp
+    this._perChatLastSend = new Map(); // chatId -> ts (shared across all bots)
+    this._minGapGlobalMs = 200;   // 5 msgs/sec global per bot
+    this._perChatMinGapMs = 1000; // 1 msg/sec per chat
+
+    // TTL and cleanup for memory leak prevention
+    this._queueLastAccess = new Map(); // alertType -> timestamp
+    this._chatLastAccess = new Map(); // chatId -> timestamp
+    this._batches = new Map(); // exchange -> { messages: [], timer: Timeout }
+    this._cleanupInterval = null;
+    this._cleanupEveryMs = 5 * 60 * 1000;
+    this._queueMaxIdleMs = 30 * 60 * 1000;
+    this._chatMaxIdleMs = 6 * 60 * 60 * 1000;
+    this._lastCleanupAt = 0;
   }
 
   /**
-   * Initialize Telegram bot
+   * Initialize Telegram bots for all alert types
    */
   async initialize() {
     try {
-      const token = configService.getString('TELEGRAM_BOT_TOKEN');
-      if (!token) {
-        logger.warn('Telegram bot token not configured');
+      // 1. Order Service Alerts
+      const orderToken = configService.getString('TELEGRAM_BOT_TOKEN');
+      if (orderToken) {
+        this.clients.set('order', {
+          bot: new Telegraf(orderToken),
+          chatId: '-1003163801780'
+        });
+        logger.info('Telegram client initialized for Order Service alerts');
+      } else {
+        logger.warn('TELEGRAM_BOT_TOKEN for Order Service not configured');
+      }
+
+      // 2. MEXC Price Alerts
+      const mexcPriceToken = configService.getString('TELEGRAM_BOT_TOKEN_SEND_ALERT_MEXC');
+      if (mexcPriceToken) {
+        this.clients.set('price_mexc', {
+          bot: new Telegraf(mexcPriceToken),
+          chatId: '-1003052914854'
+        });
+        logger.info('Telegram client initialized for MEXC Price alerts');
+      } else {
+        logger.warn('TELEGRAM_BOT_TOKEN_SEND_ALERT_MEXC not configured');
+      }
+
+      // 3. Binance Price Alerts
+      const binancePriceToken = configService.getString('TELEGRAM_BOT_TOKEN_SEND_ALERT_BINANCE');
+      if (binancePriceToken) {
+        this.clients.set('price_binance', {
+          bot: new Telegraf(binancePriceToken),
+          chatId: '-1003009070677'
+        });
+        logger.info('Telegram client initialized for Binance Price alerts');
+      } else {
+        logger.warn('TELEGRAM_BOT_TOKEN_SEND_ALERT_BINANCE not configured');
+      }
+
+      if (this.clients.size === 0) {
+        logger.error('No Telegram clients could be initialized. Alerts will not be sent.');
         return false;
       }
 
-      this.bot = new Telegraf(token);
-      this.alertChannelId = configService.getString('TELEGRAM_ALERT_CHANNEL_ID', this.alertChannelId || '-1003163801780');
       this.initialized = true;
-      logger.info('Telegram bot initialized');
+      
+      // Start periodic cleanup to prevent memory leaks
+      this._startCleanupTimer();
+      
+      logger.info(`Telegram clients initialized for ${this.clients.size} modules`);
       return true;
     } catch (error) {
-      logger.error('Failed to initialize Telegram bot:', error);
+      logger.error('Failed to initialize Telegram bots:', error);
       return false;
+    }
+  }
+
+  /**
+   * Get bot instance for exchange
+   * @param {string} exchange - Exchange name (mexc, binance, or null for default)
+   * @returns {Telegraf|null} Bot instance or null
+   */
+  _getBot(alertType) {
+    // Resolve client by alertType; fallback order -> price_binance -> price_mexc
+    // (fallback is defensive, but callers should pass correct alertType)
+    return this.clients.get(alertType)?.bot ||
+      this.clients.get('order')?.bot ||
+      this.clients.get('price_binance')?.bot ||
+      this.clients.get('price_mexc')?.bot ||
+      null;
+  }
+
+  /**
+   * Start periodic cleanup timer to prevent memory leaks
+   */
+  _startCleanupTimer() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+    }
+    
+    this._cleanupInterval = setInterval(() => {
+      this._cleanupMaps().catch(err => {
+        logger.error(`[TelegramService] Cleanup error:`, err?.message || err);
+      });
+    }, this._cleanupEveryMs);
+    
+    logger.info(`[TelegramService] Started cleanup timer (every ${this._cleanupEveryMs}ms)`);
+  }
+
+  /**
+   * Stop cleanup timer (for graceful shutdown)
+   */
+  _stopCleanupTimer() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+      logger.info(`[TelegramService] Stopped cleanup timer`);
+    }
+  }
+
+  /**
+   * Cleanup old entries from Maps to prevent memory leaks
+   */
+  async _cleanupMaps() {
+    const now = Date.now();
+    
+    // Skip if cleanup ran recently (within 1 minute)
+    if (now - this._lastCleanupAt < 60000) {
+      return;
+    }
+    
+    this._lastCleanupAt = now;
+    let cleaned = 0;
+
+    // Cleanup empty queues and idle queues
+    if (this._queues && this._queues.entries) {
+      for (const [exchange, queue] of this._queues.entries()) {
+        const lastAccess = this._queueLastAccess.get(exchange) || 0;
+        
+        // Remove queue if empty and not accessed for maxIdleMs
+        if (queue.length === 0 && (now - lastAccess) > this._queueMaxIdleMs) {
+          this._queues.delete(exchange);
+          this._processing.delete(exchange);
+          this._lastSendAt.delete(exchange);
+          this._queueLastAccess.delete(exchange);
+          if (this._batches) {
+            this._batches.delete(exchange);
+          }
+          cleaned++;
+          logger.debug(`[TelegramService] Cleaned up idle queue for exchange: ${exchange}`);
+        }
+      }
+    }
+
+    // Cleanup per-chat tracking for inactive chats
+    if (this._chatLastAccess && this._chatLastAccess.entries) {
+      for (const [chatId, lastAccess] of this._chatLastAccess.entries()) {
+        if ((now - lastAccess) > this._chatMaxIdleMs) {
+          this._perChatLastSend.delete(chatId);
+          this._chatLastAccess.delete(chatId);
+          cleaned++;
+        }
+      }
+    }
+
+    // Cleanup batches that are stale
+    if (this._batches && this._batches.entries) {
+      for (const [exchange, batch] of this._batches.entries()) {
+        if (batch && batch.timer && batch.messages && batch.messages.length === 0) {
+          // Clear timer if batch is empty
+          clearTimeout(batch.timer);
+          this._batches.delete(exchange);
+          cleaned++;
+        }
+      }
+    }
+
+    if (cleaned > 0) {
+      logger.debug(`[TelegramService] Cleanup completed: removed ${cleaned} idle entries. ` +
+        `Queues: ${this._queues.size}, Chats: ${this._perChatLastSend.size}, Batches: ${this._batches.size}`);
     }
   }
 
@@ -62,7 +214,7 @@ export class TelegramService {
    * Send message to chat
    * @param {string} chatId - Chat ID
    * @param {string} message - Message text
-   * @param {Object} options - Additional options
+   * @param {Object} options - Additional options (can include exchange)
    */
   async sendMessage(chatId, message, options = {}) {
     // Master toggle to enable/disable all alerts from DB config
@@ -72,7 +224,7 @@ export class TelegramService {
       return;
     }
 
-    if (!this.initialized || !this.bot) {
+    if (!this.initialized || this.clients.size === 0) {
       logger.warn(`[Telegram] Bot not initialized, skipping message to ${chatId}`);
       return;
     }
@@ -82,20 +234,59 @@ export class TelegramService {
       return;
     }
 
+    // Determine which telegram client to use.
+    // Supported: order, price_mexc, price_binance
+    const alertType = (options?.alertType || '').toLowerCase() || 'order';
+
+    // Get or create queue for this alert type
+    if (!this._queues.has(alertType)) {
+      this._queues.set(alertType, []);
+    }
+    
+    // Update last access time for cleanup tracking
+    this._queueLastAccess.set(alertType, Date.now());
+    this._chatLastAccess.set(chatId, Date.now());
+
     // Enqueue to avoid blocking and to respect rate limits
-    this._queue.push({ chatId, message, options });
-    this._processQueue().catch(() => {});
+    this._queues.get(alertType).push({ chatId, message, options });
+    logger.debug(`[Telegram] Queued message for alertType=${alertType}, queue.length=${this._queues.get(alertType).length}`);
+    this._processQueue(alertType).catch((err) => {
+      logger.error(`[Telegram] Error processing queue for alertType=${alertType}:`, err?.message || err);
+    });
   }
 
-  async _processQueue() {
-    if (this._processing) return;
-    this._processing = true;
+  async _processQueue(alertType = 'order') {
+    // Normalize alertType
+    const queueKey = (alertType || '').toLowerCase() || 'order';
+    
+    if (this._processing.get(queueKey)) {
+      logger.debug(`[Telegram] Queue ${queueKey} is already being processed, skipping`);
+      return;
+    }
+    
+    this._processing.set(queueKey, true);
+    logger.debug(`[Telegram] Starting queue processing for alertType=${alertType} (queueKey=${queueKey})`);
+    
+    const queue = this._queues.get(queueKey) || [];
+    logger.debug(`[Telegram] Queue ${queueKey} has ${queue.length} messages`);
+    
+    const bot = this._getBot(alertType);
+    
+    if (!bot) {
+      logger.error(`[Telegram] ❌ No bot available for alertType ${alertType || 'order'} (queueKey=${queueKey}), skipping queue processing. Available clients: ${Array.from(this.clients.keys()).join(', ')}`);
+      this._processing.set(queueKey, false);
+      return;
+    }
+    
+    logger.debug(`[Telegram] Using bot for alertType=${alertType} (queueKey=${queueKey})`);
+    
     try {
-      while (this._queue.length > 0) {
-        const { chatId, message, options } = this._queue.shift();
-        // Throttle globally and per-chat
+      while (queue.length > 0) {
+        const { chatId, message, options } = queue.shift();
+        // Throttle globally (per exchange) and per-chat
         const now = Date.now();
-        const gapGlobal = now - this._lastSendAt;
+        const lastSendAt = this._lastSendAt.get(queueKey) || 0;
+        const gapGlobal = now - lastSendAt;
         const lastPerChat = this._perChatLastSend.get(chatId) || 0;
         const gapPerChat = now - lastPerChat;
         const waitMs = Math.max(0, this._minGapGlobalMs - gapGlobal, this._perChatMinGapMs - gapPerChat);
@@ -104,13 +295,15 @@ export class TelegramService {
         }
 
         try {
-          logger.debug(`[Telegram] Sending message to ${chatId}, length=${message.length}`);
+          logger.debug(`[Telegram] Sending message to ${chatId} (alertType=${alertType || 'order'}), length=${message.length}`);
           
           // Add timeout for Telegram API call (10 seconds)
           const telegramTimeout = Number(configService.getNumber('TELEGRAM_API_TIMEOUT_MS', 10000));
-          const sendPromise = this.bot.telegram.sendMessage(chatId, message, {
+          // Do not forward internal routing options to Telegram API
+          const { alertType: _at, exchange: _ex, ...tgOptions } = (options || {});
+          const sendPromise = bot.telegram.sendMessage(chatId, message, {
             parse_mode: 'HTML',
-            ...options
+            ...tgOptions
           });
           
           const timeoutPromise = new Promise((_, reject) => 
@@ -119,9 +312,12 @@ export class TelegramService {
           
           await Promise.race([sendPromise, timeoutPromise]);
           
-          this._lastSendAt = Date.now();
-          this._perChatLastSend.set(chatId, this._lastSendAt);
-          logger.info(`[Telegram] ✅ Successfully sent message to ${chatId}`);
+          const now = Date.now();
+          this._lastSendAt.set(queueKey, now);
+          this._perChatLastSend.set(chatId, now);
+          this._queueLastAccess.set(queueKey, now);
+          this._chatLastAccess.set(chatId, now);
+          logger.info(`[Telegram] ✅ Successfully sent message to ${chatId} (alertType=${alertType || 'order'})`);
         } catch (error) {
           // ✅ IMPROVED: Extract comprehensive error information
           const msg = error?.message || '';
@@ -154,18 +350,28 @@ export class TelegramService {
           } else if (transient) {
             // Respect Telegram retry_after when present
             const backoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000) : 2000; // Increased default backoff to 2s
-            logger.warn(`[Telegram] Throttled or transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, ${errorDetails}`);
-            this._queue.unshift({ chatId, message, options }); // requeue
+            logger.warn(`[Telegram] Throttled or transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, alertType=${alertType || 'order'}, ${errorDetails}`);
+            queue.unshift({ chatId, message, options }); // requeue
             await new Promise(r => setTimeout(r, backoffMs));
           } else {
             // Other errors - log with full details
-            logger.error(`[Telegram] Failed to send message to ${chatId}: ${errorDetails}`, error?.stack || '');
+            logger.error(`[Telegram] Failed to send message to ${chatId} (alertType=${alertType || 'order'}): ${errorDetails}`, error?.stack || '');
             // Don't requeue for unknown errors to avoid infinite loops
           }
         }
       }
+      
+      const remaining = this._queues.get(queueKey)?.length || 0;
+      if (remaining > 0) {
+        logger.debug(`[Telegram] Queue ${queueKey} processing completed, ${remaining} messages remaining`);
+      } else {
+        logger.debug(`[Telegram] Queue ${queueKey} processing completed, queue is empty`);
+      }
+    } catch (outerError) {
+      logger.error(`[Telegram] ❌ CRITICAL: Error in _processQueue for alertType=${alertType} (queueKey=${queueKey}):`, outerError?.message || outerError, outerError?.stack);
     } finally {
-      this._processing = false;
+      this._processing.set(queueKey, false);
+      logger.debug(`[Telegram] Queue ${queueKey} processing flag cleared`);
     }
   }
 
@@ -213,7 +419,7 @@ Bot: ${bot.bot_name || 'N/A'}
 Strategy: ${strategy.interval} | OC: ${strategy.oc}%
     `.trim();
 
-    await this.sendMessage(chatId, message);
+    await this.sendMessage(chatId, message, { alertType: 'order' });
   }
 
   /**
@@ -238,14 +444,18 @@ Strategy: ${strategy.interval} | OC: ${strategy.oc}%
 
   async sendEntryTradeAlert(position, strategy, oc) {
     try {
-      if (!this.initialized || !this.bot) {
+      if (!this.initialized || this.clients.size === 0) {
         logger.warn(`[Entry Alert] Telegram bot not initialized, skipping alert for position ${position?.id}`);
         return;
       }
+      
 
-      const channelId = (strategy?.bot?.telegram_alert_channel_id) || this.alertChannelId;
+      const channelId = '-1003163801780';
+      logger.debug(`[Entry Alert] Channel ID resolved: strategy.bot.telegram_alert_channel_id=${strategy?.bot?.telegram_alert_channel_id || 'NULL'}, this.alertChannelId=${this.alertChannelId || 'NULL'}, final=${channelId || 'NULL'}`);
+      
       if (!channelId) {
         logger.warn(`[Entry Alert] Alert channel ID not configured, skipping alert for position ${position?.id}`);
+        logger.warn(`[Entry Alert] Debug info: strategy.bot=${!!strategy?.bot}, strategy.bot_id=${strategy?.bot_id || 'NULL'}, position.bot_id=${position?.bot_id || 'NULL'}`);
         return;
       }
 
@@ -268,8 +478,8 @@ Open price: ${openPrice}
 Amount: ${amountStr} (100%)`.trim();
 
       logger.info(`[Entry Alert] Sending entry trade alert for position ${position.id} (${symbol}) to channel ${channelId}`);
-      await this.sendMessage(channelId, msg);
-      logger.info(`[Entry Alert] ✅ Successfully sent entry trade alert for position ${position.id} (${symbol})`);
+      await this.sendMessage(channelId, msg, { alertType: 'order' });
+      logger.info(`[Entry Alert] ✅ Message queued for position ${position.id} (actual send happens in _processQueue)`);
     } catch (e) {
       logger.error(`[Entry Alert] Failed to send entry trade alert for position ${position?.id}:`, e);
       logger.error(`[Entry Alert] Error stack:`, e?.stack);
@@ -293,7 +503,7 @@ Amount: ${amountStr} (100%)`.trim();
       
       // Fall back to default alert channel
       if (!channelId) {
-        channelId = this.alertChannelId;
+        channelId = "-1003163801780";
       }
       
       if (!channelId) {
@@ -305,6 +515,7 @@ Amount: ${amountStr} (100%)`.trim();
       }
 
       logger.info(`[CloseSummaryAlert] Sending alert for position ${position.id} to channel ${channelId}`);
+      logger.debug(`[CloseSummaryAlert] Queue status: queues.size=${this._queues.size}, clients.size=${this.clients.size}, initialized=${this.initialized}`);
 
       const symbol = this.formatSymbolUnderscore(position.symbol);
       const pnlVal = Number(position.pnl || 0);
@@ -341,10 +552,53 @@ Close price: ${closePrice}$
 Amount: ${amountStr}
 💰 PNL: ${pnlLine}`.trim();
 
-      await this.sendMessage(channelId, msg);
-      logger.info(`[CloseSummaryAlert] ✅ Successfully sent alert for position ${position.id}`);
+      await this.sendMessage(channelId, msg, { alertType: 'order' });
+      logger.info(`[CloseSummaryAlert] ✅ Message queued for position ${position.id} (actual send happens in _processQueue)`);
     } catch (e) {
       logger.error(`[CloseSummaryAlert] ❌ Failed to send close summary alert for position ${position?.id || 'unknown'}:`, e?.message || e, e?.stack);
+    }
+  }
+
+  /**
+   * Send WebSocket exit order filled alert when DB position not found
+   * This ensures we always notify about exit orders filled via WS, even if position lookup fails
+   * @param {number} botId - Bot ID
+   * @param {string} orderId - Exit order ID
+   * @param {string} symbol - Trading symbol
+   * @param {number} avgPrice - Average fill price
+   * @param {number} filledQty - Filled quantity (optional)
+   * @param {string} exchange - Exchange name (default: 'binance')
+   */
+  async sendWsExitFilledAlert(botId, orderId, symbol, avgPrice, filledQty = null, exchange = 'binance') {
+    try {
+      if (!this.initialized || this.clients.size === 0) {
+        logger.warn(`[WS Exit Alert] Telegram bot not initialized, skipping alert for order ${orderId}`);
+        return;
+      }
+
+      // WS exit filled alert is part of order service -> always use order client/channel
+      const formattedSymbol = this.formatSymbolUnderscore(symbol);
+      const formattedPrice = avgPrice ? this.formatPriceAdaptive(avgPrice) : 'N/A';
+      const formattedQty = filledQty ? Number(filledQty).toFixed(2) : 'N/A';
+
+      const msg = `
+⚠️ <b>Closed Position ${formattedSymbol} </b>
+
+Symbol: <b>${formattedSymbol}</b>
+Bot ID: <b>${botId}</b>
+Order ID: <b>${orderId}</b>
+Avg Price: <b>${formattedPrice}</b>
+Filled Qty: <b>${formattedQty}</b>
+Exchange: <b>${String(exchange || 'N/A').toUpperCase()}</b>
+
+<i>⚠️ DB position not found (no matching exit_order_id/sl_order_id). Please check PositionSync / orderId mapping.</i>
+      `.trim();
+
+      logger.info(`[WS Exit Alert] Sending WS exit filled alert for order ${orderId} (${symbol}) to channel -1003163801780`);
+      await this.sendMessage('-1003163801780', msg, { alertType: 'order' });
+      logger.info(`[WS Exit Alert] ✅ Message queued for order ${orderId} (actual send happens in _processQueue)`);
+    } catch (e) {
+      logger.error(`[WS Exit Alert] Failed to send WS exit filled alert for order ${orderId}:`, e?.message || e, e?.stack);
     }
   }
 
@@ -380,7 +634,7 @@ PnL: <b>${pnlSign}$${pnl.toFixed(2)}</b> (${pnlSign}${pnlPercent.toFixed(2)}%)
 Reason: <b>${this.formatCloseReason(position.close_reason)}</b>
     `.trim();
 
-    await this.sendMessage(chatId, message);
+    await this.sendMessage(chatId, message, { alertType: 'order' });
   }
 
   /**
@@ -411,7 +665,7 @@ Error: <code>${error.message || 'Unknown error'}</code>
 Time: ${new Date().toLocaleString()}
     `.trim();
 
-    await this.sendMessage(chatId, message);
+    await this.sendMessage(chatId, message, { alertType: 'order' });
   }
 
   /**
@@ -440,7 +694,7 @@ Type: <b>${typeLabels[type] || type}</b>
 Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
     `.trim();
 
-    await this.sendMessage(chatId, message);
+    await this.sendMessage(chatId, message, { alertType: 'order' });
   }
 
   /**
@@ -509,7 +763,7 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
 // └ ${formatPrice(open)} → ${formatPrice(currentPrice)}
 //     `.trim();
 
-//     await this.sendMessage(chatId, message);
+//     await this.sendMessage(chatId, message, { alertType: 'order' });
 //   }
 
   /**
@@ -538,6 +792,8 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
    * Format:
    * ┌🚀🚀🚀 SVSA ⚡️ 10.50% 🟢
    * └ 0.003788 → 0.004186
+   * @param {string} chatId - Chat ID
+   * @param {Object} alertData - Alert data (can include exchange)
    */
   async sendVolatilityAlert(chatId, alertData) {
     if (!chatId) {
@@ -552,7 +808,7 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
       return;
     }
 
-    if (!this.initialized || !this.bot) {
+    if (!this.initialized || this.clients.size === 0) {
       logger.warn(`[VolatilityAlert] Telegram bot not initialized, skipping alert to ${chatId}`);
       return;
     }
@@ -596,17 +852,20 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
 └ ${formatPrice(open)} → ${formatPrice(currentPrice)}
     `.trim();
 
-    logger.info(`[VolatilityAlert] Queuing alert to ${chatId}: ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
-    
+    // Extract exchange from alertData to use correct bot token and normalize to 'default' if empty/null
+    const exchange = (alertData?.exchange || '').toLowerCase() || '';
+
+    const alertType = exchange === 'mexc' ? 'price_mexc' : 'price_binance';
+
+    logger.info(`[VolatilityAlert] Queuing alert to ${chatId} (alertType=${alertType}): ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
+
     // sendMessage is queue-based, so we queue it and let the queue processor handle it
     // The actual send status will be logged by _processQueue
     try {
-      await this.sendMessage(chatId, message);
-      // Note: sendMessage returns immediately after queuing, actual send happens in _processQueue
-      // We log "queued" here, and "sent successfully" is logged in _processQueue
-      logger.debug(`[VolatilityAlert] Alert queued for ${chatId}: ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
+      await this.sendMessage(chatId, message, { alertType });
+      logger.debug(`[VolatilityAlert] Alert queued for ${chatId} (alertType=${alertType}): ${symbol} ${intervalLabel} ${ocAbs}% ${directionEmoji}`);
     } catch (error) {
-      logger.error(`[VolatilityAlert] Failed to queue alert to ${chatId}:`, error?.message || error);
+      logger.error(`[VolatilityAlert] Failed to queue alert to ${chatId} (alertType=${alertType}):`, error?.message || error);
       throw error;
     }
   }
@@ -635,10 +894,11 @@ Amount: <b>$${parseFloat(amount).toFixed(2)}</b>
    */
   async sendConcurrencyLimitAlert(strategy, status) {
     try {
-      if (!this.initialized || !this.bot) {
+      if (!this.initialized || this.clients.size === 0) {
         logger.warn(`[ConcurrencyAlert] Telegram bot not initialized`);
         return;
       }
+      
 
       let bot = strategy.bot || {};
       let chatId = bot.telegram_alert_channel_id || bot.telegram_chat_id || this.alertChannelId;
@@ -675,7 +935,7 @@ Utilization: ${utilizationBar} <b>${utilizationPercent}%</b>
       `.trim();
 
       logger.info(`[ConcurrencyAlert] Sending concurrency limit alert for strategy ${strategy.id} (${strategy.symbol})`);
-      await this.sendMessage(chatId, message);
+      await this.sendMessage(chatId, message, { alertType: 'order' });
       logger.info(`[ConcurrencyAlert] ✅ Successfully sent concurrency limit alert`);
     } catch (e) {
       logger.error(`[ConcurrencyAlert] Failed to send concurrency limit alert:`, e);
@@ -692,6 +952,40 @@ Utilization: ${utilizationBar} <b>${utilizationPercent}%</b>
     const empty = 10 - filled;
     const bar = '█'.repeat(filled) + '░'.repeat(empty);
     return bar;
+  }
+
+  /**
+   * Stop service and cleanup all resources (for graceful shutdown)
+   */
+  async stop() {
+    logger.info('[TelegramService] Stopping service and cleaning up resources...');
+    
+    // Stop cleanup timer
+    this._stopCleanupTimer();
+    
+    // Clear all batches timers
+    for (const [exchange, batch] of this._batches.entries()) {
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+      }
+    }
+    
+    // Run final cleanup
+    await this._cleanupMaps();
+    
+    // Clear all Maps
+    this._queues.clear();
+    this._processing.clear();
+    this._lastSendAt.clear();
+    this._perChatLastSend.clear();
+    this._batches.clear();
+    this._queueLastAccess.clear();
+    this._chatLastAccess.clear();
+    
+    // Note: Keep bots Map as it may be needed for re-initialization
+    
+    this.initialized = false;
+    logger.info('[TelegramService] Service stopped and resources cleaned up');
   }
 }
 

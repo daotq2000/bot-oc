@@ -60,6 +60,12 @@ export class BinanceDirectClient {
     this._circuitBreakerTimeout = Number(configService.getNumber('BINANCE_CIRCUIT_BREAKER_TIMEOUT_MS', 60000)); // 1 minute cooldown
     this._circuitBreakerSuccessThreshold = Number(configService.getNumber('BINANCE_CIRCUIT_BREAKER_SUCCESS_THRESHOLD', 2)); // Successes to close
 
+    // CRITICAL FIX: Rate limit blocking - block all requests immediately when 429 detected
+    this._rateLimitBlocked = false;
+    this._rateLimitBlockedUntil = 0;
+    this._rateLimitBlockDuration = Number(configService.getNumber('BINANCE_RATE_LIMIT_BLOCK_DURATION_MS', 10000)); // 10 seconds default
+    this._rateLimitTestInProgress = false;
+
     // CRITICAL FIX: Error classification for retry logic
     this._nonRetryableErrors = new Set([
       -2019, // Insufficient margin
@@ -95,6 +101,168 @@ export class BinanceDirectClient {
     }
     
     return true; // CLOSED or HALF_OPEN
+  }
+
+  /**
+   * CRITICAL FIX: Check if rate limit is blocking requests
+   * @returns {boolean} True if requests should be allowed
+   */
+  _checkRateLimitBlock() {
+    const now = Date.now();
+    
+    if (!this._rateLimitBlocked) {
+      return true; // Not blocked
+    }
+    
+    // Check if block period has passed
+    if (now >= this._rateLimitBlockedUntil) {
+      // Block period expired, test connection if not already testing
+      if (!this._rateLimitTestInProgress) {
+        this._testConnectionAfterBlock().catch(err => {
+          logger.debug(`[Binance-RateLimit] Connection test failed: ${err?.message || err}`);
+        });
+      }
+      // Still return false to block until test completes and unblocks
+      return false;
+    }
+    
+    // Still blocked
+    return false;
+  }
+
+  /**
+   * CRITICAL FIX: Block all requests due to rate limit
+   */
+  _blockRateLimit() {
+    if (this._rateLimitBlocked) {
+      // Already blocked, extend block time
+      this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+      logger.warn(`[Binance-RateLimit] ⚠️ Rate limit detected again. Extending block until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+      return;
+    }
+    
+    this._rateLimitBlocked = true;
+    this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+    logger.error(`[Binance-RateLimit] 🚫 RATE LIMIT (429) DETECTED! Blocking ALL requests for ${this._rateLimitBlockDuration}ms until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+    
+    // Schedule connection test after block period
+    setTimeout(() => {
+      this._testConnectionAfterBlock().catch(err => {
+        logger.debug(`[Binance-RateLimit] Connection test failed: ${err?.message || err}`);
+      });
+    }, this._rateLimitBlockDuration);
+  }
+
+  /**
+   * CRITICAL FIX: Test connection after rate limit block period
+   * Uses a lightweight endpoint to test if rate limit is cleared
+   */
+  async _testConnectionAfterBlock() {
+    // Prevent multiple concurrent tests
+    if (this._rateLimitTestInProgress) {
+      return;
+    }
+    
+    this._rateLimitTestInProgress = true;
+    
+    try {
+      logger.info(`[Binance-RateLimit] 🧪 Testing connection after rate limit block...`);
+      
+      // Use a lightweight endpoint to test (ping or ticker for a common symbol)
+      // Try ping endpoint first (if available), otherwise use ticker for BTCUSDT
+      let testSuccess = false;
+      
+      try {
+        // Try ping endpoint (lightweight, no params needed)
+        const pingUrl = `${this.productionDataURL}/fapi/v1/ping`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
+        const response = await fetch(pingUrl, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          },
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (response.ok || response.status === 200) {
+          testSuccess = true;
+        } else if (response.status === 429) {
+          // Still rate limited, extend block
+          logger.warn(`[Binance-RateLimit] ⚠️ Still rate limited. Extending block for another ${this._rateLimitBlockDuration}ms`);
+          this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+          return;
+        }
+      } catch (pingError) {
+        // Ping failed, try ticker endpoint as fallback
+        try {
+          const tickerUrl = `${this.productionDataURL}/fapi/v1/ticker/price?symbol=BTCUSDT`;
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 5000);
+          
+          const response = await fetch(tickerUrl, {
+            method: 'GET',
+            headers: {
+              'Accept': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            signal: controller.signal
+          });
+          
+          clearTimeout(timeoutId);
+          
+          if (response.ok) {
+            const data = await response.json();
+            if (data && data.price) {
+              testSuccess = true;
+            }
+          } else if (response.status === 429) {
+            // Still rate limited, extend block
+            logger.warn(`[Binance-RateLimit] ⚠️ Still rate limited. Extending block for another ${this._rateLimitBlockDuration}ms`);
+            this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+            return;
+          }
+        } catch (tickerError) {
+          // Both tests failed, but might be network issue, not rate limit
+          // Check if it's a 429 error
+          const errorMsg = tickerError?.message || '';
+          if (errorMsg.includes('429') || tickerError?.status === 429) {
+            logger.warn(`[Binance-RateLimit] ⚠️ Still rate limited. Extending block for another ${this._rateLimitBlockDuration}ms`);
+            this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+            return;
+          }
+        }
+      }
+      
+      if (testSuccess) {
+        // Connection test passed, unblock
+        this._rateLimitBlocked = false;
+        this._rateLimitBlockedUntil = 0;
+        logger.info(`[Binance-RateLimit] ✅ Connection test passed! Unblocking requests.`);
+      } else {
+        // Test failed but not 429, might be network issue
+        // Extend block to be safe
+        logger.warn(`[Binance-RateLimit] ⚠️ Connection test inconclusive. Extending block for another ${this._rateLimitBlockDuration}ms`);
+        this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+      }
+    } catch (error) {
+      // Test failed, extend block to be safe
+      const errorMsg = error?.message || '';
+      if (errorMsg.includes('429') || error?.status === 429) {
+        logger.warn(`[Binance-RateLimit] ⚠️ Still rate limited. Extending block for another ${this._rateLimitBlockDuration}ms`);
+        this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+      } else {
+        // Network error, extend block to be safe
+        logger.warn(`[Binance-RateLimit] ⚠️ Connection test failed (network error). Extending block for another ${this._rateLimitBlockDuration}ms`);
+        this._rateLimitBlockedUntil = Date.now() + this._rateLimitBlockDuration;
+      }
+    } finally {
+      this._rateLimitTestInProgress = false;
+    }
   }
 
   /**
@@ -147,13 +315,26 @@ export class BinanceDirectClient {
       return { retryable: true, reason: 'network_error', code };
     }
     
+    // Binance API timeout error (-1007) - retryable
+    // Error -1007: "Timeout waiting for response from backend server. Send status unknown; execution status unknown."
+    if (code === -1007 || /timeout waiting for response|backend server/i.test(msg)) {
+      return { retryable: true, reason: 'timeout_error', code };
+    }
+    
     // 5xx server errors - retryable
     if (/HTTP 5\d{2}/.test(msg) || error?.status >= 500) {
       return { retryable: true, reason: 'server_error', code, status: error?.status };
     }
     
+    // 408 Request Timeout - retryable
+    if (error?.status === 408 || /request timeout/i.test(msg)) {
+      return { retryable: true, reason: 'timeout_error', code, status: error?.status };
+    }
+    
     // Rate limit (429) - retryable with backoff
     if (error?.status === 429 || /429|Too Many Requests|rate limit/i.test(msg)) {
+      // CRITICAL: Trigger rate limit block immediately
+      this._blockRateLimit();
       return { retryable: true, reason: 'rate_limit', code };
     }
     
@@ -204,6 +385,19 @@ export class BinanceDirectClient {
         const error = new Error('Circuit breaker is OPEN - Binance API is unavailable');
         error.code = 'CIRCUIT_BREAKER_OPEN';
         reject(error);
+        continue;
+      }
+
+      // Check rate limit block
+      if (!this._checkRateLimitBlock()) {
+        const error = new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+        error.code = 'RATE_LIMIT_BLOCKED';
+        error.status = 429;
+        reject(error);
+        // Re-queue the request to retry later
+        this._requestQueue.unshift({ requestFn, isSigned, resolve, reject });
+        // Wait a bit before checking again
+        await new Promise(resolve => setTimeout(resolve, 1000));
         continue;
       }
 
@@ -482,16 +676,37 @@ export class BinanceDirectClient {
       }
     };
 
+    // Check rate limit block before making request
+    if (!this._checkRateLimitBlock()) {
+      const error = new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+      error.status = 429;
+      error.code = 'RATE_LIMIT_BLOCKED';
+      throw error;
+    }
+
     // Retry on 403/429/5xx/timeout with exponential backoff
     const maxAttempts = isMarketDataEndpoint ? 3 : 2;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
+        // Check rate limit block before each attempt
+        if (!this._checkRateLimitBlock()) {
+          const error = new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+          error.status = 429;
+          error.code = 'RATE_LIMIT_BLOCKED';
+          throw error;
+        }
+        
         return await doFetch();
       } catch (error) {
         const msg = error?.message || '';
         const status = error?.status || 0;
         const is429 = status === 429 || /429|Too Many Requests|rate limit/i.test(msg);
         const isRetryable = is429 || /HTTP 403|HTTP 5\d{2}|network|fetch|aborted|timeout/i.test(msg);
+        
+        // CRITICAL: If 429 detected, trigger rate limit block immediately
+        if (is429) {
+          this._blockRateLimit();
+        }
         
         if (attempt < maxAttempts && isRetryable) {
           // Exponential backoff: longer delay for 429, shorter for other errors
@@ -526,6 +741,14 @@ export class BinanceDirectClient {
    * Make PUBLIC request against TRADING baseURL (used for testnet exchangeInfo without auth)
    */
   async makeTradingPublicRequest(endpoint, method = 'GET', params = {}) {
+    // Check rate limit block before making request
+    if (!this._checkRateLimitBlock()) {
+      const error = new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+      error.status = 429;
+      error.code = 'RATE_LIMIT_BLOCKED';
+      throw error;
+    }
+
     // Rate limiting
     const now = Date.now();
     const timeSinceLastRequest = now - this.lastRequestTime;
@@ -543,8 +766,14 @@ export class BinanceDirectClient {
 
     const response = await fetch(url.toString(), { method, headers: { 'Content-Type': 'application/json' } });
     if (!response.ok) {
+      // CRITICAL: Check for 429 rate limit in response status
+      if (response.status === 429) {
+        this._blockRateLimit();
+      }
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      const error = new Error(`HTTP ${response.status}: ${text}`);
+      error.status = response.status;
+      throw error;
     }
     return await response.json();
   }
@@ -582,9 +811,25 @@ export class BinanceDirectClient {
       await this.ensureTimeSync();
     }
 
+    // Check rate limit block before making request
+    if (!this._checkRateLimitBlock()) {
+      const error = new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+      error.status = 429;
+      error.code = 'RATE_LIMIT_BLOCKED';
+      throw error;
+    }
+
     // CRITICAL FIX: Make request with retries and error classification
     let useDirectServerTime = false;
     for (let i = 0; i < retries; i++) {
+      // Check rate limit block before each attempt
+      if (!this._checkRateLimitBlock()) {
+        const error = new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+        error.status = 429;
+        error.code = 'RATE_LIMIT_BLOCKED';
+        throw error;
+      }
+
       let queryString = '';
       let requestBody = null;
 
@@ -636,8 +881,63 @@ export class BinanceDirectClient {
 
         clearTimeout(timeoutId);
 
-        const data = await response.json();
+        // CRITICAL FIX: Check content-type before parsing JSON
+        // Binance may return HTML (error pages, rate limit pages, maintenance pages)
+        // IMPORTANT: Response body can only be read once, so we must handle both cases carefully
+        const contentType = response.headers.get('content-type') || '';
+        let data;
+        let responseText = null;
+        
+        try {
+          // Always read as text first to handle both JSON and HTML
+          responseText = await response.text();
+          
+          // Try to parse as JSON
+          try {
+            data = JSON.parse(responseText);
+          } catch (parseError) {
+            // Response is not valid JSON (likely HTML error page)
+            // Check if it looks like HTML
+            if (responseText.trim().startsWith('<!DOCTYPE') || responseText.trim().startsWith('<html') || responseText.trim().startsWith('<')) {
+              const error = new Error(`Binance API returned HTML instead of JSON (status ${response.status}): ${responseText.substring(0, 200)}...`);
+              error.status = response.status;
+              error.responseText = responseText;
+              error.isHtmlResponse = true;
+              error.code = response.status >= 500 ? -1000 : -1001; // Use generic error code for HTML responses
+              throw error;
+            }
+            
+            // Not HTML but still not valid JSON - this is unexpected
+            const error = new Error(`Binance API returned invalid JSON (${contentType}): ${parseError?.message || parseError}`);
+            error.status = response.status;
+            error.responseText = responseText;
+            error.originalError = parseError;
+            throw error;
+          }
+        } catch (parseError) {
+          // If parse error occurs, create error with original error
+          if (parseError.isHtmlResponse) {
+            // For HTML responses, classify as server error (retryable if 5xx)
+            const error = parseError;
+            if (response.status >= 500) {
+              error.retryable = true;
+            }
+            throw error;
+          }
+          // JSON parse error - not retryable (malformed response)
+          const error = new Error(`Failed to parse Binance API response as JSON: ${parseError?.message || parseError}`);
+          error.status = response.status;
+          error.responseText = responseText;
+          error.originalError = parseError;
+          throw error;
+        }
+        
         if (!response.ok) {
+          // CRITICAL: Check for 429 rate limit in response status
+          if (response.status === 429) {
+            this._blockRateLimit();
+          }
+          
           if (data.code && data.msg) {
             // CRITICAL FIX: Enhanced timestamp error handling with auto-recovery
             if (data.code === -1021) {
@@ -664,9 +964,16 @@ export class BinanceDirectClient {
               logger.error('Binance precision rejection', { endpoint, params: this.sanitizeParams(params), response: data });
             }
             
+              // CRITICAL FIX: Handle timeout error (-1007) - retryable
+            if (data.code === -1007) {
+              logger.warn(`[Binance] Timeout error -1007 on ${endpoint}. This is retryable - will retry with backoff.`);
+              // Continue to throw error so retry logic handles it
+            }
+            
             // CRITICAL FIX: Create error with code for classification
             const error = new Error(`Binance API Error ${data.code}: ${data.msg}`);
             error.code = data.code;
+            error.status = response.status;
             throw error;
           }
           const error = new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
@@ -695,11 +1002,18 @@ export class BinanceDirectClient {
           // Rate limit: longer backoff with jitter
           backoff = Math.min(1000 * Math.pow(2, i), 10000) + Math.random() * 1000;
           logger.warn(`[Binance] Rate limit hit, backing off ${Math.round(backoff)}ms before retry ${i + 1}/${retries}`);
+        } else if (classification.reason === 'timeout_error' || classification.code === -1007) {
+          // Timeout error (-1007): longer backoff (3s, 6s, 12s) since backend server is slow
+          backoff = Math.min(3000 * Math.pow(2, i), 15000) + Math.random() * 1000;
+          logger.warn(`[Binance] Timeout error (code: ${classification.code}), backing off ${Math.round(backoff)}ms before retry ${i + 1}/${retries}`);
         } else if (classification.reason === 'timestamp_error') {
           // Timestamp error: short backoff, time already synced
           backoff = 50;
+        } else if (classification.reason === 'network_error') {
+          // Network error: exponential backoff with jitter
+          backoff = Math.min(2000 * Math.pow(2, i), 10000) + Math.random() * 500;
         } else {
-          // Network/server error: exponential backoff
+          // Server error: exponential backoff
           backoff = 1000 * (i + 1);
         }
         
@@ -1967,7 +2281,7 @@ export class BinanceDirectClient {
    * Create CLOSE-POSITION STOP_MARKET
    * LONG closes with SELL; SHORT closes with BUY.
    */
-  async createCloseStopMarket(symbol, side, stopPrice) {
+  async createCloseStopMarket(symbol, side, stopPrice, position = null, bot = null) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
     const [tickSize, dualSide, currentPrice] = await Promise.all([
@@ -2002,6 +2316,16 @@ export class BinanceDirectClient {
       workingType: 'MARK_PRICE' // Use MARK_PRICE for better trigger accuracy
     };
 
+    // Add deterministic clientOrderId to reliably map WS fills back to DB position
+    // Format: OC_B{botId}_P{positionId}_EXIT / _SL
+    try {
+      const botId = bot?.id;
+      const posId = position?.id;
+      if (botId && posId) {
+        params.newClientOrderId = `OC_B${botId}_P${posId}_EXIT`;
+      }
+    } catch (_) {}
+
     if (dualSide) params.positionSide = positionSide;
 
     // CRITICAL FIX: TP/SL orders use standard /fapi/v1/order endpoint
@@ -2014,7 +2338,7 @@ export class BinanceDirectClient {
    * Create CLOSE-POSITION TAKE_PROFIT_MARKET
    * LONG closes with SELL; SHORT closes with BUY.
    */
-  async createCloseTakeProfitMarket(symbol, side, stopPrice) {
+  async createCloseTakeProfitMarket(symbol, side, stopPrice, position = null, bot = null) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
     const [tickSize, dualSide, currentPrice] = await Promise.all([
@@ -2049,6 +2373,16 @@ export class BinanceDirectClient {
       timeInForce: 'GTC',
       workingType: 'MARK_PRICE' // Use MARK_PRICE for better trigger accuracy
     };
+
+    // Add deterministic clientOrderId to reliably map WS fills back to DB position
+    // Format: OC_B{botId}_P{positionId}_TP
+    try {
+      const botId = bot?.id;
+      const posId = position?.id;
+      if (botId && posId) {
+        params.newClientOrderId = `OC_B${botId}_P${posId}_TP`;
+      }
+    } catch (_) {}
 
     if (dualSide) params.positionSide = positionSide;
 
