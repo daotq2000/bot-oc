@@ -1010,18 +1010,18 @@ export class ExchangeService {
     throw new Error('createTakeProfitLimit not supported on this exchange');
   }
 
-  async createCloseStopMarket(symbol, side, stopPrice) {
+  async createCloseStopMarket(symbol, side, stopPrice, position = null) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
       const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
-      return await this.binanceDirectClient.createCloseStopMarket(normalizedSymbol, side, stopPrice);
+      return await this.binanceDirectClient.createCloseStopMarket(normalizedSymbol, side, stopPrice, position, this.bot);
     }
     throw new Error('createCloseStopMarket not supported on this exchange');
   }
 
-  async createCloseTakeProfitMarket(symbol, side, stopPrice) {
+  async createCloseTakeProfitMarket(symbol, side, stopPrice, position = null) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
       const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
-      return await this.binanceDirectClient.createCloseTakeProfitMarket(normalizedSymbol, side, stopPrice);
+      return await this.binanceDirectClient.createCloseTakeProfitMarket(normalizedSymbol, side, stopPrice, position, this.bot);
     }
     throw new Error('createCloseTakeProfitMarket not supported on this exchange');
   }

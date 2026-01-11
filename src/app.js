@@ -154,8 +154,8 @@ async function start() {
       await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.co', 'MEXC Futures REST base URL (using .co domain for better connectivity)');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
-      await AppConfig.set('POSITION_MONITOR_INTERVAL_MS', '25000', 'Delay between subscribe batches (ms)');
-      await AppConfig.set('POSITION_SYNC_INTERVAL_MS', '40000', 'Delay between subscribe batches (ms)');
+      await AppConfig.set('POSITION_MONITOR_INTERVAL_MS', '40000', 'Interval (ms) between position monitor cycles (increased from 25s to reduce rate limit)');
+      await AppConfig.set('POSITION_SYNC_INTERVAL_MS', '60000', 'Interval (ms) between position sync cycles (increased from 40s to reduce rate limit)');
 
       // REST ticker fallbacks when WS has no price
       await AppConfig.set('BINANCE_TICKER_REST_FALLBACK', 'false', 'Enable REST fallback for Binance ticker price when WS has no price');
@@ -192,11 +192,11 @@ async function start() {
       // Batch processing configs
       await AppConfig.set('SIGNAL_SCAN_BATCH_SIZE', '200', 'Number of strategies to scan in parallel per batch');
       await AppConfig.set('SIGNAL_SCAN_BATCH_DELAY_MS', '300', 'Delay (ms) between signal scan batches');
-      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '3', 'Number of positions to monitor in parallel per batch');
-      await AppConfig.set('POSITION_MONITOR_BATCH_DELAY_MS', '300', 'Delay (ms) between position monitor batches');
-      await AppConfig.set('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', '200', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
-      await AppConfig.set('BINANCE_REST_PRICE_COOLDOWN_MS', '10000', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
-      await AppConfig.set('POSITION_MONITOR_POSITION_DELAY_MS', '500', 'Minutes before auto-cancel unfilled entry LIMIT orders (default). You can change this in app_configs');
+      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '2', 'Number of positions to monitor in parallel per batch (reduced from 3 to reduce rate limit)');
+      await AppConfig.set('POSITION_MONITOR_BATCH_DELAY_MS', '2000', 'Delay (ms) between position monitor batches (increased from 300ms to reduce rate limit)');
+      await AppConfig.set('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', '200', 'Minimum interval (ms) between Binance market data requests');
+      await AppConfig.set('BINANCE_REST_PRICE_COOLDOWN_MS', '10000', 'Cooldown (ms) before reusing cached REST price fallback');
+      await AppConfig.set('POSITION_MONITOR_POSITION_DELAY_MS', '1000', 'Delay (ms) between each position in a batch (increased from 500ms to reduce rate limit)');
 
       // Symbols refresh configs
       await AppConfig.set('ENABLE_SYMBOLS_REFRESH', 'true', 'Enable periodic symbols/filters refresh for exchanges');

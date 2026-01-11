@@ -1,5 +1,5 @@
 import { Position } from '../models/Position.js';
-import { calculatePnL, calculatePnLPercent, calculateDynamicStopLoss, calculateTakeProfit, calculateInitialStopLoss, calculateNextTrailingStop, calculateNextTrailingTakeProfit } from '../utils/calculator.js';
+import { calculatePnL, calculatePnLPercent, calculateDynamicStopLoss, calculateTakeProfit, calculateInitialStopLoss, calculateInitialStopLossByAmount, calculateNextTrailingStop, calculateNextTrailingTakeProfit } from '../utils/calculator.js';
 import { exchangeInfoService } from './ExchangeInfoService.js';
 import { configService } from './ConfigService.js';
 import { orderStatusCache } from './OrderStatusCache.js';
@@ -193,11 +193,24 @@ export class PositionService {
         
         // Only update TP if actual minutes have increased (ensures exactly once per minute)
         if (totalMinutesElapsed <= prevMinutes) {
-          logger.debug(`[TP Trail] pos=${position.id} totalMinutes=${totalMinutesElapsed} <= prevMinutes=${prevMinutes}, skipping TP trail (not yet time for next step)`);
+          logger.info(
+            `[TP Trail] ⏸️ Skipping TP trail (not yet time) | pos=${position.id} ` +
+            `totalMinutes=${totalMinutesElapsed} <= prevMinutes=${prevMinutes} ` +
+            `(will update minutes_elapsed=${totalMinutesElapsed} but no TP movement)`
+          );
           // Still update PnL and minutes_elapsed (increment by 0 if no time passed, or by actual difference)
           // CRITICAL FIX: Always update minutes_elapsed to current time, even if no TP trail
           actualMinutesElapsed = totalMinutesElapsed; // Use actual time elapsed
           minutesToProcess = 0; // No minutes to process for trailing
+          
+          // CRITICAL DEBUG: Log when skipping to understand why TP doesn't trail
+          if (totalMinutesElapsed < prevMinutes) {
+            logger.warn(
+              `[TP Trail] ⚠️ WARNING: totalMinutes (${totalMinutesElapsed}) < prevMinutes (${prevMinutes}) for position ${position.id}! ` +
+              `This should not happen. Position may have been manually updated or there's a time sync issue. ` +
+              `opened_at=${position.opened_at} now=${new Date().toISOString()}`
+            );
+          }
         } else {
           // Calculate how many minutes to process (max 1 minute per call to ensure smooth movement)
           minutesToProcess = Math.min(totalMinutesElapsed - prevMinutes, 1); // Only process 1 minute at a time
@@ -213,7 +226,11 @@ export class PositionService {
             );
           }
           
-          logger.debug(`[TP Trail] pos=${position.id} Proceeding with TP trail: totalMinutes=${totalMinutesElapsed} > prevMinutes=${prevMinutes}, processing ${minutesToProcess} minute(s), targetMinutes=${actualMinutesElapsed}`);
+          logger.info(
+            `[TP Trail] ✅ Proceeding with TP trail | pos=${position.id} ` +
+            `totalMinutes=${totalMinutesElapsed} > prevMinutes=${prevMinutes}, ` +
+            `processing ${minutesToProcess} minute(s), targetMinutes=${actualMinutesElapsed}`
+          );
         }
       } else {
         // Fallback: increment-based calculation
@@ -252,10 +269,90 @@ export class PositionService {
             `initial_tp_price=${position.initial_tp_price || 'N/A'} timestamp=${new Date().toISOString()}`
           );
 
-          // Need initial TP to calculate trailing
+          // CRITICAL FIX: If take_profit_price is 0 but exit_order_id exists, try to recover TP from exchange or initial_tp_price
           if (!Number.isFinite(prevTP) || prevTP <= 0) {
-            logger.warn(`[TP Trail] Skip TP trail for position ${position.id} - no initial TP (prevTP=${prevTP})`);
-          } else if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+            logger.warn(
+              `[TP Trail] ⚠️ take_profit_price is invalid (${prevTP}) for position ${position.id} ` +
+              `(symbol=${position.symbol}, bot_id=${position.bot_id}, exit_order_id=${position.exit_order_id || 'null'}, ` +
+              `initial_tp_price=${position.initial_tp_price || 'null'}). Attempting recovery...`
+            );
+            
+            // Try to recover TP from initial_tp_price or exchange order
+            if (position.exit_order_id && position.initial_tp_price && Number.isFinite(Number(position.initial_tp_price)) && Number(position.initial_tp_price) > 0) {
+              const recoveredTP = Number(position.initial_tp_price);
+              logger.warn(
+                `[TP Trail] ⚠️ take_profit_price is ${prevTP} but exit_order_id exists. ` +
+                `Recovering from initial_tp_price=${recoveredTP} for position ${position.id}`
+              );
+              // Update take_profit_price from initial_tp_price
+              await Position.update(position.id, { take_profit_price: recoveredTP });
+              prevTP = recoveredTP;
+              logger.info(`[TP Trail] ✅ Recovered take_profit_price=${recoveredTP} from initial_tp_price for position ${position.id}`);
+            } else if (position.exit_order_id) {
+              // Try to get TP from exchange order
+              try {
+                const orderStatus = await this.exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
+                if (orderStatus && orderStatus.stopPrice && Number.isFinite(Number(orderStatus.stopPrice)) && Number(orderStatus.stopPrice) > 0) {
+                  const recoveredTP = Number(orderStatus.stopPrice);
+                  logger.warn(
+                    `[TP Trail] ⚠️ take_profit_price is ${prevTP} but exit_order_id exists. ` +
+                    `Recovering from exchange order stopPrice=${recoveredTP} for position ${position.id}`
+                  );
+                  await Position.update(position.id, { take_profit_price: recoveredTP });
+                  prevTP = recoveredTP;
+                  logger.info(`[TP Trail] ✅ Recovered take_profit_price=${recoveredTP} from exchange order for position ${position.id}`);
+                } else {
+                  // Last resort: calculate from strategy if available
+                  if (position.take_profit && Number.isFinite(Number(position.take_profit)) && Number(position.take_profit) > 0 && 
+                      entryPrice > 0) {
+                    const { calculateTakeProfit } = await import('../utils/calculator.js');
+                    const calculatedTP = calculateTakeProfit(entryPrice, Number(position.take_profit), position.side);
+                    if (Number.isFinite(calculatedTP) && calculatedTP > 0) {
+                      logger.warn(
+                        `[TP Trail] ⚠️ take_profit_price is ${prevTP}, cannot recover from exchange. ` +
+                        `Calculating from strategy: entry=${entryPrice}, take_profit=${position.take_profit}, calculatedTP=${calculatedTP} for position ${position.id}`
+                      );
+                      await Position.update(position.id, { 
+                        take_profit_price: calculatedTP,
+                        initial_tp_price: calculatedTP 
+                      });
+                      prevTP = calculatedTP;
+                      logger.info(`[TP Trail] ✅ Recovered take_profit_price=${calculatedTP} from strategy calculation for position ${position.id}`);
+                    } else {
+                      logger.warn(
+                        `[TP Trail] Skip TP trail for position ${position.id} - no initial TP (prevTP=${prevTP}) ` +
+                        `and cannot recover from exchange or strategy (exit_order_id=${position.exit_order_id}, orderStatus=${JSON.stringify(orderStatus)})`
+                      );
+                    }
+                  } else {
+                    logger.warn(
+                      `[TP Trail] Skip TP trail for position ${position.id} - no initial TP (prevTP=${prevTP}) ` +
+                      `and cannot recover from exchange (exit_order_id=${position.exit_order_id}, orderStatus=${JSON.stringify(orderStatus)})`
+                    );
+                  }
+                }
+              } catch (recoverError) {
+                logger.warn(
+                  `[TP Trail] Skip TP trail for position ${position.id} - no initial TP (prevTP=${prevTP}) ` +
+                  `and failed to recover from exchange: ${recoverError?.message || recoverError}`
+                );
+              }
+            } else {
+              logger.warn(
+                `[TP Trail] Skip TP trail for position ${position.id} - no initial TP (prevTP=${prevTP}) and no exit_order_id. ` +
+                `Position may need TP order to be created first.`
+              );
+            }
+            
+            // If still no valid TP after recovery attempt, skip trailing
+            if (!Number.isFinite(prevTP) || prevTP <= 0) {
+              // Skip trailing for this cycle
+              logger.debug(`[TP Trail] Skipping trailing for position ${position.id} - no valid TP after recovery attempts`);
+              return position;
+            }
+          }
+          
+          if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
             logger.warn(`[TP Trail] Skip TP trail for position ${position.id} - invalid entry price (${entryPrice})`);
           } else if (reduce <= 0 && upReduce <= 0) {
             logger.debug(`[TP Trail] Static mode: reduce=${reduce} upReduce=${upReduce}, TP will not trail`);
@@ -326,9 +423,49 @@ export class PositionService {
               const hasCrossedEntry = (position.side === 'long' && newTP <= entryPrice) || 
                                      (position.side === 'short' && newTP >= entryPrice);
               
-              if (hasCrossedEntry) {
-                // Case 2: TP has crossed entry.
-                // NEW BEHAVIOR (A): Try to exit as soon as possible based on PnL,
+              // CRITICAL FIX: If newTP has crossed entry (in loss zone) AND currentPrice is better than newTP,
+              // close position immediately with MARKET order to avoid worse loss
+              // For LONG: newTP <= entry (loss) AND currentPrice < newTP → close now (currentPrice is better)
+              // For SHORT: newTP >= entry (loss) AND currentPrice > newTP → close now (currentPrice is better)
+              const shouldCloseImmediately = hasCrossedEntry && (
+                (position.side === 'long' && marketPrice < newTP) ||
+                (position.side === 'short' && marketPrice > newTP)
+              );
+              
+              if (shouldCloseImmediately) {
+                // Case 2B: TP crossed entry AND current price is better than newTP
+                // Close immediately with MARKET order to minimize loss
+                logger.warn(
+                  `[TP Trail] 🚨 CRITICAL: TP crossed entry AND currentPrice better than newTP -> immediate MARKET close | ` +
+                  `pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
+                  `entry=${entryPrice.toFixed(8)} newTP=${newTP.toFixed(8)} currentPrice=${marketPrice.toFixed(8)} ` +
+                  `(closing now to avoid worse loss at newTP)`
+                );
+                
+                try {
+                  // Calculate PnL at current price
+                  const currentPnl = calculatePnL(position.entry_price, marketPrice, position.amount, position.side);
+                  
+                  // Close position immediately with MARKET order
+                  await this.closePosition(position, marketPrice, currentPnl, 'tp_trailing_loss_zone');
+                  
+                  logger.info(
+                    `[TP Trail] ✅ Immediate MARKET close executed | pos=${position.id} ` +
+                    `price=${marketPrice.toFixed(8)} pnl=${currentPnl.toFixed(2)} reason=tp_trailing_loss_zone`
+                  );
+                  
+                  // Return early - position is closed
+                  return position;
+                } catch (closeError) {
+                  logger.error(
+                    `[TP Trail] ❌ Failed to close position immediately | pos=${position.id} ` +
+                    `error=${closeError?.message || closeError}`
+                  );
+                  // Continue to fallback logic below
+                }
+              } else if (hasCrossedEntry) {
+                // Case 2A: TP has crossed entry, but currentPrice is NOT better than newTP
+                // Try to exit as soon as possible based on PnL,
                 // but NEVER close DB / send Telegram here. DB/Telegram is WS-driven only.
 
                 // Dedupe: avoid spamming exit attempts
@@ -341,7 +478,8 @@ export class PositionService {
 
                   logger.warn(
                     `[TP Trail] ⚠️ TP crossed entry -> attempt fast exit (WS-driven close) | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
-                    `entry=${entryPrice.toFixed(8)} prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} market=${marketPrice.toFixed(8)}`
+                    `entry=${entryPrice.toFixed(8)} prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} market=${marketPrice.toFixed(8)} ` +
+                    `(currentPrice NOT better than newTP, using conditional order)`
                   );
 
                   // Persist trailing TP value for audit/debug
@@ -450,7 +588,13 @@ export class PositionService {
                 // Case 1: TP still in profit zone - continue using TAKE_PROFIT_LIMIT
                 // Try to replace TP order, but continue even if it fails
                 try {
+                  logger.info(
+                    `[TP Trail] 🔄 Attempting to replace TP order on exchange | pos=${position.id} ` +
+                    `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
+                    `exit_order_id=${position.exit_order_id || 'null'}`
+                  );
                   await this._maybeReplaceTpOrder(position, prevTP, newTP, getCachedClosableQty);
+                  logger.info(`[TP Trail] ✅ TP order replacement completed for position ${position.id}`);
                 } catch (replaceError) {
                   logger.warn(`[TP Trail] Failed to replace TP order for position ${position.id}: ${replaceError?.message || replaceError}. Continuing with TP price update.`);
                 }
@@ -492,13 +636,39 @@ export class PositionService {
       
       // SINGLE UPDATE: Consolidate all updates into one payload to avoid race conditions and double writes
       // CRITICAL FIX: Use soft lock to prevent race condition with PositionSync
+      // IMPROVEMENT: Auto-release stuck locks (older than 5 minutes) to prevent blocking
       let lockAcquired = false;
+      let useLock = true; // Flag to track if lock mechanism is available
+      const lockTimeoutMs = 5 * 60 * 1000; // 5 minutes timeout for stuck locks
+      
       try {
         const pool = (await import('../config/database.js')).default;
+        
+        // First, check and release any stuck locks (older than timeout)
+        try {
+          const [stuckLocks] = await pool.execute(
+            `UPDATE positions 
+             SET is_processing = 0 
+             WHERE id = ? AND status = 'open' AND is_processing = 1 
+               AND (updated_at IS NULL OR updated_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
+             LIMIT 1`,
+            [position.id, lockTimeoutMs / 1000]
+          );
+          if (stuckLocks.affectedRows > 0) {
+            logger.warn(
+              `[PositionService] 🔓 Released stuck lock for position ${position.id} (${position.symbol}) ` +
+              `(lock was older than ${lockTimeoutMs / 1000}s)`
+            );
+          }
+        } catch (stuckLockError) {
+          // Ignore errors when checking for stuck locks (column might not exist)
+          logger.debug(`[PositionService] Could not check for stuck locks: ${stuckLockError?.message || stuckLockError}`);
+        }
+        
         // Try to acquire lock before updating
         const [lockResult] = await pool.execute(
           `UPDATE positions 
-           SET is_processing = 1 
+           SET is_processing = 1, updated_at = NOW()
            WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
            LIMIT 1`,
           [position.id]
@@ -506,14 +676,25 @@ export class PositionService {
         lockAcquired = lockResult.affectedRows > 0;
         
         if (!lockAcquired) {
-          // Another process is handling this position, skip update
-          logger.debug(`[PositionService] Position ${position.id} is being processed by another instance, skipping update`);
-          return position; // Return original position without changes
+          // Another process is handling this position, skip update (non-blocking)
+          logger.debug(
+            `[PositionService] Position ${position.id} (${position.symbol}) is being processed by another instance, skipping update. ` +
+            `This is normal behavior to prevent race conditions.`
+          );
+          return position; // Return original position without changes (non-blocking)
         }
       } catch (lockError) {
         // If is_processing column doesn't exist, proceed without lock (backward compatibility)
-        logger.debug(`[PositionService] Could not acquire lock for position ${position.id}: ${lockError?.message || lockError}`);
-        lockAcquired = true; // Proceed with update
+        const errorMsg = lockError?.message || String(lockError);
+        if (errorMsg.includes("Unknown column 'is_processing'") || errorMsg.includes("is_processing")) {
+          logger.debug(`[PositionService] Column 'is_processing' does not exist, proceeding without lock for position ${position.id}`);
+          useLock = false; // Disable lock mechanism
+          lockAcquired = false; // Don't try to release lock later
+        } else {
+          logger.debug(`[PositionService] Could not acquire lock for position ${position.id}: ${errorMsg}`);
+          useLock = false; // Disable lock mechanism on other errors too
+          lockAcquired = false;
+        }
       }
       
       try {
@@ -536,16 +717,26 @@ export class PositionService {
       const updated = await Position.update(position.id, updatePayload);
       return updated;
       } finally {
-        // Always release lock if acquired
-        if (lockAcquired) {
+        // Always release lock if acquired (CRITICAL: prevents stuck locks)
+        // Only try to release if lock mechanism is available (column exists)
+        if (lockAcquired && useLock) {
           try {
             const pool = (await import('../config/database.js')).default;
-            await pool.execute(
+            const [releaseResult] = await pool.execute(
               `UPDATE positions SET is_processing = 0 WHERE id = ?`,
               [position.id]
             );
+            if (releaseResult.affectedRows === 0) {
+              logger.debug(`[PositionService] Failed to release lock for position ${position.id}: no rows affected (position may not exist or already unlocked)`);
+            }
           } catch (releaseError) {
-            logger.debug(`[PositionService] Could not release lock for position ${position.id}: ${releaseError?.message || releaseError}`);
+            const errorMsg = releaseError?.message || String(releaseError);
+            // If column doesn't exist, just log debug (not error) since we already know column is missing
+            if (errorMsg.includes("Unknown column 'is_processing'") || errorMsg.includes("is_processing")) {
+              logger.debug(`[PositionService] Column 'is_processing' does not exist, cannot release lock for position ${position.id} (this is expected if column was never created)`);
+            } else {
+              logger.warn(`[PositionService] ⚠️ Could not release lock for position ${position.id}: ${errorMsg}. Will auto-release on next check.`);
+            }
           }
         }
       }
@@ -557,60 +748,61 @@ export class PositionService {
 
   /**
    * Internal helper: quyết định có cần hủy / đặt lại TP order hay không
+   * CRITICAL FIX: For trailing TP, always update order (no threshold check) to ensure order follows TP movement
    */
   async _maybeReplaceTpOrder(position, prevTP, desiredTP, getCachedClosableQty) {
     try {
           const entryPrice = Number(position.entry_price || 0);
           const newTP = Number(desiredTP || 0);
           
-          // logger.debug(`[TP Replace] _maybeReplaceTpOrder called: pos=${position.id} prevTP=${prevTP.toFixed(2)} desiredTP=${newTP.toFixed(2)} entryPrice=${entryPrice.toFixed(2)} side=${position.side}`);
+          logger.debug(`[TP Replace] _maybeReplaceTpOrder called: pos=${position.id} prevTP=${prevTP.toFixed(8)} desiredTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} side=${position.side}`);
           
           // Note: TP→SL conversion is now handled in the main TP trail logic
           // This function only handles TP order replacement when TP is still in profit zone
           
-          const thresholdTicksTP = Number(configService.getNumber('TP_UPDATE_THRESHOLD_TICKS', configService.getNumber('SL_UPDATE_THRESHOLD_TICKS', 2)));
-          // Try to get tick size from cache first
-          let tickSizeStrTP = exchangeInfoService.getTickSize(position.symbol);
-          if (!tickSizeStrTP) {
-            // Fallback to REST API if cache miss
-            tickSizeStrTP = await this.exchangeService.getTickSize(position.symbol);
-          }
-          const tickTP = parseFloat(tickSizeStrTP || '0') || 0;
+          // CRITICAL FIX: For trailing TP, always update order if TP changed (even slightly)
+          // This ensures order on exchange follows trailing TP movement every minute
+          // Threshold check is only for manual TP updates, not for time-based trailing
+          const isTrailingTP = Math.abs(newTP - prevTP) > 0; // Any change indicates trailing
           
-          // logger.debug(`[TP Replace] Threshold check: tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP} prevTP=${prevTP.toFixed(2)} newTP=${newTP.toFixed(2)}`);
-          
-          if (tickTP > 0 && newTP > 0 && prevTP > 0) {
+          if (isTrailingTP && newTP > 0 && prevTP > 0) {
             const movedTP = Math.abs(newTP - prevTP);
+            
+            // For trailing TP, use minimal threshold (1 tick) to ensure order updates frequently
+            const thresholdTicksTP = Number(configService.getNumber('TP_UPDATE_THRESHOLD_TICKS', 1));
+            let tickSizeStrTP = exchangeInfoService.getTickSize(position.symbol);
+            if (!tickSizeStrTP) {
+              tickSizeStrTP = await this.exchangeService.getTickSize(position.symbol);
+            }
+            const tickTP = parseFloat(tickSizeStrTP || '0') || 0;
             const effectiveThreshold = thresholdTicksTP * tickTP;
             
-            // Additional cooldown check: only replace if price changed significantly (>0.1% of current price)
-            // This prevents unnecessary order replacements that create dangerous gaps
-            const minPriceChangePercent = Number(configService.getNumber('EXIT_ORDER_MIN_PRICE_CHANGE_PCT', 0.1)); // 0.1%
+            // For trailing TP, use very low minimum price change (0.01% instead of 0.1%)
+            // This ensures order updates even with small trailing movements
+            const minPriceChangePercent = Number(configService.getNumber('EXIT_ORDER_MIN_PRICE_CHANGE_PCT', 0.01)); // 0.01% for trailing
             const avgPrice = (newTP + prevTP) / 2;
             const minPriceChange = avgPrice * (minPriceChangePercent / 100);
             const priceChangePercent = (movedTP / avgPrice) * 100;
             
-            // logger.info(
-            //   `[TP Replace] 🔍 Movement check | pos=${position.id} ` +
-            //   `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
-            //   `movedTP=${movedTP.toFixed(8)} effectiveThreshold=${effectiveThreshold.toFixed(8)} ` +
-            //   `minPriceChange=${minPriceChange.toFixed(8)} (${minPriceChangePercent}%) ` +
-            //   `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
-            //   `tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP}`
-            // );
+            logger.info(
+              `[TP Replace] 🔍 Movement check (trailing) | pos=${position.id} ` +
+              `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} ` +
+              `movedTP=${movedTP.toFixed(8)} effectiveThreshold=${effectiveThreshold.toFixed(8)} ` +
+              `minPriceChange=${minPriceChange.toFixed(8)} (${minPriceChangePercent}%) ` +
+              `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
+              `tickTP=${tickTP} thresholdTicksTP=${thresholdTicksTP}`
+            );
             
-            // Replace only if BOTH conditions are met:
-            // 1. Movement >= tick-based threshold (precision requirement)
-            // 2. Movement >= minimum price change % (cooldown requirement)
+            // Replace if movement >= 1 tick (minimal threshold for trailing)
             const tickThresholdMet = movedTP >= effectiveThreshold;
             const priceChangeThresholdMet = movedTP >= minPriceChange;
             
-            // logger.info(
-            //   `[TP Replace] 🔍 Threshold check result | pos=${position.id} ` +
-            //   `tickThresholdMet=${tickThresholdMet} (${movedTP.toFixed(8)} >= ${effectiveThreshold.toFixed(8)}) ` +
-            //   `priceChangeThresholdMet=${priceChangeThresholdMet} (${movedTP.toFixed(8)} >= ${minPriceChange.toFixed(8)}) ` +
-            //   `willReplace=${tickThresholdMet && priceChangeThresholdMet}`
-            // );
+            logger.info(
+              `[TP Replace] 🔍 Threshold check result | pos=${position.id} ` +
+              `tickThresholdMet=${tickThresholdMet} (${movedTP.toFixed(8)} >= ${effectiveThreshold.toFixed(8)}) ` +
+              `priceChangeThresholdMet=${priceChangeThresholdMet} (${movedTP.toFixed(8)} >= ${minPriceChange.toFixed(8)}) ` +
+              `willReplace=${tickThresholdMet && priceChangeThresholdMet}`
+            );
             
             if (tickThresholdMet && priceChangeThresholdMet) {
               const replaceStartTime = Date.now();
@@ -660,18 +852,18 @@ export class PositionService {
                   try {
                     const oldExitOrderId = position.exit_order_id || null;
                     
-                    // logger.info(
-                    //   `[TP Replace] 🚀 CALLING ExitOrderManager | pos=${position.id} ` +
-                    //   `symbol=${position.symbol} side=${position.side} ` +
-                    //   `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
-                    //   `oldExitOrderId=${oldExitOrderId || 'null'} timestamp=${new Date().toISOString()}`
-                    // );
+                    logger.info(
+                      `[TP Replace] 🚀 CALLING ExitOrderManager | pos=${position.id} ` +
+                      `symbol=${position.symbol} side=${position.side} ` +
+                      `newTP=${newTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} ` +
+                      `oldExitOrderId=${oldExitOrderId || 'null'} timestamp=${new Date().toISOString()}`
+                    );
                     
                     if (position.side !== 'long' && position.side !== 'short') {
-                      // logger.error(
-                      //   `[TP Replace] ⚠️ INVALID position.side: ${position.side} for position ${position.id}. ` +
-                      //   `Expected 'long' or 'short'.`
-                      // );
+                      logger.error(
+                        `[TP Replace] ⚠️ INVALID position.side: ${position.side} for position ${position.id}. ` +
+                        `Expected 'long' or 'short'.`
+                      );
                     }
                     
                     // ✅ Unified exit order: type switches based on profit/loss zone (STOP_MARKET <-> TAKE_PROFIT_MARKET)
@@ -683,12 +875,12 @@ export class PositionService {
                     const replaceDuration = replaceEndTime - replaceStartTime;
                     const newExitOrderId = placed?.orderId ? String(placed.orderId) : null;
                     
-                    // logger.info(
-                    //   `[TP Replace] ✅ ExitOrderManager returned | pos=${position.id} ` +
-                    //   `newExitOrderId=${newExitOrderId || 'null'} oldExitOrderId=${oldExitOrderId || 'null'} ` +
-                    //   `orderType=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice?.toFixed(8) || newTP.toFixed(8)} ` +
-                    //   `replaceDuration=${replaceDuration}ms timestamp=${new Date().toISOString()}`
-                    // );
+                    logger.info(
+                      `[TP Replace] ✅ ExitOrderManager returned | pos=${position.id} ` +
+                      `newExitOrderId=${newExitOrderId || 'null'} oldExitOrderId=${oldExitOrderId || 'null'} ` +
+                      `orderType=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice?.toFixed(8) || newTP.toFixed(8)} ` +
+                      `replaceDuration=${replaceDuration}ms timestamp=${new Date().toISOString()}`
+                    );
 
                     const updatePayload = { 
                       take_profit_price: newTP,
@@ -712,12 +904,12 @@ export class PositionService {
                     const replaceEndTime = Date.now();
                     const replaceDuration = replaceEndTime - replaceStartTime;
                     
-                    // logger.error(
-                    //   `[TP Replace] ❌ FAILED: ExitOrderManager error | pos=${position.id} ` +
-                    //   `newTP=${newTP.toFixed(8)} oldExitOrderId=${position.exit_order_id || 'null'} ` +
-                    //   `replaceDuration=${replaceDuration}ms error=${tpError?.message || tpError} ` +
-                    //   `stack=${tpError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
-                    // );
+                    logger.error(
+                      `[TP Replace] ❌ FAILED: ExitOrderManager error | pos=${position.id} ` +
+                      `newTP=${newTP.toFixed(8)} oldExitOrderId=${position.exit_order_id || 'null'} ` +
+                      `replaceDuration=${replaceDuration}ms error=${tpError?.message || tpError} ` +
+                      `stack=${tpError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
+                    );
                     
                     // If TP order creation fails, still update take_profit_price in DB
                     // This allows trailing TP to continue working even if orders can't be placed
@@ -753,14 +945,14 @@ export class PositionService {
                 // );
               }
             } else {
-              // logger.warn(
-              //   `[TP Replace] ⚠️ THRESHOLD NOT MET: Skipping TP order replacement | pos=${position.id} ` +
-              //   `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
-              //   `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
-              //   `tickThresholdMet=${tickThresholdMet} priceChangeThresholdMet=${priceChangeThresholdMet} ` +
-              //   `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
-              //   `(Order will NOT be replaced, but DB take_profit_price will be updated)`
-              // );
+              logger.warn(
+                `[TP Replace] ⚠️ THRESHOLD NOT MET: Skipping TP order replacement | pos=${position.id} ` +
+                `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} movedTP=${movedTP.toFixed(8)} ` +
+                `effectiveThreshold=${effectiveThreshold.toFixed(8)} minPriceChange=${minPriceChange.toFixed(8)} ` +
+                `tickThresholdMet=${tickThresholdMet} priceChangeThresholdMet=${priceChangeThresholdMet} ` +
+                `priceChangePercent=${priceChangePercent.toFixed(3)}% ` +
+                `(Order will NOT be replaced, but DB take_profit_price will be updated)`
+              );
             }
           } else {
             // logger.warn(`[TP Replace] Invalid tickTP (${tickTP}) or TP values (prevTP=${prevTP} newTP=${newTP}), skipping TP order replacement`);
@@ -854,15 +1046,41 @@ export class PositionService {
         return null; // No stoploss - only set SL when strategy.stoploss > 0
       }
       
-      // Only set SL when strategy.stoploss > 0
-      const initialSL = calculateInitialStopLoss(entry, stoploss, position.side);
+      // NEW: Calculate SL based on USDT amount (stoploss is now in USDT, not percentage)
+      // Need quantity to calculate SL price
+      let quantity = null;
       
-      if (initialSL === null || initialSL <= 0) {
-        logger.warn(`[calculateUpdatedStopLoss] Calculated SL is invalid: ${initialSL} for position ${position.id} (entry=${entry}, stoploss=${stoploss})`);
+      // Try to get quantity from exchange first (most accurate)
+      try {
+        quantity = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+      } catch (e) {
+        logger.debug(`[calculateUpdatedStopLoss] Failed to get quantity from exchange: ${e?.message || e}`);
+      }
+      
+      // Fallback: calculate quantity from amount and entry price
+      if (!quantity || quantity <= 0) {
+        const amount = Number(position.amount || 0);
+        if (Number.isFinite(amount) && amount > 0 && Number.isFinite(entry) && entry > 0) {
+          quantity = amount / entry;
+          logger.debug(`[calculateUpdatedStopLoss] Calculated quantity from amount: ${quantity} (amount=${amount}, entry=${entry})`);
+        }
+      }
+      
+      if (!quantity || quantity <= 0) {
+        logger.warn(`[calculateUpdatedStopLoss] Cannot get quantity for position ${position.id}, cannot calculate SL by amount`);
         return null;
       }
       
-      logger.debug(`[calculateUpdatedStopLoss] Calculated initial SL: ${initialSL} for position ${position.id} (entry=${entry}, stoploss=${stoploss})`);
+      // Calculate SL price based on USDT amount
+      // stoploss is now in USDT (e.g., 100 = 100 USDT loss when SL hit)
+      const initialSL = calculateInitialStopLossByAmount(entry, quantity, stoploss, position.side);
+      
+      if (initialSL === null || initialSL <= 0) {
+        logger.warn(`[calculateUpdatedStopLoss] Calculated SL is invalid: ${initialSL} for position ${position.id} (entry=${entry}, quantity=${quantity}, stoploss=${stoploss} USDT)`);
+        return null;
+      }
+      
+      logger.debug(`[calculateUpdatedStopLoss] Calculated initial SL: ${initialSL} for position ${position.id} (entry=${entry}, quantity=${quantity}, stoploss=${stoploss} USDT, side=${position.side})`);
       return initialSL;
     }
     

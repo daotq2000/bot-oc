@@ -22,6 +22,7 @@ export class TelegramService {
     // TTL and cleanup for memory leak prevention
     this._queueLastAccess = new Map(); // alertType -> timestamp
     this._chatLastAccess = new Map(); // chatId -> timestamp
+    this._batches = new Map(); // exchange -> { messages: [], timer: Timeout }
     this._cleanupInterval = null;
     this._cleanupEveryMs = 5 * 60 * 1000;
     this._queueMaxIdleMs = 30 * 60 * 1000;
@@ -146,37 +147,45 @@ export class TelegramService {
     let cleaned = 0;
 
     // Cleanup empty queues and idle queues
-    for (const [exchange, queue] of this._queues.entries()) {
-      const lastAccess = this._queueLastAccess.get(exchange) || 0;
-      
-      // Remove queue if empty and not accessed for maxIdleMs
-      if (queue.length === 0 && (now - lastAccess) > this._queueMaxIdleMs) {
-        this._queues.delete(exchange);
-        this._processing.delete(exchange);
-        this._lastSendAt.delete(exchange);
-        this._queueLastAccess.delete(exchange);
-        this._batches.delete(exchange);
-        cleaned++;
-        logger.debug(`[TelegramService] Cleaned up idle queue for exchange: ${exchange}`);
+    if (this._queues && this._queues.entries) {
+      for (const [exchange, queue] of this._queues.entries()) {
+        const lastAccess = this._queueLastAccess.get(exchange) || 0;
+        
+        // Remove queue if empty and not accessed for maxIdleMs
+        if (queue.length === 0 && (now - lastAccess) > this._queueMaxIdleMs) {
+          this._queues.delete(exchange);
+          this._processing.delete(exchange);
+          this._lastSendAt.delete(exchange);
+          this._queueLastAccess.delete(exchange);
+          if (this._batches) {
+            this._batches.delete(exchange);
+          }
+          cleaned++;
+          logger.debug(`[TelegramService] Cleaned up idle queue for exchange: ${exchange}`);
+        }
       }
     }
 
     // Cleanup per-chat tracking for inactive chats
-    for (const [chatId, lastAccess] of this._chatLastAccess.entries()) {
-      if ((now - lastAccess) > this._chatMaxIdleMs) {
-        this._perChatLastSend.delete(chatId);
-        this._chatLastAccess.delete(chatId);
-        cleaned++;
+    if (this._chatLastAccess && this._chatLastAccess.entries) {
+      for (const [chatId, lastAccess] of this._chatLastAccess.entries()) {
+        if ((now - lastAccess) > this._chatMaxIdleMs) {
+          this._perChatLastSend.delete(chatId);
+          this._chatLastAccess.delete(chatId);
+          cleaned++;
+        }
       }
     }
 
     // Cleanup batches that are stale
-    for (const [exchange, batch] of this._batches.entries()) {
-      if (batch.timer && batch.messages.length === 0) {
-        // Clear timer if batch is empty
-        clearTimeout(batch.timer);
-        this._batches.delete(exchange);
-        cleaned++;
+    if (this._batches && this._batches.entries) {
+      for (const [exchange, batch] of this._batches.entries()) {
+        if (batch && batch.timer && batch.messages && batch.messages.length === 0) {
+          // Clear timer if batch is empty
+          clearTimeout(batch.timer);
+          this._batches.delete(exchange);
+          cleaned++;
+        }
       }
     }
 
@@ -536,17 +545,11 @@ Amount: ${amountStr} (100%)`.trim();
 
       const msg = `
 ${title}
-
 ${wins} WIN, ${loses} LOSE | Total PNL: ${totalPnl.toFixed(2)}$
-
 Bot: ${botName}
-
 Strategy: ${intervalLabel} | OC: ${ocStr}% | Extend: ${extendStr}% | TP: ${tpStr}% | Reduce: ${reduceStr}% | Up Reduce: ${upReduceStr}%
-
 Close price: ${closePrice}$
-
 Amount: ${amountStr}
-
 💰 PNL: ${pnlLine}`.trim();
 
       await this.sendMessage(channelId, msg, { alertType: 'order' });

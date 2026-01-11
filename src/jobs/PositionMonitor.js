@@ -276,7 +276,7 @@ export class PositionMonitor {
       }
 
       // Recalculate TP/SL based on the real entry price
-      const { calculateTakeProfit, calculateInitialStopLoss } = await import('../utils/calculator.js');
+      const { calculateTakeProfit, calculateInitialStopLoss, calculateInitialStopLossByAmount } = await import('../utils/calculator.js');
       const oc = strategy.oc || position.oc || 1; // Fallback to position.oc if available, then default to 1
       
       // CRITICAL FIX: Don't fallback to 50 if strategy.take_profit is explicitly 0 (disabled)
@@ -315,12 +315,7 @@ export class PositionMonitor {
         );
       }
       
-      // Only set SL if strategy.stoploss > 0. No fallback to reduce/up_reduce
-      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : (position.stoploss !== undefined ? Number(position.stoploss) : NaN);
-      const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
-      const slPrice = isStoplossValid ? calculateInitialStopLoss(fillPrice, rawStoploss, position.side) : null;
-
-      // Get the exact quantity of the position
+      // Get the exact quantity of the position first (needed for SL calculation)
       const quantity = await exchangeService.getClosableQuantity(position.symbol, position.side);
       if (!quantity || quantity <= 0) {
         logger.warn(`[Place TP/SL] No closable quantity found for position ${position.id}, cannot place TP/SL.`);
@@ -328,6 +323,12 @@ export class PositionMonitor {
         await this._releasePositionLock(position.id);
         return;
       }
+
+      // Only set SL if strategy.stoploss > 0. No fallback to reduce/up_reduce
+      // NEW: stoploss is now in USDT (not percentage), need quantity to calculate SL price
+      const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : (position.stoploss !== undefined ? Number(position.stoploss) : NaN);
+      const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
+      const slPrice = isStoplossValid ? calculateInitialStopLossByAmount(fillPrice, quantity, rawStoploss, position.side) : null;
 
       // Check quantity mismatch with DB amount (warn if significant difference)
       const dbAmount = parseFloat(position.amount || 0);
@@ -897,6 +898,20 @@ export class PositionMonitor {
     try {
       const openPositions = await Position.findOpen();
       
+      // DEBUG: Log position IDs being monitored (use info level for visibility)
+      if (openPositions.length > 0) {
+        const positionIds = openPositions.map(p => `${p.id}(${p.symbol})`).join(', ');
+        logger.info(`[PositionMonitor] 📋 Found ${openPositions.length} open positions: [${positionIds}]`);
+        
+        // Check if specific position (186) is in the list
+        const position186 = openPositions.find(p => p.id === 186);
+        if (!position186) {
+          logger.warn(`[PositionMonitor] ⚠️ Position 186 (POLYXUSDT) NOT found in open positions list! This may indicate status is not 'open' or JOIN issue.`);
+        }
+      } else {
+        logger.warn(`[PositionMonitor] ⚠️ No open positions found`);
+      }
+      
       // Ensure WebSocket subscriptions for all position symbols (Binance)
       try {
         const { webSocketManager } = await import('../services/WebSocketManager.js');
@@ -917,42 +932,94 @@ export class PositionMonitor {
         logger.debug(`[PositionMonitor] Failed to ensure WebSocket subscriptions: ${e?.message || e}`);
       }
 
-      // Process positions in batches (reduced to avoid rate limits)
-      const batchSize = Number(configService.getNumber('POSITION_MONITOR_BATCH_SIZE', 3)); // Reduced from 5 to 3
-      for (let i = 0; i < openPositions.length; i += batchSize) {
-        const batch = openPositions.slice(i, i + batchSize);
-        
-        // First, try to place TP/SL for new positions that might be missing them
-        await Promise.allSettled(
-          batch.map(p => this.placeExitOrder(p))
-        );
-
-        // Then, monitor positions (update dynamic SL, check for TP/SL hit)
-        // Process sequentially with delay to avoid rate limits
-        for (const position of batch) {
-          await this.monitorPosition(position);
-          // Small delay between each position to avoid rate limits
-          const positionDelayMs = Number(configService.getNumber('POSITION_MONITOR_POSITION_DELAY_MS', 500));
-          if (positionDelayMs > 0) {
-            await new Promise(resolve => setTimeout(resolve, positionDelayMs));
-          }
+      // CRITICAL FIX: Group positions by bot_id to ensure fair distribution
+      // Process each bot's positions in parallel to avoid one bot monopolizing the monitor
+      const positionsByBot = new Map();
+      for (const pos of openPositions) {
+        const botId = pos.bot_id || pos.strategy?.bot_id;
+        if (!botId) {
+          logger.warn(`[PositionMonitor] Position ${pos.id} has no bot_id, skipping`);
+          continue;
         }
-
-        // Check for other order management tasks
-        await Promise.allSettled(
-          batch.map(p => this.checkUnfilledOrders(p))
-        );
-
-        // Increased delay between batches to avoid rate limits
-        if (i + batchSize < openPositions.length) {
-          const delayMs = Number(configService.getNumber('POSITION_MONITOR_BATCH_DELAY_MS', 2000)); // Increased from 500ms to 2s
-          await new Promise(resolve => setTimeout(resolve, delayMs));
+        if (!positionsByBot.has(botId)) {
+          positionsByBot.set(botId, []);
         }
+        positionsByBot.get(botId).push(pos);
       }
 
-      // Only log if there are positions or if it's been a while since last log
+      logger.info(`[PositionMonitor] 🔄 Processing ${openPositions.length} positions across ${positionsByBot.size} bots: ${Array.from(positionsByBot.entries()).map(([botId, positions]) => `bot_${botId}=${positions.length}`).join(', ')}`);
+
+      // Process each bot's positions in parallel (fair distribution)
+      // CRITICAL FIX: Process bots in parallel but with timeout to prevent one bot from blocking others
+      const botProcessingPromises = Array.from(positionsByBot.entries()).map(async ([botId, botPositions]) => {
+        const startTime = Date.now();
+        try {
+          logger.info(`[PositionMonitor] 🚀 Starting processing ${botPositions.length} positions for bot ${botId}`);
+          
+          // Process positions in batches per bot (to avoid rate limits per exchange)
+          const batchSize = Number(configService.getNumber('POSITION_MONITOR_BATCH_SIZE', 3));
+          const maxProcessingTimeMs = Number(configService.getNumber('POSITION_MONITOR_MAX_TIME_PER_BOT_MS', 300000)); // 5 minutes max per bot
+          
+          for (let i = 0; i < botPositions.length; i += batchSize) {
+            // Check if we've exceeded max processing time for this bot
+            const elapsed = Date.now() - startTime;
+            if (elapsed > maxProcessingTimeMs) {
+              logger.warn(
+                `[PositionMonitor] ⏱️ Max processing time (${maxProcessingTimeMs}ms) reached for bot ${botId}. ` +
+                `Processed ${i}/${botPositions.length} positions. Remaining positions will be processed in next cycle.`
+              );
+              break; // Stop processing this bot, continue with others
+            }
+            
+            const batch = botPositions.slice(i, i + batchSize);
+            
+            // First, try to place TP/SL for new positions that might be missing them
+            await Promise.allSettled(
+              batch.map(p => this.placeExitOrder(p))
+            );
+
+            // Then, monitor positions (update dynamic SL, check for TP/SL hit, trailing TP)
+            // Process sequentially with delay to avoid rate limits per exchange
+            for (const position of batch) {
+              try {
+                logger.info(`[PositionMonitor] 🔄 Monitoring position ${position.id} (${position.symbol}, bot_id=${position.bot_id})`);
+                await this.monitorPosition(position);
+                logger.debug(`[PositionMonitor] ✅ Completed monitoring position ${position.id}`);
+              } catch (monitorError) {
+                logger.error(`[PositionMonitor] Error monitoring position ${position.id}: ${monitorError?.message || monitorError}`);
+              }
+              // Small delay between each position to avoid rate limits
+              const positionDelayMs = Number(configService.getNumber('POSITION_MONITOR_POSITION_DELAY_MS', 500));
+              if (positionDelayMs > 0) {
+                await new Promise(resolve => setTimeout(resolve, positionDelayMs));
+              }
+            }
+
+            // Check for other order management tasks
+            await Promise.allSettled(
+              batch.map(p => this.checkUnfilledOrders(p))
+            );
+
+            // Delay between batches for the same bot (to avoid rate limits)
+            if (i + batchSize < botPositions.length) {
+              const delayMs = Number(configService.getNumber('POSITION_MONITOR_BATCH_DELAY_MS', 2000));
+              await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+          }
+          
+          const totalTime = Date.now() - startTime;
+          logger.info(`[PositionMonitor] ✅ Completed processing ${botPositions.length} positions for bot ${botId} in ${totalTime}ms`);
+        } catch (error) {
+          logger.error(`[PositionMonitor] ❌ Error processing positions for bot ${botId}:`, error?.message || error);
+        }
+      });
+
+      // Wait for all bots to complete (parallel processing)
+      await Promise.allSettled(botProcessingPromises);
+
+      // Log monitoring summary
       if (openPositions.length > 0 || !this._lastLogTime || (Date.now() - this._lastLogTime) > 60000) {
-        logger.debug(`Monitored ${openPositions.length} open positions`);
+        logger.info(`[PositionMonitor] ✅ Monitored ${openPositions.length} open positions (interval: ${Date.now() - (this._lastLogTime || Date.now())}ms)`);
         this._lastLogTime = Date.now();
       }
     } catch (error) {

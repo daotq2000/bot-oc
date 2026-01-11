@@ -149,15 +149,75 @@ export class ExitOrderManager {
 
     const oldOrderId = position?.exit_order_id ? String(position.exit_order_id) : null;
 
-    // 1) Create NEW order first
+    // CRITICAL FIX: Cancel old order FIRST to avoid -4116 (ClientOrderId duplicated)
+    // Also check for orders with same newClientOrderId pattern and cancel them
+    if (oldOrderId) {
+      try {
+        await this.exchangeService.cancelOrder(oldOrderId, position.symbol);
+        logger.debug(`[ExitOrderManager] ✅ Cancelled old exit order ${oldOrderId} before creating new one | pos=${position.id}`);
+      } catch (cancelError) {
+        // If order doesn't exist or already cancelled, that's fine
+        const errorMsg = String(cancelError?.message || cancelError);
+        if (!errorMsg.includes('does not exist') && !errorMsg.includes('Unknown order') && !errorMsg.includes('-2011')) {
+          logger.warn(`[ExitOrderManager] ⚠️ Failed to cancel old order ${oldOrderId} before creating new one | pos=${position.id} error=${errorMsg}`);
+        }
+      }
+    }
+
+    // Also check for orders with same newClientOrderId pattern (to handle race conditions)
+    try {
+      const botId = this.exchangeService?.bot?.id;
+      const posId = position?.id;
+      if (botId && posId) {
+        // Check for orders with same clientOrderId pattern
+        const expectedClientOrderIdPattern = orderType === 'STOP_MARKET' 
+          ? `OC_B${botId}_P${posId}_EXIT`
+          : `OC_B${botId}_P${posId}_TP`;
+        
+        const openOrders = await this.exchangeService.getOpenOrders(position.symbol);
+        if (Array.isArray(openOrders)) {
+          const exitTypes = new Set(['STOP_MARKET', 'TAKE_PROFIT_MARKET']);
+          const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+          
+          const duplicateOrders = openOrders.filter(o => {
+            const type = String(o?.type || '').toUpperCase();
+            const ps = String(o?.positionSide || '').toUpperCase();
+            const clientOrderId = String(o?.clientOrderId || '');
+            return exitTypes.has(type) && 
+                   (!ps || ps === positionSide) &&
+                   clientOrderId === expectedClientOrderIdPattern;
+          });
+          
+          for (const dupOrder of duplicateOrders) {
+            const dupOrderId = String(dupOrder?.orderId || '');
+            if (dupOrderId && dupOrderId !== oldOrderId) {
+              try {
+                await this.exchangeService.cancelOrder(dupOrderId, position.symbol);
+                logger.info(`[ExitOrderManager] ✅ Cancelled duplicate order ${dupOrderId} with same clientOrderId pattern | pos=${position.id} clientOrderId=${expectedClientOrderIdPattern}`);
+              } catch (e) {
+                logger.warn(`[ExitOrderManager] ⚠️ Failed to cancel duplicate order ${dupOrderId}: ${e?.message || e}`);
+              }
+            }
+          }
+        }
+      }
+    } catch (checkError) {
+      // Non-critical: if we can't check, continue anyway
+      logger.debug(`[ExitOrderManager] Could not check for duplicate clientOrderId (non-critical): ${checkError?.message || checkError}`);
+    }
+
+    // Small delay to ensure cancellation is processed
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // 2) Create NEW order after old one is cancelled
     let res;
     let newOrderId = null;
     try {
       const isStopOrder = orderType === 'STOP' || orderType === 'STOP_MARKET';
       if (isStopOrder) {
-        res = await this.exchangeService.createCloseStopMarket(position.symbol, side, stopPrice);
+        res = await this.exchangeService.createCloseStopMarket(position.symbol, side, stopPrice, position);
       } else {
-        res = await this.exchangeService.createCloseTakeProfitMarket(position.symbol, side, stopPrice);
+        res = await this.exchangeService.createCloseTakeProfitMarket(position.symbol, side, stopPrice, position);
       }
 
       newOrderId = res?.orderId != null ? String(res.orderId) : null;
@@ -185,18 +245,83 @@ export class ExitOrderManager {
         }
       }
       
-      logger.error(
-        `[ExitOrderManager] ❌ Create error | pos=${position.id} type=${orderType} stopPrice=${stopPrice.toFixed(8)} oldOrderId=${oldOrderId || 'null'} error=${errorMessage} stack=${createError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
-      );
-      throw createError;
-    }
-
-    // 2) Cancel OLD order after new is created (best-effort)
-    if (oldOrderId && oldOrderId !== newOrderId) {
-      try {
-        await this.exchangeService.cancelOrder(oldOrderId, position.symbol);
-      } catch (_) {
-        // Non-critical
+      // Handle -4116: ClientOrderId duplicated
+      if (errorMessage.includes('-4116') || errorMessage.includes('ClientOrderId is duplicated') || errorMessage.includes('duplicated')) {
+        logger.warn(
+          `[ExitOrderManager] ⚠️ ClientOrderId duplicated error (-4116) | pos=${position.id} type=${orderType} ` +
+          `This may indicate a race condition. Will retry after checking and cancelling duplicate orders.`
+        );
+        
+        // Retry: check and cancel any duplicate orders, then retry creation
+        try {
+          const botId = this.exchangeService?.bot?.id;
+          const posId = position?.id;
+          if (botId && posId) {
+            const expectedClientOrderIdPattern = orderType === 'STOP_MARKET' 
+              ? `OC_B${botId}_P${posId}_EXIT`
+              : `OC_B${botId}_P${posId}_TP`;
+            
+            const openOrders = await this.exchangeService.getOpenOrders(position.symbol);
+            if (Array.isArray(openOrders)) {
+              const exitTypes = new Set(['STOP_MARKET', 'TAKE_PROFIT_MARKET']);
+              const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+              
+              const duplicateOrders = openOrders.filter(o => {
+                const type = String(o?.type || '').toUpperCase();
+                const ps = String(o?.positionSide || '').toUpperCase();
+                const clientOrderId = String(o?.clientOrderId || '');
+                return exitTypes.has(type) && 
+                       (!ps || ps === positionSide) &&
+                       clientOrderId === expectedClientOrderIdPattern;
+              });
+              
+              for (const dupOrder of duplicateOrders) {
+                const dupOrderId = String(dupOrder?.orderId || '');
+                if (dupOrderId) {
+                  try {
+                    await this.exchangeService.cancelOrder(dupOrderId, position.symbol);
+                    logger.info(`[ExitOrderManager] ✅ Cancelled duplicate order ${dupOrderId} during retry | pos=${position.id}`);
+                  } catch (e) {
+                    logger.warn(`[ExitOrderManager] ⚠️ Failed to cancel duplicate order ${dupOrderId} during retry: ${e?.message || e}`);
+                  }
+                }
+              }
+              
+              // Wait a bit for cancellation to process
+              await new Promise(resolve => setTimeout(resolve, 200));
+              
+              // Retry creation
+              const isStopOrder = orderType === 'STOP' || orderType === 'STOP_MARKET';
+              if (isStopOrder) {
+                res = await this.exchangeService.createCloseStopMarket(position.symbol, side, stopPrice, position);
+              } else {
+                res = await this.exchangeService.createCloseTakeProfitMarket(position.symbol, side, stopPrice, position);
+              }
+              
+              newOrderId = res?.orderId != null ? String(res.orderId) : null;
+              if (newOrderId) {
+                position.exit_order_id = newOrderId;
+                logger.info(`[ExitOrderManager] ✅ Retry successful after cancelling duplicates | pos=${position.id} newOrderId=${newOrderId}`);
+              } else {
+                throw new Error('Retry failed: no orderId in response');
+              }
+            } else {
+              throw createError; // Re-throw if we can't check
+            }
+          } else {
+            throw createError; // Re-throw if we don't have botId/posId
+          }
+        } catch (retryError) {
+          logger.error(
+            `[ExitOrderManager] ❌ Retry failed after -4116 error | pos=${position.id} error=${retryError?.message || retryError}`
+          );
+          throw createError; // Re-throw original error
+        }
+      } else {
+        logger.error(
+          `[ExitOrderManager] ❌ Create error | pos=${position.id} type=${orderType} stopPrice=${stopPrice.toFixed(8)} oldOrderId=${oldOrderId || 'null'} error=${errorMessage} stack=${createError?.stack || 'N/A'} timestamp=${new Date().toISOString()}`
+        );
+        throw createError;
       }
     }
 

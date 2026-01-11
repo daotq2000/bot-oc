@@ -1,5 +1,6 @@
 import cron from 'node-cron';
-import { EntryOrder } from '../models/EntryOrder.js';
+// EntryOrder tracking deprecated (replaced by positions.status='entry_pending')
+// import { EntryOrder } from '../models/EntryOrder.js';
 import { Position } from '../models/Position.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { PositionWebSocketClient } from '../services/PositionWebSocketClient.js';
@@ -116,7 +117,10 @@ export class EntryOrderMonitor {
 
       const o = evt.o || evt.order || {};
       const orderId = o.i ?? o.orderId; // i: orderId in futures stream
+      const clientOrderId = o.c ?? o.clientOrderId ?? null; // c: clientOrderId in futures stream
       const symbol = o.s || o.symbol;
+      // Normalize symbol: RIVER_USDT -> RIVERUSDT (remove underscore)
+      const normalizedSymbol = symbol ? symbol.replace(/_/g, '') : symbol;
       // Normalize status early for consistent handling
       const status = String(o.X || o.orderStatus || '').toUpperCase(); // NEW, PARTIALLY_FILLED, FILLED, CANCELED, EXPIRED
       const avgPriceStr = o.ap ?? o.avgPrice ?? o.p ?? o.price ?? null;
@@ -127,6 +131,16 @@ export class EntryOrderMonitor {
       if (!orderId || !symbol) {
         logger.debug(`[EntryOrderMonitor] Missing orderId or symbol in ORDER_TRADE_UPDATE event: orderId=${orderId}, symbol=${symbol}`);
         return;
+      }
+
+      // Parse positionId from clientOrderId if present (format: OC_B{botId}_P{positionId}_EXIT/TP/SL)
+      let parsedPositionId = null;
+      if (clientOrderId && typeof clientOrderId === 'string') {
+        const match = clientOrderId.match(/OC_B\d+_P(\d+)_(EXIT|TP|SL)/);
+        if (match) {
+          parsedPositionId = parseInt(match[1], 10);
+          logger.debug(`[EntryOrderMonitor] Parsed positionId=${parsedPositionId} from clientOrderId=${clientOrderId}`);
+        }
       }
 
       // CRITICAL: Update order status cache for ALL orders (entry, TP, SL)
@@ -149,31 +163,40 @@ export class EntryOrderMonitor {
       const isFilled = status === 'FILLED';
       const isCanceled = status === 'CANCELED' || status === 'CANCELLED' || status === 'EXPIRED';
 
-      // Handle entry orders first (highest priority)
-      const entry = await EntryOrder.findOpenByBotAndOrder(botId, orderId);
-      if (entry) {
-        if (isFilled) {
-          // Confirmed filled → create Position and mark entry_orders as filled
-          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) FILLED via WebSocket. Creating Position...`);
-          await this._confirmEntryWithPosition(botId, entry, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
-        } else if (isCanceled && (!Number.isFinite(filledQty) || filledQty <= 0)) {
-          // Cancelled/expired without fill → mark as canceled
-          await EntryOrder.markCanceled(entry.id, status === 'EXPIRED' ? 'expired' : 'canceled');
-          logger.info(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) ${status} via WebSocket.`);
-        } else if (status === 'PARTIALLY_FILLED') {
-          logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${orderId}, ${symbol}) PARTIALLY_FILLED: ${filledQty}`);
-        }
-        return; // Entry order handled
-      }
-
-      // TP/SL orders: Cache already updated above.
-      // CRITICAL CHANGE:
-      // Close position in DB + send Telegram ONLY when WebSocket confirms exit order FILLED.
-      // Do NOT rely on PositionService.updatePosition inference.
+      // CRITICAL: Distinguish ENTRY orders from EXIT orders
+      // Entry orders: orderId matches order_id in positions table
+      // Exit orders: orderId matches exit_order_id/sl_order_id OR clientOrderId has _EXIT/_TP/_SL
       if (isFilled) {
-        logger.info(`[EntryOrderMonitor] Exit order ${orderId} (${symbol}) FILLED via WebSocket. Will close matching DB position + notify.`);
-        logger.debug(`[EntryOrderMonitor] Searching for position with exit_order_id=${orderId} or sl_order_id=${orderId} for bot=${botId}`);
-        await this._closePositionFromExitFill(botId, orderId, symbol, avgPrice, filledQty);
+        // Strategy 1: Check if this is an entry order (by order_id in positions table)
+        const entryPosition = await this._findPositionByOrderId(botId, orderId);
+        if (entryPosition) {
+          // This is an ENTRY order fill
+          if (entryPosition.status === 'entry_pending') {
+            logger.info(`[EntryOrderMonitor] Entry order FILLED via WS. Promoting entry_pending position ${entryPosition.id} (orderId=${orderId}, ${symbol}) to open...`);
+            await this._confirmEntryFill(entryPosition, isNaN(avgPrice) || avgPrice <= 0 ? null : avgPrice);
+          } else {
+            logger.debug(`[EntryOrderMonitor] Entry order ${orderId} already processed (position ${entryPosition.id} status=${entryPosition.status}). Skipping.`);
+          }
+          return; // Entry order handled, don't process as exit order
+        }
+
+        // Strategy 2: Check if this is an exit order
+        // Exit order indicators:
+        // - clientOrderId contains _EXIT/_TP/_SL
+        // - parsedPositionId is available (from clientOrderId)
+        // - orderId matches exit_order_id or sl_order_id
+        const isExitOrder = 
+          (clientOrderId && (clientOrderId.includes('_EXIT') || clientOrderId.includes('_TP') || clientOrderId.includes('_SL'))) ||
+          parsedPositionId !== null ||
+          await this._isExitOrderId(botId, orderId);
+
+        if (isExitOrder) {
+          logger.info(`[EntryOrderMonitor] Exit order ${orderId} (${symbol}, normalized=${normalizedSymbol}) FILLED via WebSocket. clientOrderId=${clientOrderId || 'n/a'}, parsedPositionId=${parsedPositionId || 'n/a'}. Will close matching DB position + notify.`);
+          logger.debug(`[EntryOrderMonitor] Searching for position with exit_order_id=${orderId} or sl_order_id=${orderId} for bot=${botId}`);
+          await this._closePositionFromExitFill(botId, orderId, normalizedSymbol, avgPrice, filledQty, clientOrderId, parsedPositionId);
+        } else {
+          logger.debug(`[EntryOrderMonitor] Order ${orderId} (${symbol}) FILLED but not identified as entry or exit order. Skipping position update.`);
+        }
       } else if (isCanceled) {
         logger.debug(`[EntryOrderMonitor] TP/SL order ${orderId} (${symbol}) ${status} via WebSocket. Cache updated.`);
       } else if (status === 'PARTIALLY_FILLED') {
@@ -193,27 +216,68 @@ export class EntryOrderMonitor {
   /**
    * Close DB position and notify when an exit order (TP/SL) is FILLED via WebSocket.
    * This is the ONLY allowed path to mark a position closed + send Telegram close alert.
+   * @param {number} botId
+   * @param {string|number} exitOrderId - Exchange orderId
+   * @param {string} symbol - Normalized symbol (without underscore)
+   * @param {number} avgPrice
+   * @param {number|null} filledQty
+   * @param {string|null} clientOrderId - Optional clientOrderId from WebSocket
+   * @param {number|null} parsedPositionId - Optional positionId parsed from clientOrderId
    */
-  async _closePositionFromExitFill(botId, exitOrderId, symbol, avgPrice, filledQty = null) {
+  async _closePositionFromExitFill(botId, exitOrderId, symbol, avgPrice, filledQty = null, clientOrderId = null, parsedPositionId = null) {
     try {
-      logger.debug(`[EntryOrderMonitor] _closePositionFromExitFill: botId=${botId}, exitOrderId=${exitOrderId}, symbol=${symbol}, avgPrice=${avgPrice}`);
+      logger.debug(`[EntryOrderMonitor] _closePositionFromExitFill: botId=${botId}, exitOrderId=${exitOrderId}, symbol=${symbol}, avgPrice=${avgPrice}, clientOrderId=${clientOrderId || 'n/a'}, parsedPositionId=${parsedPositionId || 'n/a'}`);
       
-      const dbPos = await Position.findOpenByExitOrderId(botId, exitOrderId);
+      // Strategy 1: If we have parsedPositionId from clientOrderId, try direct lookup first
+      let dbPos = null;
+      if (parsedPositionId) {
+        try {
+          const { default: pool } = await import('../config/database.js');
+          const [rows] = await pool.execute(
+            `SELECT * FROM positions WHERE id = ? AND bot_id = ? AND status = 'open' LIMIT 1`,
+            [parsedPositionId, botId]
+          );
+          if (rows.length > 0) {
+            dbPos = rows[0];
+            logger.info(`[EntryOrderMonitor] ✅ Found position ${dbPos.id} by parsedPositionId from clientOrderId`);
+          }
+        } catch (err) {
+          logger.warn(`[EntryOrderMonitor] Failed to lookup position by parsedPositionId ${parsedPositionId}: ${err?.message || err}`);
+        }
+      }
+      
+      // Strategy 2: Match by exit_order_id
+      if (!dbPos) {
+        dbPos = await Position.findOpenByExitOrderId(botId, exitOrderId);
+      }
+      
+      // Strategy 3: Match by sl_order_id
       if (!dbPos) {
         logger.debug(`[EntryOrderMonitor] No position found with exit_order_id=${exitOrderId}, trying sl_order_id...`);
-        // Might be SL order
         const dbPosSl = await Position.findOpenBySlOrderId(botId, exitOrderId);
-        if (!dbPosSl) {
+        if (dbPosSl) {
+          dbPos = dbPosSl;
+        }
+      }
+      
+      if (!dbPos) {
           logger.warn(`[EntryOrderMonitor] ❌ No open DB position found for exitOrderId=${exitOrderId} bot=${botId} symbol=${symbol}`);
           logger.warn(`[EntryOrderMonitor] Searched: exit_order_id=${exitOrderId} (type: ${typeof exitOrderId}) and sl_order_id=${exitOrderId} (type: ${typeof exitOrderId})`);
           
           // Try to find any open position for this symbol to help debug
+          // Normalize both DB symbol and search symbol for comparison
           try {
             const openPositions = await Position.findOpen();
-            const symbolPositions = openPositions.filter(p => 
-              p.bot_id === botId && 
-              (p.symbol === symbol || p.symbol === symbol.replace('USDT', '') || symbol.includes(p.symbol))
-            );
+            const symbolPositions = openPositions.filter(p => {
+              if (p.bot_id !== botId) return false;
+              // Normalize both symbols for comparison
+              const dbSymbol = (p.symbol || '').replace(/_/g, '');
+              const searchSymbol = (symbol || '').replace(/_/g, '');
+              return dbSymbol === searchSymbol || 
+                     dbSymbol === searchSymbol.replace('USDT', '') || 
+                     searchSymbol.includes(dbSymbol) ||
+                     dbSymbol.includes(searchSymbol);
+            });
             
             logger.warn(`[EntryOrderMonitor] Found ${symbolPositions.length} open positions for bot=${botId} symbol=${symbol}`);
             
@@ -236,7 +300,7 @@ export class EntryOrderMonitor {
               }
             } else {
               // Check if position was already closed
-              const { pool } = await import('../config/database.js');
+              const { default: pool } = await import('../config/database.js');
               const [closedRows] = await pool.execute(
                 `SELECT id, exit_order_id, sl_order_id, status, closed_at FROM positions WHERE bot_id = ? AND symbol = ? ORDER BY closed_at DESC LIMIT 5`,
                 [botId, symbol]
@@ -268,11 +332,10 @@ export class EntryOrderMonitor {
           }
           
           return;
-        }
-        logger.info(`[EntryOrderMonitor] Found position ${dbPosSl.id} with sl_order_id=${exitOrderId}`);
-        return await this._finalizeDbClose(botId, dbPosSl, avgPrice, exitOrderId);
       }
-      logger.info(`[EntryOrderMonitor] Found position ${dbPos.id} with exit_order_id=${exitOrderId}`);
+      
+      // Found position - close it
+      logger.info(`[EntryOrderMonitor] Found position ${dbPos.id} with exit_order_id=${exitOrderId} or sl_order_id=${exitOrderId}`);
       return await this._finalizeDbClose(botId, dbPos, avgPrice, exitOrderId);
     } catch (e) {
       logger.error(`[EntryOrderMonitor] ❌ Failed to close DB position from exit fill | bot=${botId} orderId=${exitOrderId} symbol=${symbol}: ${e?.message || e}`, e?.stack);
@@ -319,34 +382,146 @@ export class EntryOrderMonitor {
   }
 
   /**
+   * Find entry_pending position by botId and orderId
+   * @param {number} botId
+   * @param {number|string} orderId
+   * @returns {Promise<Object|null>}
+   */
+  async _findEntryPendingPosition(botId, orderId) {
+    try {
+      const { default: pool } = await import('../config/database.js');
+      const [rows] = await pool.execute(
+        `SELECT * FROM positions WHERE bot_id = ? AND order_id = ? AND status = 'entry_pending' LIMIT 1`,
+        [botId, String(orderId)]
+      );
+      return rows[0] || null;
+    } catch (error) {
+      logger.error(`[EntryOrderMonitor] Error finding entry_pending position: ${error?.message || error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Find position by order_id (entry order)
+   * @param {number} botId
+   * @param {number|string} orderId
+   * @returns {Promise<Object|null>}
+   */
+  async _findPositionByOrderId(botId, orderId) {
+    try {
+      const { default: pool } = await import('../config/database.js');
+      const [rows] = await pool.execute(
+        `SELECT * FROM positions WHERE bot_id = ? AND order_id = ? LIMIT 1`,
+        [botId, String(orderId)]
+      );
+      return rows[0] || null;
+    } catch (error) {
+      logger.error(`[EntryOrderMonitor] Error finding position by order_id: ${error?.message || error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Check if orderId matches exit_order_id or sl_order_id (exit order)
+   * @param {number} botId
+   * @param {number|string} orderId
+   * @returns {Promise<boolean>}
+   */
+  async _isExitOrderId(botId, orderId) {
+    try {
+      const { default: pool } = await import('../config/database.js');
+      const [rows] = await pool.execute(
+        `SELECT id FROM positions WHERE bot_id = ? AND (exit_order_id = ? OR sl_order_id = ?) AND status = 'open' LIMIT 1`,
+        [botId, String(orderId), String(orderId)]
+      );
+      return rows.length > 0;
+    } catch (error) {
+      logger.error(`[EntryOrderMonitor] Error checking exit order: ${error?.message || error}`);
+      return false;
+    }
+  }
+
+  /**
+   * Confirm entry fill: promote entry_pending position to open
+   * IDEMPOTENT: Checks if position is already open before updating
+   * @param {Object} position - Position object with status='entry_pending'
+   * @param {number|null} overrideEntryPrice - Optional override entry price from WS/REST
+   * @returns {Promise<Object>} Updated position
+   */
+  async _confirmEntryFill(position, overrideEntryPrice = null) {
+    try {
+      // IDEMPOTENCY GUARD: Check if position is already open
+      if (position.status === 'open') {
+        logger.debug(`[EntryOrderMonitor] Position ${position.id} already open, skipping promotion.`);
+        return position;
+      }
+
+      // Validate position is entry_pending
+      if (position.status !== 'entry_pending') {
+        logger.warn(`[EntryOrderMonitor] Position ${position.id} status is '${position.status}', expected 'entry_pending'. Skipping.`);
+        return position;
+      }
+
+      // Update entry_price if override provided and valid
+      const updates = { status: 'open' };
+      if (Number.isFinite(overrideEntryPrice) && overrideEntryPrice > 0) {
+        updates.entry_price = overrideEntryPrice;
+        logger.debug(`[EntryOrderMonitor] Updating entry_price to ${overrideEntryPrice} for position ${position.id}`);
+      }
+
+      // Update position status to 'open'
+      const updated = await Position.update(position.id, updates);
+      logger.info(`[EntryOrderMonitor] ✅ Promoted entry_pending position ${position.id} to 'open' (orderId=${position.order_id}, ${position.symbol})`);
+
+      // Send Telegram notification
+      try {
+        const { Strategy } = await import('../models/Strategy.js');
+        const strategy = await Strategy.findById(position.strategy_id);
+        if (strategy && this.telegramService?.sendEntryTradeAlert) {
+          await this.telegramService.sendEntryTradeAlert(updated, strategy, strategy.oc);
+          logger.info(`[EntryOrderMonitor] ✅ Entry trade alert sent for Position ${updated.id}`);
+        }
+      } catch (notifyErr) {
+        logger.warn(`[EntryOrderMonitor] Failed to send Telegram notification for Position ${position.id}: ${notifyErr?.message || notifyErr}`);
+      }
+
+      return updated;
+    } catch (error) {
+      logger.error(`[EntryOrderMonitor] Error confirming entry fill for position ${position.id}: ${error?.message || error}`, error?.stack);
+      throw error;
+    }
+  }
+
+  /**
    * Fallback polling using REST for all exchanges
    */
-  async pollOpenEntryOrders() {
+  async pollEntryPendingPositions() {
     try {
-      const openEntries = await EntryOrder.findOpen();
-      if (!openEntries.length) return;
+      // New flow: poll positions that are waiting for entry fill confirmation
+      const pendingPositions = await Position.findAll({ status: 'entry_pending' });
+      if (!pendingPositions.length) return;
 
-      logger.debug(`[EntryOrderMonitor] Polling ${openEntries.length} open entry orders via REST.`);
+      logger.debug(`[EntryOrderMonitor] Polling ${pendingPositions.length} entry_pending positions via REST.`);
 
       // RATE-LIMIT GUARD: Process entries in batches with delay to avoid overwhelming exchange API
       const batchSize = Number(configService.getNumber('ENTRY_ORDER_POLL_BATCH_SIZE', 10));
       const batchDelayMs = Number(configService.getNumber('ENTRY_ORDER_POLL_BATCH_DELAY_MS', 1000));
       
-      for (let i = 0; i < openEntries.length; i += batchSize) {
-        const batch = openEntries.slice(i, i + batchSize);
+      for (let i = 0; i < pendingPositions.length; i += batchSize) {
+        const batch = pendingPositions.slice(i, i + batchSize);
         
         // Process batch with Promise.allSettled to handle errors gracefully
         await Promise.allSettled(
-          batch.map(entry => this._pollSingleEntryOrder(entry))
+          batch.map(pos => this._pollSingleEntryPendingPosition(pos))
         );
         
         // Delay between batches to avoid rate limits
-        if (i + batchSize < openEntries.length && batchDelayMs > 0) {
+        if (i + batchSize < pendingPositions.length && batchDelayMs > 0) {
           await new Promise(resolve => setTimeout(resolve, batchDelayMs));
         }
       }
     } catch (error) {
-      logger.error('[EntryOrderMonitor] Error in pollOpenEntryOrders:', error?.message || error);
+      logger.error('[EntryOrderMonitor] Error in pollEntryPendingPositions:', error?.message || error);
     }
   }
 
@@ -354,76 +529,55 @@ export class EntryOrderMonitor {
    * Poll a single entry order (extracted for batch processing)
    * @param {Object} entry - Entry order object
    */
-  async _pollSingleEntryOrder(entry) {
+  async _pollSingleEntryPendingPosition(position) {
         try {
-          const exchangeService = this.exchangeServices.get(entry.bot_id);
-      if (!exchangeService) return;
+          const exchangeService = this.exchangeServices.get(position.bot_id);
+          if (!exchangeService) return;
 
-          const st = await exchangeService.getOrderStatus(entry.symbol, entry.order_id);
+          const st = await exchangeService.getOrderStatus(position.symbol, position.order_id);
           const status = (st?.status || '').toLowerCase();
           const filled = Number(st?.filled || 0);
 
           if ((status === 'closed' || status === 'filled') && filled > 0) {
-            // Confirmed filled via REST
-            await this._confirmEntryWithPosition(entry.bot_id, entry, null);
+            // Confirmed filled via REST: promote to open
+            await this._confirmEntryFill(position, null);
           } else if ((status === 'canceled' || status === 'cancelled' || status === 'expired') && filled === 0) {
-            await EntryOrder.markCanceled(entry.id, status === 'expired' ? 'expired' : 'canceled');
-            logger.debug(`[EntryOrderMonitor] Entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) canceled/expired via REST polling.`);
+            await Position.update(position.id, { status: 'cancelled', close_reason: 'entry_order_canceled', closed_at: new Date() });
+            logger.debug(`[EntryOrderMonitor] entry_pending position ${position.id} (orderId=${position.order_id}, ${position.symbol}) canceled/expired via REST polling.`);
           } else {
-        // TTL-based auto-cancel for stale LIMIT entry orders
+        // TTL-based auto-cancel for stale pending entry positions
         const ttlMinutes = Number(configService.getNumber('ENTRY_ORDER_TTL_MINUTES', 30));
-            const ttlMs = Math.max(1, ttlMinutes) * 60 * 1000;
-            const createdAtMs = new Date(entry.created_at || entry.createdAt || entry.created || Date.now()).getTime();
-            const now = Date.now();
+        const ttlMs = Math.max(1, ttlMinutes) * 60 * 1000;
+        const createdAtMs = new Date(position.opened_at || position.created_at || Date.now()).getTime();
+        const now = Date.now();
 
-            if (!Number.isNaN(createdAtMs) && now - createdAtMs >= ttlMs) {
-          // RACE CONDITION FIX: Re-check order status before canceling
-          // Order might have been FILLED between last check and TTL expiration
+        if (!Number.isNaN(createdAtMs) && now - createdAtMs >= ttlMs) {
           try {
-            const recheckStatus = await exchangeService.getOrderStatus(entry.symbol, entry.order_id);
+            const recheckStatus = await exchangeService.getOrderStatus(position.symbol, position.order_id);
             const recheckStatusLower = (recheckStatus?.status || '').toLowerCase();
             const recheckFilled = Number(recheckStatus?.filled || 0);
             
-            // If order is now FILLED, don't cancel - create Position instead
             if ((recheckStatusLower === 'closed' || recheckStatusLower === 'filled') && recheckFilled > 0) {
-              logger.info(
-                `[EntryOrderMonitor] Entry order ${entry.id} was FILLED during TTL check (orderId=${entry.order_id}, ${entry.symbol}). ` +
-                `Creating Position instead of canceling.`
-              );
-              await this._confirmEntryWithPosition(entry.bot_id, entry, null);
+              logger.info(`[EntryOrderMonitor] Position ${position.id} was FILLED during TTL check. Promoting to 'open'.`);
+              await this._confirmEntryFill(position, null);
               return; // Skip cancellation
             }
             
-            // Order is still open - proceed with cancellation
-              try {
-                // Cancel on exchange first
-                await exchangeService.cancelOrder(entry.order_id, entry.symbol);
-              } catch (cancelErr) {
-                logger.warn(
-                  `[EntryOrderMonitor] Failed to cancel stale entry order ${entry.id} on exchange (orderId=${entry.order_id}, ${entry.symbol}): ${cancelErr?.message || cancelErr}`
-                );
-              }
-
-              // Mark as canceled in DB regardless of remote cancel result
-              await EntryOrder.markCanceled(entry.id, 'expired_ttl');
-              logger.info(
-                `[EntryOrderMonitor] ⏱️ Auto-canceled stale entry order ${entry.id} (orderId=${entry.order_id}, ${entry.symbol}) after TTL ` +
-                `${ttlMinutes} minutes (created_at=${new Date(createdAtMs).toISOString()})`
-              );
-          } catch (recheckErr) {
-            // If re-check fails, proceed with cancellation (safer than leaving stale order)
-            logger.warn(`[EntryOrderMonitor] Failed to re-check order status before TTL cancel for entry ${entry.id}: ${recheckErr?.message || recheckErr}`);
             try {
-              await exchangeService.cancelOrder(entry.order_id, entry.symbol);
+              await exchangeService.cancelOrder(position.order_id, position.symbol);
             } catch (cancelErr) {
-              logger.warn(`[EntryOrderMonitor] Failed to cancel stale entry order ${entry.id}: ${cancelErr?.message || cancelErr}`);
+              logger.warn(`[EntryOrderMonitor] Failed to cancel stale entry order ${position.order_id} on exchange: ${cancelErr?.message || cancelErr}`);
             }
-            await EntryOrder.markCanceled(entry.id, 'expired_ttl');
+
+            await Position.update(position.id, { status: 'cancelled', close_reason: 'entry_order_ttl', closed_at: new Date() });
+            logger.info(`[EntryOrderMonitor] ⏱️ Auto-canceled stale entry position ${position.id} (orderId=${position.order_id}) after TTL.`);
+          } catch (recheckErr) {
+            logger.warn(`[EntryOrderMonitor] Failed to re-check order status before TTL cancel for position ${position.id}: ${recheckErr?.message || recheckErr}`);
           }
         }
       }
     } catch (inner) {
-      logger.warn(`[EntryOrderMonitor] Failed to poll entry order ${entry.id} (${entry.symbol}): ${inner?.message || inner}`);
+      logger.warn(`[EntryOrderMonitor] Failed to poll entry_pending position ${position.id} (${position.symbol}): ${inner?.message || inner}`);
     }
   }
 
@@ -434,6 +588,7 @@ export class EntryOrderMonitor {
    * @param {Object} entry
    * @param {number|null} overrideEntryPrice
    */
+  // Deprecated: EntryOrder-based flow. Kept for backward compatibility during rollout.
   async _confirmEntryWithPosition(botId, entry, overrideEntryPrice = null) {
     try {
       // IDEMPOTENCY GUARD: Check if Position already exists for this order_id
@@ -441,7 +596,7 @@ export class EntryOrderMonitor {
       // or when WS sends duplicate events
       const { pool } = await import('../config/database.js');
       const [existingPositions] = await pool.execute(
-        `SELECT id, status FROM positions WHERE bot_id = ? AND order_id = ? LIMIT 1`,
+        `SELECT id, status, exit_order_id FROM positions WHERE bot_id = ? AND order_id = ? LIMIT 1`,
         [botId, entry.order_id]
       );
       
@@ -644,7 +799,7 @@ export class EntryOrderMonitor {
     const cronPattern = configService.getString('ENTRY_ORDER_MONITOR_CRON', defaultPattern);
 
     this.cronJob = cron.schedule(cronPattern, async () => {
-      await this.pollOpenEntryOrders();
+      await this.pollEntryPendingPositions();
     });
 
     logger.info(`[EntryOrderMonitor] Started with cron pattern: ${cronPattern}`);
