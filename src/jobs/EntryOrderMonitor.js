@@ -382,6 +382,95 @@ export class EntryOrderMonitor {
   }
 
   /**
+   * Place TP order with retry mechanism and exponential backoff
+   * Retry schedule: 200ms -> 500ms -> 1000ms (max 3 retries)
+   * This ensures TP is always placed even if initial attempt fails due to network/rate limit issues
+   * @param {ExitOrderManager} mgr - ExitOrderManager instance
+   * @param {Object} position - Position object
+   * @param {number} tpPrice - Take profit price
+   * @returns {Promise<Object|null>} Result from placeOrReplaceExitOrder or null if all retries failed
+   */
+  async _placeTPWithRetry(mgr, position, tpPrice) {
+    const maxRetries = 3;
+    const retryDelays = [200, 500, 1000]; // ms: 200ms, 500ms, 1000ms
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await mgr.placeOrReplaceExitOrder(position, tpPrice);
+        
+        // Check if placement was successful (has orderId or shouldCloseImmediately flag)
+        if (result?.orderId || result?.shouldCloseImmediately) {
+          if (attempt > 0) {
+            logger.info(
+              `[EntryOrderMonitor] ✅ TP placement succeeded on retry attempt ${attempt + 1}/${maxRetries + 1} | ` +
+              `pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}`
+            );
+          }
+          return result;
+        }
+        
+        // If result is null but no error thrown, it might be a valid case (e.g., price too close to market)
+        // But we still retry to ensure TP is placed
+        if (result === null && attempt < maxRetries) {
+          const delay = retryDelays[attempt] || 1000;
+          logger.warn(
+            `[EntryOrderMonitor] ⚠️ TP placement returned null (attempt ${attempt + 1}/${maxRetries + 1}) | ` +
+            `pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}. ` +
+            `Retrying in ${delay}ms...`
+          );
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        
+        // If we've exhausted retries and result is still null, return null
+        if (result === null) {
+          logger.error(
+            `[EntryOrderMonitor] ❌ TP placement returned null after ${maxRetries + 1} attempts | ` +
+            `pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}`
+          );
+          return null;
+        }
+        
+        return result;
+      } catch (error) {
+        const errorMsg = error?.message || String(error);
+        const isRetryable = !errorMsg.includes('shouldCloseImmediately') && 
+                           !errorMsg.includes('position not open') &&
+                           !errorMsg.includes('Invalid entry_price');
+        
+        if (attempt < maxRetries && isRetryable) {
+          const delay = retryDelays[attempt] || 1000;
+          logger.warn(
+            `[EntryOrderMonitor] ⚠️ TP placement failed (attempt ${attempt + 1}/${maxRetries + 1}) | ` +
+            `pos=${position.id} symbol=${position.symbol} error=${errorMsg}. ` +
+            `Retrying in ${delay}ms...`
+          );
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        
+        // If error is not retryable or we've exhausted retries, throw/return
+        if (!isRetryable) {
+          logger.error(
+            `[EntryOrderMonitor] ❌ TP placement failed with non-retryable error | ` +
+            `pos=${position.id} symbol=${position.symbol} error=${errorMsg}`
+          );
+          throw error; // Re-throw non-retryable errors
+        }
+        
+        // Last attempt failed
+        logger.error(
+          `[EntryOrderMonitor] ❌ TP placement failed after ${maxRetries + 1} attempts | ` +
+          `pos=${position.id} symbol=${position.symbol} error=${errorMsg}`
+        );
+        throw error;
+      }
+    }
+    
+    return null; // Should never reach here, but just in case
+  }
+
+  /**
    * Find entry_pending position by botId and orderId
    * @param {number} botId
    * @param {number|string} orderId
@@ -707,7 +796,9 @@ export class EntryOrderMonitor {
             `symbol=${position.symbol} side=${position.side} tpPrice=${tpPrice} entry=${effectiveEntryPrice}`
           );
 
-          const placed = await mgr.placeOrReplaceExitOrder(position, tpPrice);
+          // CRITICAL: Use retry mechanism with exponential backoff to ensure TP is always placed
+          // Retry schedule: 200ms -> 500ms -> 1000ms (max 3 retries)
+          const placed = await this._placeTPWithRetry(mgr, position, tpPrice);
           const tpOrderId = placed?.orderId ? String(placed.orderId) : null;
 
           if (tpOrderId) {
@@ -722,9 +813,9 @@ export class EntryOrderMonitor {
               `type=${placed?.orderType || 'n/a'} stopPrice=${placed?.stopPrice || tpPrice}`
             );
           } else {
-            // ⚠️ Nếu TP placement failed, giữ tp_sl_pending=true để PositionMonitor retry
+            // ⚠️ Nếu TP placement failed sau tất cả retries, giữ tp_sl_pending=true để PositionMonitor retry
             logger.warn(
-              `[EntryOrderMonitor] ⚠️ Immediate TP placement returned null | pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}. ` +
+              `[EntryOrderMonitor] ⚠️ Immediate TP placement failed after all retries | pos=${position.id} symbol=${position.symbol} tpPrice=${tpPrice}. ` +
               `PositionMonitor will retry on next cycle.`
             );
           }

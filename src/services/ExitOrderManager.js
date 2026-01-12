@@ -138,11 +138,60 @@ export class ExitOrderManager {
     }
 
     const desiredExit = Number(desiredExitPrice);
-    const orderType = this._decideExitType(side, entry, desiredExit);
+    let orderType = this._decideExitType(side, entry, desiredExit);
 
     const currentPrice = await this.exchangeService.getTickerPrice(position.symbol);
     let stopPrice = Number(desiredExitPrice);
 
+    // CRITICAL: Check if price has already exceeded TP before placing order
+    // LONG: currentPrice > desiredTP means we're already past TP (more profit than expected)
+    // SHORT: currentPrice < desiredTP means we're already past TP (more profit than expected)
+    const hasPriceExceededTP = (side === 'long' && currentPrice > desiredExit) ||
+                               (side === 'short' && currentPrice < desiredExit);
+
+    if (hasPriceExceededTP) {
+      // Distinguish between initial TP vs trailing TP
+      const isInitialTP = !position.exit_order_id || !position.initial_tp_price;
+      
+      if (isInitialTP) {
+        // Initial TP: Price already exceeded TP → Close immediately with MARKET to lock in better profit
+        logger.warn(
+          `[ExitOrderManager] 🚨 Price already exceeded initial TP | pos=${position.id} ` +
+          `desiredTP=${desiredExit.toFixed(8)} currentPrice=${currentPrice.toFixed(8)} side=${side} ` +
+          `→ Returning shouldCloseImmediately flag (caller should close with MARKET order)`
+        );
+        
+        // Return special object to signal caller to close position immediately
+        return {
+          shouldCloseImmediately: true,
+          currentPrice: currentPrice,
+          desiredTP: desiredExit,
+          reason: 'price_exceeded_initial_tp',
+          orderType: null,
+          stopPrice: null,
+          orderId: null
+        };
+      } else {
+        // Trailing TP: Price exceeded trailing TP → Adjust to new TP higher than current price
+        const bufferPct = Number(configService.getNumber('TP_TRAILING_BUFFER_PCT', 0.005)); // 0.5% default
+        if (side === 'long') {
+          stopPrice = currentPrice * (1 + bufferPct);
+        } else {
+          stopPrice = currentPrice * (1 - bufferPct);
+        }
+        
+        logger.info(
+          `[ExitOrderManager] 📈 Price exceeded trailing TP, adjusting to new TP | pos=${position.id} ` +
+          `oldTP=${desiredExit.toFixed(8)} newTP=${stopPrice.toFixed(8)} currentPrice=${currentPrice.toFixed(8)} ` +
+          `side=${side} bufferPct=${(bufferPct * 100).toFixed(2)}%`
+        );
+        
+        // Recalculate orderType based on new stopPrice
+        orderType = this._decideExitType(side, entry, stopPrice);
+      }
+    }
+
+    // Validate stopPrice vs market (existing logic)
     if (!this._isValidStopVsMarket(orderType, side, stopPrice, currentPrice)) {
       stopPrice = this._nudgeStopPrice(orderType, side, currentPrice);
     }

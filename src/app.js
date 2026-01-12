@@ -174,11 +174,15 @@ async function start() {
       // Batch processing configs
       await AppConfig.set('SIGNAL_SCAN_BATCH_SIZE', '200', 'Number of strategies to scan in parallel per batch');
       await AppConfig.set('SIGNAL_SCAN_BATCH_DELAY_MS', '300', 'Delay (ms) between signal scan batches');
-      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '2', 'Number of positions to monitor in parallel per batch (reduced from 3 to reduce rate limit)');
-      await AppConfig.set('POSITION_MONITOR_BATCH_DELAY_MS', '2000', 'Delay (ms) between position monitor batches (increased from 300ms to reduce rate limit)');
+      // Position Monitor - Optimized for high-volume processing
+      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '5', 'Number of positions per batch for general processing (increased for better throughput)');
+      await AppConfig.set('POSITION_MONITOR_TP_BATCH_SIZE', '10', 'Number of positions per batch for TP/SL placement (larger batch for urgent TP placement)');
+      await AppConfig.set('POSITION_MONITOR_MONITORING_BATCH_SIZE', '8', 'Number of positions per batch for monitoring (parallel monitoring)');
+      await AppConfig.set('POSITION_MONITOR_TP_BATCH_DELAY_MS', '300', 'Delay (ms) between TP/SL placement batches (reduced for faster processing)');
+      await AppConfig.set('POSITION_MONITOR_MONITORING_BATCH_DELAY_MS', '200', 'Delay (ms) between monitoring batches (reduced for faster processing)');
+      await AppConfig.set('POSITION_MONITOR_MAX_TIME_PER_BOT_MS', '300000', 'Max processing time (ms) per bot before moving to next bot (5 minutes)');
       await AppConfig.set('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', '200', 'Minimum interval (ms) between Binance market data requests');
       await AppConfig.set('BINANCE_REST_PRICE_COOLDOWN_MS', '10000', 'Cooldown (ms) before reusing cached REST price fallback');
-      await AppConfig.set('POSITION_MONITOR_POSITION_DELAY_MS', '1000', 'Delay (ms) between each position in a batch (increased from 500ms to reduce rate limit)');
 
       // Symbols refresh configs
       await AppConfig.set('ENABLE_SYMBOLS_REFRESH', 'true', 'Enable periodic symbols/filters refresh for exchanges');
