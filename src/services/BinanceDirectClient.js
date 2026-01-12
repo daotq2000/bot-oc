@@ -1637,6 +1637,71 @@ export class BinanceDirectClient {
   /**
    * Fetch user trades for an order and compute average fill price
    */
+  /**
+   * Check if a position was recently closed by examining trade history
+   * @param {string} symbol - Trading symbol
+   * @param {'long'|'short'} side - Position side (long/short)
+   * @param {number} positionSize - Position size to verify was closed
+   * @param {number} [lookbackMs=30000] - How far back to check trades (default 30s)
+   * @returns {Promise<boolean>} True if matching closing trades found
+   */
+  async wasPositionClosedByTrade(symbol, side, positionSize, lookbackMs = 30000) {
+    const normalizedSymbol = this.normalizeSymbol(symbol);
+    const since = Date.now() - lookbackMs;
+    
+    try {
+      // Get recent trades for this symbol
+      const params = { 
+        symbol: normalizedSymbol,
+        startTime: since,
+        limit: 1000 // Max allowed by Binance
+      };
+      
+      const trades = await this.makeRequest('/fapi/v1/userTrades', 'GET', params, true);
+      if (!Array.isArray(trades) || trades.length === 0) {
+        return false; // No recent trades found
+      }
+      
+      // Determine if we're looking for buy or sell trades to close the position
+      const isLong = side.toLowerCase() === 'long';
+      const closingSide = isLong ? 'SELL' : 'BUY';
+      
+      // Filter for closing trades within the lookback period
+      const closingTrades = trades.filter(t => 
+        t.side === closingSide && 
+        t.time >= since
+      );
+      
+      if (closingTrades.length === 0) {
+        return false; // No closing trades found
+      }
+      
+      // Sum up the quantity of closing trades
+      const closedQty = closingTrades.reduce((sum, t) => {
+        const qty = parseFloat(t.qty || 0);
+        // For market orders, use 'qty', for limit orders use 'executedQty'
+        const executedQty = qty > 0 ? qty : parseFloat(t.executedQty || 0);
+        return sum + (executedQty || 0);
+      }, 0);
+      
+      // Consider the position closed if we found trades covering at least 95% of the position
+      const minCloseThreshold = positionSize * 0.95;
+      const isClosed = closedQty >= minCloseThreshold;
+      
+      if (isClosed) {
+        logger.info(`[Binance] Position ${normalizedSymbol} ${side} (${positionSize}) verified closed by recent trades (${closedQty} closed)`);
+      } else if (closingTrades.length > 0) {
+        logger.warn(`[Binance] Found partial closing trades for ${normalizedSymbol} ${side}: ${closedQty}/${positionSize} (${(closedQty/positionSize*100).toFixed(1)}%)`);
+      }
+      
+      return isClosed;
+      
+    } catch (error) {
+      logger.error(`[Binance] Error checking trade history for ${normalizedSymbol}:`, error?.message || error);
+      return false; // Fail safe - don't assume position is closed on error
+    }
+  }
+
   async getOrderAverageFillPrice(symbol, orderId) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
     try {

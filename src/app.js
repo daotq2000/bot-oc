@@ -321,6 +321,7 @@ async function start() {
       await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.co', 'MEXC Futures REST base URL (using .co domain for better connectivity)');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
+
       await AppConfig.set('POSITION_MONITOR_INTERVAL_MS', '40000', 'Interval (ms) between position monitor cycles (increased from 25s to reduce rate limit)');
       await AppConfig.set('POSITION_SYNC_INTERVAL_MS', '60000', 'Interval (ms) between position sync cycles (increased from 40s to reduce rate limit)');
 

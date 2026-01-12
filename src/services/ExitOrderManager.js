@@ -92,11 +92,15 @@ export class ExitOrderManager {
     }
 
     // Best-effort: cancel orphaned exits on exchange that are not in DB
+    // CRITICAL FIX: Exclude SL orders (sl_order_id) from cancellation - SL is hard/static and should not be changed
     try {
       const openOrders = await this.exchangeService.getOpenOrders(position.symbol);
       if (Array.isArray(openOrders) && openOrders.length > 0) {
         const exitTypes = new Set(['STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET']);
         const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+        
+        // Get SL order ID from position - this is a HARD SL that should NEVER be cancelled
+        const dbSlOrderId = position?.sl_order_id ? String(position.sl_order_id) : null;
         
         const existingExits = openOrders.filter(o => {
           const type = String(o?.type || '').toUpperCase();
@@ -112,22 +116,42 @@ export class ExitOrderManager {
           const existingIds = existingExits.map(o => String(o?.orderId || '')).filter(Boolean);
           const dbOrderId = position?.exit_order_id ? String(position.exit_order_id) : null;
           
-          // Cancel orphaned exit orders
-            for (const order of existingExits) {
-              const orderId = String(order?.orderId || '');
-              if (orderId && orderId !== dbOrderId) {
-                try {
-                  await this.exchangeService.cancelOrder(orderId, position.symbol);
-                } catch (cancelError) {
-                  logger.error(
+          // Cancel orphaned exit orders (TP orders only)
+          // CRITICAL: NEVER cancel SL orders (sl_order_id) - they are hard/static SL
+          for (const order of existingExits) {
+            const orderId = String(order?.orderId || '');
+            
+            // Skip if this is the TP order we're about to replace
+            if (orderId === dbOrderId) {
+              continue;
+            }
+            
+            // CRITICAL FIX: Skip if this is the SL order - SL is hard/static and should NEVER be cancelled
+            if (orderId === dbSlOrderId) {
+              logger.debug(
+                `[ExitOrderManager] 🔒 PROTECTED: Skipping SL order ${orderId} (hard SL, not orphaned) | pos=${position.id}`
+              );
+              continue;
+            }
+            
+            // Only cancel if it's truly orphaned (not TP, not SL)
+            if (orderId && orderId !== dbOrderId && orderId !== dbSlOrderId) {
+              try {
+                await this.exchangeService.cancelOrder(orderId, position.symbol);
+                logger.info(
+                  `[ExitOrderManager] ✅ Cancelled orphaned exit order ${orderId} | pos=${position.id} ` +
+                  `(not TP=${dbOrderId || 'null'}, not SL=${dbSlOrderId || 'null'})`
+                );
+              } catch (cancelError) {
+                logger.error(
                   `[ExitOrderManager] ⚠️ Failed to cancel orphaned order ${orderId} | pos=${position.id} error=${cancelError?.message || cancelError}`
-                  );
+                );
               }
             }
           }
 
           if (dbOrderId && existingIds.includes(dbOrderId)) {
-            // ok
+            // ok - TP order exists, will be replaced
           }
         }
       }
@@ -165,11 +189,14 @@ export class ExitOrderManager {
     }
 
     // Also check for orders with same newClientOrderId pattern (to handle race conditions)
+    // CRITICAL FIX: Exclude SL orders (sl_order_id) from cancellation - SL is hard/static
     try {
       const botId = this.exchangeService?.bot?.id;
       const posId = position?.id;
+      const dbSlOrderId = position?.sl_order_id ? String(position.sl_order_id) : null;
+      
       if (botId && posId) {
-        // Check for orders with same clientOrderId pattern
+        // Check for orders with same clientOrderId pattern (TP orders only, not SL)
         const expectedClientOrderIdPattern = orderType === 'STOP_MARKET' 
           ? `OC_B${botId}_P${posId}_EXIT`
           : `OC_B${botId}_P${posId}_TP`;
@@ -183,6 +210,13 @@ export class ExitOrderManager {
             const type = String(o?.type || '').toUpperCase();
             const ps = String(o?.positionSide || '').toUpperCase();
             const clientOrderId = String(o?.clientOrderId || '');
+            const orderId = String(o?.orderId || '');
+            
+            // CRITICAL FIX: Exclude SL orders - SL is hard/static and should NEVER be cancelled
+            if (orderId === dbSlOrderId) {
+              return false; // Skip SL orders
+            }
+            
             return exitTypes.has(type) && 
                    (!ps || ps === positionSide) &&
                    clientOrderId === expectedClientOrderIdPattern;
@@ -190,6 +224,15 @@ export class ExitOrderManager {
           
           for (const dupOrder of duplicateOrders) {
             const dupOrderId = String(dupOrder?.orderId || '');
+            
+            // CRITICAL FIX: Skip SL orders - SL is hard/static and should NEVER be cancelled
+            if (dupOrderId === dbSlOrderId) {
+              logger.debug(
+                `[ExitOrderManager] 🔒 PROTECTED: Skipping SL order ${dupOrderId} (hard SL, duplicate check) | pos=${position.id}`
+              );
+              continue;
+            }
+            
             if (dupOrderId && dupOrderId !== oldOrderId) {
               try {
                 await this.exchangeService.cancelOrder(dupOrderId, position.symbol);
@@ -266,10 +309,20 @@ export class ExitOrderManager {
               const exitTypes = new Set(['STOP_MARKET', 'TAKE_PROFIT_MARKET']);
               const positionSide = side === 'long' ? 'LONG' : 'SHORT';
               
+              // CRITICAL FIX: Get SL order ID to protect it from cancellation
+              const dbSlOrderId = position?.sl_order_id ? String(position.sl_order_id) : null;
+              
               const duplicateOrders = openOrders.filter(o => {
                 const type = String(o?.type || '').toUpperCase();
                 const ps = String(o?.positionSide || '').toUpperCase();
                 const clientOrderId = String(o?.clientOrderId || '');
+                const orderId = String(o?.orderId || '');
+                
+                // CRITICAL FIX: Exclude SL orders - SL is hard/static and should NEVER be cancelled
+                if (orderId === dbSlOrderId) {
+                  return false; // Skip SL orders
+                }
+                
                 return exitTypes.has(type) && 
                        (!ps || ps === positionSide) &&
                        clientOrderId === expectedClientOrderIdPattern;
@@ -277,6 +330,15 @@ export class ExitOrderManager {
               
               for (const dupOrder of duplicateOrders) {
                 const dupOrderId = String(dupOrder?.orderId || '');
+                
+                // CRITICAL FIX: Double-check - Skip SL orders - SL is hard/static
+                if (dupOrderId === dbSlOrderId) {
+                  logger.debug(
+                    `[ExitOrderManager] 🔒 PROTECTED: Skipping SL order ${dupOrderId} (hard SL, retry duplicate check) | pos=${position.id}`
+                  );
+                  continue;
+                }
+                
                 if (dupOrderId) {
                   try {
                     await this.exchangeService.cancelOrder(dupOrderId, position.symbol);

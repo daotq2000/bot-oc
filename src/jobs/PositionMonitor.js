@@ -573,7 +573,10 @@ export class PositionMonitor {
             }
 
             await Position.update(position.id, updateData);
-            logger.debug(`[Place TP/SL] ✅ Placed SL order ${slOrderId} for position ${position.id} @ ${slPrice}`);
+            logger.info(
+              `[Place TP/SL] ✅ Placed HARD SL order ${slOrderId} for position ${position.id} @ ${slPrice} ` +
+              `(HARD SL - static, will NOT be changed by trailing TP logic)`
+            );
             
             // CRITICAL FIX: Run dedupe AFTER successfully creating SL order to clean up old duplicate orders
             try {

@@ -1257,13 +1257,25 @@ export class PositionService {
               }
             }
             
-            // If position has exposure but no verified fill, block closing
+            // If position has exposure but no verified fill, try to verify via recent trades
             if (!verifiedClose) {
-              logger.error(
-                `[CloseGuard] ❌ BLOCKED: Position ${position.id} has exposure but no verified TP/SL fill. ` +
-                `Orders may have been cancelled. Will NOT close position to prevent false alert.`
-              );
-              throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+              logger.warn(`[CloseGuard] No verified TP/SL fill for pos ${position.id}, checking recent trades as fallback...`);
+              try {
+                const isClosedByTrade = await this.exchangeService.wasRecentlyClosedByTrade(position.symbol, position.side, position.quantity);
+                if (isClosedByTrade) {
+                  verifiedClose = true;
+                  logger.info(`[CloseGuard] ✅ Position ${position.id} confirmed closed via recent trade history.`);
+                } else {
+                  logger.error(
+                    `[CloseGuard] ❌ BLOCKED: Position ${position.id} has exposure but no verified TP/SL fill and no recent closing trade found. ` +
+                    `Orders may have been cancelled. Will NOT close position to prevent false alert.`
+                  );
+                  throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+                }
+              } catch (tradeErr) {
+                logger.error(`[CloseGuard] ❌ BLOCKED: Error during fallback trade verification for pos ${position.id}: ${tradeErr?.message || tradeErr}`);
+                throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+              }
             }
           }
         } catch (e) {

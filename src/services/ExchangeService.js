@@ -1472,6 +1472,51 @@ export class ExchangeService {
    * @param {string|number} orderId - Order ID
    * @returns {Promise<number|null>} Average fill price or null if not available
    */
+  /**
+   * Check if a position was recently closed by examining trade history
+   * @param {string} symbol - Trading symbol
+   * @param {'long'|'short'} side - Position side (long/short)
+   * @param {number} positionSize - Position size to verify was closed
+   * @param {number} [lookbackMs=30000] - How far back to check trades (default 30s)
+   * @returns {Promise<boolean>} True if matching closing trades found
+   */
+  async wasRecentlyClosedByTrade(symbol, side, positionSize, lookbackMs = 30000) {
+    try {
+      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+        return await this.binanceDirectClient.wasPositionClosedByTrade(symbol, side, positionSize, lookbackMs);
+      }
+      
+      // Fallback for other exchanges using CCXT
+      const since = Date.now() - lookbackMs;
+      const trades = await this.exchange.fetchMyTrades(symbol, since);
+      
+      // Filter for closing trades (opposite side of position)
+      const closingSide = side === 'long' ? 'sell' : 'buy';
+      const closingTrades = trades.filter(t => 
+        t.side === closingSide && 
+        new Date(t.timestamp) >= new Date(since)
+      );
+      
+      // Sum up the quantity of closing trades
+      const closedQty = closingTrades.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+      
+      // Consider the position closed if we found trades covering at least 95% of the position
+      const minCloseThreshold = positionSize * 0.95;
+      const isClosed = closedQty >= minCloseThreshold;
+      
+      if (isClosed) {
+        logger.info(`[${this.bot.exchange}] Position ${symbol} ${side} (${positionSize}) verified closed by recent trades (${closedQty} closed)`);
+      } else if (closingTrades.length > 0) {
+        logger.warn(`[${this.bot.exchange}] Found partial closing trades for ${symbol} ${side}: ${closedQty}/${positionSize} (${(closedQty/positionSize*100).toFixed(1)}%)`);
+      }
+      
+      return isClosed;
+    } catch (error) {
+      logger.error(`[${this.bot.exchange}] Error checking trade history for ${symbol}:`, error?.message || error);
+      return false; // Fail safe - don't assume position is closed on error
+    }
+  }
+
   async getOrderAverageFillPrice(symbol, orderId) {
     try {
       if (this.bot.exchange === 'binance' && this.binanceDirectClient) {

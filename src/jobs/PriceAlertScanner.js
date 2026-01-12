@@ -149,15 +149,24 @@ export class PriceAlertScanner {
     const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 500);
 
     const runLoop = async () => {
-      if (!this.isRunning) return;
+      if (!this.isRunning) {
+        logger.warn('[PriceAlertScanner] runLoop called but isRunning=false, stopping');
+        return;
+      }
       try {
         await this.scan();
       } catch (error) {
         logger.error('PriceAlertScanner scan error:', error);
+        // Log stack trace for debugging
+        if (error?.stack) {
+          logger.error('PriceAlertScanner runLoop error stack:', error.stack);
+        }
       } finally {
         // ✅ Avoid timer pile-up: schedule next run only after finishing current scan
         if (this.isRunning) {
           this.scanInterval = setTimeout(runLoop, interval);
+        } else {
+          logger.warn('[PriceAlertScanner] runLoop finished but isRunning=false, not scheduling next run');
         }
       }
     };
@@ -226,9 +235,18 @@ export class PriceAlertScanner {
       this.cleanupCachesIfNeeded();
 
       const scanDuration = Date.now() - scanStartTime;
-      logger.debug(`[PriceAlertScanner] Scan completed in ${scanDuration}ms`);
+      // Log every scan completion to track if scanner is still running
+      if (scanDuration > 1000) {
+        logger.info(`[PriceAlertScanner] Scan completed in ${scanDuration}ms (configs=${activeConfigs.length})`);
+      } else {
+        logger.debug(`[PriceAlertScanner] Scan completed in ${scanDuration}ms (configs=${activeConfigs.length})`);
+      }
     } catch (error) {
       logger.error('PriceAlertScanner scan failed:', error);
+      // Log stack trace for debugging
+      if (error?.stack) {
+        logger.error('PriceAlertScanner scan error stack:', error.stack);
+      }
     } finally {
       this.isScanning = false;
     }
@@ -539,6 +557,8 @@ export class PriceAlertScanner {
   async runWithConcurrency(items, concurrency, worker) {
     const limit = Math.max(1, Number(concurrency) || 1);
     let idx = 0;
+    let completed = 0;
+    let errors = 0;
 
     const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
       while (idx < items.length) {
@@ -546,13 +566,30 @@ export class PriceAlertScanner {
         const item = items[currentIndex];
         try {
           await worker(item);
+          completed++;
         } catch (err) {
-          logger.error(`[PriceAlertScanner] Worker error:`, err?.message || err);
+          errors++;
+          logger.error(`[PriceAlertScanner] Worker error (item ${currentIndex}/${items.length}):`, err?.message || err);
+          // Log stack trace for debugging
+          if (err?.stack) {
+            logger.error(`[PriceAlertScanner] Worker error stack:`, err.stack);
+          }
         }
       }
     });
 
-    await Promise.allSettled(runners);
+    try {
+      await Promise.allSettled(runners);
+      if (errors > 0) {
+        logger.warn(`[PriceAlertScanner] runWithConcurrency completed: ${completed} success, ${errors} errors out of ${items.length} items`);
+      }
+    } catch (error) {
+      logger.error(`[PriceAlertScanner] runWithConcurrency fatal error:`, error?.message || error);
+      if (error?.stack) {
+        logger.error(`[PriceAlertScanner] runWithConcurrency error stack:`, error.stack);
+      }
+      throw error;
+    }
   }
 
   /**
