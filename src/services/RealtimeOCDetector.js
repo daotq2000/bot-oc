@@ -100,11 +100,25 @@ export class RealtimeOCDetector {
     try {
       if (ex === 'binance') {
         const { webSocketManager } = await import('./WebSocketManager.js');
+
+        // 1) Best: exact bucket open from WS (kline cache / aggregator)
         const wsOpen = webSocketManager.getKlineOpen(sym, interval, bucketStart);
         if (Number.isFinite(wsOpen) && wsOpen > 0) {
-          this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp, source: 'binance_ws_kline' });
-          return { open: wsOpen, error: null, source: 'binance_ws_kline' };
+          this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp, source: 'binance_ws_bucket_open' });
+          return { open: wsOpen, error: null, source: 'binance_ws_bucket_open' };
         }
+
+        // 2) If we have latest candle for this interval and it matches the bucketStart, use its open
+        const latest = webSocketManager.getLatestCandle(sym, interval);
+        if (latest && Number(latest.startTime) === Number(bucketStart)) {
+          const lo = Number(latest.open);
+          if (Number.isFinite(lo) && lo > 0) {
+            this.openPriceCache.set(key, { open: lo, bucketStart, lastUpdate: timestamp, source: 'binance_ws_latest_candle_open' });
+            return { open: lo, error: null, source: 'binance_ws_latest_candle_open' };
+          }
+        }
+
+        // 3) Fallback: previous bucket close as current bucket open
         const intervalMs = this.getIntervalMs(interval);
         const prevBucketStart = bucketStart - intervalMs;
         const prevClose = webSocketManager.getKlineClose(sym, interval, prevBucketStart);

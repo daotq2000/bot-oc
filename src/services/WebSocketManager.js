@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import logger from '../utils/logger.js';
+import { CandleAggregator } from './CandleAggregator.js';
 
 /**
  * Binance Futures WebSocket Manager (public markPrice stream)
@@ -9,10 +10,13 @@ import logger from '../utils/logger.js';
 class WebSocketManager {
   constructor() {
     this.connections = []; // [{ ws, streams:Set<string>, url, reconnectAttempts }]
-    this.priceCache = new Map(); // symbol -> { price, lastAccess }
+    this.priceCache = new Map(); // symbol -> { price, bid, ask, lastAccess }
     this._priceHandlers = new Set(); // listeners for price ticks
+    this._latencyHandlers = new Set(); // listeners for ws latency
     this.klineOpenCache = new Map(); // key: symbol|interval|bucketStart -> { open, lastUpdate }
     this.klineCloseCache = new Map(); // key: symbol|interval|bucketStart -> { close, lastUpdate }
+
+    this.candleAggregator = new CandleAggregator(['1m', '5m', '15m', '30m']);
 
     this.baseUrl = 'wss://fstream.binance.com/stream?streams=';
     this.maxStreamsPerConn = 180; // keep well below 200 limit and URL length issues
@@ -81,6 +85,35 @@ class WebSocketManager {
     return null;
   }
 
+  // Return latest best bid/ask if available
+  getBook(symbol) {
+    const key = String(symbol).toUpperCase();
+    const cached = this.priceCache.get(key);
+    if (cached) {
+      cached.lastAccess = Date.now();
+      const bid = Number(cached.bid);
+      const ask = Number(cached.ask);
+      return {
+        bid: Number.isFinite(bid) ? bid : null,
+        ask: Number.isFinite(ask) ? ask : null,
+        ts: cached.lastAccess
+      };
+    }
+    return { bid: null, ask: null, ts: null };
+  }
+
+  onLatency(handler) {
+    try {
+      if (typeof handler === 'function') this._latencyHandlers.add(handler);
+    } catch (_) {}
+  }
+
+  _emitLatency(tick) {
+    for (const h of Array.from(this._latencyHandlers)) {
+      try { h(tick); } catch (_) {}
+    }
+  }
+
   /**
    * Get cached kline OPEN price for a given symbol/interval/bucket.
    * @param {string} symbol - e.g. 'BTCUSDT'
@@ -89,52 +122,15 @@ class WebSocketManager {
    * @returns {number|null}
    */
   getKlineOpen(symbol, interval, bucketStart) {
-    const sym = String(symbol).toUpperCase();
-    const key = `${sym}|${interval}|${bucketStart}`;
-    const cached = this.klineOpenCache.get(key);
-    if (!cached || !Number.isFinite(cached.open) || cached.open <= 0) {
-      return null;
-    }
-    cached.lastUpdate = Date.now();
-    return cached.open;
+    return this.candleAggregator.getOpen(symbol, interval, bucketStart);
   }
 
-  _storeKlineClose(symbol, interval, close, startTime) {
-    if (!Number.isFinite(close) || close <= 0 || !startTime) return;
-    const sym = String(symbol).toUpperCase();
-    const key = `${sym}|${interval}|${startTime}`;
-    this.klineCloseCache.set(key, {
-      close,
-      lastUpdate: Date.now()
-    });
-  }
-
-  _storeKlineOpen(symbol, interval, open, startTime) {
-    if (!Number.isFinite(open) || open <= 0 || !startTime) return;
-    const sym = String(symbol).toUpperCase();
-    const key = `${sym}|${interval}|${startTime}`;
-    this.klineOpenCache.set(key, {
-      open,
-      lastUpdate: Date.now()
-    });
-  }
-
-  /**
-   * Get cached kline CLOSE price for a given symbol/interval/bucket.
-   * @param {string} symbol - e.g. 'BTCUSDT'
-   * @param {string} interval - e.g. '1m' or '5m'
-   * @param {number} bucketStart - bucket start timestamp (ms)
-   * @returns {number|null}
-   */
   getKlineClose(symbol, interval, bucketStart) {
-    const sym = String(symbol).toUpperCase();
-    const key = `${sym}|${interval}|${bucketStart}`;
-    const cached = this.klineCloseCache.get(key);
-    if (!cached || !Number.isFinite(cached.close) || cached.close <= 0) {
-      return null;
-    }
-    cached.lastUpdate = Date.now();
-    return cached.close;
+    return this.candleAggregator.getClose(symbol, interval, bucketStart);
+  }
+
+  getLatestCandle(symbol, interval) {
+    return this.candleAggregator.getLatestCandle(symbol, interval);
   }
 
   // Subscribe a list of symbols (normalized like BTCUSDT)
@@ -150,11 +146,15 @@ class WebSocketManager {
     let newStreamsCount = 0;
     let skippedCount = 0;
     for (const sym of normalized) {
-      // We subscribe both markPrice and kline (1m, 5m) to build accurate OPEN cache.
+      // Realtime streams: bookTicker for best bid/ask (maker entry) + trade for tick-level aggregation
+      // Kline streams to get authoritative OHLC for multi-timeframes.
       const streamsForSymbol = [
-        `${sym.toLowerCase()}@markPrice`,
+        `${sym.toLowerCase()}@bookTicker`,
+        `${sym.toLowerCase()}@trade`,
         `${sym.toLowerCase()}@kline_1m`,
-        `${sym.toLowerCase()}@kline_5m`
+        `${sym.toLowerCase()}@kline_5m`,
+        `${sym.toLowerCase()}@kline_15m`,
+        `${sym.toLowerCase()}@kline_30m`
       ];
 
       for (const stream of streamsForSymbol) {
@@ -266,49 +266,64 @@ class WebSocketManager {
     });
 
     conn.ws.on('message', (raw) => {
+      const receivedAt = Date.now();
       try {
         const msg = JSON.parse(raw);
-        const payload = msg?.data || msg; // combined stream or direct
+        const payload = msg?.data || msg;
+        const eventTime = Number(payload?.E || payload?.T || 0);
+        const latency = eventTime > 0 ? receivedAt - eventTime : -1;
+        if (latency >= 0) {
+          this._emitLatency({ stream: msg?.stream || 'unknown', latencyMs: latency, receivedAt, eventTime });
+        }
 
-        // Mark price tick (markPrice stream)
-        if (payload && payload.s && payload.p !== undefined) {
+        if (latency > 1000) {
+          logger.debug(`[Binance-WS] High latency detected: ${latency}ms | stream: ${msg?.stream || 'unknown'}`);
+        }
+
+        // bookTicker stream
+        if (payload && payload.u && payload.s && payload.b && payload.a) {
+          const symbol = String(payload.s).toUpperCase();
+          const bid = parseFloat(payload.b);
+          const ask = parseFloat(payload.a);
+          if (Number.isFinite(bid) && Number.isFinite(ask)) {
+            this.priceCache.set(symbol, { price: bid, bid, ask, lastAccess: receivedAt });
+            this._emitPrice({ symbol, price: bid, bid, ask, ts: eventTime });
+          }
+        }
+        // trade stream
+        else if (payload && payload.e === 'trade') {
           const symbol = String(payload.s).toUpperCase();
           const price = parseFloat(payload.p);
-          if (Number.isFinite(price)) {
-            // Use LRU-style caching with size limit
-            if (this.priceCache.size >= this.maxPriceCacheSize && !this.priceCache.has(symbol)) {
-              // Remove oldest entry if at limit
-              const oldest = Array.from(this.priceCache.entries())
-                .sort((a, b) => a[1].lastAccess - b[1].lastAccess)[0];
-              if (oldest) this.priceCache.delete(oldest[0]);
-            }
-            this.priceCache.set(symbol, { price, lastAccess: Date.now() });
-            this._emitPrice({ symbol, price, ts: Date.now() });
+          const volume = parseFloat(payload.q);
+          if (Number.isFinite(price) && Number.isFinite(volume)) {
+            this.candleAggregator.ingestTick({ symbol, price, volume, ts: eventTime });
+            // Also update price cache with last trade price
+            const cached = this.priceCache.get(symbol) || { lastAccess: 0 };
+            cached.price = price;
+            cached.lastAccess = receivedAt;
+            this.priceCache.set(symbol, cached);
+            this._emitPrice({ symbol, price, ts: eventTime });
           }
         }
-
-        // Kline stream (for OPEN caching)
-        if (payload && payload.e === 'kline' && payload.s && payload.k) {
-          const symbol = String(payload.s).toUpperCase();
+        // kline stream
+        else if (payload && payload.e === 'kline' && payload.s && payload.k) {
           const k = payload.k;
-          const interval = String(k.i || '').toLowerCase(); // e.g. '1m', '5m'
-          const openStr = k.o;
-          const startTime = Number(k.t); // candle start time (ms)
-          const open = parseFloat(openStr);
-          if (Number.isFinite(open) && open > 0 && startTime > 0 && (interval === '1m' || interval === '5m')) {
-            this._storeKlineOpen(symbol, interval, open, startTime);
-          }
-
-          // Store CLOSE when candle is closed (k.x === true)
-          const isClosed = Boolean(k.x);
-          if (isClosed) {
-            const close = parseFloat(k.c);
-            if (Number.isFinite(close) && close > 0 && startTime > 0 && (interval === '1m' || interval === '5m')) {
-              this._storeKlineClose(symbol, interval, close, startTime);
-            }
-          }
+          this.candleAggregator.ingestKline({
+            symbol: k.s,
+            interval: k.i,
+            startTime: k.t,
+            open: k.o,
+            high: k.h,
+            low: k.l,
+            close: k.c,
+            volume: k.v,
+            isClosed: k.x,
+            ts: eventTime
+          });
         }
-      } catch (_) {}
+      } catch (e) {
+        logger.debug(`[Binance-WS] Failed to handle message: ${e?.message || e}`);
+      }
     });
 
     conn.ws.on('close', (code, reason) => {
