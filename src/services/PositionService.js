@@ -1486,7 +1486,7 @@ export class PositionService {
       // After position is confirmed closed, cancel any remaining TP/SL orders
       try {
         logger.info(`[Close Position] Cleaning up any remaining open orders for symbol ${position.symbol}`);
-        await this.exchangeService.cancelAllOpenOrders(position.symbol);
+        await this.exchangeService.cancelAllOpenOrders(position.symbol, { protectStrategySl: false });
       } catch (e) {
         logger.warn(`[Close Position] Failed to clean up open orders for ${position.symbol} after closing: ${e?.message || e}`);
       }

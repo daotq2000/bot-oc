@@ -1407,9 +1407,9 @@ export class ExchangeService {
    * @param {string} symbol - Trading symbol
    * @returns {Promise<Object>} Cancellation result
    */
-  async cancelAllOpenOrders(symbol) {
+  async cancelAllOpenOrders(symbol, options = {}) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
-      return await this.binanceDirectClient.cancelAllOpenOrders(symbol);
+      return await this.binanceDirectClient.cancelAllOpenOrders(symbol, options);
     }
     // CCXT does not have a unified method for this, so we'll skip for other exchanges for now.
     logger.warn(`[ExchangeService] cancelAllOpenOrders not implemented for ${this.bot.exchange}`);

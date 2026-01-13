@@ -8,6 +8,29 @@ import logger from '../utils/logger.js';
 import { webSocketManager } from './WebSocketManager.js';
 import { configService } from './ConfigService.js';
 
+// --- Order Ownership Helpers ---
+export const STRATEGY_PREFIX = 'STRAT_';
+export const STRATEGY_SL_PREFIX = 'STRAT_SL_';
+
+/**
+ * Checks if an order is a Stop Loss order managed by a strategy.
+ * @param {string} clientOrderId The client order ID.
+ * @returns {boolean} True if it's a strategy-managed SL order.
+ */
+export function isStrategySlOrder(clientOrderId) {
+  return clientOrderId && clientOrderId.startsWith(STRATEGY_SL_PREFIX);
+}
+
+/**
+ * Checks if an order is managed by a strategy.
+ * @param {string} clientOrderId The client order ID.
+ * @returns {boolean} True if it's a strategy-managed order.
+ */
+export function isStrategyOrder(clientOrderId) {
+  return clientOrderId && clientOrderId.startsWith(STRATEGY_PREFIX);
+}
+// -----------------------------
+
 
 export class BinanceDirectClient {
   constructor(apiKey, secretKey, isTestnet = true, exchangeInfoService = null) {
@@ -2026,7 +2049,7 @@ export class BinanceDirectClient {
    * @param {number} quantity - Order quantity (optional, use closePosition=true if not provided)
    * @returns {Promise<Object>} Order response
    */
-  async createTpLimitOrder(symbol, side, tpPrice, quantity = null) {
+  async createTpLimitOrder(symbol, side, tpPrice, quantity = null, options = {}) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
     // Get precision info & account mode
@@ -2099,6 +2122,12 @@ export class BinanceDirectClient {
       closePosition: quantity ? 'false' : 'true',
       timeInForce: 'GTC'
     };
+
+    // --- Ownership ---
+    if (options.clientOrderId) {
+      params.newClientOrderId = options.clientOrderId;
+    }
+    // -----------------
 
     // Only include positionSide in dual-side (hedge) mode
     if (dualSide) {
@@ -2209,7 +2238,7 @@ export class BinanceDirectClient {
    * @param {number} quantity - Order quantity (optional, use closePosition=true if not provided)
    * @returns {Promise<Object>} Order response
    */
-  async createSlLimitOrder(symbol, side, slPrice, quantity = null) {
+  async createSlLimitOrder(symbol, side, slPrice, quantity = null, options = {}) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
     
     // Get precision info & account mode
@@ -2365,10 +2394,16 @@ export class BinanceDirectClient {
       symbol: normalizedSymbol,
       side: orderSide,
       type: 'STOP_MARKET', // Changed from 'STOP' to 'STOP_MARKET' for API compatibility
-      stopPrice: stopPrice.toString() // Trigger price (when price reaches this, market order activates)
+      stopPrice: stopPrice.toString(), // Trigger price (when price reaches this, market order activates)
       // NOTE: Do NOT include 'price' parameter for STOP_MARKET orders (it's a market order, not limit)
       // NOTE: Do NOT include 'timeInForce' for STOP_MARKET orders
     };
+
+    // --- Ownership --- 
+    if (options.clientOrderId) {
+      params.newClientOrderId = options.clientOrderId;
+    }
+    // -----------------
 
     // Only include positionSide in dual-side (hedge) mode
     if (dualSide) {
@@ -2549,10 +2584,46 @@ export class BinanceDirectClient {
   /**
    * Cancel order by orderId
    */
-  async cancelAllOpenOrders(symbol) {
+  async cancelAllOpenOrders(symbol, { protectStrategySl = true } = {}) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
-    logger.info(`[BinanceDirectClient] Cancelling all open orders for ${normalizedSymbol}...`);
-    return await this.makeRequest('/fapi/v1/allOpenOrders', 'DELETE', { symbol: normalizedSymbol }, true);
+
+    if (!protectStrategySl) {
+      logger.info(`[BinanceDirectClient] Cancelling all open orders for ${normalizedSymbol} (no protection)...`);
+      return await this.makeRequest('/fapi/v1/allOpenOrders', 'DELETE', { symbol: normalizedSymbol }, true);
+    }
+
+    // Protected mode: do NOT cancel Strategy SL orders (clientOrderId prefix STRAT_SL_)
+    // We must list open orders and cancel individually.
+    logger.info(`[BinanceDirectClient] Cancelling open orders for ${normalizedSymbol} (protectStrategySl=true)...`);
+
+    const openOrders = await this.getOpenOrders(normalizedSymbol);
+    if (!Array.isArray(openOrders) || openOrders.length === 0) {
+      return [];
+    }
+
+    const results = [];
+    for (const o of openOrders) {
+      const coid = o?.clientOrderId || o?.origClientOrderId || '';
+      if (isStrategySlOrder(coid)) {
+        logger.info(
+          `[BinanceDirectClient] 🛡️ Skip cancel Strategy SL order | symbol=${normalizedSymbol} ` +
+          `orderId=${o?.orderId || 'N/A'} clientOrderId=${coid}`
+        );
+        continue;
+      }
+
+      try {
+        const r = await this.cancelOrder(normalizedSymbol, o.orderId);
+        results.push(r);
+      } catch (e) {
+        logger.warn(
+          `[BinanceDirectClient] Failed to cancel order during cancelAllOpenOrders protected mode | ` +
+          `symbol=${normalizedSymbol} orderId=${o?.orderId || 'N/A'} error=${e?.message || e}`
+        );
+      }
+    }
+
+    return results;
   }
 
   /**
