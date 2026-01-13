@@ -331,6 +331,15 @@ export class EntryOrderMonitor {
             logger.error(`[EntryOrderMonitor] Failed to send WS exit filled alert for order ${exitOrderId}: ${alertErr?.message || alertErr}`);
           }
           
+          // CRITICAL: Cancel all pending orders for this symbol even if position not found in DB
+          // This prevents orders from hanging when position is closed via websocket but not found in DB
+          try {
+            await this._cancelPendingOrdersForSymbol(botId, symbol, null);
+          } catch (cancelErr) {
+            // Non-critical: log error but don't fail
+            logger.warn(`[EntryOrderMonitor] Failed to cancel pending orders for symbol ${symbol} after exit order ${exitOrderId} fill (position not found): ${cancelErr?.message || cancelErr}`);
+          }
+          
           return;
       }
       
@@ -370,7 +379,141 @@ export class EntryOrderMonitor {
       logger.error(`[EntryOrderMonitor] Failed to send Telegram close alert for position ${position.id}: ${notifyErr?.message || notifyErr}`);
     }
 
+    // CRITICAL: Cancel all pending orders for this symbol to prevent hanging orders
+    // This ensures that when a position is closed via websocket, any pending entry orders
+    // or other pending orders for the same symbol are cancelled to avoid order hanging
+    try {
+      await this._cancelPendingOrdersForSymbol(botId, position.symbol, position.id);
+    } catch (cancelErr) {
+      // Non-critical: log error but don't fail position close
+      logger.warn(`[EntryOrderMonitor] Failed to cancel pending orders for symbol ${position.symbol} after position ${position.id} close: ${cancelErr?.message || cancelErr}`);
+    }
+
     return closed;
+  }
+
+  /**
+   * Cancel all pending orders for a symbol after position is closed
+   * This prevents orders from hanging when position is closed via websocket
+   * CRITICAL: This function cancels ALL pending orders for the symbol, including:
+   * - Entry orders (LIMIT, MARKET)
+   * - TP orders (TAKE_PROFIT_MARKET, TAKE_PROFIT)
+   * - SL orders (STOP_MARKET, STOP, STOP_LOSS_LIMIT)
+   * - Any other pending orders
+   * This ensures no orders are left hanging after position closure
+   * @param {number} botId - Bot ID
+   * @param {string} symbol - Symbol (e.g., 'BTCUSDT')
+   * @param {number|null} closedPositionId - Closed position ID (for logging, null if position not found in DB)
+   */
+  async _cancelPendingOrdersForSymbol(botId, symbol, closedPositionId) {
+    try {
+      const exchangeService = this.exchangeServices.get(botId);
+      if (!exchangeService) {
+        logger.debug(`[EntryOrderMonitor] ExchangeService not found for bot ${botId}, skipping pending order cancellation for ${symbol}`);
+        return;
+      }
+
+      // Get all open orders for this symbol
+      const openOrders = await exchangeService.getOpenOrders(symbol);
+      if (!Array.isArray(openOrders) || openOrders.length === 0) {
+        const positionInfo = closedPositionId ? `position ${closedPositionId}` : 'exit order fill';
+        logger.debug(`[EntryOrderMonitor] No open orders found for symbol ${symbol} after ${positionInfo}`);
+        return;
+      }
+
+      // CRITICAL: Cancel ALL pending orders for this symbol, regardless of order type
+      // This includes:
+      // - Entry orders (LIMIT, MARKET)
+      // - TP orders (TAKE_PROFIT_MARKET, TAKE_PROFIT)
+      // - SL orders (STOP_MARKET, STOP, STOP_LOSS_LIMIT) - even if hard SL, position is closed so cancel them
+      // - Any other pending orders
+      // Filter pending orders (status: NEW, OPEN, or PARTIALLY_FILLED)
+      // Exclude orders that are already filled or cancelled
+      const pendingOrders = openOrders.filter(order => {
+        const status = String(order?.status || '').toUpperCase();
+        const orderId = String(order?.orderId || order?.id || '');
+        const orderType = String(order?.type || order?.orderType || '').toUpperCase();
+        
+        // Skip if order is already filled, cancelled, or expired
+        if (status === 'FILLED' || status === 'CANCELED' || status === 'CANCELLED' || status === 'EXPIRED') {
+          return false;
+        }
+
+        // Include NEW, OPEN, or PARTIALLY_FILLED orders
+        // For PARTIALLY_FILLED, we still cancel to avoid hanging partial fills
+        if (status === 'NEW' || status === 'OPEN' || status === 'PARTIALLY_FILLED') {
+          return true;
+        }
+
+        // If status is unknown but order exists, include it to be safe
+        // This ensures we don't miss any orders that might be in an unexpected state
+        return true;
+      });
+
+      if (pendingOrders.length === 0) {
+        const positionInfo = closedPositionId ? `position ${closedPositionId}` : 'exit order fill';
+        logger.debug(`[EntryOrderMonitor] No pending orders to cancel for symbol ${symbol} after ${positionInfo}`);
+        return;
+      }
+
+      const positionInfo = closedPositionId ? `position ${closedPositionId} close` : 'exit order fill';
+      const orderTypes = pendingOrders.map(o => `${o.orderId || o.id}(${o.type || o.orderType || 'UNKNOWN'})`).join(', ');
+      logger.info(
+        `[EntryOrderMonitor] 🗑️ Cancelling ${pendingOrders.length} pending orders for symbol ${symbol} ` +
+        `after ${positionInfo}. Orders: ${orderTypes}`
+      );
+
+      // Cancel all pending orders in parallel (with error handling)
+      const cancelResults = await Promise.allSettled(
+        pendingOrders.map(async (order) => {
+          const orderId = String(order.orderId || order.id || '');
+          const orderType = String(order?.type || order?.orderType || 'UNKNOWN').toUpperCase();
+          if (!orderId) {
+            logger.warn(`[EntryOrderMonitor] Skipping order cancellation: invalid orderId for order ${JSON.stringify(order)}`);
+            return { success: false, orderId: 'invalid', error: 'Invalid orderId' };
+          }
+
+          try {
+            await exchangeService.cancelOrder(orderId, symbol);
+            const posInfo = closedPositionId ? `position ${closedPositionId} closed` : 'exit order filled';
+            logger.info(`[EntryOrderMonitor] ✅ Cancelled pending order ${orderId} (${orderType}) for symbol ${symbol} (${posInfo})`);
+            return { success: true, orderId };
+          } catch (cancelError) {
+            const errorMsg = cancelError?.message || String(cancelError);
+            // Ignore "Unknown order" errors (order may have been filled/cancelled already)
+            if (errorMsg.includes('Unknown order') || errorMsg.includes('not found') || errorMsg.includes('does not exist')) {
+              logger.debug(`[EntryOrderMonitor] Order ${orderId} already cancelled/filled on exchange, skipping`);
+              return { success: true, orderId, skipped: true };
+            }
+            logger.warn(`[EntryOrderMonitor] Failed to cancel pending order ${orderId} for symbol ${symbol}: ${errorMsg}`);
+            return { success: false, orderId, error: errorMsg };
+          }
+        })
+      );
+
+      // Log summary
+      const successful = cancelResults.filter(r => r.status === 'fulfilled' && r.value?.success).length;
+      const failed = cancelResults.filter(r => r.status === 'rejected' || (r.status === 'fulfilled' && !r.value?.success)).length;
+      const posInfo = closedPositionId ? `position ${closedPositionId} close` : 'exit order fill';
+      
+      if (failed > 0) {
+        logger.warn(
+          `[EntryOrderMonitor] ⚠️ Cancelled ${successful}/${pendingOrders.length} pending orders for symbol ${symbol} ` +
+          `after ${posInfo} (${failed} failed)`
+        );
+      } else {
+        logger.info(
+          `[EntryOrderMonitor] ✅ Successfully cancelled ${successful} pending orders for symbol ${symbol} ` +
+          `after ${posInfo}`
+        );
+      }
+    } catch (error) {
+      logger.error(
+        `[EntryOrderMonitor] ❌ Error cancelling pending orders for symbol ${symbol} after position ${closedPositionId} close: ` +
+        `${error?.message || error}`
+      );
+      throw error; // Re-throw to be caught by caller
+    }
   }
 
   async _getPositionServiceForBot(botId) {

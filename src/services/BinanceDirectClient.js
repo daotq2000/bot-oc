@@ -2201,10 +2201,11 @@ export class BinanceDirectClient {
   }
 
   /**
-   * Create Stop Loss Limit order
+   * Create Stop Loss STOP_MARKET order (changed from STOP limit order for API compatibility)
+   * Uses STOP_MARKET type which triggers a market order when stopPrice is hit
    * @param {string} symbol - Trading symbol
    * @param {string} side - 'long' or 'short' (original position side)
-   * @param {number} slPrice - Stop loss price
+   * @param {number} slPrice - Stop loss trigger price (when reached, market order activates)
    * @param {number} quantity - Order quantity (optional, use closePosition=true if not provided)
    * @returns {Promise<Object>} Order response
    */
@@ -2357,13 +2358,16 @@ export class BinanceDirectClient {
     // For SL: long position closes with SELL, short position closes with BUY
     const orderSide = side === 'long' ? 'SELL' : 'BUY';
     
+    // CRITICAL FIX for Testnet: Use STOP_MARKET instead of STOP
+    // STOP type is not supported on /fapi/v1/order endpoint (returns -4120 or -1106)
+    // STOP_MARKET is the supported alternative that triggers a market order when stopPrice is hit
     const params = {
       symbol: normalizedSymbol,
       side: orderSide,
-      type: 'STOP',
-      stopPrice: stopPrice.toString(), // Trigger price (when price reaches this, order activates)
-      price: limitPrice.toString(), // Limit price (adjusted to be slightly better than stop price)
-      timeInForce: 'GTC'
+      type: 'STOP_MARKET', // Changed from 'STOP' to 'STOP_MARKET' for API compatibility
+      stopPrice: stopPrice.toString() // Trigger price (when price reaches this, market order activates)
+      // NOTE: Do NOT include 'price' parameter for STOP_MARKET orders (it's a market order, not limit)
+      // NOTE: Do NOT include 'timeInForce' for STOP_MARKET orders
     };
 
     // Only include positionSide in dual-side (hedge) mode
@@ -2379,14 +2383,15 @@ export class BinanceDirectClient {
       }
       params.quantity = formattedQuantity; // Pass as string
       params.closePosition = 'false';
-      // NOTE: Do NOT set reduceOnly when quantity is provided for STOP orders
-      // Binance will automatically treat it as reduce-only based on positionSide
+      // CRITICAL: Do NOT set reduceOnly for STOP_MARKET orders with quantity
+      // Binance Testnet returns -1106 error if reduceOnly is sent when not required
+      // Binance will automatically treat it as reduce-only based on positionSide in hedge mode
     } else {
-      // No quantity: use closePosition=true (and optionally reduceOnly for -4400 compliance)
+      // No quantity: use closePosition=true
       params.closePosition = 'true';
-      // For STOP orders with closePosition, reduceOnly may not be needed/allowed
-      // Only set it if Binance requires it (e.g., during -4400 quant rule windows)
-      // For now, don't set it to avoid -1106 error
+      // CRITICAL: Do NOT set reduceOnly for STOP_MARKET orders with closePosition
+      // Binance Testnet returns -1106 error: "Parameter 'reduceonly' sent when not required"
+      // closePosition=true already implies reduce-only behavior
     }
     
     // Safety check to prevent -2021 "Order would immediately trigger"
@@ -2403,15 +2408,15 @@ export class BinanceDirectClient {
       }
     }
     
-    logger.info(`Creating SL limit order: ${orderSide} ${normalizedSymbol} @ stopPrice=${stopPrice}, limitPrice=${limitPrice}${dualSide ? ` (${positionSide})` : ''}`);
+    logger.info(`Creating SL STOP_MARKET order: ${orderSide} ${normalizedSymbol} @ stopPrice=${stopPrice}${dualSide ? ` (${positionSide})` : ''}`);
     
     try {
       const data = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
       if (!data || !data.orderId) {
-        logger.error(`Failed to place SL limit order: Invalid response from Binance`, { data, symbol: normalizedSymbol, side, slPrice, stopPrice, limitPrice });
+          logger.error(`Failed to place SL STOP_MARKET order: Invalid response from Binance`, { data, symbol: normalizedSymbol, side, slPrice, stopPrice });
         throw new Error(`Invalid order response: ${JSON.stringify(data)}`);
       }
-      logger.info(`✅ SL limit order placed: Order ID: ${data.orderId}`);
+      logger.info(`✅ SL STOP_MARKET order placed: Order ID: ${data.orderId}`);
       return data;
     } catch (error) {
       const errorMsg = error?.message || String(error);
@@ -2424,10 +2429,14 @@ export class BinanceDirectClient {
       );
       
       // Handle -4120: Order type not supported → fallback to LIMIT order with reduceOnly
-      if (errorCode === -4120 || errorCode === '-4120' || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
+      // Also handle -1106: Parameter 'reduceonly' sent when not required (should not happen with STOP_MARKET)
+      if (errorCode === -4120 || errorCode === '-4120' || errorCode === -1106 || errorCode === '-1106' || 
+          errorMsg.includes('-4120') || errorMsg.includes('-1106') || 
+          errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API') ||
+          errorMsg.includes("Parameter 'reduceonly' sent when not required")) {
         logger.warn(
-          `[SL Fallback] STOP order type not supported for ${normalizedSymbol}, ` +
-          `using LIMIT order with reduceOnly instead | errorCode=${errorCode}`
+          `[SL Fallback] STOP_MARKET order failed for ${normalizedSymbol} (errorCode=${errorCode}), ` +
+          `using LIMIT order with reduceOnly instead`
         );
         
         // Fallback: Use LIMIT order
@@ -2459,13 +2468,13 @@ export class BinanceDirectClient {
         try {
           const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
           if (!fallbackData || !fallbackData.orderId) {
-            logger.error(`Failed to place SL limit order (fallback): Invalid response from Binance`, { data: fallbackData, symbol: normalizedSymbol, side, slPrice });
+            logger.error(`Failed to place SL order (fallback LIMIT): Invalid response from Binance`, { data: fallbackData, symbol: normalizedSymbol, side, slPrice });
             throw new Error(`Invalid order response: ${JSON.stringify(fallbackData)}`);
           }
           logger.info(`✅ SL limit order placed (fallback LIMIT): Order ID: ${fallbackData.orderId}`);
           return fallbackData;
         } catch (fallbackError) {
-          logger.error(`Failed to create SL limit order (fallback also failed):`, {
+          logger.error(`Failed to create SL order (fallback LIMIT also failed):`, {
             error: fallbackError?.message || String(fallbackError),
             symbol: normalizedSymbol,
             side,
@@ -2476,13 +2485,13 @@ export class BinanceDirectClient {
       }
       
       // For other errors, log and throw
-      logger.error(`Failed to create SL limit order:`, {
+      logger.error(`Failed to create SL STOP_MARKET order:`, {
         error: errorMsg,
+        errorCode,
         symbol: normalizedSymbol,
         side,
         slPrice,
         stopPrice,
-        limitPrice,
         params: this.sanitizeParams(params)
       });
       throw error;
