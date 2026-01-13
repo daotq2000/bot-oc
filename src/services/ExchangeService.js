@@ -790,6 +790,7 @@ export class ExchangeService {
       return order;
     } catch (error) {
       const msg = error?.message || '';
+      const errorCode = error?.code;
       
       // MEXC-specific error codes and messages
       const mexcErrors = [
@@ -802,7 +803,15 @@ export class ExchangeService {
         'Order price is too low', // MEXC: Price out of range
       ];
       
+      // Check for -4400 by code or message (handled gracefully in OrderService)
+      // errorCode can be number (-4400) or string ('-4400')
+      const isQuantitativeRuleError = 
+        errorCode === -4400 || errorCode === '-4400' || String(errorCode) === '-4400' ||
+        msg.includes('-4400') || msg.includes('Quantitative Rules violated') || 
+        msg.includes('only reduceOnly order is allowed');
+      
       const soft = (
+        isQuantitativeRuleError ||
         msg.includes('not available for trading on Binance Futures') ||
         msg.includes('below minimum notional') ||
         msg.includes('Invalid price after rounding') ||
@@ -810,8 +819,16 @@ export class ExchangeService {
         msg.includes('-1121') || msg.includes('-1111') || msg.includes('-4061') ||
         mexcErrors.some(err => msg.includes(err))
       );
+      
+      // CRITICAL: -4400 is handled gracefully in OrderService, so log as warn not error
       if (soft) {
-        logger.warn(`Create order validation for bot ${this.bot.id}: ${msg}`);
+        if (isQuantitativeRuleError) {
+          logger.warn(
+            `[ExchangeService] -4400 Quantitative Rules violation (handled in OrderService) for bot ${this.bot.id}: ${msg}`
+          );
+        } else {
+          logger.warn(`Create order validation for bot ${this.bot.id}: ${msg}`);
+        }
       } else {
         logger.error(`Failed to create order for bot ${this.bot.id}:`, error);
       }

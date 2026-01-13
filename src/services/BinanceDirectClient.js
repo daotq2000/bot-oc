@@ -46,8 +46,10 @@ export class BinanceDirectClient {
 
     // CRITICAL FIX: Request queue for rate limiting (prevents IP ban)
     // Binance Futures: 1200 requests per minute (20 req/sec), but we use conservative 8 req/sec
+    // PRIORITY QUEUE: Mainnet (isTestnet=false) has priority=1 (highest), Testnet has priority=0
     this._requestQueue = [];
     this._isProcessingQueue = false;
+    this.isMainnet = !isTestnet; // Track if this client is for mainnet
     this._requestInterval = Number(configService.getNumber('BINANCE_REQUEST_INTERVAL_MS', 125)); // 8 req/sec default
     this._lastSignedRequestTime = 0; // Track signed requests separately (more strict)
     this._signedRequestInterval = Number(configService.getNumber('BINANCE_SIGNED_REQUEST_INTERVAL_MS', 150)); // ~6.6 req/sec for signed
@@ -358,27 +360,48 @@ export class BinanceDirectClient {
   }
 
   /**
-   * CRITICAL FIX: Queue request for rate limiting
+   * CRITICAL FIX: Queue request for rate limiting with priority
+   * PRIORITY: Mainnet (isMainnet=true) = 1 (highest), Testnet = 0 (lower)
    * @param {Function} requestFn - Async function to execute
    * @param {boolean} isSigned - Whether this is a signed request (stricter rate limit)
    * @returns {Promise} Request result
    */
   async _queueRequest(requestFn, isSigned = false) {
     return new Promise((resolve, reject) => {
-      this._requestQueue.push({ requestFn, isSigned, resolve, reject });
+      // Priority: Mainnet = 1 (highest), Testnet = 0 (lower)
+      // Higher priority = processed first
+      const priority = this.isMainnet ? 1 : 0;
+      const queueItem = { requestFn, isSigned, resolve, reject, priority };
+      
+      // Insert into queue maintaining priority order (highest first)
+      // Mainnet requests go to front, testnet to back
+      let inserted = false;
+      for (let i = 0; i < this._requestQueue.length; i++) {
+        if (this._requestQueue[i].priority < priority) {
+          this._requestQueue.splice(i, 0, queueItem);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) {
+        this._requestQueue.push(queueItem);
+      }
+      
       this._processRequestQueue().catch(() => {});
     });
   }
 
   /**
    * CRITICAL FIX: Process request queue with rate limiting
+   * PRIORITY: Always processes mainnet requests first, then testnet
    */
   async _processRequestQueue() {
     if (this._isProcessingQueue) return;
     this._isProcessingQueue = true;
 
     while (this._requestQueue.length > 0) {
-      const { requestFn, isSigned, resolve, reject } = this._requestQueue.shift();
+      // Queue is already sorted by priority (mainnet first), so shift() gets highest priority
+      const { requestFn, isSigned, resolve, reject, priority } = this._requestQueue.shift();
       
       // Check circuit breaker
       if (!this._checkCircuitBreaker()) {
@@ -394,8 +417,10 @@ export class BinanceDirectClient {
         error.code = 'RATE_LIMIT_BLOCKED';
         error.status = 429;
         reject(error);
-        // Re-queue the request to retry later
-        this._requestQueue.unshift({ requestFn, isSigned, resolve, reject });
+        // Re-queue the request to retry later (maintain priority)
+        const queueItem = { requestFn, isSigned, resolve, reject, priority };
+        // Insert at front to retry immediately (but still respect priority when processing)
+        this._requestQueue.unshift(queueItem);
         // Wait a bit before checking again
         await new Promise(resolve => setTimeout(resolve, 1000));
         continue;
@@ -971,9 +996,17 @@ export class BinanceDirectClient {
             }
             
             // CRITICAL FIX: Create error with code for classification
+            // Suppress error log for -4400 (Quantitative Rules) as it's handled gracefully in OrderService
             const error = new Error(`Binance API Error ${data.code}: ${data.msg}`);
             error.code = data.code;
             error.status = response.status;
+            if (data.code === -4400) {
+              // Log as debug instead of error since OrderService handles it gracefully
+              logger.debug(
+                `[Binance] -4400 Quantitative Rules violation (handled in OrderService) | ` +
+                `endpoint=${endpoint} symbol=${params?.symbol || 'N/A'}`
+              );
+            }
             throw error;
           }
           const error = new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
@@ -1272,6 +1305,7 @@ export class BinanceDirectClient {
     const priceFilter = info?.filters?.find(f => f.filterType === 'PRICE_FILTER');
     return {
       minPrice: priceFilter?.minPrice || '0',
+      maxPrice: priceFilter?.maxPrice || null,
       tickSize: priceFilter?.tickSize || '0.01'
     };
   }
@@ -1285,11 +1319,44 @@ export class BinanceDirectClient {
     if (triggerFilter) {
       return {
         minPrice: triggerFilter?.minPrice || '0',
+        maxPrice: triggerFilter?.maxPrice || null,
         tickSize: triggerFilter?.tickSize || '0.01'
       };
     }
     // Fallback to price filter when trigger filter is not present
     return await this.getPriceFilter(symbol);
+  }
+
+  /**
+   * Get percent price band for a symbol and order side (for price protection)
+   * Uses PERCENT_PRICE_BY_SIDE if available, else PERCENT_PRICE.
+   */
+  async getPercentPriceBand(symbol, orderSideForPrice) {
+    const info = await this.getTradingExchangeSymbol(symbol);
+    if (!info?.filters) return null;
+
+    const filter =
+      info.filters.find(f => f.filterType === 'PERCENT_PRICE_BY_SIDE') ||
+      info.filters.find(f => f.filterType === 'PERCENT_PRICE');
+
+    if (!filter) return null;
+
+    // For hedge mode: BUY uses askMultiplier*, SELL uses bidMultiplier*
+    // For one-way: use multiplierUp/Down
+    if (filter.filterType === 'PERCENT_PRICE_BY_SIDE') {
+      const isBuy = orderSideForPrice === 'BUY';
+      const up = isBuy ? filter.askMultiplierUp : filter.bidMultiplierUp;
+      const down = isBuy ? filter.askMultiplierDown : filter.bidMultiplierDown;
+      return {
+        up: up ? parseFloat(up) : null,
+        down: down ? parseFloat(down) : null
+      };
+    }
+
+    return {
+      up: filter.multiplierUp ? parseFloat(filter.multiplierUp) : null,
+      down: filter.multiplierDown ? parseFloat(filter.multiplierDown) : null
+    };
   }
 
   /**
@@ -2066,12 +2133,12 @@ export class BinanceDirectClient {
         logger.warn(`[TP Fallback] TAKE_PROFIT order type not supported, using LIMIT order with reduceOnly instead`);
         
         // Fallback: Use LIMIT order with reduceOnly=true
+        // CRITICAL FIX: Must include closePosition=true OR quantity for LIMIT orders
         const fallbackParams = {
           symbol: normalizedSymbol,
           side: orderSide,
           type: 'LIMIT',
           price: limitPriceStr,
-          quantity: params.quantity || undefined,
           timeInForce: 'GTC',
           reduceOnly: 'true'
         };
@@ -2081,12 +2148,20 @@ export class BinanceDirectClient {
           fallbackParams.positionSide = positionSide;
         }
         
-        // If quantity not provided, we need to get it from position
-        if (!fallbackParams.quantity && quantity) {
+        // If quantity provided, use it; otherwise use closePosition=true
+        if (params.quantity) {
+          fallbackParams.quantity = params.quantity;
+        } else if (quantity) {
           const formattedQuantity = this.formatQuantity(quantity, stepSize);
           if (parseFloat(formattedQuantity) > 0) {
             fallbackParams.quantity = formattedQuantity;
+          } else {
+            // No valid quantity, use closePosition instead
+            fallbackParams.closePosition = 'true';
           }
+        } else {
+          // No quantity at all, use closePosition
+          fallbackParams.closePosition = 'true';
         }
         
         try {
@@ -2143,8 +2218,26 @@ export class BinanceDirectClient {
       this.getDualSidePosition()
     ]);
     
-    // Format stop price (trigger price)
-    const stopPrice = this.formatPrice(slPrice, tickSize);
+    // Fetch price bounds to avoid -4016 / -4024 (price outside allowed band)
+    const [priceFilter, triggerFilter, percentBand, markPrice] = await Promise.all([
+      this.getPriceFilter(normalizedSymbol),
+      this.getTriggerOrderPriceFilter(normalizedSymbol),
+      this.getPercentPriceBand(normalizedSymbol, side === 'long' ? 'SELL' : 'BUY'),
+      this.getPrice(normalizedSymbol)
+    ]);
+
+    const clampPrice = (val, filter) => {
+      const minP = parseFloat(filter?.minPrice || '0');
+      const maxP = parseFloat(filter?.maxPrice || '0');
+      let v = parseFloat(val);
+      if (minP > 0 && v < minP) v = minP;
+      if (maxP > 0 && v > maxP) v = maxP;
+      return v;
+    };
+
+    // Format stop price (trigger price) with trigger filter bounds
+    let stopPrice = this.formatPrice(slPrice, triggerFilter?.tickSize || tickSize);
+    stopPrice = this.formatPrice(clampPrice(stopPrice, triggerFilter), triggerFilter?.tickSize || tickSize);
     
     // For STOP (stop loss) orders, use the same rule as TP: set limit slightly worse to increase fill probability
     // SELL orders: limit price slightly lower than stop
@@ -2154,10 +2247,109 @@ export class BinanceDirectClient {
     const orderSideForSl = side === 'long' ? 'SELL' : 'BUY';
     if (orderSideForSl === 'SELL') {
       // SELL: set limit below stop
-      limitPrice = this.formatPrice(stopPrice - tick, tickSize);
+      limitPrice = this.formatPrice(stopPrice - tick, priceFilter?.tickSize || tickSize);
     } else {
       // BUY: set limit above stop
-      limitPrice = this.formatPrice(stopPrice + tick, tickSize);
+      limitPrice = this.formatPrice(stopPrice + tick, priceFilter?.tickSize || tickSize);
+    }
+
+    // Apply percent price protection band FIRST (uses mark price) - this is the strictest constraint
+    if (markPrice && percentBand) {
+      const mp = parseFloat(markPrice);
+      if (mp > 0) {
+        const bandMin = percentBand.down ? mp * percentBand.down : null;
+        const bandMax = percentBand.up ? mp * percentBand.up : null;
+        if (bandMin && limitPrice < bandMin) {
+          logger.warn(
+            `[SL Clamp] Limit price ${limitPrice} below percent band min ${bandMin.toFixed(8)} for ${normalizedSymbol}, clamping`
+          );
+          limitPrice = this.formatPrice(bandMin, priceFilter?.tickSize || tickSize);
+        }
+        if (bandMax && limitPrice > bandMax) {
+          logger.warn(
+            `[SL Clamp] Limit price ${limitPrice} above percent band max ${bandMax.toFixed(8)} for ${normalizedSymbol}, clamping`
+          );
+          limitPrice = this.formatPrice(bandMax, priceFilter?.tickSize || tickSize);
+        }
+      }
+    }
+
+    // Then clamp to PRICE_FILTER bounds (minPrice/maxPrice)
+    const clampedLimit = clampPrice(limitPrice, priceFilter);
+    if (Math.abs(clampedLimit - limitPrice) > parseFloat(priceFilter?.tickSize || tickSize) * 0.1) {
+      logger.warn(
+        `[SL Clamp] Limit price ${limitPrice} clamped to ${clampedLimit.toFixed(8)} for ${normalizedSymbol} ` +
+        `(min=${priceFilter?.minPrice || 'N/A'}, max=${priceFilter?.maxPrice || 'N/A'})`
+      );
+    }
+    limitPrice = this.formatPrice(clampedLimit, priceFilter?.tickSize || tickSize);
+    
+    // CRITICAL: After formatPrice, ensure price is still within bounds (formatPrice may round up)
+    const maxP = parseFloat(priceFilter?.maxPrice || '0');
+    const minP = parseFloat(priceFilter?.minPrice || '0');
+    const formattedLimitNum = parseFloat(limitPrice);
+    if (maxP > 0 && formattedLimitNum > maxP) {
+      // formatPrice rounded up too much, use maxPrice directly
+      logger.warn(
+        `[SL Clamp] Formatted limit price ${limitPrice} exceeds maxPrice ${maxP.toFixed(8)} for ${normalizedSymbol}, using maxPrice`
+      );
+      limitPrice = String(maxP);
+    }
+    if (minP > 0 && formattedLimitNum < minP) {
+      // formatPrice rounded down too much, use minPrice directly
+      logger.warn(
+        `[SL Clamp] Formatted limit price ${limitPrice} below minPrice ${minP.toFixed(8)} for ${normalizedSymbol}, using minPrice`
+      );
+      limitPrice = String(minP);
+    }
+
+    // Ensure directional relationship still holds after clamping
+    // SELL: limit must be < stop; BUY: limit must be > stop
+    if (orderSideForSl === 'SELL' && limitPrice >= stopPrice) {
+      // Try to set limit just below stop, but respect price bounds
+      const targetLimit = parseFloat(stopPrice) - tick;
+      const clampedTarget = clampPrice(targetLimit, priceFilter);
+      if (markPrice && percentBand) {
+        const mp = parseFloat(markPrice);
+        if (mp > 0) {
+          const bandMin = percentBand.down ? mp * percentBand.down : null;
+          if (bandMin && clampedTarget < bandMin) {
+            logger.warn(
+              `[SL Clamp] Cannot maintain SELL limit < stop relationship for ${normalizedSymbol} ` +
+              `(stop=${stopPrice}, would need limit < ${stopPrice} but min allowed=${bandMin.toFixed(8)})`
+            );
+            // Use minimum allowed price
+            limitPrice = this.formatPrice(bandMin, priceFilter?.tickSize || tickSize);
+          } else {
+            limitPrice = this.formatPrice(clampedTarget, priceFilter?.tickSize || tickSize);
+          }
+        }
+      } else {
+        limitPrice = this.formatPrice(clampedTarget, priceFilter?.tickSize || tickSize);
+      }
+    }
+    if (orderSideForSl === 'BUY' && limitPrice <= stopPrice) {
+      // Try to set limit just above stop, but respect price bounds
+      const targetLimit = parseFloat(stopPrice) + tick;
+      const clampedTarget = clampPrice(targetLimit, priceFilter);
+      if (markPrice && percentBand) {
+        const mp = parseFloat(markPrice);
+        if (mp > 0) {
+          const bandMax = percentBand.up ? mp * percentBand.up : null;
+          if (bandMax && clampedTarget > bandMax) {
+            logger.warn(
+              `[SL Clamp] Cannot maintain BUY limit > stop relationship for ${normalizedSymbol} ` +
+              `(stop=${stopPrice}, would need limit > ${stopPrice} but max allowed=${bandMax.toFixed(8)})`
+            );
+            // Use maximum allowed price
+            limitPrice = this.formatPrice(bandMax, priceFilter?.tickSize || tickSize);
+          } else {
+            limitPrice = this.formatPrice(clampedTarget, priceFilter?.tickSize || tickSize);
+          }
+        }
+      } else {
+        limitPrice = this.formatPrice(clampedTarget, priceFilter?.tickSize || tickSize);
+      }
     }
     
     // Determine position side
@@ -2171,7 +2363,6 @@ export class BinanceDirectClient {
       type: 'STOP',
       stopPrice: stopPrice.toString(), // Trigger price (when price reaches this, order activates)
       price: limitPrice.toString(), // Limit price (adjusted to be slightly better than stop price)
-      closePosition: quantity ? 'false' : 'true',
       timeInForce: 'GTC'
     };
 
@@ -2187,6 +2378,15 @@ export class BinanceDirectClient {
         throw new Error(`Invalid quantity after formatting: ${formattedQuantity}`);
       }
       params.quantity = formattedQuantity; // Pass as string
+      params.closePosition = 'false';
+      // NOTE: Do NOT set reduceOnly when quantity is provided for STOP orders
+      // Binance will automatically treat it as reduce-only based on positionSide
+    } else {
+      // No quantity: use closePosition=true (and optionally reduceOnly for -4400 compliance)
+      params.closePosition = 'true';
+      // For STOP orders with closePosition, reduceOnly may not be needed/allowed
+      // Only set it if Binance requires it (e.g., during -4400 quant rule windows)
+      // For now, don't set it to avoid -1106 error
     }
     
     // Safety check to prevent -2021 "Order would immediately trigger"
@@ -2214,7 +2414,77 @@ export class BinanceDirectClient {
       logger.info(`✅ SL limit order placed: Order ID: ${data.orderId}`);
       return data;
     } catch (error) {
-      logger.error(`Failed to create SL limit order:`, error);
+      const errorMsg = error?.message || String(error);
+      const errorCode = error?.code || error?.status;
+      
+      // Debug logging
+      logger.debug(
+        `[createSlLimitOrder] Error caught | symbol=${normalizedSymbol} ` +
+        `errorCode=${errorCode} errorMsg=${errorMsg.substring(0, 100)}`
+      );
+      
+      // Handle -4120: Order type not supported → fallback to LIMIT order with reduceOnly
+      if (errorCode === -4120 || errorCode === '-4120' || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
+        logger.warn(
+          `[SL Fallback] STOP order type not supported for ${normalizedSymbol}, ` +
+          `using LIMIT order with reduceOnly instead | errorCode=${errorCode}`
+        );
+        
+        // Fallback: Use LIMIT order
+        const fallbackParams = {
+          symbol: normalizedSymbol,
+          side: orderSide,
+          type: 'LIMIT',
+          price: limitPrice.toString(),
+          timeInForce: 'GTC'
+        };
+        
+        if (dualSide) {
+          fallbackParams.positionSide = positionSide;
+        }
+        
+        if (quantity) {
+          const formattedQuantity = this.formatQuantity(quantity, stepSize);
+          if (parseFloat(formattedQuantity) > 0) {
+            fallbackParams.quantity = formattedQuantity;
+            // For LIMIT orders with quantity, set reduceOnly to comply with -4400 quant rules
+            // Binance allows reduceOnly with quantity for LIMIT orders
+            fallbackParams.reduceOnly = 'true';
+          }
+        } else {
+          fallbackParams.closePosition = 'true';
+          // Do NOT set reduceOnly when using closePosition (Binance doesn't allow both)
+        }
+        
+        try {
+          const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
+          if (!fallbackData || !fallbackData.orderId) {
+            logger.error(`Failed to place SL limit order (fallback): Invalid response from Binance`, { data: fallbackData, symbol: normalizedSymbol, side, slPrice });
+            throw new Error(`Invalid order response: ${JSON.stringify(fallbackData)}`);
+          }
+          logger.info(`✅ SL limit order placed (fallback LIMIT): Order ID: ${fallbackData.orderId}`);
+          return fallbackData;
+        } catch (fallbackError) {
+          logger.error(`Failed to create SL limit order (fallback also failed):`, {
+            error: fallbackError?.message || String(fallbackError),
+            symbol: normalizedSymbol,
+            side,
+            params: this.sanitizeParams(fallbackParams)
+          });
+          throw fallbackError;
+        }
+      }
+      
+      // For other errors, log and throw
+      logger.error(`Failed to create SL limit order:`, {
+        error: errorMsg,
+        symbol: normalizedSymbol,
+        side,
+        slPrice,
+        stopPrice,
+        limitPrice,
+        params: this.sanitizeParams(params)
+      });
       throw error;
     }
   }
@@ -2253,7 +2523,14 @@ export class BinanceDirectClient {
         throw new Error('Precision error. Price or quantity format is incorrect.');
       }
       if (error.message?.includes('-2019')) {
-        throw new Error('Insufficient margin. Please check your account balance.');
+        // Margin insufficient - log clearly but don't modify error message (caller needs to handle)
+        logger.error(
+          `[Binance] ❌ Margin insufficient (-2019) | endpoint=${endpoint} ` +
+          `symbol=${params?.symbol || 'N/A'} side=${params?.side || 'N/A'} ` +
+          `type=${params?.type || 'N/A'} amount=${params?.quantity || params?.amount || 'N/A'}`
+        );
+        // Keep original error message for caller to handle
+        throw error;
       }
       
       throw error;
@@ -2331,7 +2608,59 @@ export class BinanceDirectClient {
     // CRITICAL FIX: TP/SL orders use standard /fapi/v1/order endpoint
     // DO NOT use algoOrder endpoint or algoType parameter for regular TP/SL orders
     // algoOrder endpoint is only for OCO, trailing stop, etc.
+    try {
     return await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
+    } catch (error) {
+      const errorMsg = error?.message || String(error);
+      const errorCode = error?.code || error?.status;
+      
+      // Handle -4120: Order type not supported → fallback to MARKET order with reduceOnly
+      if (errorCode === -4120 || errorCode === '-4120' || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
+        logger.warn(
+          `[SL Fallback] STOP_MARKET order type not supported for ${normalizedSymbol}, ` +
+          `using MARKET order with reduceOnly instead | pos=${position?.id || 'N/A'}`
+        );
+        
+        // Fallback: Use MARKET order with reduceOnly=true to close position
+        const fallbackParams = {
+          symbol: normalizedSymbol,
+          side: orderSide,
+          type: 'MARKET',
+          closePosition: 'true'
+        };
+        
+        if (dualSide) {
+          fallbackParams.positionSide = positionSide;
+        }
+        
+        // Add clientOrderId if available
+        try {
+          const botId = bot?.id;
+          const posId = position?.id;
+          if (botId && posId) {
+            fallbackParams.newClientOrderId = `OC_B${botId}_P${posId}_SL_FB`;
+          }
+        } catch (_) {}
+        
+        try {
+          const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
+          logger.info(
+            `[SL Fallback] ✅ MARKET order placed (fallback) | pos=${position?.id || 'N/A'} ` +
+            `orderId=${fallbackData?.orderId || 'N/A'}`
+          );
+          return fallbackData;
+        } catch (fallbackError) {
+          logger.error(
+            `[SL Fallback] ❌ Failed to create MARKET order (fallback) | pos=${position?.id || 'N/A'} ` +
+            `error=${fallbackError?.message || fallbackError}`
+          );
+          throw fallbackError;
+        }
+      }
+      
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   /**
@@ -2389,7 +2718,96 @@ export class BinanceDirectClient {
     // CRITICAL FIX: TP/SL orders use standard /fapi/v1/order endpoint
     // DO NOT use algoOrder endpoint or algoType parameter for regular TP/SL orders
     // algoOrder endpoint is only for OCO, trailing stop, etc.
+    try {
     return await this.makeRequestWithRetry('/fapi/v1/order', 'POST', params, true);
+    } catch (error) {
+      const errorMsg = error?.message || String(error);
+      const errorCode = error?.code || error?.status;
+      
+      // Handle -4120: Order type not supported → fallback to LIMIT order with reduceOnly
+      if (errorCode === -4120 || errorCode === '-4120' || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
+        logger.warn(
+          `[TP Fallback] TAKE_PROFIT_MARKET order type not supported for ${normalizedSymbol}, ` +
+          `using LIMIT order with reduceOnly instead | pos=${position?.id || 'N/A'} stopPrice=${finalStop}`
+        );
+        
+        // Fallback: Use LIMIT order. Must include EITHER quantity or closePosition=true.
+        // IMPORTANT: Binance does not allow reduceOnly together with closePosition=true.
+        const fallbackParams = {
+          symbol: normalizedSymbol,
+          side: orderSide,
+          type: 'LIMIT',
+          price: String(finalStop),
+          timeInForce: 'GTC'
+        };
+        
+        if (dualSide) {
+          fallbackParams.positionSide = positionSide;
+        }
+        
+        // Add clientOrderId if available
+        try {
+          const botId = bot?.id;
+          const posId = position?.id;
+          if (botId && posId) {
+            fallbackParams.newClientOrderId = `OC_B${botId}_P${posId}_TP_FB`;
+          }
+        } catch (_) {}
+
+        // Quantity handling:
+        // - Prefer an explicit quantity and set reduceOnly=true (Binance rejects LIMIT + closePosition=true with -4136)
+        // - As a fallback, try to fetch current position size from the exchange
+        // - Only if everything fails, we will fall back to closePosition=true (may be rejected, but we log and surface)
+        let fallbackQuantity = params.quantity;
+        try {
+          if (!fallbackQuantity && position) {
+            const stepSize = await this.getStepSize(normalizedSymbol);
+            const openPositions = await this.getOpenPositions(normalizedSymbol);
+            const posSideFilter = dualSide ? positionSide : null;
+            const posMatch = Array.isArray(openPositions)
+              ? openPositions.find(
+                  p =>
+                    p.symbol === normalizedSymbol &&
+                    (posSideFilter ? p.positionSide === posSideFilter : true) &&
+                    Math.abs(parseFloat(p.positionAmt || 0)) > 0
+                )
+              : null;
+            if (posMatch) {
+              const posAmt = Math.abs(parseFloat(posMatch.positionAmt || 0));
+              fallbackQuantity = this.formatQuantity(posAmt, stepSize);
+            }
+          }
+        } catch (qtyErr) {
+          logger.warn(`[TP Fallback] Unable to derive quantity for LIMIT fallback | pos=${position?.id || 'N/A'} error=${qtyErr?.message || qtyErr}`);
+        }
+
+        if (fallbackQuantity) {
+          fallbackParams.quantity = fallbackQuantity;
+          fallbackParams.reduceOnly = 'true';
+        } else {
+          // Last resort: closePosition=true (may be rejected with -4136, but we surface the error)
+          fallbackParams.closePosition = 'true';
+        }
+        
+        try {
+          const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
+          logger.info(
+            `[TP Fallback] ✅ LIMIT order placed (fallback) | pos=${position?.id || 'N/A'} ` +
+            `orderId=${fallbackData?.orderId || 'N/A'} price=${finalStop}`
+          );
+          return fallbackData;
+        } catch (fallbackError) {
+          logger.error(
+            `[TP Fallback] ❌ Failed to create LIMIT order (fallback) | pos=${position?.id || 'N/A'} ` +
+            `error=${fallbackError?.message || fallbackError}`
+          );
+          throw fallbackError;
+        }
+      }
+      
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   async cancelOrder(symbol, orderId) {

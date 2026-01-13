@@ -118,6 +118,33 @@ export class PositionMonitor {
       return;
     }
 
+    // CRITICAL SAFETY CHECK: If position has been open > 30s without TP/SL, force create immediately
+    // This prevents positions from being exposed to market risk without protection
+    const SAFETY_CHECK_MS = 30000; // 30 seconds
+    if (position.opened_at) {
+      const openedAt = new Date(position.opened_at).getTime();
+      const timeSinceOpened = Date.now() - openedAt;
+      const hasTPSL = position.exit_order_id && position.sl_order_id;
+      
+      if (timeSinceOpened > SAFETY_CHECK_MS && !hasTPSL) {
+        logger.error(
+          `[Place TP/SL] 🚨 CRITICAL SAFETY CHECK: Position ${position.id} (${position.symbol}) has been open for ` +
+          `${Math.floor(timeSinceOpened / 1000)}s without TP/SL! ` +
+          `exit_order_id=${position.exit_order_id || 'NULL'}, sl_order_id=${position.sl_order_id || 'NULL'}. ` +
+          `FORCING immediate TP/SL creation to prevent deep loss or missed profit!`
+        );
+        // Force set tp_sl_pending to ensure TP/SL creation
+        try {
+          if (Position?.rawAttributes?.tp_sl_pending) {
+            await Position.update(position.id, { tp_sl_pending: true });
+            position.tp_sl_pending = true;
+          }
+        } catch (e) {
+          logger.debug(`[Place TP/SL] Could not set tp_sl_pending flag: ${e?.message || e}`);
+        }
+      }
+    }
+
     // RACE CONDITION FIX: Use soft lock to prevent concurrent TP/SL placement
     // Try to acquire lock by setting is_processing flag
     try {
@@ -326,19 +353,46 @@ export class PositionMonitor {
       // NEW: stoploss is now in USDT (not percentage), need quantity to calculate SL price
       const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : (position.stoploss !== undefined ? Number(position.stoploss) : NaN);
       const isStoplossValid = Number.isFinite(rawStoploss) && rawStoploss > 0;
-      const slPrice = isStoplossValid ? calculateInitialStopLossByAmount(fillPrice, quantity, rawStoploss, position.side) : null;
-
-      // Check quantity mismatch with DB amount (warn if significant difference)
+      
+      // Check quantity mismatch with DB amount BEFORE calculating SL
+      // CRITICAL: If quantity differs significantly, actual loss will differ from slAmount
       const dbAmount = parseFloat(position.amount || 0);
       const markPrice = parseFloat(position.entry_price || fillPrice || 0);
       const estimatedQuantity = markPrice > 0 ? dbAmount / markPrice : 0;
       const quantityDiffPercent = estimatedQuantity > 0 ? Math.abs((quantity - estimatedQuantity) / estimatedQuantity) * 100 : 0;
       
-      if (quantityDiffPercent > 10) { // More than 10% difference
-        logger.warn(
-          `[Place TP/SL] Quantity mismatch for position ${position.id}: ` +
-          `DB estimated=${estimatedQuantity.toFixed(4)}, Exchange=${quantity.toFixed(4)}, diff=${quantityDiffPercent.toFixed(2)}%`
-        );
+      let slPrice = null;
+      let quantityToUse = quantity; // Default: use exchange quantity
+      
+      if (isStoplossValid) {
+        // CRITICAL FIX: If quantity mismatch > 10%, use estimated quantity to ensure loss = slAmount
+        // This prevents actual loss from exceeding the set slAmount
+        if (quantityDiffPercent > 10 && estimatedQuantity > 0) {
+          logger.warn(
+            `[Place TP/SL] ⚠️ Quantity mismatch detected for position ${position.id}: ` +
+            `DB estimated=${estimatedQuantity.toFixed(4)}, Exchange=${quantity.toFixed(4)}, diff=${quantityDiffPercent.toFixed(2)}% ` +
+            `Using estimated quantity to ensure SL loss matches set amount (${rawStoploss} USDT)`
+          );
+          
+          // Use estimated quantity to calculate SL (ensures loss = slAmount)
+          quantityToUse = estimatedQuantity;
+          slPrice = calculateInitialStopLossByAmount(fillPrice, quantityToUse, rawStoploss, position.side);
+          
+          if (slPrice) {
+            // Calculate what the actual loss would be with exchange quantity
+            const actualLossWithExchangeQty = Math.abs(slPrice - fillPrice) * quantity;
+            const lossDiff = actualLossWithExchangeQty - rawStoploss;
+            
+            logger.warn(
+              `[Place TP/SL] 🔄 Recalculated SL using estimated quantity | ` +
+              `pos=${position.id} slPrice=${slPrice.toFixed(8)} ` +
+              `(if exchange qty used, actual loss would be ${actualLossWithExchangeQty.toFixed(2)} USDT, diff=${lossDiff.toFixed(2)} USDT)`
+            );
+          }
+        } else {
+          // Quantity matches or difference is small, safe to use exchange quantity
+          slPrice = calculateInitialStopLossByAmount(fillPrice, quantityToUse, rawStoploss, position.side);
+        }
       }
 
       // Place TP order if needed and tpPrice is valid
@@ -554,7 +608,13 @@ export class PositionMonitor {
           }
         }
       } else if (needsTp && (!tpPrice || !Number.isFinite(tpPrice) || tpPrice <= 0)) {
-        logger.warn(`[Place TP/SL] Cannot place TP order for position ${position.id}: invalid tpPrice (${tpPrice})`);
+        logger.error(
+          `[Place TP/SL] ❌ CRITICAL: Cannot place TP order for position ${position.id}: invalid tpPrice (${tpPrice}). ` +
+          `Position is exposed to unlimited loss risk! Strategy take_profit=${strategy?.take_profit || 'N/A'}, ` +
+          `position.take_profit=${position?.take_profit || 'N/A'}. Please check strategy configuration.`
+        );
+        // CRITICAL: Even if TP cannot be placed, we should still try to place SL if possible
+        // This is better than having no protection at all
       }
 
       // Delay before placing SL order to avoid rate limits
@@ -636,10 +696,22 @@ export class PositionMonitor {
             }
           }
         } catch (e) {
-          logger.error(`[Place TP/SL] ❌ Failed to create SL order for position ${position.id}:`, e?.message || e);
+          logger.error(
+            `[Place TP/SL] ❌ CRITICAL: Failed to create SL order for position ${position.id}: ${e?.message || e}. ` +
+            `Position is exposed to unlimited loss risk! Will retry on next cycle.`
+          );
+          // CRITICAL: Set tp_sl_pending to true to ensure retry on next cycle
+          try {
+            if (Position?.rawAttributes?.tp_sl_pending) {
+              await Position.update(position.id, { tp_sl_pending: true });
+            }
+          } catch (updateError) {
+            logger.debug(`[Place TP/SL] Could not set tp_sl_pending flag for retry: ${updateError?.message || updateError}`);
+          }
         }
       } else if (slPrice === null || slPrice <= 0) {
-        logger.debug(`[Place TP/SL] Skipping SL order placement for position ${position.id} (stoploss <= 0 or not set)`);
+        // If strategy has no stoploss configured, this is expected behavior
+        logger.debug(`[Place TP/SL] Skipping SL order placement for position ${position.id} (stoploss <= 0 or not set in strategy)`);
       }
     } catch (error) {
       logger.error(`[Place TP/SL] Error processing TP/SL for position ${position.id}:`, error?.message || error, error?.stack);
@@ -670,6 +742,7 @@ export class PositionMonitor {
    * Binance-only: remove duplicated close orders (TP/SL) to avoid order spam / Binance open-order limits.
    * Keeps at most 1 unified STOP_MARKET exit order (tracked by position.exit_order_id) and 1 STOP order (only if strategy stoploss enabled).
    * Also tries to keep the orders referenced by position.exit_order_id / position.sl_order_id (if present).
+   * CRITICAL: Never cancels SL orders if strategy has stoploss > 0 (hard SL requirement).
    */
   async _dedupeCloseOrdersOnExchange(exchangeService, position) {
     const symbol = position.symbol;
@@ -677,10 +750,29 @@ export class PositionMonitor {
     const desiredPositionSide = side === 'long' ? 'LONG' : 'SHORT';
     const timestamp = new Date().toISOString();
 
+    // CRITICAL FIX: Check if strategy has hard SL requirement (stoploss > 0)
+    // If yes, we must NEVER cancel SL orders, only cancel duplicate TP orders
+    let hasHardSL = false;
+    try {
+      const strategy = await Strategy.findById(position.strategy_id);
+      if (strategy) {
+        const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+        hasHardSL = Number.isFinite(rawStoploss) && rawStoploss > 0;
+        if (hasHardSL) {
+          logger.info(
+            `[Dedupe] 🛡️ Strategy ${strategy.id} has hard SL requirement (stoploss=${rawStoploss} USDT). ` +
+            `Will NOT cancel any SL orders, only dedupe TP orders. | pos=${position.id}`
+          );
+        }
+      }
+    } catch (e) {
+      logger.debug(`[Dedupe] Could not check strategy for hard SL: ${e?.message || e} | pos=${position.id}`);
+    }
+
     logger.debug(
       `[Dedupe] 🔍 Starting dedupe check | pos=${position.id} symbol=${symbol} side=${side} ` +
       `exit_order_id=${position.exit_order_id || 'NULL'} sl_order_id=${position.sl_order_id || 'NULL'} ` +
-      `timestamp=${timestamp}`
+      `hasHardSL=${hasHardSL} timestamp=${timestamp}`
     );
 
     const openOrders = await exchangeService.getOpenOrders(symbol);
@@ -801,33 +893,54 @@ export class PositionMonitor {
         `Found exit orders: ${exits.map(o => `${o.orderId}(${o.type}@${o.stopPrice || o.price})`).join(', ')}`
       );
       
-      // Only cancel stop orders (SL), not exit orders (TP)
-      const stopOrdersToCancel = toCancel.filter(o => stopTypes.has(String(o?.type || '').toUpperCase()));
-      if (stopOrdersToCancel.length > 0) {
-        logger.warn(
-          `[Dedupe] ⚠️  Will cancel ${stopOrdersToCancel.length} duplicate STOP orders only (not exit orders) | pos=${position.id}`
-        );
-        for (const o of stopOrdersToCancel) {
-          try {
-            logger.info(`[Dedupe] 🗑️  Cancelling duplicate STOP order ${o.orderId} (${o.type}) | pos=${position.id} symbol=${symbol}`);
-            await exchangeService.cancelOrder(String(o.orderId), symbol);
-            logger.info(`[Dedupe] ✅ Cancelled duplicate STOP order ${o.orderId} | pos=${position.id}`);
-          } catch (e) {
-            logger.error(`[Dedupe] ❌ Failed to cancel duplicate STOP order ${o.orderId}: ${e?.message || e} | pos=${position.id}`);
+      // CRITICAL FIX: Only cancel stop orders (SL) if strategy does NOT have hard SL requirement
+      // If strategy has hard SL (stoploss > 0), NEVER cancel SL orders
+      if (!hasHardSL) {
+        const stopOrdersToCancel = toCancel.filter(o => stopTypes.has(String(o?.type || '').toUpperCase()));
+        if (stopOrdersToCancel.length > 0) {
+          logger.warn(
+            `[Dedupe] ⚠️  Will cancel ${stopOrdersToCancel.length} duplicate STOP orders only (not exit orders) | pos=${position.id}`
+          );
+          for (const o of stopOrdersToCancel) {
+            try {
+              logger.info(`[Dedupe] 🗑️  Cancelling duplicate STOP order ${o.orderId} (${o.type}) | pos=${position.id} symbol=${symbol}`);
+              await exchangeService.cancelOrder(String(o.orderId), symbol);
+              logger.info(`[Dedupe] ✅ Cancelled duplicate STOP order ${o.orderId} | pos=${position.id}`);
+            } catch (e) {
+              logger.error(`[Dedupe] ❌ Failed to cancel duplicate STOP order ${o.orderId}: ${e?.message || e} | pos=${position.id}`);
+            }
           }
         }
+      } else {
+        logger.info(
+          `[Dedupe] 🛡️ Strategy has hard SL requirement, skipping cancellation of ${toCancel.filter(o => stopTypes.has(String(o?.type || '').toUpperCase())).length} STOP orders | pos=${position.id}`
+        );
       }
       return; // Exit early, don't cancel exit orders
     }
 
     // CRITICAL FIX: Enable cancellation of duplicate orders to prevent order spam
     // Only cancel if exit_order_id exists in DB (race condition protection above)
+    // CRITICAL: If strategy has hard SL requirement, NEVER cancel SL orders, only cancel duplicate TP orders
+    const ordersToCancel = hasHardSL 
+      ? toCancel.filter(o => exitTypes.has(String(o?.type || '').toUpperCase())) // Only cancel TP orders
+      : toCancel; // Cancel all duplicate orders
+    
+    if (ordersToCancel.length === 0 && toCancel.length > 0) {
+      logger.info(
+        `[Dedupe] 🛡️ Strategy has hard SL requirement, skipping cancellation of ${toCancel.length} SL orders | pos=${position.id} ` +
+        `(only ${toCancel.filter(o => exitTypes.has(String(o?.type || '').toUpperCase())).length} TP orders would be cancelled if any)`
+      );
+      return; // No orders to cancel
+    }
+    
     logger.info(
-      `[Dedupe] 🗑️  Cancelling ${toCancel.length} duplicate orders | pos=${position.id} symbol=${symbol} ` +
-      `to enforce 1-exit-order invariant. Orders to cancel: ${toCancel.map(o => `${o.orderId}(${o.type})`).join(', ')}`
+      `[Dedupe] 🗑️  Cancelling ${ordersToCancel.length} duplicate orders | pos=${position.id} symbol=${symbol} ` +
+      `${hasHardSL ? '(SL orders protected due to hard SL requirement)' : ''} ` +
+      `to enforce 1-exit-order invariant. Orders to cancel: ${ordersToCancel.map(o => `${o.orderId}(${o.type})`).join(', ')}`
     );
 
-    for (const o of toCancel) {
+    for (const o of ordersToCancel) {
       try {
         const cancelStart = Date.now();
         logger.info(
@@ -947,12 +1060,6 @@ export class PositionMonitor {
       if (openPositions.length > 0) {
         const positionIds = openPositions.map(p => `${p.id}(${p.symbol})`).join(', ');
         logger.info(`[PositionMonitor] 📋 Found ${openPositions.length} open positions: [${positionIds}]`);
-        
-        // Check if specific position (186) is in the list
-        const position186 = openPositions.find(p => p.id === 186);
-        if (!position186) {
-          logger.warn(`[PositionMonitor] ⚠️ Position 186 (POLYXUSDT) NOT found in open positions list! This may indicate status is not 'open' or JOIN issue.`);
-        }
       } else {
         logger.warn(`[PositionMonitor] ⚠️ No open positions found`);
       }
@@ -992,16 +1099,62 @@ export class PositionMonitor {
         positionsByBot.get(botId).push(pos);
       }
 
-      logger.info(`[PositionMonitor] 🔄 Processing ${openPositions.length} positions across ${positionsByBot.size} bots: ${Array.from(positionsByBot.entries()).map(([botId, positions]) => `bot_${botId}=${positions.length}`).join(', ')}`);
+      // PRIORITY QUEUE: Sort bots by mainnet/testnet priority
+      // Mainnet (binance_testnet=false/null) = priority 1 (highest), Testnet = priority 0 (lower)
+      const botEntries = Array.from(positionsByBot.entries());
+      botEntries.sort(([botIdA], [botIdB]) => {
+        const exchangeServiceA = this.exchangeServices.get(botIdA);
+        const exchangeServiceB = this.exchangeServices.get(botIdB);
+        const isMainnetA = exchangeServiceA?.bot?.exchange === 'binance' && 
+                          (exchangeServiceA.bot.binance_testnet === null || exchangeServiceA.bot.binance_testnet === false || exchangeServiceA.bot.binance_testnet === 0);
+        const isMainnetB = exchangeServiceB?.bot?.exchange === 'binance' && 
+                          (exchangeServiceB.bot.binance_testnet === null || exchangeServiceB.bot.binance_testnet === false || exchangeServiceB.bot.binance_testnet === 0);
+        const priorityA = isMainnetA ? 1 : 0;
+        const priorityB = isMainnetB ? 1 : 0;
+        return priorityB - priorityA; // Higher priority first (mainnet first)
+      });
+
+      const mainnetBots = botEntries.filter(([botId]) => {
+        const exchangeService = this.exchangeServices.get(botId);
+        return exchangeService?.bot?.exchange === 'binance' && 
+               (exchangeService.bot.binance_testnet === null || exchangeService.bot.binance_testnet === false || exchangeService.bot.binance_testnet === 0);
+      }).length;
+      const testnetBots = botEntries.length - mainnetBots;
+
+      logger.info(
+        `[PositionMonitor] 🔄 Processing ${openPositions.length} positions across ${positionsByBot.size} bots ` +
+        `(MAINNET: ${mainnetBots}, TESTNET: ${testnetBots}): ` +
+        `${botEntries.map(([botId, positions]) => `bot_${botId}=${positions.length}`).join(', ')}`
+      );
 
       // CRITICAL OPTIMIZATION: Separate positions into priority queues
       // High priority: positions without TP/SL (need immediate attention)
+      // CRITICAL FIX: Also check positions that have been open for > 30s without TP/SL (safety check)
       // Low priority: positions with TP/SL (can be monitored less frequently)
       const highPriorityPositions = [];
       const lowPriorityPositions = [];
+      const now = Date.now();
+      const SAFETY_CHECK_MS = 30000; // 30 seconds - force create TP/SL if missing
       
       for (const pos of openPositions) {
         const needsTPSL = !pos.exit_order_id || !pos.sl_order_id || pos.tp_sl_pending === true || pos.tp_sl_pending === 1;
+        
+        // CRITICAL SAFETY CHECK: If position has been open > 30s without TP/SL, force it to high priority
+        if (!needsTPSL && pos.opened_at) {
+          const openedAt = new Date(pos.opened_at).getTime();
+          const timeSinceOpened = now - openedAt;
+          if (timeSinceOpened > SAFETY_CHECK_MS) {
+            // Position has been open for > 30s without TP/SL - CRITICAL RISK!
+            logger.error(
+              `[PositionMonitor] 🚨 CRITICAL: Position ${pos.id} (${pos.symbol}) has been open for ${Math.floor(timeSinceOpened / 1000)}s ` +
+              `without TP/SL! exit_order_id=${pos.exit_order_id || 'NULL'}, sl_order_id=${pos.sl_order_id || 'NULL'}. ` +
+              `FORCING TP/SL creation immediately to prevent deep loss!`
+            );
+            highPriorityPositions.push(pos);
+            continue;
+          }
+        }
+        
         if (needsTPSL) {
           highPriorityPositions.push(pos);
         } else {
@@ -1015,8 +1168,8 @@ export class PositionMonitor {
       );
 
       // Process each bot's positions in parallel (fair distribution)
-      // CRITICAL OPTIMIZATION: Process high-priority positions first, then low-priority
-      const botProcessingPromises = Array.from(positionsByBot.entries()).map(async ([botId, botPositions]) => {
+      // CRITICAL OPTIMIZATION: Process mainnet bots first (already sorted), then high-priority positions, then low-priority
+      const botProcessingPromises = botEntries.map(async ([botId, botPositions]) => {
         const startTime = Date.now();
         try {
           // Split bot positions by priority
@@ -1038,8 +1191,16 @@ export class PositionMonitor {
           const maxProcessingTimeMs = Number(configService.getNumber('POSITION_MONITOR_MAX_TIME_PER_BOT_MS', 300000)); // 5 minutes max per bot
           
           // PHASE 1: Process high-priority positions (need TP/SL) - URGENT
+          // CRITICAL: Sort by opened_at (newest first) to prioritize recently filled positions
+          // This ensures positions just filled get TP/SL immediately, reducing exposure risk
+          botHighPriority.sort((a, b) => {
+            const timeA = a.opened_at ? new Date(a.opened_at).getTime() : 0;
+            const timeB = b.opened_at ? new Date(b.opened_at).getTime() : 0;
+            return timeB - timeA; // Newest first (highest priority)
+          });
+          
           if (botHighPriority.length > 0) {
-            logger.info(`[PositionMonitor] 🔥 Processing ${botHighPriority.length} high-priority positions for bot ${botId} (TP/SL placement)`);
+            logger.info(`[PositionMonitor] 🔥 Processing ${botHighPriority.length} high-priority positions for bot ${botId} (TP/SL placement, sorted by newest first)`);
             
             // Process TP/SL placement in larger parallel batches (faster)
             for (let i = 0; i < botHighPriority.length; i += tpPlacementBatchSize) {

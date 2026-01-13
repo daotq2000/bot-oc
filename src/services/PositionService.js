@@ -102,6 +102,66 @@ export class PositionService {
         return position; // Return original position without changes
       }
 
+      // CRITICAL FIX: Check if price has exceeded initial TP and should close immediately
+      // This handles the case where position already has TP order but price exceeded initial TP
+      // Logic: If initial_tp_price exists OR we can calculate it from strategy, and current price exceeded it, close immediately
+      let initialTP = null;
+      
+      // Try to get initial TP from position.initial_tp_price first
+      if (position.initial_tp_price && Number.isFinite(Number(position.initial_tp_price)) && Number(position.initial_tp_price) > 0) {
+        initialTP = Number(position.initial_tp_price);
+      } else if (position.take_profit && Number.isFinite(Number(position.take_profit)) && Number(position.take_profit) > 0) {
+        // Fallback: Calculate initial TP from strategy take_profit if initial_tp_price not set
+        const { calculateTakeProfit } = await import('../utils/calculator.js');
+        const entryPrice = Number(position.entry_price || 0);
+        if (entryPrice > 0) {
+          initialTP = calculateTakeProfit(entryPrice, Number(position.take_profit), position.side);
+          logger.debug(
+            `[PositionService] Calculated initial TP from strategy | pos=${position.id} ` +
+            `entry=${entryPrice} take_profit=${position.take_profit} calculatedTP=${initialTP?.toFixed(8) || 'null'}`
+          );
+        }
+      }
+      
+      // Check if price exceeded initial TP
+      if (initialTP && Number.isFinite(initialTP) && initialTP > 0) {
+        const hasPriceExceededInitialTP = (position.side === 'long' && currentPrice > initialTP) ||
+                                         (position.side === 'short' && currentPrice < initialTP);
+        
+        if (hasPriceExceededInitialTP) {
+          logger.warn(
+            `[PositionService] 🚨 Price exceeded initial TP during monitoring | pos=${position.id} ` +
+            `symbol=${position.symbol} side=${position.side} ` +
+            `initialTP=${initialTP.toFixed(8)} currentPrice=${currentPrice.toFixed(8)} ` +
+            `→ Closing immediately with MARKET order to lock in better profit`
+          );
+          
+          // Calculate PnL for the close
+          const pnl = calculatePnL(
+            position.entry_price,
+            currentPrice,
+            position.amount,
+            position.side
+          );
+          
+          try {
+            // Close position immediately with MARKET order
+            const closedPosition = await this.closePosition(position, currentPrice, pnl, 'price_exceeded_initial_tp');
+            logger.info(
+              `[PositionService] ✅ Position ${position.id} closed immediately | ` +
+              `price=${currentPrice.toFixed(8)} pnl=${pnl.toFixed(2)} reason=price_exceeded_initial_tp`
+            );
+            return closedPosition;
+          } catch (closeError) {
+            logger.error(
+              `[PositionService] ❌ Failed to close position immediately | pos=${position.id} ` +
+              `error=${closeError?.message || closeError}`
+            );
+            // Continue with normal update flow if close fails
+          }
+        }
+      }
+
       // Calculate PnL
       const pnl = calculatePnL(
         position.entry_price,
@@ -1100,17 +1160,26 @@ export class PositionService {
   async sendTelegramCloseNotification(closedPosition) {
     try {
       if (!this.telegramService?.sendCloseSummaryAlert) {
-        logger.warn(`[Notification] TelegramService not available, skipping close summary alert for position ${closedPosition.id}`);
-        logger.warn(`[Notification] telegramService: ${!!this.telegramService}, sendCloseSummaryAlert: ${!!this.telegramService?.sendCloseSummaryAlert}`);
+        logger.error(
+          `[Notification] ❌ CRITICAL: TelegramService not available, cannot send close summary alert for position ${closedPosition.id}! ` +
+          `telegramService: ${!!this.telegramService}, sendCloseSummaryAlert: ${!!this.telegramService?.sendCloseSummaryAlert}`
+        );
         return;
       }
-      logger.info(`[Notification] Preparing to send close summary for position ${closedPosition.id} (reason: ${closedPosition.close_reason})`);
+      logger.info(
+        `[Notification] 📤 Preparing to send close summary alert for position ${closedPosition.id} ` +
+        `(symbol: ${closedPosition.symbol || 'N/A'}, reason: ${closedPosition.close_reason || 'N/A'}, ` +
+        `pnl: ${closedPosition.pnl || 'N/A'} USDT)`
+      );
       
       // CRITICAL FIX: Always re-fetch position with bot info to ensure we have all required fields
       // Position.close() may not return all fields from JOIN, so we re-fetch to be safe
       let positionWithBotInfo = await Position.findById(closedPosition.id);
       if (!positionWithBotInfo) {
-        logger.warn(`[Notification] Could not find position ${closedPosition.id} to send notification`);
+        logger.error(
+          `[Notification] ❌ CRITICAL: Could not find position ${closedPosition.id} in DB to send notification! ` +
+          `Position may have been deleted or ID is incorrect.`
+        );
         return;
       }
 
@@ -1130,20 +1199,48 @@ export class PositionService {
       }
       
       const stats = await Position.getBotStats(positionWithBotInfo.bot_id);
-      logger.debug(`[Notification] Fetched bot stats for bot ${positionWithBotInfo.bot_id}: wins=${stats?.wins || 0}, loses=${stats?.loses || 0}, total_pnl=${stats?.total_pnl || 0}`);
+      logger.debug(
+        `[Notification] Fetched bot stats for bot ${positionWithBotInfo.bot_id}: ` +
+        `wins=${stats?.wins || 0}, loses=${stats?.loses || 0}, total_pnl=${stats?.total_pnl || 0}`
+      );
+      
+      // CRITICAL: Log position details before sending to help debug missing alerts
+      logger.info(
+        `[Notification] 📋 Sending close alert for position ${positionWithBotInfo.id}: ` +
+        `symbol=${positionWithBotInfo.symbol}, side=${positionWithBotInfo.side}, ` +
+        `pnl=${positionWithBotInfo.pnl || 'N/A'} USDT, reason=${positionWithBotInfo.close_reason || 'N/A'}, ` +
+        `bot_id=${positionWithBotInfo.bot_id}, telegram_chat_id=${positionWithBotInfo.telegram_chat_id || 'N/A'}, ` +
+        `telegram_alert_channel_id=${positionWithBotInfo.telegram_alert_channel_id || 'N/A'}`
+      );
+      
       await this.telegramService.sendCloseSummaryAlert(positionWithBotInfo, stats);
-      logger.info(`[Notification] ✅ Successfully sent close summary alert for position ${closedPosition.id}`);
+      logger.info(
+        `[Notification] ✅ Successfully sent close summary alert for position ${closedPosition.id} ` +
+        `(${positionWithBotInfo.symbol} ${positionWithBotInfo.side}, PnL: ${positionWithBotInfo.pnl || 'N/A'} USDT)`
+      );
     } catch (inner) {
-      logger.error(`[Notification] ❌ Failed to send close summary alert for position ${closedPosition.id}:`, inner?.message || inner, inner?.stack);
+      logger.error(
+        `[Notification] ❌ CRITICAL: Failed to send close summary alert for position ${closedPosition.id}: ` +
+        `${inner?.message || inner}. Stack: ${inner?.stack || 'N/A'}`
+      );
+      // Re-throw to allow caller to handle retry
+      throw inner;
     }
   }
 
   async closePosition(position, currentPrice, pnl, reason) {
     try {
 
-      // CRITICAL FIX: Skip CloseGuard for force close reasons (tp_cross_entry_force_close)
-      // Force close is intentional and should bypass verification checks
-      const isForceClose = reason === 'tp_cross_entry_force_close';
+      // CRITICAL FIX: Skip CloseGuard for force close reasons
+      // Force close reasons are intentional and should bypass verification checks
+      // - tp_cross_entry_force_close: TP crossed entry, force close to prevent loss
+      // - price_exceeded_initial_tp: Price exceeded initial TP, close with MARKET to lock in better profit
+      // - tp_trailing_loss_zone: TP trailing into loss zone, force close to prevent worse loss
+      // - tp_sl_cancelled_force_close: TP/SL order cancelled but position needs to be closed (risk management)
+      const isForceClose = reason === 'tp_cross_entry_force_close' || 
+                          reason === 'price_exceeded_initial_tp' ||
+                          reason === 'tp_trailing_loss_zone' ||
+                          reason === 'tp_sl_cancelled_force_close';
       
       if (isForceClose) {
         logger.info(`[CloseGuard] ⚠️ FORCE CLOSE: Skipping CloseGuard for position ${position.id} (reason: ${reason})`);
@@ -1215,12 +1312,21 @@ export class PositionService {
                     verifiedClose = true;
                     logger.info(`[CloseGuard] ✅ TP order ${position.exit_order_id} verified FILLED via REST - safe to close position ${position.id}`);
                   } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
-                    // Order was cancelled, not filled - DO NOT close position
-                    logger.error(
-                      `[CloseGuard] ❌ BLOCKED: TP order ${position.exit_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
-                      `Position still has exposure. Will NOT close position to prevent false alert.`
-                    );
-                    throw new Error(`TP order ${position.exit_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                    // Order was cancelled, not filled
+                    // If this is a force close reason, allow it (TP/SL cancelled but position needs to be closed)
+                    // Otherwise, block to prevent false alerts
+                    if (reason && (reason === 'tp_trailing_loss_zone' || reason === 'price_exceeded_initial_tp' || reason === 'tp_sl_cancelled_force_close')) {
+                      logger.warn(
+                        `[CloseGuard] ⚠️ TP order ${position.exit_order_id} for position ${position.id} was ${normalizedStatus}, but allowing force close (reason: ${reason})`
+                      );
+                      verifiedClose = true; // Allow force close even if order was cancelled
+                    } else {
+                      logger.error(
+                        `[CloseGuard] ❌ BLOCKED: TP order ${position.exit_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                        `Position still has exposure. Will NOT close position to prevent false alert.`
+                      );
+                      throw new Error(`TP order ${position.exit_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                    }
                   }
                 } catch (e) {
                   if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
@@ -1243,12 +1349,21 @@ export class PositionService {
                     verifiedClose = true;
                     logger.info(`[CloseGuard] ✅ SL order ${position.sl_order_id} verified FILLED via REST - safe to close position ${position.id}`);
                   } else if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled' || normalizedStatus === 'expired') {
-                    // Order was cancelled, not filled - DO NOT close position
-                    logger.error(
-                      `[CloseGuard] ❌ BLOCKED: SL order ${position.sl_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
-                      `Position still has exposure. Will NOT close position to prevent false alert.`
-                    );
-                    throw new Error(`SL order ${position.sl_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                    // Order was cancelled, not filled
+                    // If this is a force close reason, allow it (TP/SL cancelled but position needs to be closed)
+                    // Otherwise, block to prevent false alerts
+                    if (reason && (reason === 'tp_trailing_loss_zone' || reason === 'price_exceeded_initial_tp' || reason === 'tp_sl_cancelled_force_close')) {
+                      logger.warn(
+                        `[CloseGuard] ⚠️ SL order ${position.sl_order_id} for position ${position.id} was ${normalizedStatus}, but allowing force close (reason: ${reason})`
+                      );
+                      verifiedClose = true; // Allow force close even if order was cancelled
+                    } else {
+                      logger.error(
+                        `[CloseGuard] ❌ BLOCKED: SL order ${position.sl_order_id} for position ${position.id} was ${normalizedStatus}, NOT FILLED. ` +
+                        `Position still has exposure. Will NOT close position to prevent false alert.`
+                      );
+                      throw new Error(`SL order ${position.sl_order_id} was ${normalizedStatus}, not FILLED. Cannot close position ${position.id}.`);
+                    }
                   }
                 } catch (e) {
                   if (e?.message?.includes('BLOCKED')) throw e; // Re-throw our blocking error
@@ -1257,13 +1372,21 @@ export class PositionService {
               }
             }
             
-            // If position has exposure but no verified fill, block closing
+            // If position has exposure but no verified fill, check if this is a force close reason
             if (!verifiedClose) {
-              logger.error(
-                `[CloseGuard] ❌ BLOCKED: Position ${position.id} has exposure but no verified TP/SL fill. ` +
-                `Orders may have been cancelled. Will NOT close position to prevent false alert.`
-              );
-              throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+              // Allow force close even if TP/SL orders were cancelled (for risk management)
+              if (reason && (reason === 'tp_trailing_loss_zone' || reason === 'price_exceeded_initial_tp' || reason === 'tp_sl_cancelled_force_close')) {
+                logger.warn(
+                  `[CloseGuard] ⚠️ Position ${position.id} has exposure but TP/SL orders cancelled, allowing force close (reason: ${reason})`
+                );
+                verifiedClose = true; // Allow force close
+              } else {
+                logger.error(
+                  `[CloseGuard] ❌ BLOCKED: Position ${position.id} has exposure but no verified TP/SL fill. ` +
+                  `Orders may have been cancelled. Will NOT close position to prevent false alert.`
+                );
+                throw new Error(`Position ${position.id} has exposure but no verified fill. Cannot close position.`);
+              }
             }
           }
         } catch (e) {
@@ -1306,18 +1429,33 @@ export class PositionService {
       // Close on exchange (only if position exists)
       let closeRes = null;
       if (hasExposure) {
-        // ExchangeService handles exchange-specific logic (Binance, MEXC, Gate.io)
-        // MEXC: Uses CCXT to close position via market order
-        // Binance: Uses direct API with reduce-only flag
-        closeRes = await this.exchangeService.closePosition(
-          position.symbol,
-          position.side,
-          position.amount
-        );
+        try {
+          // ExchangeService handles exchange-specific logic (Binance, MEXC, Gate.io)
+          // MEXC: Uses CCXT to close position via market order
+          // Binance: Uses direct API with reduce-only flag
+          closeRes = await this.exchangeService.closePosition(
+            position.symbol,
+            position.side,
+            position.amount
+          );
 
-        if (closeRes?.skipped) {
-          logger.warn(`[CloseGuard] Exchange reported no position to close for ${position.symbol}; will close in DB only`);
-          // Don't return - continue to close in DB
+          if (closeRes?.skipped) {
+            logger.warn(`[CloseGuard] Exchange reported no position to close for ${position.symbol}; will close in DB only`);
+            // Don't return - continue to close in DB
+          }
+        } catch (closeError) {
+          const errorMsg = closeError?.message || String(closeError);
+          // Handle notional value too small (< 5 USDT) - skip exchange close but allow DB close
+          if (errorMsg.includes('notional value') && errorMsg.includes('below minimum')) {
+            logger.warn(
+              `[ClosePosition] ⚠️ Position ${position.id} (${position.symbol}) notional value too small for exchange close. ` +
+              `Will close in DB only. Error: ${errorMsg}`
+            );
+            closeRes = { skipped: true, reason: 'notional_too_small' };
+          } else {
+            // Re-throw other errors
+            throw closeError;
+          }
         }
       } else {
         logger.info(`[CloseGuard] Skipping exchange close for position ${position.id} - no exposure (already closed on exchange)`);
@@ -1353,11 +1491,62 @@ export class PositionService {
         logger.warn(`[Close Position] Failed to clean up open orders for ${position.symbol} after closing: ${e?.message || e}`);
       }
 
-      await this.sendTelegramCloseNotification(closed);
+      // CRITICAL FIX: Always send Telegram notification, even if there are errors
+      // Use try-catch to ensure notification is sent even if other operations fail
+      try {
+        await this.sendTelegramCloseNotification(closed);
+      } catch (notifyError) {
+        // Log error but don't throw - position is already closed in DB
+        logger.error(
+          `[ClosePosition] ❌ CRITICAL: Failed to send Telegram close notification for position ${position.id}: ` +
+          `${notifyError?.message || notifyError}. Position is closed in DB but alert was not sent! ` +
+          `This is a critical issue - user may not be notified of position close.`
+        );
+        // Try to send a simple fallback alert
+        try {
+          if (this.telegramService?.sendCloseSummaryAlert) {
+            const positionWithBotInfo = await Position.findById(position.id);
+            if (positionWithBotInfo) {
+              const stats = await Position.getBotStats(positionWithBotInfo.bot_id);
+              await this.telegramService.sendCloseSummaryAlert(positionWithBotInfo, stats);
+              logger.info(`[ClosePosition] ✅ Fallback Telegram alert sent for position ${position.id}`);
+            }
+          }
+        } catch (fallbackError) {
+          logger.error(
+            `[ClosePosition] ❌ CRITICAL: Fallback Telegram alert also failed for position ${position.id}: ` +
+            `${fallbackError?.message || fallbackError}`
+          );
+        }
+      }
 
       return closed;
     } catch (error) {
       logger.error(`Failed to close position ${position.id}:`, error);
+      
+      // CRITICAL FIX: Even if closePosition fails, try to send alert if position was already closed in DB
+      // This handles cases where CloseGuard blocks the close but position was already closed elsewhere
+      try {
+        const dbPosition = await Position.findById(position.id);
+        if (dbPosition && dbPosition.status === 'closed') {
+          logger.warn(
+            `[ClosePosition] ⚠️ Position ${position.id} is already closed in DB but closePosition failed. ` +
+            `Attempting to send Telegram alert anyway...`
+          );
+          try {
+            await this.sendTelegramCloseNotification(dbPosition);
+            logger.info(`[ClosePosition] ✅ Telegram alert sent for already-closed position ${position.id}`);
+          } catch (notifyError) {
+            logger.error(
+              `[ClosePosition] ❌ Failed to send Telegram alert for already-closed position ${position.id}: ` +
+              `${notifyError?.message || notifyError}`
+            );
+          }
+        }
+      } catch (checkError) {
+        logger.debug(`[ClosePosition] Could not check position status after error: ${checkError?.message || checkError}`);
+      }
+      
       throw error;
     }
   }

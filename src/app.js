@@ -337,7 +337,7 @@ async function start() {
       try {
         const { PositionSync } = await import('./jobs/PositionSync.js');
         positionSyncJob = new PositionSync();
-        await positionSyncJob.initialize();
+        await positionSyncJob.initialize(telegramService); // Pass TelegramService for alert notifications
         positionSyncJob.start();
         logger.info('✅ Position Sync Job started successfully');
       } catch (error) {
