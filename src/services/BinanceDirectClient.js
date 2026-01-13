@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import logger from '../utils/logger.js';
 import { webSocketManager } from './WebSocketManager.js';
 import { configService } from './ConfigService.js';
+import { binanceRequestScheduler } from './BinanceRequestScheduler.js';
 
 // --- Order Ownership Helpers ---
 export const STRATEGY_PREFIX = 'STRAT_';
@@ -390,14 +391,36 @@ export class BinanceDirectClient {
    * @returns {Promise} Request result
    */
   async _queueRequest(requestFn, isSigned = false) {
+    // Global shared scheduler so mainnet always has priority across ALL bots (mainnet + testnet)
+    const enableGlobalScheduler = configService.getBoolean('BINANCE_GLOBAL_SCHEDULER_ENABLED', true);
+    if (enableGlobalScheduler) {
+      return await binanceRequestScheduler.enqueue({
+        isMainnet: this.isMainnet,
+        requiresAuth: !!isSigned,
+        fn: async () => {
+          // Keep per-client protections
+          if (!this._checkCircuitBreaker()) {
+            const error = new Error('Circuit breaker is OPEN - Binance API is unavailable');
+            error.code = 'CIRCUIT_BREAKER_OPEN';
+            throw error;
+          }
+          if (!this._checkRateLimitBlock()) {
+            const error = new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()}`);
+            error.code = 'RATE_LIMIT_BLOCKED';
+            error.status = 429;
+            throw error;
+          }
+          return await requestFn();
+        },
+        label: `binance_${this.isMainnet ? 'mainnet' : 'testnet'}_${isSigned ? 'signed' : 'public'}`
+      });
+    }
+
+    // Fallback to legacy per-instance queue
     return new Promise((resolve, reject) => {
-      // Priority: Mainnet = 1 (highest), Testnet = 0 (lower)
-      // Higher priority = processed first
       const priority = this.isMainnet ? 1 : 0;
       const queueItem = { requestFn, isSigned, resolve, reject, priority };
-      
-      // Insert into queue maintaining priority order (highest first)
-      // Mainnet requests go to front, testnet to back
+
       let inserted = false;
       for (let i = 0; i < this._requestQueue.length; i++) {
         if (this._requestQueue[i].priority < priority) {
@@ -409,7 +432,7 @@ export class BinanceDirectClient {
       if (!inserted) {
         this._requestQueue.push(queueItem);
       }
-      
+
       this._processRequestQueue().catch(() => {});
     });
   }
@@ -2463,60 +2486,49 @@ export class BinanceDirectClient {
         `errorCode=${errorCode} errorMsg=${errorMsg.substring(0, 100)}`
       );
       
-      // Handle -4120: Order type not supported → fallback to LIMIT order with reduceOnly
-      // Also handle -1106: Parameter 'reduceonly' sent when not required (should not happen with STOP_MARKET)
+      // Handle -4120 (Order type not supported) & -1106 (reduceOnly not required)
+      // Fallback strategy: Retry with different STOP variations instead of LIMIT to avoid immediate fills.
       if (errorCode === -4120 || errorCode === '-4120' || errorCode === -1106 || errorCode === '-1106' || 
           errorMsg.includes('-4120') || errorMsg.includes('-1106') || 
           errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API') ||
           errorMsg.includes("Parameter 'reduceonly' sent when not required")) {
         logger.warn(
-          `[SL Fallback] STOP_MARKET order failed for ${normalizedSymbol} (errorCode=${errorCode}), ` +
-          `using LIMIT order with reduceOnly instead`
+          `[SL Fallback] STOP_MARKET failed for ${normalizedSymbol} (errorCode=${errorCode}). ` +
+          `Attempting fallback with different STOP variations...`
         );
-        
-        // Fallback: Use LIMIT order
-        const fallbackParams = {
-          symbol: normalizedSymbol,
-          side: orderSide,
-          type: 'LIMIT',
-          price: limitPrice.toString(),
-          timeInForce: 'GTC'
-        };
-        
-        if (dualSide) {
-          fallbackParams.positionSide = positionSide;
-        }
-        
-        if (quantity) {
-          const formattedQuantity = this.formatQuantity(quantity, stepSize);
-          if (parseFloat(formattedQuantity) > 0) {
-            fallbackParams.quantity = formattedQuantity;
-            // For LIMIT orders with quantity, set reduceOnly to comply with -4400 quant rules
-            // Binance allows reduceOnly with quantity for LIMIT orders
-            fallbackParams.reduceOnly = 'true';
+
+        // Fallback attempts
+        const fallbackStrategies = [
+          // 1. Try STOP_LOSS type (often an alias for STOP_MARKET)
+          { ...params, type: 'STOP_LOSS' },
+          // 2. Try STOP_MARKET with reduceOnly explicitly set (sometimes works despite -1106)
+          { ...params, reduceOnly: 'true' },
+          // 3. If original had quantity, try with closePosition instead
+          (params.quantity ? { ...params, quantity: undefined, closePosition: 'true' } : null),
+        ].filter(Boolean); // Remove null entries
+
+        for (let i = 0; i < fallbackStrategies.length; i++) {
+          const fallbackParams = fallbackStrategies[i];
+          try {
+            logger.info(`[SL Fallback] Attempt ${i + 1}/${fallbackStrategies.length} with type=${fallbackParams.type}, closePos=${fallbackParams.closePosition}, reduceOnly=${fallbackParams.reduceOnly}`);
+            const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
+            if (fallbackData && fallbackData.orderId) {
+              logger.info(`✅ SL order placed with fallback strategy: Order ID: ${fallbackData.orderId}`);
+              return fallbackData;
+            }
+          } catch (fallbackError) {
+            logger.warn(
+              `[SL Fallback] Attempt ${i + 1} failed for ${normalizedSymbol}: ${fallbackError?.message || fallbackError}`
+            );
           }
-        } else {
-          fallbackParams.closePosition = 'true';
-          // Do NOT set reduceOnly when using closePosition (Binance doesn't allow both)
         }
-        
-        try {
-          const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
-          if (!fallbackData || !fallbackData.orderId) {
-            logger.error(`Failed to place SL order (fallback LIMIT): Invalid response from Binance`, { data: fallbackData, symbol: normalizedSymbol, side, slPrice });
-            throw new Error(`Invalid order response: ${JSON.stringify(fallbackData)}`);
-          }
-          logger.info(`✅ SL limit order placed (fallback LIMIT): Order ID: ${fallbackData.orderId}`);
-          return fallbackData;
-        } catch (fallbackError) {
-          logger.error(`Failed to create SL order (fallback LIMIT also failed):`, {
-            error: fallbackError?.message || String(fallbackError),
-            symbol: normalizedSymbol,
-            side,
-            params: this.sanitizeParams(fallbackParams)
-          });
-          throw fallbackError;
-        }
+
+        // If all fallbacks fail, throw a clear error.
+        const finalError = new Error(
+          `All SL placement strategies failed for ${normalizedSymbol} after STOP_MARKET error (code=${errorCode}). No SL was placed.`
+        );
+        finalError.code = errorCode;
+        throw finalError;
       }
       
       // For other errors, log and throw

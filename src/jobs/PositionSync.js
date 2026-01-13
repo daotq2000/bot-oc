@@ -418,7 +418,7 @@ export class PositionSync {
               // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
               try {
                 const { PositionService } = await import('../services/PositionService.js');
-                const positionService = new PositionService(exchangeService, null); // TelegramService will be injected if available
+                const positionService = new PositionService(exchangeService, this.telegramService); // Inject TelegramService if available
                 
                 // Get current price for PnL calculation
                 let closePrice = dbPos.entry_price || 0;

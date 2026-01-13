@@ -323,7 +323,7 @@ class WebSocketManager {
         }
       } catch (e) {
         logger.debug(`[Binance-WS] Failed to handle message: ${e?.message || e}`);
-      }
+            }
     });
 
     conn.ws.on('close', (code, reason) => {

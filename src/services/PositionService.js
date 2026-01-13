@@ -12,6 +12,7 @@ export class PositionService {
   constructor(exchangeService, telegramService = null) {
     this.exchangeService = exchangeService;
     this.telegramService = telegramService;
+    this._missingTelegramWarn = new Map(); // key -> lastWarnAt
     // A) Memory map for cross-entry exit deduplication
     this.crossEntryExitPending = new Map(); // position.id -> timestamp
     this.crossEntryExitTTL = 60 * 1000; // 60 seconds cooldown
@@ -493,37 +494,18 @@ export class PositionService {
               );
               
               if (shouldCloseImmediately) {
-                // Case 2B: TP crossed entry AND current price is better than newTP
-                // Close immediately with MARKET order to minimize loss
+                // Disabled by request: NEVER force-close position via MARKET when TP crosses entry.
+                // Keep WS-driven close only.
                 logger.warn(
-                  `[TP Trail] 🚨 CRITICAL: TP crossed entry AND currentPrice better than newTP -> immediate MARKET close | ` +
-                  `pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
-                  `entry=${entryPrice.toFixed(8)} newTP=${newTP.toFixed(8)} currentPrice=${marketPrice.toFixed(8)} ` +
-                  `(closing now to avoid worse loss at newTP)`
+                  `[TP Trail] ⚠️ TP crossed entry and currentPrice better than newTP, but FORCE CLOSE is DISABLED. ` +
+                  `Will attempt WS-driven single-exit replace instead | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
+                  `entry=${entryPrice.toFixed(8)} newTP=${newTP.toFixed(8)} currentPrice=${marketPrice.toFixed(8)}`
                 );
-                
-                try {
-                  // Calculate PnL at current price
-                  const currentPnl = calculatePnL(position.entry_price, marketPrice, position.amount, position.side);
-                  
-                  // Close position immediately with MARKET order
-                  await this.closePosition(position, marketPrice, currentPnl, 'tp_trailing_loss_zone');
-                  
-                  logger.info(
-                    `[TP Trail] ✅ Immediate MARKET close executed | pos=${position.id} ` +
-                    `price=${marketPrice.toFixed(8)} pnl=${currentPnl.toFixed(2)} reason=tp_trailing_loss_zone`
-                  );
-                  
-                  // Return early - position is closed
-                  return position;
-                } catch (closeError) {
-                  logger.error(
-                    `[TP Trail] ❌ Failed to close position immediately | pos=${position.id} ` +
-                    `error=${closeError?.message || closeError}`
-                  );
-                  // Continue to fallback logic below
-                }
-              } else if (hasCrossedEntry) {
+
+                // Fall through to cross-entry exit replace logic (Case 2A)
+              }
+
+              if (hasCrossedEntry) {
                 // Case 2A: TP has crossed entry, but currentPrice is NOT better than newTP
                 // Try to exit as soon as possible based on PnL,
                 // but NEVER close DB / send Telegram here. DB/Telegram is WS-driven only.
@@ -1160,10 +1142,17 @@ export class PositionService {
   async sendTelegramCloseNotification(closedPosition) {
     try {
       if (!this.telegramService?.sendCloseSummaryAlert) {
-        logger.error(
-          `[Notification] ❌ CRITICAL: TelegramService not available, cannot send close summary alert for position ${closedPosition.id}! ` +
-          `telegramService: ${!!this.telegramService}, sendCloseSummaryAlert: ${!!this.telegramService?.sendCloseSummaryAlert}`
-        );
+        const key = String(closedPosition?.bot_id || closedPosition?.botId || 'global');
+        const now = Date.now();
+        const last = this._missingTelegramWarn.get(key) || 0;
+        const ttl = Number(configService.getNumber('TELEGRAM_MISSING_WARN_TTL_MS', 300000)); // 5 minutes
+        if (now - last >= ttl) {
+          this._missingTelegramWarn.set(key, now);
+          logger.error(
+            `[Notification] ❌ CRITICAL: TelegramService not available, cannot send close summary alert for position ${closedPosition.id}! ` +
+            `telegramService: ${!!this.telegramService}, sendCloseSummaryAlert: ${!!this.telegramService?.sendCloseSummaryAlert}`
+          );
+        }
         return;
       }
       logger.info(
