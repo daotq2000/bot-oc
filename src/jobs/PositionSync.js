@@ -14,14 +14,17 @@ import pool from '../config/database.js';
 export class PositionSync {
   constructor() {
     this.exchangeServices = new Map(); // botId -> ExchangeService
+    this.telegramService = null; // TelegramService for sending alerts
     this.isRunning = false;
     this.task = null;
   }
 
   /**
    * Initialize services for all active bots
+   * @param {TelegramService} telegramService - Optional TelegramService for sending alerts
    */
-  async initialize() {
+  async initialize(telegramService = null) {
+    this.telegramService = telegramService;
     try {
       const { Bot } = await import('../models/Bot.js');
       const bots = await Bot.findAll(true); // Active bots only
@@ -160,14 +163,40 @@ export class PositionSync {
             if (lockResult.affectedRows > 0) {
               try {
                 logger.warn(
-                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but exchange has no positions, marking as closed`
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but exchange has no positions, closing via PositionService`
                 );
-                await Position.update(dbPos.id, {
-                  status: 'closed',
-                  close_reason: 'sync_exchange_empty',
-                  closed_at: new Date()
-                });
-                closedCount++;
+                // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
+                try {
+                  const { PositionService } = await import('../services/PositionService.js');
+                  const positionService = new PositionService(exchangeService, this.telegramService); // Use TelegramService if available
+
+                  // Get current price for PnL calculation
+                  let closePrice = dbPos.entry_price || 0;
+                  try {
+                    closePrice = await exchangeService.getTickerPrice(dbPos.symbol);
+                  } catch (priceError) {
+                    logger.warn(`[PositionSync] Could not get ticker price for ${dbPos.symbol}, using entry_price: ${priceError?.message || priceError}`);
+                  }
+
+                  const { calculatePnL } = await import('../utils/calculator.js');
+                  const pnl = calculatePnL(dbPos.entry_price, closePrice, dbPos.amount, dbPos.side);
+
+                  await positionService.closePosition(dbPos, closePrice, pnl, 'sync_exchange_empty');
+                  closedCount++;
+                  logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (Telegram alert should be sent)`);
+                } catch (closeError) {
+                  // Fallback to direct update if PositionService fails
+                  logger.error(
+                    `[PositionSync] Failed to close position ${dbPos.id} via PositionService: ${closeError?.message || closeError}. ` +
+                    `Falling back to direct DB update (no Telegram alert will be sent).`
+                  );
+                  await Position.update(dbPos.id, {
+                    status: 'closed',
+                    close_reason: 'sync_exchange_empty',
+                    closed_at: new Date()
+                  });
+                  closedCount++;
+                }
               } finally {
                 try {
                   await pool.execute(
@@ -180,7 +209,50 @@ export class PositionSync {
               }
             }
           } catch (error) {
-            logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, error?.message || error);
+            const errorMsg = error?.message || String(error);
+            // Handle SQL error about is_processing column gracefully
+            if (errorMsg.includes("Unknown column 'is_processing'") || errorMsg.includes("is_processing")) {
+              logger.debug(`[PositionSync] Column 'is_processing' does not exist, proceeding without lock for position ${dbPos.id}`);
+              try {
+                logger.warn(
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but exchange has no positions, closing via PositionService`
+                );
+                // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
+                try {
+                  const { PositionService } = await import('../services/PositionService.js');
+                  const positionService = new PositionService(exchangeService, this.telegramService); // Use TelegramService if available
+
+                  // Get current price for PnL calculation
+                  let closePrice = dbPos.entry_price || 0;
+                  try {
+                    closePrice = await exchangeService.getTickerPrice(dbPos.symbol);
+                  } catch (priceError) {
+                    logger.warn(`[PositionSync] Could not get ticker price for ${dbPos.symbol}, using entry_price: ${priceError?.message || priceError}`);
+                  }
+
+                  const { calculatePnL } = await import('../utils/calculator.js');
+                  const pnl = calculatePnL(dbPos.entry_price, closePrice, dbPos.amount, dbPos.side);
+
+                  await positionService.closePosition(dbPos, closePrice, pnl, 'sync_exchange_empty');
+                  logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (Telegram alert should be sent)`);
+                } catch (closeError) {
+                  // Fallback to direct update if PositionService fails
+                  logger.error(
+                    `[PositionSync] Failed to close position ${dbPos.id} via PositionService: ${closeError?.message || closeError}. ` +
+                    `Falling back to direct DB update (no Telegram alert will be sent).`
+                  );
+                  await Position.update(dbPos.id, {
+                    status: 'closed',
+                    close_reason: 'sync_exchange_empty',
+                    closed_at: new Date()
+                  });
+                }
+              } catch (updateError) {
+                logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, updateError?.message || updateError);
+              }
+            } else {
+              logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, errorMsg);
+            }
           }
         }
         logger.info(`[PositionSync] Closed ${closedCount} positions for bot ${botId} (exchange has no positions)`);
@@ -287,14 +359,40 @@ export class PositionSync {
               // Lock acquired, proceed with update
               try {
                 logger.warn(
-                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, marking as closed`
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, closing via PositionService`
                 );
-                await Position.update(dbPos.id, {
-                  status: 'closed',
-                  close_reason: 'sync_not_on_exchange',
-                  closed_at: new Date()
-                });
-                closedCount++;
+                // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
+                try {
+                  const { PositionService } = await import('../services/PositionService.js');
+                  const positionService = new PositionService(exchangeService, this.telegramService); // Use TelegramService if available
+
+                  // Get current price for PnL calculation
+                  let closePrice = dbPos.entry_price || 0;
+                  try {
+                    closePrice = await exchangeService.getTickerPrice(dbPos.symbol);
+                  } catch (priceError) {
+                    logger.warn(`[PositionSync] Could not get ticker price for ${dbPos.symbol}, using entry_price: ${priceError?.message || priceError}`);
+                  }
+
+                  const { calculatePnL } = await import('../utils/calculator.js');
+                  const pnl = calculatePnL(dbPos.entry_price, closePrice, dbPos.amount, dbPos.side);
+
+                  await positionService.closePosition(dbPos, closePrice, pnl, 'sync_not_on_exchange');
+                  closedCount++;
+                  logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (Telegram alert should be sent)`);
+                } catch (closeError) {
+                  // Fallback to direct update if PositionService fails
+                  logger.error(
+                    `[PositionSync] Failed to close position ${dbPos.id} via PositionService: ${closeError?.message || closeError}. ` +
+                    `Falling back to direct DB update (no Telegram alert will be sent).`
+                  );
+                  await Position.update(dbPos.id, {
+                    status: 'closed',
+                    close_reason: 'sync_not_on_exchange',
+                    closed_at: new Date()
+                  });
+                  closedCount++;
+                }
               } finally {
                 // Always release lock in finally block
                 try {
@@ -315,16 +413,59 @@ export class PositionSync {
             logger.debug(`[PositionSync] Could not acquire lock for position ${dbPos.id}: ${lockError?.message || lockError}`);
             try {
               logger.warn(
-                `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, marking as closed`
+                `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, closing via PositionService`
               );
-              await Position.update(dbPos.id, {
-                status: 'closed',
-                close_reason: 'sync_not_on_exchange',
-                closed_at: new Date()
-              });
-              closedCount++;
+              // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
+              try {
+                const { PositionService } = await import('../services/PositionService.js');
+                const positionService = new PositionService(exchangeService, this.telegramService); // Inject TelegramService if available
+
+                // Get current price for PnL calculation
+                let closePrice = dbPos.entry_price || 0;
+                try {
+                  closePrice = await exchangeService.getTickerPrice(dbPos.symbol);
+                } catch (priceError) {
+                  logger.warn(`[PositionSync] Could not get ticker price for ${dbPos.symbol}, using entry_price: ${priceError?.message || priceError}`);
+                }
+
+                const { calculatePnL } = await import('../utils/calculator.js');
+                const pnl = calculatePnL(dbPos.entry_price, closePrice, dbPos.amount, dbPos.side);
+
+                await positionService.closePosition(dbPos, closePrice, pnl, 'sync_not_on_exchange');
+                closedCount++;
+                logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (Telegram alert should be sent)`);
+              } catch (closeError) {
+                // Fallback to direct update if PositionService fails
+                logger.error(
+                  `[PositionSync] Failed to close position ${dbPos.id} via PositionService: ${closeError?.message || closeError}. ` +
+                  `Falling back to direct DB update (no Telegram alert will be sent).`
+                );
+                await Position.update(dbPos.id, {
+                  status: 'closed',
+                  close_reason: 'sync_not_on_exchange',
+                  closed_at: new Date()
+                });
+                closedCount++;
+              }
             } catch (updateError) {
-              logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, updateError?.message || updateError);
+              const updateErrorMsg = updateError?.message || String(updateError);
+              // Handle SQL error about is_processing column gracefully
+              if (updateErrorMsg.includes("Unknown column 'is_processing'") || updateErrorMsg.includes("is_processing")) {
+                logger.debug(`[PositionSync] Column 'is_processing' does not exist, proceeding without lock for position ${dbPos.id}`);
+                // Try to update without lock
+                try {
+                  await Position.update(dbPos.id, {
+                    status: 'closed',
+                    close_reason: 'sync_not_on_exchange',
+                    closed_at: new Date()
+                  });
+                  closedCount++;
+                } catch (retryError) {
+                  logger.error(`[PositionSync] Failed to close position ${dbPos.id} (retry):`, retryError?.message || retryError);
+                }
+              } else {
+                logger.error(`[PositionSync] Failed to close position ${dbPos.id}:`, updateErrorMsg);
+              }
             }
           }
         }
@@ -638,30 +779,17 @@ export class PositionSync {
         return;
       }
 
-      // 3. Check and sync size mismatch (USDT notional value)
+      // 3. Check size mismatch (warn if significant difference)
       const dbAmount = parseFloat(dbPos.amount || 0);
-      const markPrice = parseFloat(exPos.markPrice || exPos.info?.markPrice || dbPos.entry_price || 0);
+      const exAmount = contracts * parseFloat(exPos.markPrice || exPos.info?.markPrice || dbPos.entry_price || 0);
+      const sizeDiffPercent = dbAmount > 0 ? Math.abs((exAmount - dbAmount) / dbAmount) * 100 : 0;
 
-      // Ensure markPrice is valid before calculating exAmount
-      if (markPrice > 0) {
-        const exAmount = contracts * markPrice;
-        const sizeDiffPercent = dbAmount > 0 ? Math.abs((exAmount - dbAmount) / dbAmount) * 100 : (exAmount > 0 ? 100 : 0);
-
-        // Always sync amount from exchange -> DB (exchange is source of truth)
-        // NOTE: `amount` is treated as USDT notional in this system.
-        logger.info(
-          `[PositionSync] Syncing size for position ${dbPos.id}: ` +
-          `DB=${dbAmount.toFixed(2)}, Exchange=${exAmount.toFixed(2)} (diff=${sizeDiffPercent.toFixed(2)}%). Updating DB.`
+      if (sizeDiffPercent > 10) { // More than 10% difference
+        logger.warn(
+          `[PositionSync] Size mismatch for position ${dbPos.id}: ` +
+          `DB=${dbAmount.toFixed(2)}, Exchange=${exAmount.toFixed(2)}, diff=${sizeDiffPercent.toFixed(2)}%`
         );
-        try {
-          await Position.update(dbPos.id, { amount: exAmount });
-        } catch (updateError) {
-          logger.error(`[PositionSync] Failed to update amount for position ${dbPos.id}:`, updateError);
-        }
-      } else {
-        logger.warn(`[PositionSync] Could not verify size for position ${dbPos.id}: Invalid markPrice from exchange data.`);
       }
-
 
       // 4. Check entry price mismatch (warn if significant difference)
       const exEntryPrice = parseFloat(exPos.entryPrice || exPos.info?.entryPrice || 0);

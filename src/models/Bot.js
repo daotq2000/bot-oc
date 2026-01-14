@@ -6,33 +6,7 @@ import logger from '../utils/logger.js';
  */
 export class Bot {
   /**
-   * Parse bot row from database, converting config_filter JSON string to object
-   * @param {Object} row - Raw database row
-   * @returns {Object} Parsed bot object with config_filter as object
-   */
-  static _parseBotRow(row) {
-    if (!row) return row;
-    
-    // Parse config_filter from JSON string to object
-    if (row.config_filter !== null && row.config_filter !== undefined) {
-      try {
-        if (typeof row.config_filter === 'string') {
-          row.config_filter = JSON.parse(row.config_filter);
-        }
-        // If already an object, keep it as is
-      } catch (e) {
-        logger.warn(`[Bot] Failed to parse config_filter for bot ${row.id}: ${e?.message || e}`);
-        row.config_filter = {}; // Fallback to empty object
-      }
-    } else {
-      row.config_filter = {}; // Default to empty object if null
-    }
-    
-    return row;
-  }
-
-  /**
-   * Get all bots (with parsed config_filter)
+   * Get all bots
    * @param {boolean} activeOnly - Only return active bots
    * @returns {Promise<Array>}
    */
@@ -44,11 +18,11 @@ export class Bot {
     query += ' ORDER BY created_at DESC';
     
     const [rows] = await pool.execute(query);
-    return rows.map(row => this._parseBotRow(row));
+    return rows;
   }
 
   /**
-   * Get bot by ID (with parsed config_filter)
+   * Get bot by ID
    * @param {number} id - Bot ID
    * @returns {Promise<Object|null>}
    */
@@ -57,7 +31,7 @@ export class Bot {
       'SELECT * FROM bots WHERE id = ?',
       [id]
     );
-    return rows[0] ? this._parseBotRow(rows[0]) : null;
+    return rows[0] || null;
   }
 
   /**

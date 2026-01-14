@@ -122,19 +122,11 @@ export class PositionWebSocketClient extends EventEmitter {
       try {
       await this.createListenKey();
       } catch (e) {
-        const isInvalidKeyError = e?.code === -2015 || (e?.message || '').includes('-2015');
-
-        if (isInvalidKeyError) {
-          logger.error(`[WS] PERMANENT ERROR: Invalid API key (code ${e?.code || -2015}). Disabling user-data WebSocket for this bot to prevent retry storms.`);
-          // Stop this client instance permanently. It will not try to reconnect.
-          await this.stop();
-        } else {
-          // For temporary errors, log and schedule a reconnect
         logger.error('[WS] Failed to create listenKey, will retry:', e?.message || e);
         this.state = 'idle';
+        // Retry with new listenKey after backoff
         this.reconnect(true);
-        }
-        return; // Exit the connect attempt
+        return;
       }
     }
 

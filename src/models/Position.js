@@ -220,6 +220,12 @@ export class Position {
    * @returns {Promise<Object>}
    */
   static async close(id, closePrice, pnl, reason) {
+    // Idempotency guard: do not double-close and double-count PnL
+    const current = await this.findById(id);
+    if (current && current.status === 'closed') {
+      return current;
+    }
+
     return this.update(id, {
       status: 'closed',
       close_price: closePrice,

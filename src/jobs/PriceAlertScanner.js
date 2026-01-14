@@ -15,7 +15,6 @@ export class PriceAlertScanner {
   constructor() {
     this.exchangeServices = new Map(); // exchange -> ExchangeService
     this.orderServices = new Map(); // botId -> OrderService
-    this.exchangeServicesByBotId = new Map(); // botId -> ExchangeService (from OrderService)
     this.telegramService = null;
     this.isRunning = false;
     this.scanInterval = null;
@@ -57,17 +56,6 @@ export class PriceAlertScanner {
   async initialize(telegramService, orderServices = new Map()) {
     this.telegramService = telegramService;
     this.orderServices = orderServices;
-
-    // Build botId -> ExchangeService map from provided OrderServices (reliable for warmup/seed)
-    this.exchangeServicesByBotId = new Map();
-    try {
-      for (const [botId, os] of (orderServices || new Map()).entries()) {
-        if (os?.exchangeService) this.exchangeServicesByBotId.set(botId, os.exchangeService);
-      }
-      logger.info(`[PriceAlertScanner] Mapped ${this.exchangeServicesByBotId.size} ExchangeServices by bot_id for trend warmup`);
-    } catch (e) {
-      logger.warn(`[PriceAlertScanner] Failed to build exchangeServicesByBotId map: ${e?.message || e}`);
-    }
 
     try {
       // ✅ OPTIMIZED: Cache PriceAlertConfigs lúc init (sẽ refresh định kỳ theo TTL)
@@ -149,24 +137,15 @@ export class PriceAlertScanner {
     const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 500);
 
     const runLoop = async () => {
-      if (!this.isRunning) {
-        logger.warn('[PriceAlertScanner] runLoop called but isRunning=false, stopping');
-        return;
-      }
+      if (!this.isRunning) return;
       try {
         await this.scan();
       } catch (error) {
         logger.error('PriceAlertScanner scan error:', error);
-        // Log stack trace for debugging
-        if (error?.stack) {
-          logger.error('PriceAlertScanner runLoop error stack:', error.stack);
-        }
       } finally {
         // ✅ Avoid timer pile-up: schedule next run only after finishing current scan
         if (this.isRunning) {
           this.scanInterval = setTimeout(runLoop, interval);
-        } else {
-          logger.warn('[PriceAlertScanner] runLoop finished but isRunning=false, not scheduling next run');
         }
       }
     };
@@ -235,18 +214,9 @@ export class PriceAlertScanner {
       this.cleanupCachesIfNeeded();
 
       const scanDuration = Date.now() - scanStartTime;
-      // Log every scan completion to track if scanner is still running
-      if (scanDuration > 1000) {
-        logger.info(`[PriceAlertScanner] Scan completed in ${scanDuration}ms (configs=${activeConfigs.length})`);
-      } else {
-        logger.debug(`[PriceAlertScanner] Scan completed in ${scanDuration}ms (configs=${activeConfigs.length})`);
-      }
+      logger.debug(`[PriceAlertScanner] Scan completed in ${scanDuration}ms`);
     } catch (error) {
       logger.error('PriceAlertScanner scan failed:', error);
-      // Log stack trace for debugging
-      if (error?.stack) {
-        logger.error('PriceAlertScanner scan error stack:', error.stack);
-      }
     } finally {
       this.isScanning = false;
     }
@@ -557,8 +527,6 @@ export class PriceAlertScanner {
   async runWithConcurrency(items, concurrency, worker) {
     const limit = Math.max(1, Number(concurrency) || 1);
     let idx = 0;
-    let completed = 0;
-    let errors = 0;
 
     const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
       while (idx < items.length) {
@@ -566,30 +534,13 @@ export class PriceAlertScanner {
         const item = items[currentIndex];
         try {
           await worker(item);
-          completed++;
         } catch (err) {
-          errors++;
-          logger.error(`[PriceAlertScanner] Worker error (item ${currentIndex}/${items.length}):`, err?.message || err);
-          // Log stack trace for debugging
-          if (err?.stack) {
-            logger.error(`[PriceAlertScanner] Worker error stack:`, err.stack);
-          }
+          logger.error(`[PriceAlertScanner] Worker error:`, err?.message || err);
         }
       }
     });
 
-    try {
-      await Promise.allSettled(runners);
-      if (errors > 0) {
-        logger.warn(`[PriceAlertScanner] runWithConcurrency completed: ${completed} success, ${errors} errors out of ${items.length} items`);
-      }
-    } catch (error) {
-      logger.error(`[PriceAlertScanner] runWithConcurrency fatal error:`, error?.message || error);
-      if (error?.stack) {
-        logger.error(`[PriceAlertScanner] runWithConcurrency error stack:`, error.stack);
-      }
-      throw error;
-    }
+    await Promise.allSettled(runners);
   }
 
   /**
@@ -711,9 +662,6 @@ export class PriceAlertScanner {
       const bullish = Number(currentPrice) >= Number(openPrice);
       const direction = bullish ? 'bullish' : 'bearish';
 
-      // Normalize exchange name for bot token selection
-      const normalizedExchange = (exchange || 'mexc').toLowerCase();
-
       // Use compact line format via TelegramService
       logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
 
@@ -724,8 +672,7 @@ export class PriceAlertScanner {
           oc: ocPercent,
           open: openPrice,
           currentPrice,
-          direction,
-          exchange: normalizedExchange // Pass exchange to use correct bot token
+          direction
         });
         logger.info(`[PriceAlertScanner] ✅ Alert queued: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
       } catch (error) {
@@ -763,68 +710,6 @@ export class PriceAlertScanner {
         : currentPrice;
 
       const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
-
-      // ✅ Trend filter (ONLY for trend-following / is_reverse_strategy=false)
-      if (!isReverseStrategy) {
-        const { trendContext } = await import('../utils/TrendContext.js');
-        const { Bot } = await import('../models/Bot.js');
-
-        // Load bot if not already loaded to get config_filter
-        if (!strategy.bot && strategy.bot_id) {
-          strategy.bot = await Bot.findById(strategy.bot_id);
-        }
-
-        // Get bot config_filter, add bot_id for state key separation
-        const botConfig = strategy.bot?.config_filter ? {
-          ...strategy.bot.config_filter,
-          _botId: strategy.bot_id
-        } : null;
-
-        trendContext.updateFromTick({
-          symbol: strategy.symbol,
-          currentPrice,
-          ocAbs: Math.abs(oc),
-          direction,
-          timestamp,
-          botConfig
-        });
-
-        const v = trendContext.isValidTrend({
-          symbol: strategy.symbol,
-          currentPrice,
-          openPrice: baseOpen,
-          direction,
-          ocAbs: Math.abs(oc),
-          ocThreshold: Math.abs(Number(strategy.oc || strategy.open_change || oc || 0)),
-          botConfig
-        });
-
-        if (!v.ok) {
-          trendContext.logBlock({ reason: v.reason, symbol: strategy.symbol, direction, meta: v.meta });
-
-          // ✅ Trigger warmup polling if block is due to insufficient EMA data
-          if (v.reason === 'ema_slope_insufficient_data') {
-            // Try to get ExchangeService instance for this bot (binance only warmup)
-            const exchangeService = this.exchangeServicesByBotId?.get(strategy.bot_id);
-            if (exchangeService) {
-              logger.info(`[TREND-WARMUP-TRIGGER] source=PriceAlertScanner botId=${strategy.bot_id} symbol=${strategy.symbol} exchange=${exchangeService?.bot?.exchange || 'unknown'}`);
-              trendContext.maybeWarmupOnInsufficientData({
-                symbol: strategy.symbol,
-                exchangeService,
-                direction,
-                botConfig
-              }).catch(e => {
-                logger.warn(`[TREND-WARMUP] Failed to trigger warmup for ${strategy.symbol}: ${e?.message || e}`);
-              });
-            } else {
-              logger.warn(`[TREND-WARMUP-TRIGGER] source=PriceAlertScanner botId=${strategy.bot_id} symbol=${strategy.symbol} missing_exchangeService=true`);
-            }
-          }
-
-          return null; // BLOCK ENTRY (trend-follow only)
-        }
-      }
-
       let entryPrice;
       let forceMarket = false;
 

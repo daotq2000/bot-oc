@@ -17,24 +17,6 @@ import { webSocketManager } from './services/WebSocketManager.js';
 // Load environment variables
 dotenv.config();
 
-// Global error handlers to avoid silent stalls (especially under pm2)
-process.on('unhandledRejection', (reason) => {
-  // Ignore EPIPE errors (pipe closed) - these are non-critical and happen when stdout/stderr is closed
-  if (reason && typeof reason === 'object' && (reason.code === 'EPIPE' || reason.errno === -32)) {
-    return; // Silently ignore EPIPE errors
-  }
-  logger.error('[GLOBAL] Unhandled Rejection:', reason);
-});
-
-process.on('uncaughtException', (err) => {
-  // Ignore EPIPE errors (pipe closed) - these are non-critical and happen when stdout/stderr is closed
-  if (err && (err.code === 'EPIPE' || err.errno === -32 || err.syscall === 'write')) {
-    return; // Silently ignore EPIPE errors
-  }
-  logger.error('[GLOBAL] Uncaught Exception:', err);
-  // Do not exit here; pm2 can be configured to restart if needed.
-});
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -75,173 +57,6 @@ let strategiesWorker = null;
 let symbolsUpdaterJob = null;
 let positionSyncJob = null;
 let telegramBot = null;
-let telegramService = null;
-
-/**
- * Cleanup all caches and memory structures
- * This function should be called during graceful shutdown to free memory
- */
-async function cleanupAllCaches() {
-  logger.info('🧹 Starting cleanup of all caches and memory structures...');
-  const cleanupStart = Date.now();
-  let cleanedCount = 0;
-  
-  try {
-    // 1. OrderStatusCache
-    try {
-      const { orderStatusCache } = await import('./services/OrderStatusCache.js');
-      orderStatusCache.stopCleanupTimer();
-      orderStatusCache.clear();
-      cleanedCount++;
-      logger.info('✅ Cleared OrderStatusCache');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to clear OrderStatusCache: ${e?.message || e}`);
-    }
-    
-    // 2. StrategyCache
-    try {
-      const { strategyCache } = await import('./services/StrategyCache.js');
-      strategyCache.clear();
-      cleanedCount++;
-      logger.info('✅ Cleared StrategyCache');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to clear StrategyCache: ${e?.message || e}`);
-    }
-    
-    // 3. ExchangeInfoService
-    try {
-      const { exchangeInfoService } = await import('./services/ExchangeInfoService.js');
-      exchangeInfoService.destroy();
-      cleanedCount++;
-      logger.info('✅ Destroyed ExchangeInfoService');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to destroy ExchangeInfoService: ${e?.message || e}`);
-    }
-    
-    // 4. ConfigService (optional - may want to keep for shutdown)
-    // Skipping ConfigService as it may be needed during shutdown
-    
-    // 5. TelegramService
-    try {
-      if (telegramService) {
-        await telegramService.stop();
-        cleanedCount++;
-        logger.info('✅ Stopped TelegramService');
-      }
-    } catch (e) {
-      logger.warn(`⚠️ Failed to stop TelegramService: ${e?.message || e}`);
-    }
-    
-    // 6. OrderService caches (if accessible)
-    // Note: OrderService instances are per-bot, cleanup handled by service lifecycle
-    
-    // 7. RealtimeOCDetector
-    try {
-      const { RealtimeOCDetector } = await import('./services/RealtimeOCDetector.js');
-      // RealtimeOCDetector is instantiated per worker, cleanup handled by worker stop
-      cleanedCount++;
-      logger.info('✅ RealtimeOCDetector cleanup handled by worker stop');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to cleanup RealtimeOCDetector: ${e?.message || e}`);
-    }
-    
-    // 8. PositionRealtimeCache
-    try {
-      const { positionRealtimeCache } = await import('./services/PositionRealtimeCache.js');
-      positionRealtimeCache.cleanup();
-      cleanedCount++;
-      logger.info('✅ Cleaned PositionRealtimeCache');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to cleanup PositionRealtimeCache: ${e?.message || e}`);
-    }
-    
-    // 9. SymbolStateManager
-    try {
-      const { symbolStateManager } = await import('./services/SymbolStateManager.js');
-      symbolStateManager.stopCleanup();
-      symbolStateManager.cleanup();
-      cleanedCount++;
-      logger.info('✅ Cleaned SymbolStateManager');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to cleanup SymbolStateManager: ${e?.message || e}`);
-    }
-    
-    // 10. WebSocketManager (Binance)
-    try {
-      webSocketManager.disconnect();
-      cleanedCount++;
-      logger.info('✅ Disconnected Binance WebSocketManager');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to disconnect Binance WebSocketManager: ${e?.message || e}`);
-    }
-    
-    // 11. MexcWebSocketManager
-    try {
-      const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
-      mexcPriceWs.disconnect();
-      cleanedCount++;
-      logger.info('✅ Disconnected MEXC WebSocketManager');
-    } catch (e) {
-      logger.warn(`⚠️ Failed to disconnect MEXC WebSocketManager: ${e?.message || e}`);
-    }
-    
-    // 12. BinanceDirectClient caches (per-instance, handled by service lifecycle)
-    // Note: BinanceDirectClient instances are per-bot, cleanup handled by service lifecycle
-    // However, we can clear the request queue if accessible
-    
-    // 13. PositionService internal caches
-    // Note: PositionService instances are per-bot, cleanup handled by service lifecycle
-    // However, we can clear crossEntryExitPending Map if accessible
-    try {
-      // PositionService has crossEntryExitPending Map that should be cleared
-      // This is per-instance, but we log it for awareness
-      logger.debug('PositionService caches are per-instance, cleanup handled by service lifecycle');
-    } catch (e) {
-      // Ignore - per-instance cleanup
-    }
-    
-    // 14. PriceAlertWorker caches
-    if (priceAlertWorker) {
-      try {
-        // PriceAlertWorker.stop() should handle internal cleanup
-        cleanedCount++;
-        logger.info('✅ PriceAlertWorker cleanup handled by stop()');
-      } catch (e) {
-        logger.warn(`⚠️ Failed to cleanup PriceAlertWorker: ${e?.message || e}`);
-      }
-    }
-    
-    // 15. StrategiesWorker caches
-    if (strategiesWorker) {
-      try {
-        // StrategiesWorker.stop() should handle internal cleanup
-        cleanedCount++;
-        logger.info('✅ StrategiesWorker cleanup handled by stop()');
-      } catch (e) {
-        logger.warn(`⚠️ Failed to cleanup StrategiesWorker: ${e?.message || e}`);
-      }
-    }
-    
-    // 16. Clear any remaining intervals/timers
-    // Note: Most timers are cleared by individual service stop() methods
-    
-    // 17. Force garbage collection hint (if available)
-    if (global.gc) {
-      try {
-        global.gc();
-        logger.info('✅ Triggered garbage collection');
-      } catch (e) {
-        logger.debug('Garbage collection not available or failed');
-      }
-    }
-    
-    const cleanupDuration = Date.now() - cleanupStart;
-    logger.info(`✅ Cleanup completed: ${cleanedCount} caches/services cleaned in ${cleanupDuration}ms`);
-    
-  } catch (error) {
-    logger.error(`❌ Error during cache cleanup: ${error?.message || error}`);
-  }
-}
 
 
 // Initialize services and start server
@@ -321,7 +136,6 @@ async function start() {
       await AppConfig.set('MEXC_FUTURES_REST_BASE', 'https://contract.mexc.co', 'MEXC Futures REST base URL (using .co domain for better connectivity)');
       await AppConfig.set('WS_SUB_BATCH_SIZE', '150', 'Number of symbols/streams per subscribe batch');
       await AppConfig.set('WS_SUB_BATCH_DELAY_MS', '50', 'Delay between subscribe batches (ms)');
-
       await AppConfig.set('POSITION_MONITOR_INTERVAL_MS', '40000', 'Interval (ms) between position monitor cycles (increased from 25s to reduce rate limit)');
       await AppConfig.set('POSITION_SYNC_INTERVAL_MS', '60000', 'Interval (ms) between position sync cycles (increased from 40s to reduce rate limit)');
 
@@ -360,17 +174,19 @@ async function start() {
       // Batch processing configs
       await AppConfig.set('SIGNAL_SCAN_BATCH_SIZE', '200', 'Number of strategies to scan in parallel per batch');
       await AppConfig.set('SIGNAL_SCAN_BATCH_DELAY_MS', '300', 'Delay (ms) between signal scan batches');
-      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '2', 'Number of positions to monitor in parallel per batch (reduced from 3 to reduce rate limit)');
-      await AppConfig.set('POSITION_MONITOR_BATCH_DELAY_MS', '2000', 'Delay (ms) between position monitor batches (increased from 300ms to reduce rate limit)');
+      // Position Monitor - Optimized for high-volume processing
+      await AppConfig.set('POSITION_MONITOR_BATCH_SIZE', '5', 'Number of positions per batch for general processing (increased for better throughput)');
+      await AppConfig.set('POSITION_MONITOR_TP_BATCH_SIZE', '10', 'Number of positions per batch for TP/SL placement (larger batch for urgent TP placement)');
+      await AppConfig.set('POSITION_MONITOR_MONITORING_BATCH_SIZE', '8', 'Number of positions per batch for monitoring (parallel monitoring)');
+      await AppConfig.set('POSITION_MONITOR_TP_BATCH_DELAY_MS', '300', 'Delay (ms) between TP/SL placement batches (reduced for faster processing)');
+      await AppConfig.set('POSITION_MONITOR_MONITORING_BATCH_DELAY_MS', '200', 'Delay (ms) between monitoring batches (reduced for faster processing)');
+      await AppConfig.set('POSITION_MONITOR_MAX_TIME_PER_BOT_MS', '300000', 'Max processing time (ms) per bot before moving to next bot (5 minutes)');
       await AppConfig.set('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', '200', 'Minimum interval (ms) between Binance market data requests');
       await AppConfig.set('BINANCE_REST_PRICE_COOLDOWN_MS', '10000', 'Cooldown (ms) before reusing cached REST price fallback');
-      await AppConfig.set('POSITION_MONITOR_POSITION_DELAY_MS', '1000', 'Delay (ms) between each position in a batch (increased from 500ms to reduce rate limit)');
 
       // Symbols refresh configs
       await AppConfig.set('ENABLE_SYMBOLS_REFRESH', 'true', 'Enable periodic symbols/filters refresh for exchanges');
       await AppConfig.set('SYMBOLS_REFRESH_CRON', '*/15 * * * *', 'Cron for symbols refresh job (default every 15 minutes)');
-      // NOTE: TREND_FILTER configs are now read from bot.config_filter (JSON column in bots table)
-      // These AppConfig values are kept as fallback defaults if bot.config_filter is not set
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);
     }
@@ -408,7 +224,7 @@ async function start() {
 
     // Initialize Telegram service
     logger.info('Initializing Telegram service...');
-    telegramService = new TelegramService();
+    const telegramService = new TelegramService();
     await telegramService.initialize();
 
     // Delay Telegram bot startup to reduce CPU load
@@ -521,7 +337,7 @@ async function start() {
       try {
         const { PositionSync } = await import('./jobs/PositionSync.js');
         positionSyncJob = new PositionSync();
-        await positionSyncJob.initialize();
+        await positionSyncJob.initialize(telegramService); // Pass TelegramService for alert notifications
         positionSyncJob.start();
         logger.info('✅ Position Sync Job started successfully');
       } catch (error) {
@@ -542,14 +358,6 @@ async function start() {
       logger.error('❌ Failed to start Memory Monitor:', error?.message || error);
       // Don't exit - memory monitoring is optional
     }
-
-    // Heartbeat (helps detect event-loop stalls / job stops)
-    setInterval(() => {
-      try {
-        const mem = process.memoryUsage();
-        logger.info(`[Heartbeat] alive pid=${process.pid} rssMB=${Math.round(mem.rss / 1024 / 1024)} heapMB=${Math.round(mem.heapUsed / 1024 / 1024)}`);
-      } catch (_) {}
-    }, 60000);
 
     // Start HTTP server
     app.listen(PORT, () => {
@@ -598,8 +406,25 @@ async function start() {
         }
       }
       
-      // Cleanup all caches and memory structures
-      await cleanupAllCaches();
+      // Cleanup WebSocket connections
+      webSocketManager.disconnect();
+      // Cleanup MEXC WebSocket
+      try {
+        const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
+        mexcPriceWs.disconnect();
+        logger.info('Disconnected MEXC WebSocket');
+      } catch (e) {
+        logger.warn('Failed to disconnect MEXC WebSocket:', e?.message || e);
+      }
+      
+      // Cleanup all caches to free memory
+      try {
+        const { orderStatusCache } = await import('./services/OrderStatusCache.js');
+        orderStatusCache.clear();
+        logger.info('Cleared OrderStatusCache');
+      } catch (e) {
+        logger.warn('Failed to clear OrderStatusCache:', e?.message || e);
+      }
       
       // Stop Memory Monitor
       try {
@@ -610,17 +435,11 @@ async function start() {
         logger.warn('Failed to stop Memory Monitor:', e?.message || e);
       }
       
-      // Stop Telegram Bot
       if (telegramBot) {
-        try {
-          await telegramBot.stop();
-          logger.info('Stopped Telegram Bot');
-        } catch (e) {
-          logger.warn('Failed to stop Telegram Bot:', e?.message || e);
-        }
+        if (telegramBot) {
+        await telegramBot.stop();
       }
-      
-      logger.info('✅ Graceful shutdown completed');
+      }
       process.exit(0);
     });
 
@@ -654,9 +473,26 @@ async function start() {
         }
       }
       
-      // Cleanup all caches and memory structures
-      await cleanupAllCaches();
+      // Cleanup WebSocket connections
+      webSocketManager.disconnect();
+      // Cleanup MEXC WebSocket
+      try {
+        const { mexcPriceWs } = await import('./services/MexcWebSocketManager.js');
+        mexcPriceWs.disconnect();
+        logger.info('Disconnected MEXC WebSocket');
+      } catch (e) {
+        logger.warn('Failed to disconnect MEXC WebSocket:', e?.message || e);
+      }
       
+      // Cleanup all caches to free memory
+      try {
+        const { orderStatusCache } = await import('./services/OrderStatusCache.js');
+        orderStatusCache.clear();
+        logger.info('Cleared OrderStatusCache');
+      } catch (e) {
+        logger.warn('Failed to clear OrderStatusCache:', e?.message || e);
+      }
+
       // Stop Memory Monitor
       try {
         const { memoryMonitor } = await import('./utils/MemoryMonitor.js');
@@ -666,17 +502,7 @@ async function start() {
         logger.warn('Failed to stop Memory Monitor:', e?.message || e);
       }
       
-      // Stop Telegram Bot
-      if (telegramBot) {
-        try {
-          await telegramBot.stop();
-          logger.info('Stopped Telegram Bot');
-        } catch (e) {
-          logger.warn('Failed to stop Telegram Bot:', e?.message || e);
-        }
-      }
-      
-      logger.info('✅ Graceful shutdown completed');
+      await telegramBot.stop();
       process.exit(0);
     });
 
@@ -685,22 +511,6 @@ async function start() {
     process.exit(1);
   }
 }
-
-// Global error handlers to prevent hard crashes on transient network/DNS issues
-process.on('unhandledRejection', (reason) => {
-  logger.error('[Global] unhandledRejection:', reason?.message || reason, reason?.stack);
-});
-
-process.on('uncaughtException', (err) => {
-  logger.error('[Global] uncaughtException:', err?.message || err, err?.stack);
-
-  // If it's a known transient network/DNS error, exit so PM2 can restart cleanly.
-  const code = err?.code;
-  if (code === 'EAI_AGAIN' || code === 'ETIMEDOUT') {
-    logger.warn(`[Global] Transient network error (${code}). Exiting for PM2 restart.`);
-    process.exit(1);
-  }
-});
 
 // Start the application
 start();

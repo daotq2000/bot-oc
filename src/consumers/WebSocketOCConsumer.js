@@ -270,8 +270,29 @@ export class WebSocketOCConsumer {
 
       logger.info(`[WebSocketOCConsumer] 🎯 Found ${matches.length} match(es) for ${exchange} ${symbol}: ${matches.map(m => `strategy ${m.strategy.id} (OC=${m.oc.toFixed(2)}%)`).join(', ')}`);
 
+      // PRIORITY QUEUE: Sort matches by mainnet/testnet priority
+      // Mainnet (binance_testnet=false/null) = priority 1 (highest), Testnet = priority 0 (lower)
+      matches.sort((matchA, matchB) => {
+        const botIdA = matchA.strategy.bot_id;
+        const botIdB = matchB.strategy.bot_id;
+        const orderServiceA = this.orderServices.get(botIdA);
+        const orderServiceB = this.orderServices.get(botIdB);
+        const isMainnetA = orderServiceA?.exchangeService?.bot?.exchange === 'binance' &&
+                          (orderServiceA.exchangeService.bot.binance_testnet === null ||
+                           orderServiceA.exchangeService.bot.binance_testnet === false ||
+                           orderServiceA.exchangeService.bot.binance_testnet === 0);
+        const isMainnetB = orderServiceB?.exchangeService?.bot?.exchange === 'binance' &&
+                          (orderServiceB.exchangeService.bot.binance_testnet === null ||
+                           orderServiceB.exchangeService.bot.binance_testnet === false ||
+                           orderServiceB.exchangeService.bot.binance_testnet === 0);
+        const priorityA = isMainnetA ? 1 : 0;
+        const priorityB = isMainnetB ? 1 : 0;
+        return priorityB - priorityA; // Higher priority first (mainnet first)
+      });
+
       // Process matches in parallel (batch processing for better performance)
       // Use Promise.allSettled to avoid one failure blocking others
+      // Mainnet matches are processed first due to sorting above
       const results = await Promise.allSettled(
         matches.map(match => 
           this.processMatch(match).catch(error => {

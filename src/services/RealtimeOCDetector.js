@@ -28,18 +28,11 @@ export class RealtimeOCDetector {
     this.telegramService = null;
     this.alertEnabled = false;
     this.alertScanRunning = false;
-
-    // CPU optimization: batch alert ticks to reduce per-tick overhead
-    this._alertTickQueue = [];
-    this._alertTickProcessing = false;
-    this._alertTickBatchSize = Number(configService.getNumber('OC_ALERT_TICK_BATCH_SIZE', 200));
-    this._alertTickBatchIntervalMs = Number(configService.getNumber('OC_ALERT_TICK_BATCH_INTERVAL_MS', 200));
-    this._alertTickMaxQueue = Number(configService.getNumber('OC_ALERT_TICK_MAX_QUEUE', 20000));
-    this._alertTickTimer = null;
     this.alertScanTimer = null;
     this.alertWatchlistRefreshTimer = null;
-    this.alertState = new LRUCache(Number(configService.getNumber('OC_ALERT_STATE_CACHE_SIZE', 20000)));
+    this.alertState = new Map();
     this.alertWatchers = [];
+    this.maxAlertStateCacheSize = 1000;
     this.startCacheCleanup();
   }
 
@@ -107,11 +100,25 @@ export class RealtimeOCDetector {
     try {
       if (ex === 'binance') {
         const { webSocketManager } = await import('./WebSocketManager.js');
+
+        // 1) Best: exact bucket open from WS (kline cache / aggregator)
         const wsOpen = webSocketManager.getKlineOpen(sym, interval, bucketStart);
         if (Number.isFinite(wsOpen) && wsOpen > 0) {
-          this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp, source: 'binance_ws_kline' });
-          return { open: wsOpen, error: null, source: 'binance_ws_kline' };
+          this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp, source: 'binance_ws_bucket_open' });
+          return { open: wsOpen, error: null, source: 'binance_ws_bucket_open' };
         }
+
+        // 2) If we have latest candle for this interval and it matches the bucketStart, use its open
+        const latest = webSocketManager.getLatestCandle(sym, interval);
+        if (latest && Number(latest.startTime) === Number(bucketStart)) {
+          const lo = Number(latest.open);
+          if (Number.isFinite(lo) && lo > 0) {
+            this.openPriceCache.set(key, { open: lo, bucketStart, lastUpdate: timestamp, source: 'binance_ws_latest_candle_open' });
+            return { open: lo, error: null, source: 'binance_ws_latest_candle_open' };
+          }
+        }
+
+        // 3) Fallback: previous bucket close as current bucket open
         const intervalMs = this.getIntervalMs(interval);
         const prevBucketStart = bucketStart - intervalMs;
         const prevClose = webSocketManager.getKlineClose(sym, interval, prevBucketStart);
@@ -155,7 +162,9 @@ export class RealtimeOCDetector {
     try {
       const { mexcPriceWs } = await import('./MexcWebSocketManager.js');
       mexcPriceWs.onPrice(({ symbol, price, ts }) => {
-        this.enqueueAlertTick('mexc', symbol, price, ts);
+        this.onAlertTick('mexc', symbol, price, ts).catch(error => {
+          logger.error(`[RealtimeOCDetector] Error in MEXC alert tick:`, error?.message || error);
+        });
       });
       logger.info(`[RealtimeOCDetector] ✅ Registered MEXC alert price handler`);
     } catch (error) {
@@ -165,7 +174,9 @@ export class RealtimeOCDetector {
     try {
       const { webSocketManager } = await import('./WebSocketManager.js');
       webSocketManager.onPrice(({ symbol, price, ts }) => {
-        this.enqueueAlertTick('binance', symbol, price, ts);
+        this.onAlertTick('binance', symbol, price, ts).catch(error => {
+          logger.error(`[RealtimeOCDetector] Error in Binance alert tick:`, error?.message || error);
+        });
       });
       logger.info(`[RealtimeOCDetector] ✅ Registered Binance alert price handler`);
     } catch (error) {
@@ -223,71 +234,7 @@ export class RealtimeOCDetector {
     }
   }
 
-  enqueueAlertTick(exchange, symbol, price, ts = Date.now()) {
-    try {
-      if (!this.alertEnabled) return;
-      const p = Number(price);
-      if (!Number.isFinite(p) || p <= 0) return;
-      if (!symbol) return;
-
-      if (this._alertTickQueue.length >= this._alertTickMaxQueue) {
-        // Drop oldest 20% to keep newest ticks
-        const drop = Math.max(1, Math.floor(this._alertTickMaxQueue * 0.2));
-        this._alertTickQueue.splice(0, drop);
-        logger.warn(`[RealtimeOCDetector] Alert tick queue overflow (>${this._alertTickMaxQueue}). Dropped ${drop} ticks.`);
-      }
-
-      this._alertTickQueue.push({ exchange, symbol, price: p, ts });
-
-      if (!this._alertTickTimer) {
-        this._alertTickTimer = setTimeout(() => {
-          this._alertTickTimer = null;
-          this._processAlertTickBatch().catch(e => logger.error(`[RealtimeOCDetector] Alert batch error: ${e?.message || e}`));
-        }, this._alertTickBatchIntervalMs);
-      }
-    } catch (e) {
-      logger.error(`[RealtimeOCDetector] enqueueAlertTick error: ${e?.message || e}`);
-    }
-  }
-
-  async _processAlertTickBatch() {
-    if (this._alertTickProcessing) return;
-    if (!this.alertEnabled) return;
-    if (!this._alertTickQueue || this._alertTickQueue.length === 0) return;
-    if (!this.alertWatchers || this.alertWatchers.length === 0) {
-      // no watchers - clear quickly to avoid memory growth
-      this._alertTickQueue.length = 0;
-      return;
-    }
-
-    this._alertTickProcessing = true;
-    try {
-      const batch = this._alertTickQueue.splice(0, this._alertTickBatchSize);
-
-      // Deduplicate: keep only latest tick per exchange|symbol
-      const latest = new Map();
-      for (const t of batch) {
-        const k = `${String(t.exchange).toLowerCase()}|${String(t.symbol).toUpperCase()}`;
-        const prev = latest.get(k);
-        if (!prev || (t.ts || 0) >= (prev.ts || 0)) latest.set(k, t);
-      }
-
-      // Process sequentially to avoid CPU spikes (still far less work than per-tick)
-      for (const t of latest.values()) {
-        await this._onAlertTickCore(t.exchange, t.symbol, t.price, t.ts);
-      }
-    } finally {
-      this._alertTickProcessing = false;
-      if (this._alertTickQueue.length > 0 && !this._alertTickTimer) {
-        this._alertTickTimer = setTimeout(() => {
-          this._alertTickTimer = null;
-          this._processAlertTickBatch().catch(e => logger.error(`[RealtimeOCDetector] Alert batch error: ${e?.message || e}`));
-        }, this._alertTickBatchIntervalMs);
-      }
-    }
-  }
-
-  async _onAlertTickCore(exchange, symbol, price, ts = Date.now()) {
+  async onAlertTick(exchange, symbol, price, ts = Date.now()) {
     if (!this.alertEnabled) return;
     if (!this.alertWatchers || this.alertWatchers.length === 0) return;
 
@@ -329,8 +276,7 @@ export class RealtimeOCDetector {
             if (this.telegramService) {
               this.telegramService.sendVolatilityAlert(w.chatId, {
                 symbol: sym, interval, oc, open, currentPrice: p,
-                direction: oc >= 0 ? 'bullish' : 'bearish',
-                exchange: exchange // Pass exchange to use correct bot token
+                direction: oc >= 0 ? 'bullish' : 'bearish'
               }).catch(e => logger.error(`[Telegram] Failed to send alert to ${w.chatId}:`, e));
             }
             state.lastAlertTime = Date.now();
@@ -342,24 +288,6 @@ export class RealtimeOCDetector {
           state.lastAlertOcAbs = 0;
         }
       }
-    }
-  }
-
-  // CRITICAL: Backward-compatible stub to avoid runtime crashes.
-  // The realtime OC matching engine was refactored; some callers (e.g. WebSocketOCConsumer)
-  // still call realtimeOCDetector.detectOC(). Returning [] keeps the system running.
-  // TODO: Re-implement full OC detection/matching here or update callers to the new engine.
-  async detectOC(exchange, symbol, price, timestamp = Date.now(), source = 'unknown') {
-    try {
-      // Lightweight guard to prevent CPU blowups and crashes.
-      if (!exchange || !symbol) return [];
-      const p = Number(price);
-      if (!Number.isFinite(p) || p <= 0) return [];
-      // No-op match: return empty list.
-      return [];
-    } catch (e) {
-      logger.error(`[RealtimeOCDetector] detectOC stub error: ${e?.message || e}`);
-      return [];
     }
   }
 }

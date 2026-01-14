@@ -790,7 +790,8 @@ export class ExchangeService {
       return order;
     } catch (error) {
       const msg = error?.message || '';
-      
+      const errorCode = error?.code;
+
       // MEXC-specific error codes and messages
       const mexcErrors = [
         'Invalid symbol', // MEXC: Invalid trading pair
@@ -802,7 +803,15 @@ export class ExchangeService {
         'Order price is too low', // MEXC: Price out of range
       ];
       
+      // Check for -4400 by code or message (handled gracefully in OrderService)
+      // errorCode can be number (-4400) or string ('-4400')
+      const isQuantitativeRuleError =
+        errorCode === -4400 || errorCode === '-4400' || String(errorCode) === '-4400' ||
+        msg.includes('-4400') || msg.includes('Quantitative Rules violated') ||
+        msg.includes('only reduceOnly order is allowed');
+
       const soft = (
+        isQuantitativeRuleError ||
         msg.includes('not available for trading on Binance Futures') ||
         msg.includes('below minimum notional') ||
         msg.includes('Invalid price after rounding') ||
@@ -810,8 +819,16 @@ export class ExchangeService {
         msg.includes('-1121') || msg.includes('-1111') || msg.includes('-4061') ||
         mexcErrors.some(err => msg.includes(err))
       );
+
+      // CRITICAL: -4400 is handled gracefully in OrderService, so log as warn not error
       if (soft) {
-        logger.warn(`Create order validation for bot ${this.bot.id}: ${msg}`);
+        if (isQuantitativeRuleError) {
+          logger.warn(
+            `[ExchangeService] -4400 Quantitative Rules violation (handled in OrderService) for bot ${this.bot.id}: ${msg}`
+          );
+        } else {
+          logger.warn(`Create order validation for bot ${this.bot.id}: ${msg}`);
+        }
       } else {
         logger.error(`Failed to create order for bot ${this.bot.id}:`, error);
       }
@@ -1390,9 +1407,9 @@ export class ExchangeService {
    * @param {string} symbol - Trading symbol
    * @returns {Promise<Object>} Cancellation result
    */
-  async cancelAllOpenOrders(symbol) {
+  async cancelAllOpenOrders(symbol, options = {}) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
-      return await this.binanceDirectClient.cancelAllOpenOrders(symbol);
+      return await this.binanceDirectClient.cancelAllOpenOrders(symbol, options);
     }
     // CCXT does not have a unified method for this, so we'll skip for other exchanges for now.
     logger.warn(`[ExchangeService] cancelAllOpenOrders not implemented for ${this.bot.exchange}`);
@@ -1472,51 +1489,6 @@ export class ExchangeService {
    * @param {string|number} orderId - Order ID
    * @returns {Promise<number|null>} Average fill price or null if not available
    */
-  /**
-   * Check if a position was recently closed by examining trade history
-   * @param {string} symbol - Trading symbol
-   * @param {'long'|'short'} side - Position side (long/short)
-   * @param {number} positionSize - Position size to verify was closed
-   * @param {number} [lookbackMs=30000] - How far back to check trades (default 30s)
-   * @returns {Promise<boolean>} True if matching closing trades found
-   */
-  async wasRecentlyClosedByTrade(symbol, side, positionSize, lookbackMs = 30000) {
-    try {
-      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
-        return await this.binanceDirectClient.wasPositionClosedByTrade(symbol, side, positionSize, lookbackMs);
-      }
-      
-      // Fallback for other exchanges using CCXT
-      const since = Date.now() - lookbackMs;
-      const trades = await this.exchange.fetchMyTrades(symbol, since);
-      
-      // Filter for closing trades (opposite side of position)
-      const closingSide = side === 'long' ? 'sell' : 'buy';
-      const closingTrades = trades.filter(t => 
-        t.side === closingSide && 
-        new Date(t.timestamp) >= new Date(since)
-      );
-      
-      // Sum up the quantity of closing trades
-      const closedQty = closingTrades.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
-      
-      // Consider the position closed if we found trades covering at least 95% of the position
-      const minCloseThreshold = positionSize * 0.95;
-      const isClosed = closedQty >= minCloseThreshold;
-      
-      if (isClosed) {
-        logger.info(`[${this.bot.exchange}] Position ${symbol} ${side} (${positionSize}) verified closed by recent trades (${closedQty} closed)`);
-      } else if (closingTrades.length > 0) {
-        logger.warn(`[${this.bot.exchange}] Found partial closing trades for ${symbol} ${side}: ${closedQty}/${positionSize} (${(closedQty/positionSize*100).toFixed(1)}%)`);
-      }
-      
-      return isClosed;
-    } catch (error) {
-      logger.error(`[${this.bot.exchange}] Error checking trade history for ${symbol}:`, error?.message || error);
-      return false; // Fail safe - don't assume position is closed on error
-    }
-  }
-
   async getOrderAverageFillPrice(symbol, orderId) {
     try {
       if (this.bot.exchange === 'binance' && this.binanceDirectClient) {

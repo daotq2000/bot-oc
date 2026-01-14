@@ -144,8 +144,6 @@ class MexcWebSocketManager {
     this.ws.on('error', (err) => {
       logger.error('[MEXC-WS] WebSocket error:', err?.message || err, err?.code || '');
       this._connecting = false;
-      // Ensure we always attempt to recover from DNS/network errors
-      this._scheduleReconnect();
     });
   }
 
@@ -183,16 +181,7 @@ class MexcWebSocketManager {
       // MEXC format: { "channel": "rs.sub.ticker", "data": "success", "ts": ... }
       if (data && data.channel && (data.channel.includes('sub.ticker') || data.channel.includes('sub.kline'))) {
         if (data.data === 'success' || data.code === 0) {
-          // Throttle success logs to avoid CPU/IO overload when exchange spams acks
-          const now = Date.now();
-          if (!this._subLogThrottle) this._subLogThrottle = new Map();
-          const key = `channel:${data.channel}`;
-          const last = this._subLogThrottle.get(key) || 0;
-          const intervalMs = Number(configService.getNumber('MEXC_WS_SUB_LOG_THROTTLE_MS', 60000));
-          if (now - last > intervalMs) {
-            this._subLogThrottle.set(key, now);
-            logger.info(`[MEXC-WS] ✅ Subscription success: ${data.channel}`);
-          }
+          logger.info(`[MEXC-WS] ✅ Subscription success: ${data.channel}`);
         } else {
           logger.error(`[MEXC-WS] ❌ Subscription failed: ${data.channel}`, JSON.stringify(data));
         }
@@ -202,15 +191,7 @@ class MexcWebSocketManager {
       // Also check for method-based format (backward compatibility)
       if (data && (data.method === 'sub.ticker' || data.method === 'sub.kline')) {
         if (data.code === 0 || data.status === 'ok') {
-          const now = Date.now();
-          if (!this._subLogThrottle) this._subLogThrottle = new Map();
-          const key = `method:${data.method}`;
-          const last = this._subLogThrottle.get(key) || 0;
-          const intervalMs = Number(configService.getNumber('MEXC_WS_SUB_LOG_THROTTLE_MS', 60000));
-          if (now - last > intervalMs) {
-            this._subLogThrottle.set(key, now);
-            logger.info(`[MEXC-WS] ✅ Subscription success: ${data.method} ${JSON.stringify(data.param || {})}`);
-          }
+          logger.info(`[MEXC-WS] ✅ Subscription success: ${data.method} ${JSON.stringify(data.param || {})}`);
         } else {
           logger.error(`[MEXC-WS] ❌ Subscription failed: ${data.method}`, JSON.stringify(data));
         }
@@ -292,21 +273,6 @@ class MexcWebSocketManager {
     if (!Number.isFinite(open) || open <= 0 || !startTime) return;
     const sym = String(symbol).toUpperCase();
     const key = `${sym}|${interval}|${startTime}`;
-
-    if (this.klineOpenCache.size >= this.maxKlineCacheSize && !this.klineOpenCache.has(key)) {
-      const keys = Array.from(this.klineOpenCache.keys());
-      const drop = Math.max(1, Math.floor(this.maxKlineCacheSize * 0.05));
-      for (let i = 0; i < Math.min(drop, keys.length); i++) {
-        this.klineOpenCache.delete(keys[i]);
-      }
-      const now = Date.now();
-      const last = this._lastKlineEvictLogOpen || 0;
-      if (now - last > 60000) {
-        this._lastKlineEvictLogOpen = now;
-        logger.warn(`[MEXC-WS] Kline OPEN cache overflow (>${this.maxKlineCacheSize}). Evicted ${Math.min(drop, keys.length)} entries.`);
-      }
-    }
-
     this.klineOpenCache.set(key, {
       open,
       lastUpdate: Date.now()
@@ -317,21 +283,6 @@ class MexcWebSocketManager {
     if (!Number.isFinite(close) || close <= 0 || !startTime) return;
     const sym = String(symbol).toUpperCase();
     const key = `${sym}|${interval}|${startTime}`;
-
-    if (this.klineCloseCache.size >= this.maxKlineCacheSize && !this.klineCloseCache.has(key)) {
-      const keys = Array.from(this.klineCloseCache.keys());
-      const drop = Math.max(1, Math.floor(this.maxKlineCacheSize * 0.05));
-      for (let i = 0; i < Math.min(drop, keys.length); i++) {
-        this.klineCloseCache.delete(keys[i]);
-      }
-      const now = Date.now();
-      const last = this._lastKlineEvictLogClose || 0;
-      if (now - last > 60000) {
-        this._lastKlineEvictLogClose = now;
-        logger.warn(`[MEXC-WS] Kline CLOSE cache overflow (>${this.maxKlineCacheSize}). Evicted ${Math.min(drop, keys.length)} entries.`);
-      }
-    }
-
     this.klineCloseCache.set(key, {
       close,
       lastUpdate: Date.now()
@@ -411,17 +362,6 @@ class MexcWebSocketManager {
       if (!Number.isFinite(price) || price <= 0) return;
       const norm = this.normalizeSymbol(sym);
       const ts = Date.now();
-      // Hard cap cache to prevent OOM if subscribed symbols explode
-      if (this.priceCache.size >= this.maxPriceCacheSize && !this.priceCache.has(norm)) {
-        // Remove a handful of oldest entries (simple eviction)
-        const entries = Array.from(this.priceCache.entries())
-          .sort((a, b) => (a[1]?.ts || 0) - (b[1]?.ts || 0));
-        const drop = Math.max(1, Math.floor(this.maxPriceCacheSize * 0.05));
-        for (let i = 0; i < Math.min(drop, entries.length); i++) {
-          this.priceCache.delete(entries[i][0]);
-        }
-        logger.warn(`[MEXC-WS] Price cache overflow (>${this.maxPriceCacheSize}). Evicted ${Math.min(drop, entries.length)} entries.`);
-      }
       this.priceCache.set(norm, { price, ts });
       this._emitPrice({ symbol: norm, price, ts });
     } catch (e) {
@@ -510,8 +450,6 @@ class MexcWebSocketManager {
     this._cleanupTimer = setInterval(() => {
       const now = Date.now();
       const maxAge = this.openTtlMs;
-      const klineMaxAge = this.klineTtlMs;
-      let klineRemoved = 0;
       
       // Cleanup openCache
       for (const [k, v] of this.openCache) {
@@ -525,26 +463,12 @@ class MexcWebSocketManager {
       
       // Cleanup klineOpenCache
       for (const [k, v] of this.klineOpenCache) {
-        if (!v?.lastUpdate || now - v.lastUpdate > klineMaxAge) {
-          this.klineOpenCache.delete(k);
-          klineRemoved++;
-        }
+        if (now - v.lastUpdate > maxAge) this.klineOpenCache.delete(k);
       }
       
       // Cleanup klineCloseCache
       for (const [k, v] of this.klineCloseCache) {
-        if (!v?.lastUpdate || now - v.lastUpdate > klineMaxAge) {
-          this.klineCloseCache.delete(k);
-          klineRemoved++;
-        }
-      }
-
-      if (klineRemoved > 0) {
-        const last = this._lastKlineCleanupLog || 0;
-        if (now - last > 60000) {
-          this._lastKlineCleanupLog = now;
-          logger.info(`[MEXC-WS] Cleaned ${klineRemoved} kline cache entries by TTL. open=${this.klineOpenCache.size} close=${this.klineCloseCache.size}`);
-        }
+        if (now - v.lastUpdate > maxAge) this.klineCloseCache.delete(k);
       }
     }, this.cleanupIntervalMs);
   }

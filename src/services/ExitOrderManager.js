@@ -91,17 +91,35 @@ export class ExitOrderManager {
       throw new Error(`Invalid entry_price for pos=${position.id}: ${position?.entry_price}`);
     }
 
-    // Best-effort: cancel orphaned exits on exchange that are not in DB
-    // CRITICAL FIX: Exclude SL orders (sl_order_id) from cancellation - SL is hard/static and should not be changed
+    // CRITICAL FIX: Check if strategy has hard SL requirement (stoploss > 0)
+    // If yes, we must NEVER cancel SL orders, only cancel TP orders
+    let hasHardSL = false;
+    try {
+      const { Strategy } = await import('../models/Strategy.js');
+      const strategy = await Strategy.findById(position.strategy_id);
+      if (strategy) {
+        const rawStoploss = strategy.stoploss !== undefined ? Number(strategy.stoploss) : NaN;
+        hasHardSL = Number.isFinite(rawStoploss) && rawStoploss > 0;
+        if (hasHardSL) {
+          logger.info(
+            `[ExitOrderManager] 🛡️ Strategy ${strategy.id} has hard SL requirement (stoploss=${rawStoploss} USDT). ` +
+            `Will NOT cancel any SL orders, only cancel orphaned TP orders. | pos=${position.id}`
+          );
+        }
+      }
+    } catch (e) {
+      logger.debug(`[ExitOrderManager] Could not check strategy for hard SL: ${e?.message || e} | pos=${position.id}`);
+    }
+
+    // Best-effort: cancel orphaned TP orders (exit orders) on exchange that are not in DB
+    // CRITICAL: Do NOT cancel SL orders - they are managed separately and may be hard SL requirements
     try {
       const openOrders = await this.exchangeService.getOpenOrders(position.symbol);
       if (Array.isArray(openOrders) && openOrders.length > 0) {
-        const exitTypes = new Set(['STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET']);
+        // Only TP/exit order types - NOT SL orders (STOP, STOP_LOSS, STOP_LOSS_LIMIT)
+        const exitTypes = new Set(['TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP_MARKET']); // Removed 'STOP' to avoid canceling SL orders
         const positionSide = side === 'long' ? 'LONG' : 'SHORT';
-        
-        // Get SL order ID from position - this is a HARD SL that should NEVER be cancelled
-        const dbSlOrderId = position?.sl_order_id ? String(position.sl_order_id) : null;
-        
+
         const existingExits = openOrders.filter(o => {
           const type = String(o?.type || '').toUpperCase();
           const isExitType = exitTypes.has(type);
@@ -115,33 +133,36 @@ export class ExitOrderManager {
         if (existingExits.length > 0) {
           const existingIds = existingExits.map(o => String(o?.orderId || '')).filter(Boolean);
           const dbOrderId = position?.exit_order_id ? String(position.exit_order_id) : null;
-          
-          // Cancel orphaned exit orders (TP orders only)
-          // CRITICAL: NEVER cancel SL orders (sl_order_id) - they are hard/static SL
+          const dbSlOrderId = position?.sl_order_id ? String(position.sl_order_id) : null;
+
+          // Cancel orphaned TP/exit orders ONLY (not SL orders)
+          // CRITICAL: Never cancel SL orders under any circumstances
           for (const order of existingExits) {
             const orderId = String(order?.orderId || '');
-            
-            // Skip if this is the TP order we're about to replace
-            if (orderId === dbOrderId) {
-              continue;
-            }
-            
-            // CRITICAL FIX: Skip if this is the SL order - SL is hard/static and should NEVER be cancelled
-            if (orderId === dbSlOrderId) {
-              logger.debug(
-                `[ExitOrderManager] 🔒 PROTECTED: Skipping SL order ${orderId} (hard SL, not orphaned) | pos=${position.id}`
+            const orderType = String(order?.type || '').toUpperCase();
+
+            // CRITICAL: Never cancel SL orders, regardless of matching or hard SL requirement
+            const isSLOrder = orderType === 'STOP' || orderType === 'STOP_LOSS' || orderType === 'STOP_LOSS_LIMIT';
+            if (isSLOrder) {
+              logger.info(
+                `[ExitOrderManager] 🛡️ PROTECTED: Order ${orderId} is SL order type (${orderType}), will NEVER cancel | pos=${position.id}`
               );
-              continue;
+              continue; // Skip SL orders - never cancel them under any circumstances
             }
             
-            // Only cancel if it's truly orphaned (not TP, not SL)
+            // If strategy has hard SL requirement, skip canceling any orders to be safe
+            if (hasHardSL) {
+              logger.info(
+                `[ExitOrderManager] 🛡️ Strategy has hard SL requirement, skipping cancellation of order ${orderId} (${orderType}) | pos=${position.id}`
+              );
+              continue; // Skip all orders if hard SL requirement
+            }
+            
+            // Only cancel if order doesn't match DB exit_order_id
             if (orderId && orderId !== dbOrderId && orderId !== dbSlOrderId) {
               try {
                 await this.exchangeService.cancelOrder(orderId, position.symbol);
-                logger.info(
-                  `[ExitOrderManager] ✅ Cancelled orphaned exit order ${orderId} | pos=${position.id} ` +
-                  `(not TP=${dbOrderId || 'null'}, not SL=${dbSlOrderId || 'null'})`
-                );
+                logger.info(`[ExitOrderManager] ✅ Cancelled orphaned TP order ${orderId} (${orderType}) | pos=${position.id}`);
               } catch (cancelError) {
                 logger.error(
                   `[ExitOrderManager] ⚠️ Failed to cancel orphaned order ${orderId} | pos=${position.id} error=${cancelError?.message || cancelError}`
@@ -151,7 +172,7 @@ export class ExitOrderManager {
           }
 
           if (dbOrderId && existingIds.includes(dbOrderId)) {
-            // ok - TP order exists, will be replaced
+            // ok - existing exit order matches DB
           }
         }
       }
@@ -162,41 +183,123 @@ export class ExitOrderManager {
     }
 
     const desiredExit = Number(desiredExitPrice);
-    const orderType = this._decideExitType(side, entry, desiredExit);
+    let orderType = this._decideExitType(side, entry, desiredExit);
 
     const currentPrice = await this.exchangeService.getTickerPrice(position.symbol);
     let stopPrice = Number(desiredExitPrice);
 
+    // CRITICAL: Check if price has already exceeded TP before placing order
+    // LONG: currentPrice > desiredTP means we're already past TP (more profit than expected)
+    // SHORT: currentPrice < desiredTP means we're already past TP (more profit than expected)
+    const hasPriceExceededTP = (side === 'long' && currentPrice > desiredExit) ||
+                               (side === 'short' && currentPrice < desiredExit);
+
+    if (hasPriceExceededTP) {
+      // Distinguish between initial TP vs trailing TP
+      const isInitialTP = !position.exit_order_id || !position.initial_tp_price;
+
+      if (isInitialTP) {
+        // Initial TP: Price already exceeded TP → Close immediately with MARKET to lock in better profit
+        logger.warn(
+          `[ExitOrderManager] 🚨 Price already exceeded initial TP | pos=${position.id} ` +
+          `desiredTP=${desiredExit.toFixed(8)} currentPrice=${currentPrice.toFixed(8)} side=${side} ` +
+          `→ Returning shouldCloseImmediately flag (caller should close with MARKET order)`
+        );
+
+        // Return special object to signal caller to close position immediately
+        return {
+          shouldCloseImmediately: true,
+          currentPrice: currentPrice,
+          desiredTP: desiredExit,
+          reason: 'price_exceeded_initial_tp',
+          orderType: null,
+          stopPrice: null,
+          orderId: null
+        };
+      } else {
+        // Trailing TP: Price exceeded trailing TP → Adjust to new TP higher than current price
+        const bufferPct = Number(configService.getNumber('TP_TRAILING_BUFFER_PCT', 0.005)); // 0.5% default
+        if (side === 'long') {
+          stopPrice = currentPrice * (1 + bufferPct);
+        } else {
+          stopPrice = currentPrice * (1 - bufferPct);
+        }
+
+        logger.info(
+          `[ExitOrderManager] 📈 Price exceeded trailing TP, adjusting to new TP | pos=${position.id} ` +
+          `oldTP=${desiredExit.toFixed(8)} newTP=${stopPrice.toFixed(8)} currentPrice=${currentPrice.toFixed(8)} ` +
+          `side=${side} bufferPct=${(bufferPct * 100).toFixed(2)}%`
+        );
+
+        // Recalculate orderType based on new stopPrice
+        orderType = this._decideExitType(side, entry, stopPrice);
+      }
+    }
+
+    // Validate stopPrice vs market (existing logic)
     if (!this._isValidStopVsMarket(orderType, side, stopPrice, currentPrice)) {
       stopPrice = this._nudgeStopPrice(orderType, side, currentPrice);
     }
 
     const oldOrderId = position?.exit_order_id ? String(position.exit_order_id) : null;
 
-    // CRITICAL FIX: Cancel old order FIRST to avoid -4116 (ClientOrderId duplicated)
-    // Also check for orders with same newClientOrderId pattern and cancel them
+    // CRITICAL FIX: Cancel old TP/exit order FIRST to avoid -4116 (ClientOrderId duplicated)
+    // CRITICAL: Only cancel exit_order_id (TP order), NEVER cancel sl_order_id (SL order)
+    // SL orders are managed separately and must never be cancelled by ExitOrderManager
     if (oldOrderId) {
+      // Double-check: ensure we're not canceling SL order by mistake
       try {
-        await this.exchangeService.cancelOrder(oldOrderId, position.symbol);
-        logger.debug(`[ExitOrderManager] ✅ Cancelled old exit order ${oldOrderId} before creating new one | pos=${position.id}`);
-      } catch (cancelError) {
-        // If order doesn't exist or already cancelled, that's fine
-        const errorMsg = String(cancelError?.message || cancelError);
-        if (!errorMsg.includes('does not exist') && !errorMsg.includes('Unknown order') && !errorMsg.includes('-2011')) {
-          logger.warn(`[ExitOrderManager] ⚠️ Failed to cancel old order ${oldOrderId} before creating new one | pos=${position.id} error=${errorMsg}`);
+        const oldOrderStatus = await this.exchangeService.getOrderStatus(position.symbol, oldOrderId);
+        const oldOrderType = String(oldOrderStatus?.raw?.type || oldOrderStatus?.raw?.orderType || '').toUpperCase();
+        const isSLOrder = oldOrderType === 'STOP' || oldOrderType === 'STOP_LOSS' || oldOrderType === 'STOP_LOSS_LIMIT';
+
+        if (isSLOrder) {
+          logger.error(
+            `[ExitOrderManager] 🚨 CRITICAL ERROR: exit_order_id ${oldOrderId} is actually an SL order type (${oldOrderType})! ` +
+            `This should never happen. Will NOT cancel to protect SL order. | pos=${position.id}`
+          );
+          // Don't cancel - this is a data inconsistency issue
+        } else {
+          // Safe to cancel - it's a TP/exit order
+          try {
+            await this.exchangeService.cancelOrder(oldOrderId, position.symbol);
+            logger.debug(`[ExitOrderManager] ✅ Cancelled old exit order ${oldOrderId} (${oldOrderType}) before creating new one | pos=${position.id}`);
+          } catch (cancelError) {
+            // If order doesn't exist or already cancelled, that's fine
+            const errorMsg = String(cancelError?.message || cancelError);
+            if (!errorMsg.includes('does not exist') && !errorMsg.includes('Unknown order') && !errorMsg.includes('-2011')) {
+              logger.warn(`[ExitOrderManager] ⚠️ Failed to cancel old order ${oldOrderId} before creating new one | pos=${position.id} error=${errorMsg}`);
+            }
+          }
+        }
+      } catch (checkError) {
+        // If we can't check order type, be cautious and skip cancellation if hard SL requirement
+        if (hasHardSL) {
+          logger.warn(
+            `[ExitOrderManager] 🛡️ Strategy has hard SL requirement and cannot verify order type for ${oldOrderId}. ` +
+            `Skipping cancellation to protect SL orders. | pos=${position.id}`
+          );
+        } else {
+          // For non-hard-SL, proceed with cancellation (backward compatibility)
+          try {
+            await this.exchangeService.cancelOrder(oldOrderId, position.symbol);
+            logger.debug(`[ExitOrderManager] ✅ Cancelled old exit order ${oldOrderId} before creating new one (type check failed) | pos=${position.id}`);
+          } catch (cancelError) {
+            const errorMsg = String(cancelError?.message || cancelError);
+            if (!errorMsg.includes('does not exist') && !errorMsg.includes('Unknown order') && !errorMsg.includes('-2011')) {
+              logger.warn(`[ExitOrderManager] ⚠️ Failed to cancel old order ${oldOrderId} before creating new one | pos=${position.id} error=${errorMsg}`);
+            }
+          }
         }
       }
     }
 
     // Also check for orders with same newClientOrderId pattern (to handle race conditions)
-    // CRITICAL FIX: Exclude SL orders (sl_order_id) from cancellation - SL is hard/static
     try {
       const botId = this.exchangeService?.bot?.id;
       const posId = position?.id;
-      const dbSlOrderId = position?.sl_order_id ? String(position.sl_order_id) : null;
-      
       if (botId && posId) {
-        // Check for orders with same clientOrderId pattern (TP orders only, not SL)
+        // Check for orders with same clientOrderId pattern
         const expectedClientOrderIdPattern = orderType === 'STOP_MARKET' 
           ? `OC_B${botId}_P${posId}_EXIT`
           : `OC_B${botId}_P${posId}_TP`;
@@ -210,13 +313,6 @@ export class ExitOrderManager {
             const type = String(o?.type || '').toUpperCase();
             const ps = String(o?.positionSide || '').toUpperCase();
             const clientOrderId = String(o?.clientOrderId || '');
-            const orderId = String(o?.orderId || '');
-            
-            // CRITICAL FIX: Exclude SL orders - SL is hard/static and should NEVER be cancelled
-            if (orderId === dbSlOrderId) {
-              return false; // Skip SL orders
-            }
-            
             return exitTypes.has(type) && 
                    (!ps || ps === positionSide) &&
                    clientOrderId === expectedClientOrderIdPattern;
@@ -224,15 +320,6 @@ export class ExitOrderManager {
           
           for (const dupOrder of duplicateOrders) {
             const dupOrderId = String(dupOrder?.orderId || '');
-            
-            // CRITICAL FIX: Skip SL orders - SL is hard/static and should NEVER be cancelled
-            if (dupOrderId === dbSlOrderId) {
-              logger.debug(
-                `[ExitOrderManager] 🔒 PROTECTED: Skipping SL order ${dupOrderId} (hard SL, duplicate check) | pos=${position.id}`
-              );
-              continue;
-            }
-            
             if (dupOrderId && dupOrderId !== oldOrderId) {
               try {
                 await this.exchangeService.cancelOrder(dupOrderId, position.symbol);
@@ -274,6 +361,27 @@ export class ExitOrderManager {
     } catch (createError) {
       const errorMessage = createError?.message || String(createError);
       
+      // Handle -4120: Order type not supported → fallback to LIMIT/MARKET order
+      if (errorMessage.includes('-4120') || errorMessage.includes('Order type not supported') || errorMessage.includes('Algo Order API')) {
+        logger.warn(
+          `[ExitOrderManager] ⚠️ Order type ${orderType} not supported (-4120) | pos=${position.id} ` +
+          `Fallback logic should have been handled in createCloseStopMarket/createCloseTakeProfitMarket. ` +
+          `This error should not occur.`
+        );
+        // The fallback should have been handled in BinanceDirectClient, but if it still fails, return error
+        throw createError;
+      }
+
+      // Handle -2019: Margin insufficient → log and return error (caller should handle)
+      if (errorMessage.includes('-2019') || errorMessage.includes('Margin is insufficient') || errorMessage.includes('Insufficient margin')) {
+        logger.error(
+          `[ExitOrderManager] ❌ Margin insufficient (-2019) | pos=${position.id} symbol=${position.symbol} ` +
+          `side=${side} type=${orderType} stopPrice=${stopPrice}`
+        );
+        // Return error to caller - they should handle (e.g., skip TP/SL placement)
+        throw createError;
+      }
+
       // Handle -2021: immediate trigger → fallback MARKET close
       if (errorMessage.includes('-2021') || errorMessage.includes('would immediately trigger')) {
         try {
@@ -308,21 +416,11 @@ export class ExitOrderManager {
             if (Array.isArray(openOrders)) {
               const exitTypes = new Set(['STOP_MARKET', 'TAKE_PROFIT_MARKET']);
               const positionSide = side === 'long' ? 'LONG' : 'SHORT';
-              
-              // CRITICAL FIX: Get SL order ID to protect it from cancellation
-              const dbSlOrderId = position?.sl_order_id ? String(position.sl_order_id) : null;
-              
+
               const duplicateOrders = openOrders.filter(o => {
                 const type = String(o?.type || '').toUpperCase();
                 const ps = String(o?.positionSide || '').toUpperCase();
                 const clientOrderId = String(o?.clientOrderId || '');
-                const orderId = String(o?.orderId || '');
-                
-                // CRITICAL FIX: Exclude SL orders - SL is hard/static and should NEVER be cancelled
-                if (orderId === dbSlOrderId) {
-                  return false; // Skip SL orders
-                }
-                
                 return exitTypes.has(type) && 
                        (!ps || ps === positionSide) &&
                        clientOrderId === expectedClientOrderIdPattern;
@@ -330,15 +428,6 @@ export class ExitOrderManager {
               
               for (const dupOrder of duplicateOrders) {
                 const dupOrderId = String(dupOrder?.orderId || '');
-                
-                // CRITICAL FIX: Double-check - Skip SL orders - SL is hard/static
-                if (dupOrderId === dbSlOrderId) {
-                  logger.debug(
-                    `[ExitOrderManager] 🔒 PROTECTED: Skipping SL order ${dupOrderId} (hard SL, retry duplicate check) | pos=${position.id}`
-                  );
-                  continue;
-                }
-                
                 if (dupOrderId) {
                   try {
                     await this.exchangeService.cancelOrder(dupOrderId, position.symbol);

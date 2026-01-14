@@ -115,6 +115,17 @@ export class OrderService {
       // Central log: attempt
       await this.sendCentralLog(`Order Attempt | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} entry=${entryPrice} amt=${amount} tp=${tpPrice ?? 'n/a'} sl=${slPrice ?? 'n/a'} oc=${signal?.oc ?? 'n/a'}`);
 
+      // Enforce minimum notional for new positions (protect from tiny orders)
+      const minNotional = 6; // USDT
+      if (Number(amount) < minNotional) {
+        logger.warn(`[OrderService] Skip order: amount ${Number(amount).toFixed(2)} < ${minNotional} USDT (bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol})`);
+        await this.sendCentralLog(
+          `Order SkipMinNotional | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} side=${String(side).toUpperCase()} amt=${Number(amount).toFixed(2)} < ${minNotional}`,
+          'warn'
+        );
+        return null;
+      }
+
       // Simple position limit check (with cache)
       // max_concurrent_trades MUST come from bots table (JOINed into strategy as a top-level field)
       // Do not rely on strategy.bot here because strategy objects are often plain rows.
@@ -219,7 +230,33 @@ export class OrderService {
           });
       } catch (e) {
         const em = e?.message || '';
-        
+        // Binance Quant Rule (-4400): allow only reduceOnly for now → skip opening order
+        if (em.includes('-4400') || em.toLowerCase().includes('quantitative rules') || em.toLowerCase().includes('reduceonly order is allowed')) {
+          logger.warn(
+            `[OrderService] Skip order due to Binance quant rule (-4400) | bot=${strategy?.bot_id} ` +
+            `strat=${strategy?.id} symbol=${strategy.symbol} side=${side} amount=${amount} reason=${em}`
+          );
+          await this.sendCentralLog(
+            `Order SkipQuantRule | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ` +
+            `${String(side).toUpperCase()} amount=${amount} reason=${em}`,
+            'warn'
+          );
+          return null;
+        }
+
+        // Handle margin insufficient error (-2019) - skip order gracefully
+        if (em.includes('-2019') || em.includes('Margin is insufficient') || em.includes('Insufficient margin')) {
+          logger.error(
+            `[OrderService] ❌ Margin insufficient, skipping order | bot=${strategy?.bot_id} ` +
+            `strat=${strategy?.id} symbol=${strategy.symbol} side=${side} amount=${amount} USDT`
+          );
+          await this.sendCentralLog(
+            `Order SkippedInsufficientMargin | bot=${strategy?.bot_id} strat=${strategy?.id} ` +
+            `${strategy?.symbol} ${String(side).toUpperCase()} amount=${amount} USDT`
+          );
+          return null; // Skip order instead of throwing error
+        }
+
         // MEXC and Binance error handling for immediate trigger
         const shouldFallbackToMarket = 
           em.includes('-2021') || 
