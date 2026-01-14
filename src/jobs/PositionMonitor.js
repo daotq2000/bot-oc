@@ -7,6 +7,7 @@ import { TelegramService } from '../services/TelegramService.js';
 import { SCAN_INTERVALS } from '../config/constants.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
+import { ScanCycleCache } from '../utils/ScanCycleCache.js';
 
 /**
  * Position Monitor Job - Monitor and update open positions
@@ -19,6 +20,11 @@ export class PositionMonitor {
     this.telegramService = null;
     this.isRunning = false;
     this._lastLogTime = null; // For throttling debug logs
+
+    // Scan-cycle caches (cleared at the start of every monitorAllPositions run)
+    this._scanCache = new ScanCycleCache();
+    this._priceCache = new ScanCycleCache();
+    this._closableQtyCache = new ScanCycleCache();
   }
 
   /**
@@ -54,7 +60,11 @@ export class PositionMonitor {
       await exchangeService.initialize();
       this.exchangeServices.set(bot.id, exchangeService);
 
-      const positionService = new PositionService(exchangeService, this.telegramService);
+      const positionService = new PositionService(exchangeService, this.telegramService, {
+        scanCache: this._scanCache,
+        priceCache: this._priceCache,
+        closableQtyCache: this._closableQtyCache
+      });
       this.positionServices.set(bot.id, positionService);
 
       const orderService = new OrderService(exchangeService, this.telegramService);
@@ -83,11 +93,19 @@ export class PositionMonitor {
    */
   async monitorPosition(position) {
     try {
-      const positionService = this.positionServices.get(position.bot_id || position.strategy?.bot_id);
+      const botId = position.bot_id || position.strategy?.bot_id;
+      const positionService = this.positionServices.get(botId);
       if (!positionService) {
         logger.warn(`PositionService not found for position ${position.id}`);
         return;
       }
+
+      // Scan-cycle cache: avoid reprocessing the same position multiple times per cycle
+      const scanKey = `monitor:${position.id}`;
+      if (this._scanCache.has(scanKey)) {
+        return;
+      }
+      this._scanCache.set(scanKey, true);
 
       // Update position (checks TP/SL and updates dynamic SL)
       const updated = await positionService.updatePosition(position);
@@ -1052,6 +1070,11 @@ export class PositionMonitor {
     }
 
     this.isRunning = true;
+
+    // Reset per-cycle caches
+    this._scanCache.clear();
+    this._priceCache.clear();
+    this._closableQtyCache.clear();
 
     try {
       const openPositions = await Position.findOpen();

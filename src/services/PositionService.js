@@ -9,9 +9,10 @@ import logger from '../utils/logger.js';
  * Position Service - Position tracking and updates
  */
 export class PositionService {
-  constructor(exchangeService, telegramService = null) {
+  constructor(exchangeService, telegramService = null, scanCaches = null) {
     this.exchangeService = exchangeService;
     this.telegramService = telegramService;
+    this.scanCaches = scanCaches;
     this._missingTelegramWarn = new Map(); // key -> lastWarnAt
     // A) Memory map for cross-entry exit deduplication
     this.crossEntryExitPending = new Map(); // position.id -> timestamp
