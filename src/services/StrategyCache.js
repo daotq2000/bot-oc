@@ -37,10 +37,11 @@ export class StrategyCache {
    * @param {number} botId - Bot ID
    * @returns {string} Cache key
    */
-  generateKey(exchange, symbol, oc, botId) {
+  generateKey(exchange, symbol, interval, oc, botId) {
     const normalizedExchange = (exchange || '').toLowerCase();
     const normalizedSymbol = String(symbol || '').toUpperCase().replace(/[\/:_]/g, '');
-    return `${normalizedExchange}|${normalizedSymbol}|${oc}|${botId}`;
+    const normalizedInterval = String(interval || '').toLowerCase();
+    return `${normalizedExchange}|${normalizedSymbol}|${normalizedInterval}|${oc}|${botId}`;
   }
 
   /**
@@ -150,7 +151,7 @@ export class StrategyCache {
           continue;
         }
 
-        const key = this.generateKey(exchange, symbol, oc, botId);
+        const key = this.generateKey(exchange, symbol, strategy.interval, oc, botId);
           newCache.set(key, strategy);
           
           // Build secondary index
@@ -228,7 +229,7 @@ export class StrategyCache {
    * @returns {Object|null} Strategy or null
    */
   getStrategy(exchange, symbol, oc, botId) {
-    const key = this.generateKey(exchange, symbol, oc, botId);
+    const key = this.generateKey(exchange, symbol, strategy.interval, oc, botId);
     return this.cache.get(key) || null;
   }
 
@@ -284,7 +285,7 @@ export class StrategyCache {
       return false;
     }
 
-    const key = this.generateKey(exchange, symbol, oc, botId);
+    const key = this.generateKey(exchange, symbol, strategy.interval, oc, botId);
     this._addToIndexes(key, strategy);
     logger.debug(`[StrategyCache] Added strategy ${strategy.id} to cache (key: ${key})`);
     return true;
