@@ -5,6 +5,9 @@ import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import { webSocketManager } from '../services/WebSocketManager.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
+import { TrendIndicatorsState } from '../indicators/TrendIndicatorsState.js';
+import { isTrendConfirmed } from '../indicators/trendFilter.js';
+import { IndicatorWarmup } from '../indicators/IndicatorWarmup.js';
 
 /**
  * WebSocketOCConsumer
@@ -42,6 +45,20 @@ export class WebSocketOCConsumer {
     // ✅ OPTIMIZED: Throttling per symbol
     this._lastProcessed = new Map(); // exchange|symbol -> timestamp
     this._minTickInterval = Number(configService.getNumber('WS_TICK_MIN_INTERVAL_MS', 100));
+
+    // SHORT-TERM trend indicators cache (FOLLOWING_TREND filter only)
+    this._trendIndicators = new Map(); // exchange|symbol -> { state, lastTs, warmedUp }
+    this._trendIndicatorsTTL = Number(configService.getNumber('TREND_INDICATORS_TTL_MS', 30 * 60 * 1000));
+    this._trendIndicatorsCleanupEveryMs = Number(configService.getNumber('TREND_INDICATORS_CLEANUP_MS', 5 * 60 * 1000));
+    this._trendIndicatorsLastCleanupAt = 0;
+
+    // Pre-warm service (Option C: REST snapshot to achieve "ready" status quickly)
+    this._warmupService = new IndicatorWarmup();
+    this._warmupEnabled = configService.getBoolean('INDICATORS_WARMUP_ENABLED', true);
+    this._warmupConcurrency = Number(configService.getNumber('INDICATORS_WARMUP_CONCURRENCY', 5));
+    
+    // Track which symbols have been warmed up (to avoid re-warming)
+    this._warmedUpSymbols = new Set(); // exchange|symbol keys
   }
 
   /**
@@ -77,6 +94,13 @@ export class WebSocketOCConsumer {
 
       // Register WebSocket price handlers (register before start to ensure handlers are set up)
       this.registerPriceHandlers();
+
+      // ✅ Pre-warm indicators for all subscribed symbols (Option C: REST snapshot)
+      // WHY: ADX(14) needs ~28 closed candles. Without warmup, bot skips entries for ~30min after restart.
+      // This fetches ~100 closed 1m candles from public REST API and feeds into indicator state.
+      if (this._warmupEnabled) {
+        await this._warmupIndicatorsForSubscribedSymbols();
+      }
 
       logger.info(`[WebSocketOCConsumer] ✅ Initialized successfully (isRunning=${this.isRunning}, orderServices=${this.orderServices.size})`);
     } catch (error) {
@@ -127,6 +151,197 @@ export class WebSocketOCConsumer {
    * @param {number} price - Current price
    * @param {number} timestamp - Event timestamp
    */
+  _getTrendKey(exchange, symbol) {
+    return `${String(exchange || '').toLowerCase()}|${String(symbol || '').toUpperCase()}`;
+  }
+
+  _getOrCreateTrendIndicators(exchange, symbol) {
+    const key = this._getTrendKey(exchange, symbol);
+    const now = Date.now();
+    let cached = this._trendIndicators.get(key);
+    if (!cached) {
+      cached = { 
+        state: new TrendIndicatorsState({ adxInterval: '1m' }), 
+        lastTs: now, 
+        lastClosed1mStart: null,
+        warmedUp: false
+      };
+      this._trendIndicators.set(key, cached);
+      return cached;
+    }
+    cached.lastTs = now;
+    return cached;
+  }
+
+  _cleanupTrendIndicatorsIfNeeded(now = Date.now()) {
+    if (now - (this._trendIndicatorsLastCleanupAt || 0) < this._trendIndicatorsCleanupEveryMs) return;
+    this._trendIndicatorsLastCleanupAt = now;
+    for (const [k, v] of this._trendIndicators.entries()) {
+      const last = Number(v?.lastTs || 0);
+      if (!last || (now - last) > this._trendIndicatorsTTL) {
+        this._trendIndicators.delete(k);
+      }
+    }
+  }
+
+  /**
+   * Pre-warm indicators for all symbols that will be subscribed.
+   * Fetches ~100 closed 1m candles from Binance public REST API and feeds into indicator state.
+   * This achieves "ready" status immediately instead of waiting ~30 minutes for ADX warmup.
+   */
+  async _warmupIndicatorsForSubscribedSymbols() {
+    try {
+      // Get all symbols from strategy cache (these are the ones we'll subscribe to)
+      await strategyCache.refresh();
+      
+      const symbolsToWarmup = new Map(); // exchange|symbol -> state
+      
+      for (const [key, strategy] of strategyCache.cache.entries()) {
+        const [exchange, symbol] = key.split('|');
+        if (!exchange || !symbol) continue;
+        
+        // Only warmup Binance for now (MEXC needs separate endpoint)
+        if (String(exchange).toLowerCase() !== 'binance') continue;
+        
+        // Only warmup if strategy is FOLLOWING_TREND (is_reverse_strategy=false)
+        // Counter-trend strategies don't use trend filters, so no need to warmup
+        if (Boolean(strategy.is_reverse_strategy) === true) continue;
+        
+        const state = this._getOrCreateTrendIndicators(exchange, symbol);
+        const warmupKey = this._getTrendKey(exchange, symbol);
+        symbolsToWarmup.set(warmupKey, state.state);
+      }
+
+      if (symbolsToWarmup.size === 0) {
+        logger.info('[WebSocketOCConsumer] No symbols to warmup (no FOLLOWING_TREND strategies for Binance)');
+        return;
+      }
+
+      logger.info(`[WebSocketOCConsumer] 🔥 Starting indicator warmup for ${symbolsToWarmup.size} symbols...`);
+      const warmupStart = Date.now();
+
+      const results = await this._warmupService.warmupBatch(symbolsToWarmup, this._warmupConcurrency);
+
+      // Mark symbols as warmed up
+      for (const [key, state] of symbolsToWarmup.entries()) {
+        if (state.isWarmedUp && state.isWarmedUp()) {
+          this._warmedUpSymbols.add(key);
+          const cached = this._trendIndicators.get(key);
+          if (cached) cached.warmedUp = true;
+        }
+      }
+
+      const warmupDuration = Date.now() - warmupStart;
+      logger.info(
+        `[WebSocketOCConsumer] ✅ Indicator warmup complete | ` +
+        `succeeded=${results.succeeded} failed=${results.failed} ` +
+        `duration=${warmupDuration}ms`
+      );
+    } catch (error) {
+      // Non-blocking: if warmup fails, indicators will warmup progressively from live ticks
+      logger.warn(`[WebSocketOCConsumer] Indicator warmup failed (non-blocking): ${error?.message || error}`);
+    }
+  }
+
+  /**
+   * Warmup indicators for newly added FOLLOWING_TREND strategies.
+   * Called automatically when subscribeWebSockets() detects new symbols.
+   * Only warms up symbols that haven't been warmed up yet.
+   */
+  async _warmupNewSymbols() {
+    if (!this._warmupEnabled) return;
+
+    try {
+      const symbolsToWarmup = new Map(); // exchange|symbol -> state
+      
+      for (const [key, strategy] of strategyCache.cache.entries()) {
+        const [exchange, symbol] = key.split('|');
+        if (!exchange || !symbol) continue;
+        
+        // Only warmup Binance for now (MEXC needs separate endpoint)
+        if (String(exchange).toLowerCase() !== 'binance') continue;
+        
+        // Only warmup if strategy is FOLLOWING_TREND (is_reverse_strategy=false)
+        if (Boolean(strategy.is_reverse_strategy) === true) continue;
+        
+        const warmupKey = this._getTrendKey(exchange, symbol);
+        
+        // Skip if already warmed up
+        if (this._warmedUpSymbols.has(warmupKey)) continue;
+        
+        // Check if indicator state exists and is already warmed up
+        const cached = this._trendIndicators.get(warmupKey);
+        if (cached && cached.warmedUp) {
+          this._warmedUpSymbols.add(warmupKey);
+          continue;
+        }
+        
+        // Get or create indicator state
+        const state = this._getOrCreateTrendIndicators(exchange, symbol);
+        symbolsToWarmup.set(warmupKey, state.state);
+      }
+
+      if (symbolsToWarmup.size === 0) {
+        return; // No new symbols to warmup
+      }
+
+      logger.info(`[WebSocketOCConsumer] 🔥 Warming up ${symbolsToWarmup.size} new FOLLOWING_TREND symbols...`);
+      const warmupStart = Date.now();
+
+      const results = await this._warmupService.warmupBatch(symbolsToWarmup, this._warmupConcurrency);
+
+      // Mark symbols as warmed up
+      for (const [key, state] of symbolsToWarmup.entries()) {
+        if (state.isWarmedUp && state.isWarmedUp()) {
+          this._warmedUpSymbols.add(key);
+          const cached = this._trendIndicators.get(key);
+          if (cached) cached.warmedUp = true;
+        }
+      }
+
+      const warmupDuration = Date.now() - warmupStart;
+      logger.info(
+        `[WebSocketOCConsumer] ✅ New symbols warmup complete | ` +
+        `succeeded=${results.succeeded} failed=${results.failed} ` +
+        `duration=${warmupDuration}ms`
+      );
+    } catch (error) {
+      // Non-blocking: if warmup fails, indicators will warmup progressively from live ticks
+      logger.warn(`[WebSocketOCConsumer] New symbols warmup failed (non-blocking): ${error?.message || error}`);
+    }
+  }
+
+  _updateTrendIndicatorsFromTick(exchange, symbol, price, timestamp) {
+    try {
+      const ex = String(exchange || '').toLowerCase();
+      const cached = this._getOrCreateTrendIndicators(ex, symbol);
+      cached.state.updateTick(price, timestamp);
+
+      // ADX uses CLOSED 1m candles aggregated from WebSocket streams.
+      // This avoids tick noise and blocks sideways/fake OC spikes.
+      let candle = null;
+      if (ex === 'binance') {
+        candle = webSocketManager.getLatestCandle(symbol, '1m');
+      } else if (ex === 'mexc') {
+        // MexcWebSocketManager currently exposes kline open/close caches but not a candle object.
+        // For safety and no extra REST/DB calls, we only update ADX on Binance where closed 1m candle is available.
+        candle = null;
+      }
+
+      if (candle && candle.isClosed === true) {
+        const start = Number(candle.startTime);
+        if (Number.isFinite(start) && start > 0 && cached.lastClosed1mStart !== start) {
+          cached.lastClosed1mStart = start;
+          cached.state.updateClosedCandle(candle);
+        }
+      }
+
+      this._cleanupTrendIndicatorsIfNeeded(timestamp);
+    } catch (_) {
+      // Must be non-blocking.
+    }
+  }
+
   async handlePriceTick(exchange, symbol, price, timestamp = Date.now()) {
     try {
       if (!this.isRunning) {
@@ -150,6 +365,9 @@ export class WebSocketOCConsumer {
         this.skippedCount++;
         return; // Skip - too soon
       }
+
+      // ✅ Update short-term trend indicators (non-blocking)
+      this._updateTrendIndicatorsFromTick(exchange, symbol, price, timestamp);
 
       // ✅ OPTIMIZED: Add to batch queue
       this._tickQueue.push({ exchange, symbol, price, timestamp });
@@ -346,6 +564,25 @@ export class WebSocketOCConsumer {
       // - Counter-trend (is_reverse_strategy = true): Use extend logic with LIMIT order
       // - Trend-following (is_reverse_strategy = false): Use current price with MARKET order
       const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
+
+      // ✅ FOLLOWING_TREND short-term trend confirmation filters (1m–5m scalping)
+      // WHY: OC spikes during sideways markets are often fakeouts; we only trade when
+      // EMA alignment + ADX strength + RSI regime confirm the existing `direction`.
+      // Indicators NEVER flip direction; they only validate/reject.
+      if (!isReverseStrategy) {
+        // Use exchange from match (more reliable than strategy.exchange which may be undefined)
+        const matchExchange = match.exchange || strategy.exchange || 'binance';
+        const ind = this._getOrCreateTrendIndicators(matchExchange, strategy.symbol);
+        const verdict = isTrendConfirmed(direction, currentPrice, ind.state);
+        if (!verdict.ok) {
+          logger.info(
+            `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `direction=${direction} reason=${verdict.reason}`
+          );
+          return;
+        }
+      }
+
       let entryPrice;
       let forceMarket = false;
 
@@ -564,6 +801,10 @@ export class WebSocketOCConsumer {
       }
 
       logger.info(`[WebSocketOCConsumer] WebSocket subscriptions updated: MEXC=${mexcSymbols.size}, Binance=${binanceSymbols.size}`);
+
+      // ✅ Warmup indicators for newly added FOLLOWING_TREND strategies
+      // This ensures indicators are ready immediately when new strategies are added
+      await this._warmupNewSymbols();
     } catch (error) {
       logger.error('[WebSocketOCConsumer] Error subscribing WebSockets:', error?.message || error, error?.stack);
     }

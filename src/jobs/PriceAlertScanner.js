@@ -7,6 +7,9 @@ import { strategyCache } from '../services/StrategyCache.js';
 import { webSocketManager } from '../services/WebSocketManager.js';
 import { mexcPriceWs } from '../services/MexcWebSocketManager.js';
 import logger from '../utils/logger.js';
+import { TrendIndicatorsState } from '../indicators/TrendIndicatorsState.js';
+import { isTrendConfirmed } from '../indicators/trendFilter.js';
+import { IndicatorWarmup } from '../indicators/IndicatorWarmup.js';
 
 /**
  * Price Alert Scanner Job - Monitor price alerts for MEXC and other exchanges
@@ -46,6 +49,119 @@ export class PriceAlertScanner {
     this.stateMaxIdleMs = 6 * 60 * 60 * 1000; // drop states not touched for 6 hours
     this.priceCacheMaxIdleMs = 30 * 60 * 1000; // drop price cache not updated for 30 minutes
     this._lastCleanupAt = 0;
+
+    // ✅ SHORT-TERM TREND FILTERS (FOLLOWING_TREND gate)
+    this._trendIndicators = new Map(); // exchange|symbol -> { state, lastTs, warmedUp }
+    this._trendIndicatorsTTL = Number(configService.getNumber('TREND_INDICATORS_TTL_MS', 30 * 60 * 1000));
+    this._trendIndicatorsCleanupEveryMs = Number(configService.getNumber('TREND_INDICATORS_CLEANUP_MS', 5 * 60 * 1000));
+    this._trendIndicatorsLastCleanupAt = 0;
+    this._warmedUpSymbols = new Set();
+
+    this._warmupService = new IndicatorWarmup();
+    this._warmupEnabled = configService.getBoolean('INDICATORS_WARMUP_ENABLED', true);
+    this._warmupConcurrency = Number(configService.getNumber('INDICATORS_WARMUP_CONCURRENCY', 5));
+  _getTrendKey(exchange, symbol) {
+    return `${String(exchange || '').toLowerCase()}|${String(symbol || '').toUpperCase()}`;
+  }
+
+  _getOrCreateTrendIndicators(exchange, symbol) {
+    const key = this._getTrendKey(exchange, symbol);
+    const now = Date.now();
+    let cached = this._trendIndicators.get(key);
+    if (!cached) {
+      cached = { state: new TrendIndicatorsState({ adxInterval: '1m' }), lastTs: now, warmedUp: false, lastClosed1mStart: null };
+      this._trendIndicators.set(key, cached);
+      return cached;
+    }
+    cached.lastTs = now;
+    return cached;
+  }
+
+  _cleanupTrendIndicatorsIfNeeded(now = Date.now()) {
+    if (now - (this._trendIndicatorsLastCleanupAt || 0) < this._trendIndicatorsCleanupEveryMs) return;
+    this._trendIndicatorsLastCleanupAt = now;
+    for (const [k, v] of this._trendIndicators.entries()) {
+      const last = Number(v?.lastTs || 0);
+      if (!last || (now - last) > this._trendIndicatorsTTL) {
+        this._trendIndicators.delete(k);
+        this._warmedUpSymbols.delete(k);
+      }
+    }
+  }
+
+  _updateTrendIndicatorsFromTick(exchange, symbol, price, ts = Date.now()) {
+    try {
+      const ex = String(exchange || '').toLowerCase();
+      const cached = this._getOrCreateTrendIndicators(ex, symbol);
+      cached.state.updateTick(price, ts);
+
+      // Update ADX only from CLOSED 1m candles (Binance only, since we have CandleAggregator)
+      if (ex === 'binance') {
+        const candle = webSocketManager.getLatestCandle(symbol, '1m');
+        if (candle && candle.isClosed === true) {
+          const start = Number(candle.startTime);
+          if (Number.isFinite(start) && start > 0 && cached.lastClosed1mStart !== start) {
+            cached.lastClosed1mStart = start;
+            cached.state.updateClosedCandle(candle);
+          }
+        }
+      }
+
+      if (!cached.warmedUp && cached.state.isWarmedUp && cached.state.isWarmedUp()) {
+        cached.warmedUp = true;
+        this._warmedUpSymbols.add(this._getTrendKey(ex, symbol));
+      }
+
+      this._cleanupTrendIndicatorsIfNeeded(ts);
+    } catch (_) {
+      // non-blocking
+    }
+  }
+
+  async _warmupNewSymbolsFromStrategyCache() {
+    if (!this._warmupEnabled) return;
+
+    try {
+      const symbolsToWarmup = new Map();
+
+      for (const [key, strategy] of strategyCache.cache.entries()) {
+        const [exchange, symbol] = key.split('|');
+        if (String(exchange || '').toLowerCase() !== 'binance') continue;
+
+        // Only gate FOLLOWING_TREND
+        if (Boolean(strategy.is_reverse_strategy) === true) continue;
+
+        const warmupKey = this._getTrendKey(exchange, symbol);
+        if (this._warmedUpSymbols.has(warmupKey)) continue;
+
+        const cached = this._trendIndicators.get(warmupKey);
+        if (cached?.warmedUp) {
+          this._warmedUpSymbols.add(warmupKey);
+          continue;
+        }
+
+        const st = this._getOrCreateTrendIndicators(exchange, symbol);
+        symbolsToWarmup.set(warmupKey, st.state);
+      }
+
+      if (symbolsToWarmup.size === 0) return;
+
+      logger.info(`[PriceAlertScanner] 🔥 Warming up ${symbolsToWarmup.size} Binance FOLLOWING_TREND symbols...`);
+      const res = await this._warmupService.warmupBatch(symbolsToWarmup, this._warmupConcurrency);
+
+      // mark
+      for (const [k, st] of symbolsToWarmup.entries()) {
+        if (st.isWarmedUp && st.isWarmedUp()) {
+          this._warmedUpSymbols.add(k);
+          const cached = this._trendIndicators.get(k);
+          if (cached) cached.warmedUp = true;
+        }
+      }
+
+      logger.info(`[PriceAlertScanner] ✅ Warmup done | succeeded=${res.succeeded} failed=${res.failed}`);
+    } catch (e) {
+      logger.warn(`[PriceAlertScanner] Warmup failed (non-blocking): ${e?.message || e}`);
+    }
   }
 
   /**
@@ -64,6 +180,17 @@ export class PriceAlertScanner {
       this.cachedConfigs = activeConfigs;
       this.configCacheTime = Date.now();
       logger.info(`[PriceAlertScanner] Cached ${activeConfigs.length} active PriceAlertConfigs (TTL ${this.configCacheTTL}ms)`);
+
+      // ✅ Pre-warm indicators for existing FOLLOWING_TREND symbols (Binance only)
+      // This prevents "adx_not_ready" / missing indicator data right after restart.
+      if (this._warmupEnabled) {
+        try {
+          await strategyCache.refresh();
+          await this._warmupNewSymbolsFromStrategyCache();
+        } catch (e) {
+          logger.warn(`[PriceAlertScanner] Warmup init failed (non-blocking): ${e?.message || e}`);
+        }
+      }
 
       // Extract unique exchanges from configs
       const exchanges = new Set();
@@ -265,6 +392,10 @@ export class PriceAlertScanner {
     await this.runWithConcurrency(symbolsToScan, symbolConcurrency, async (symbol) => {
       const price = this.getPrice(normalizedExchange, symbol);
       if (!price) return;
+
+      // ✅ Update short-term indicators (EMA/RSI tick + ADX from closed 1m candle)
+      // Non-blocking and no DB reads.
+      this._updateTrendIndicatorsFromTick(normalizedExchange, symbol, price, Date.now());
 
       // ✅ PERF: skip if price hasn't changed recently (per exchange|symbol)
       const priceKey = `${normalizedExchange}|${symbol}`;
@@ -619,6 +750,20 @@ export class PriceAlertScanner {
         });
 
         if (signal) {
+          // ✅ Gate by short-term trend confirmation (FOLLOWING_TREND only)
+          // WHY: scanner is a safety-net; without gating it can execute on sideways OC spikes.
+          if (Boolean(strategy.is_reverse_strategy) === false && String(exchange).toLowerCase() === 'binance') {
+            const ind = this._getOrCreateTrendIndicators(exchange, symbol);
+            const verdict = isTrendConfirmed(direction, currentPrice, ind.state);
+            if (!verdict.ok) {
+              logger.info(
+                `[PriceAlertScanner] ⏭️ Trend filters rejected entry | strategy=${strategy.id} ` +
+                `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) reason=${verdict.reason}`
+              );
+              continue;
+            }
+          }
+
           logger.info(`[PriceAlertScanner] 🚀 Sending signal to OrderService for strategy ${strategy.id} (${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%)`);
           await orderService.executeSignal(signal);
         }
