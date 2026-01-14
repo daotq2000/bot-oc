@@ -1429,8 +1429,26 @@ export class PositionService {
           );
 
           if (closeRes?.skipped) {
-            logger.warn(`[CloseGuard] Exchange reported no position to close for ${position.symbol}; will close in DB only`);
-            // Don't return - continue to close in DB
+            // IMPORTANT: Do NOT close in DB when exchange close was skipped but exchange still has exposure.
+            // This was causing repeated close attempts + duplicated Telegram alerts + double-counted PnL.
+            let exchangeStillOpen = false;
+            try {
+              const qty2 = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+              exchangeStillOpen = qty2 && qty2 > 0;
+            } catch (e) {
+              // If we cannot verify, be conservative: assume still open and block DB close
+              exchangeStillOpen = true;
+            }
+
+            if (exchangeStillOpen) {
+              logger.error(
+                `[CloseGuard] ❌ Exchange close skipped but exposure still exists for ${position.symbol}; ` +
+                `BLOCK DB close to prevent false alert/double PnL | pos=${position.id}`
+              );
+              return position;
+            }
+
+            logger.warn(`[CloseGuard] Exchange reported no position to close for ${position.symbol}; closing in DB (verified no exposure)`);
           }
         } catch (closeError) {
           const errorMsg = closeError?.message || String(closeError);
