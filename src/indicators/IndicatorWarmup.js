@@ -45,7 +45,14 @@ export class IndicatorWarmup {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
-      const data = await response.json();
+      const responseText = await response.text();
+      let data;
+      try {
+        data = JSON.parse(responseText);
+      } catch (e) {
+        logger.error(`[IndicatorWarmup] Failed to parse JSON from Binance API for ${symbol}. Response: ${responseText}`);
+        throw new Error(`Failed to parse JSON from Binance API: ${e.message}`);
+      }
       
       // Binance klines format: [openTime, open, high, low, close, volume, closeTime, ...]
       // We only need OHLC + timestamps

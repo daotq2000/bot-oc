@@ -60,6 +60,8 @@ export class PriceAlertScanner {
     this._warmupService = new IndicatorWarmup();
     this._warmupEnabled = configService.getBoolean('INDICATORS_WARMUP_ENABLED', true);
     this._warmupConcurrency = Number(configService.getNumber('INDICATORS_WARMUP_CONCURRENCY', 5));
+  }
+
   _getTrendKey(exchange, symbol) {
     return `${String(exchange || '').toLowerCase()}|${String(symbol || '').toUpperCase()}`;
   }
@@ -249,6 +251,116 @@ export class PriceAlertScanner {
   }
 
   /**
+   * ✅ REALTIME: Register WebSocket price handlers for real-time OC detection
+   * This allows PriceAlertScanner to detect OC immediately when price ticks arrive,
+   * instead of waiting for polling interval (100ms).
+   */
+  registerPriceHandlers() {
+    // MEXC WebSocket price handler
+    if (mexcPriceWs && typeof mexcPriceWs.onPrice === 'function') {
+      const mexcHandler = (symbol, price, ts = Date.now()) => {
+        if (!this.isRunning) return;
+        // Fire-and-forget: process price tick asynchronously
+        this.handlePriceTick('mexc', symbol, price, ts).catch(error => {
+          logger.error(`[PriceAlertScanner] Error handling MEXC price tick:`, error?.message || error);
+        });
+      };
+      mexcPriceWs.onPrice(mexcHandler);
+      logger.info('[PriceAlertScanner] ✅ Registered MEXC WebSocket price handler (realtime OC detection)');
+    }
+
+    // Binance WebSocket price handler
+    if (webSocketManager && typeof webSocketManager.onPrice === 'function') {
+      const binanceHandler = (symbol, price, ts = Date.now()) => {
+        if (!this.isRunning) return;
+        // Fire-and-forget: process price tick asynchronously
+        this.handlePriceTick('binance', symbol, price, ts).catch(error => {
+          logger.error(`[PriceAlertScanner] Error handling Binance price tick:`, error?.message || error);
+        });
+      };
+      webSocketManager.onPrice(binanceHandler);
+      logger.info('[PriceAlertScanner] ✅ Registered Binance WebSocket price handler (realtime OC detection)');
+    }
+  }
+
+  /**
+   * ✅ REALTIME: Handle price tick from WebSocket (realtime OC detection)
+   * This processes price ticks immediately, bypassing polling delay.
+   */
+  async handlePriceTick(exchange, symbol, price, timestamp = Date.now()) {
+    try {
+      if (!this.isRunning) return;
+      if (!price || !Number.isFinite(price) || price <= 0) return;
+
+      // ✅ OPTIMIZED: Throttle - chỉ process mỗi symbol mỗi N ms
+      const key = `${exchange}|${symbol}`;
+      const lastProcessed = this.lastProcessedPriceTime.get(key) || 0;
+      const minTickInterval = Number(configService.getNumber('PRICE_ALERT_TICK_MIN_INTERVAL_MS', 50)); // 50ms throttle
+      if (lastProcessed && (timestamp - lastProcessed) < minTickInterval) {
+        return; // Skip - too soon
+      }
+
+      // Update price cache immediately
+      const cacheKey = `${exchange}_${symbol}`;
+      this.priceCache.set(cacheKey, price);
+      this.priceCacheTime.set(cacheKey, timestamp);
+      this.lastProcessedPrice.set(key, price);
+      this.lastProcessedPriceTime.set(key, timestamp);
+
+      // ✅ Update short-term indicators (non-blocking)
+      this._updateTrendIndicatorsFromTick(exchange, symbol, price, timestamp);
+
+      // ✅ REALTIME: Process OC detection immediately for all active configs
+      // This bypasses polling delay and detects OC as soon as price ticks arrive
+      await this.processPriceTickForConfigs(exchange, symbol, price, timestamp);
+    } catch (error) {
+      logger.error(`[PriceAlertScanner] Error in handlePriceTick:`, error?.message || error);
+    }
+  }
+
+  /**
+   * ✅ REALTIME: Process price tick for all active configs matching this exchange
+   */
+  async processPriceTickForConfigs(exchange, symbol, price, timestamp) {
+    try {
+      // Get active configs for this exchange
+      const activeConfigs = this.cachedConfigs || [];
+      const matchingConfigs = activeConfigs.filter(cfg => {
+        const cfgExchange = (cfg.exchange || 'mexc').toLowerCase();
+        return cfgExchange === exchange.toLowerCase();
+      });
+
+      if (matchingConfigs.length === 0) return;
+
+      // Process each matching config
+      for (const config of matchingConfigs) {
+        const { id, threshold, telegram_chat_id, intervals } = config;
+        const rawIntervals = Array.isArray(intervals) && intervals.length > 0 ? intervals : ['1m'];
+        const normalizedIntervals = rawIntervals
+          .map((x) => this.normalizeInterval(x))
+          .filter(Boolean);
+
+        if (normalizedIntervals.length === 0) continue;
+
+        // Process each interval
+        for (const interval of normalizedIntervals) {
+          await this.checkSymbolPrice(
+            exchange,
+            symbol,
+            threshold,
+            telegram_chat_id,
+            id,
+            interval,
+            price
+          );
+        }
+      }
+    } catch (error) {
+      logger.error(`[PriceAlertScanner] Error processing price tick for configs:`, error?.message || error);
+    }
+  }
+
+  /**
    * Start the scanner
    */
   start() {
@@ -259,9 +371,12 @@ export class PriceAlertScanner {
 
     this.isRunning = true;
 
-    // ✅ PERFORMANCE: Polling chỉ là safety-net khi WS miss. Không nên chạy 10ms vì sẽ đốt CPU/GC.
-    // Mặc định 500ms là đủ nhanh (realtime chủ yếu đến từ WS tick), vẫn bắt kịp thị trường.
-    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 500);
+    // ✅ REALTIME: Register WebSocket price handlers for immediate OC detection
+    this.registerPriceHandlers();
+
+    // ✅ PERFORMANCE: Polling chỉ là safety-net khi WS miss. 
+    // Giảm interval xuống 100ms để tăng tốc độ detect OC (từ 500ms)
+    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 100);
 
     const runLoop = async () => {
       if (!this.isRunning) return;
@@ -280,7 +395,7 @@ export class PriceAlertScanner {
     // First run asap
     this.scanInterval = setTimeout(runLoop, 0);
 
-    logger.info(`PriceAlertScanner started with interval ${interval}ms (polling safety-net + WS realtime)`);
+    logger.info(`PriceAlertScanner started with interval ${interval}ms (WebSocket realtime + polling safety-net)`);
   }
 
   /**
@@ -355,6 +470,12 @@ export class PriceAlertScanner {
   async checkAlertConfig(config) {
     const { id, exchange, threshold, telegram_chat_id } = config;
     const normalizedExchange = (exchange || 'mexc').toLowerCase();
+    
+    // ✅ Debug: Log config being checked (use info level for visibility)
+    logger.info(
+      `[PriceAlertScanner] 📋 Checking config ${id} | exchange=${normalizedExchange} ` +
+      `threshold=${threshold}% telegram_chat_id=${telegram_chat_id} intervals=${JSON.stringify(config.intervals || [])}`
+    );
 
     // Get exchange service
     const exchangeService = this.exchangeServices.get(normalizedExchange);
@@ -473,6 +594,12 @@ export class PriceAlertScanner {
       const oc = ((price - openPrice) / openPrice) * 100; // signed
       const ocAbs = Math.abs(oc);
 
+      // ✅ Log OC detection for visibility
+      logger.info(
+        `[PriceAlertScanner] 🔍 detectOC | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+        `OC=${oc.toFixed(2)}% (open=${openPrice}, current=${price})`
+      );
+
       // 1) ALWAYS execute signal for any OC (no threshold gate)
       // Execute is independent from Telegram success/fail.
       await this.executeStrategiesForOC({
@@ -489,9 +616,14 @@ export class PriceAlertScanner {
       const nowMs = now;
       const minAlertInterval = 60000; // 1 minute between alerts
 
+      // ✅ Debug: Log threshold check
       if (ocAbs >= threshold) {
         const timeSinceLastAlert = nowMs - state.lastAlertTime;
         if (!state.alerted || timeSinceLastAlert >= minAlertInterval) {
+          logger.info(
+            `[PriceAlertScanner] ✅ Threshold met | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+            `OC=${ocAbs.toFixed(2)}% >= threshold=${threshold}% | Sending alert to chat_id=${telegramChatId}`
+          );
           // Fire-and-forget: do not block strategy execution
           this.sendPriceAlert(
             exchange,
@@ -507,9 +639,20 @@ export class PriceAlertScanner {
           });
           state.lastAlertTime = nowMs;
           state.alerted = true;
+        } else {
+          logger.debug(
+            `[PriceAlertScanner] ⏭️ Alert throttled | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+            `OC=${ocAbs.toFixed(2)}% >= threshold=${threshold}% but timeSinceLastAlert=${timeSinceLastAlert}ms < minAlertInterval=${minAlertInterval}ms`
+          );
         }
       } else {
         // Reset alerted flag when oc drops below threshold
+        if (state.alerted) {
+          logger.debug(
+            `[PriceAlertScanner] ⏭️ OC below threshold | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+            `OC=${ocAbs.toFixed(2)}% < threshold=${threshold}% | Resetting alerted flag`
+          );
+        }
         state.alerted = false;
       }
     } catch (error) {
@@ -762,6 +905,23 @@ export class PriceAlertScanner {
               );
               continue;
             }
+            // ✅ Log when filter passes (for verification)
+            logger.info(
+              `[PriceAlertScanner] ✅ Trend filter passed | strategy=${strategy.id} ` +
+              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) FOLLOWING_TREND confirmed`
+            );
+          } else if (Boolean(strategy.is_reverse_strategy) === true) {
+            // ✅ Log COUNTER_TREND strategies (no filter applied)
+            logger.debug(
+              `[PriceAlertScanner] ⏭️ Skipping trend filter | strategy=${strategy.id} ` +
+              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) COUNTER_TREND (no filter)`
+            );
+          } else if (String(exchange).toLowerCase() !== 'binance') {
+            // ✅ Log non-Binance strategies (no filter applied)
+            logger.debug(
+              `[PriceAlertScanner] ⏭️ Skipping trend filter | strategy=${strategy.id} ` +
+              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) non-Binance (no filter)`
+            );
           }
 
           logger.info(`[PriceAlertScanner] 🚀 Sending signal to OrderService for strategy ${strategy.id} (${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%)`);
@@ -817,7 +977,8 @@ export class PriceAlertScanner {
           oc: ocPercent,
           open: openPrice,
           currentPrice,
-          direction
+          direction,
+          exchange // ✅ CRITICAL: Pass exchange to determine correct alertType (price_mexc vs price_binance)
         });
         logger.info(`[PriceAlertScanner] ✅ Alert queued: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
       } catch (error) {

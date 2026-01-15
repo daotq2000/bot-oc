@@ -291,7 +291,7 @@ async function start() {
           priceAlertWorker.start();
           logger.info('✅ Price Alert Worker started successfully');
         } catch (error) {
-          logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', error?.message || error);
+          logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', { message: error?.message || error, stack: error?.stack });
           logger.error('Price Alert system is critical - application will continue but alerts may not work');
         }
       }, 3000); // Delay 3 seconds

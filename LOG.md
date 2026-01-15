@@ -1,5 +1,137 @@
 # Changelog
 
+## [2026-01-15] - Optimize OC Detection: Real-time WebSocket Integration + Faster Polling
+
+### Tổng quan
+Tối ưu hóa hệ thống detect OC để giảm delay và tránh tình trạng "long đỉnh short đáy" bằng cách:
+1. Tích hợp WebSocket price handlers cho PriceAlertScanner (realtime OC detection)
+2. Giảm scan interval từ 500ms xuống 100ms
+3. Thêm throttling tối ưu để giảm delay trong xử lý price ticks
+
+### Files thay đổi
+
+#### 1. `src/jobs/PriceAlertScanner.js`
+- **Thêm method `registerPriceHandlers()`**: Đăng ký WebSocket price handlers cho MEXC và Binance để detect OC realtime
+- **Thêm method `handlePriceTick()`**: Xử lý price ticks từ WebSocket ngay lập tức, bypass polling delay
+- **Thêm method `processPriceTickForConfigs()`**: Xử lý OC detection cho tất cả configs matching exchange/symbol
+- **Giảm scan interval**: Từ 500ms xuống 100ms (config: `PRICE_ALERT_SCAN_INTERVAL_MS`)
+- **Thêm throttling**: `PRICE_ALERT_TICK_MIN_INTERVAL_MS` (default 50ms) để tránh xử lý quá nhiều ticks
+- **Tích hợp vào `start()`**: Gọi `registerPriceHandlers()` khi start để enable realtime detection
+
+### Lợi ích
+1. **Realtime OC Detection**: OC được detect ngay khi price tick arrives từ WebSocket, không cần chờ polling interval
+2. **Giảm delay**: Từ 500ms polling delay xuống ~50ms (throttle) hoặc realtime (nếu không throttle)
+3. **Tránh "long đỉnh short đáy"**: Detect OC sớm hơn giúp entry vào đúng thời điểm, không bị trễ
+4. **Dual-mode**: WebSocket realtime + polling safety-net (backup khi WS miss)
+5. **Performance**: Throttling giúp tránh xử lý quá nhiều ticks, giảm CPU load
+
+### Cấu hình
+- `PRICE_ALERT_SCAN_INTERVAL_MS`: Scan interval cho polling safety-net (default: 100ms, giảm từ 500ms)
+- `PRICE_ALERT_TICK_MIN_INTERVAL_MS`: Throttle interval cho WebSocket price ticks (default: 50ms)
+
+### Lưu ý
+- WebSocket handlers được đăng ký khi `start()` được gọi
+- Polling vẫn chạy như safety-net khi WebSocket miss ticks
+- Throttling giúp tránh xử lý quá nhiều ticks cho cùng một symbol
+
+---
+
+## [2026-01-15] - Fix MEXC Price Alert: Missing Exchange Parameter
+
+### Tổng quan
+Sửa lỗi MEXC price alert không được gửi do thiếu parameter `exchange` trong `alertData`, khiến `sendVolatilityAlert` không xác định đúng `alertType` (price_mexc vs price_binance).
+
+### Files thay đổi
+
+#### 1. `src/jobs/PriceAlertScanner.js`
+- **Lỗi**: Trong method `sendPriceAlert()`, khi gọi `sendVolatilityAlert()`, không truyền `exchange` vào `alertData`
+- **Hậu quả**: `sendVolatilityAlert` không biết exchange là MEXC hay Binance, nên mặc định dùng `alertType='price_binance'` cho tất cả alerts
+- **Fix**: Thêm `exchange` vào `alertData` khi gọi `sendVolatilityAlert()`
+- **Kết quả**: MEXC alerts sẽ sử dụng đúng `alertType='price_mexc'` và bot token đúng
+
+### Lợi ích
+1. **MEXC alerts hoạt động**: MEXC alerts giờ đây sẽ sử dụng đúng bot token và alertType
+2. **Phân biệt exchange**: Mỗi exchange sẽ sử dụng đúng bot token riêng của nó
+3. **Debug dễ dàng**: Có thể thấy rõ alertType trong log
+
+### Lưu ý
+- Nếu vẫn thấy lỗi "Chat not found", có thể do:
+  - Chat ID `-1003052914854` không tồn tại hoặc bot không có quyền gửi message
+  - Cần kiểm tra lại chat ID trong database hoặc thêm bot vào group/channel
+
+---
+
+## [2026-01-15] - Add Threshold Debug Logging to PriceAlertScanner
+
+### Tổng quan
+Thêm log chi tiết để debug threshold check trong `PriceAlertScanner`, giúp xác định tại sao alert không được gửi.
+
+### Files thay đổi
+
+#### 1. `src/jobs/PriceAlertScanner.js`
+- **Thay đổi**: Thêm log chi tiết cho threshold check:
+  - Log khi checkAlertConfig được gọi: hiển thị config id, exchange, threshold, telegram_chat_id
+  - Log khi threshold được đáp ứng: `✅ Threshold met | OC=X% >= threshold=Y% | Sending alert`
+  - Log khi alert bị throttled: `⏭️ Alert throttled | timeSinceLastAlert < minAlertInterval`
+  - Log khi OC dưới threshold: `⏭️ OC below threshold | OC=X% < threshold=Y%`
+
+### Lợi ích
+1. **Debug dễ dàng**: Có thể thấy chính xác tại sao alert không được gửi (threshold quá cao, throttled, v.v.)
+2. **Visibility**: Có thể thấy threshold value trong config và so sánh với OC value
+3. **Monitoring**: Có thể monitor threshold check trong real-time
+
+---
+
+## [2026-01-15] - Add detectOC Logging to PriceAlertScanner
+
+### Tổng quan
+Thêm log "detectOC" vào `PriceAlertScanner` để hiển thị khi nào OC được detect, giúp debug và monitor dễ dàng hơn.
+
+### Files thay đổi
+
+#### 1. `src/jobs/PriceAlertScanner.js`
+- **Thay đổi**: Thêm log `detectOC` trong method `checkSymbolPrice()`:
+  - Log mỗi khi OC được detect (ngay cả khi không gửi Telegram alert)
+  - Format: `[PriceAlertScanner] 🔍 detectOC | EXCHANGE SYMBOL INTERVAL OC=X% (open=Y, current=Z)`
+  - Giúp theo dõi tất cả các OC movements, không chỉ những cái đạt threshold
+
+### Lợi ích
+1. **Visibility**: Có thể thấy tất cả OC movements trong log, không chỉ những cái đạt threshold
+2. **Debug dễ dàng**: Dễ dàng trace xem OC có được detect không và giá trị OC là bao nhiêu
+3. **Monitoring**: Có thể monitor OC activity trong real-time
+
+---
+
+## [2026-01-15] - Fix Syntax Error in PriceAlertScanner.js
+
+### Tổng quan
+Sửa lỗi cú pháp JavaScript trong `PriceAlertScanner.js` khiến `PriceAlertWorker` không thể khởi động được.
+
+### Files thay đổi
+
+#### 1. `src/jobs/PriceAlertScanner.js`
+- **Lỗi**: Thiếu dấu đóng ngoặc `}` cho constructor ở dòng 62
+- **Fix**: Thêm dấu đóng ngoặc `}` sau dòng 62 để đóng constructor trước khi định nghĩa method `_getTrendKey()`
+- **Kết quả**: `PriceAlertWorker` có thể khởi động thành công
+
+#### 2. `src/indicators/IndicatorWarmup.js`
+- **Cải thiện**: Thêm error handling chi tiết cho `fetchBinanceKlines()`:
+  - Parse JSON response với try-catch riêng
+  - Log chi tiết response text khi parse JSON thất bại
+  - Giúp debug dễ dàng hơn khi Binance API trả về lỗi
+
+#### 3. `src/app.js`
+- **Cải thiện**: Cải thiện logging trong `catch` block của `PriceAlertWorker`:
+  - Log toàn bộ stack trace thay vì chỉ error message
+  - Giúp xác định chính xác vị trí lỗi trong tương lai
+
+### Lợi ích
+1. **Bot có thể khởi động**: `PriceAlertWorker` giờ đây có thể khởi động thành công
+2. **Debug dễ dàng hơn**: Logging chi tiết giúp xác định lỗi nhanh chóng
+3. **Robust hơn**: Error handling tốt hơn cho Binance API calls
+
+---
+
 ## [2024-12-XX] - Indicator Warmup Implementation (Option C: REST Snapshot) - Updated with 5m Support
 
 ### Tổng quan
