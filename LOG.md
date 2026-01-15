@@ -383,6 +383,36 @@ Sửa lỗi cú pháp JavaScript trong `PriceAlertScanner.js` khiến `PriceAler
 
 ---
 
+## [2026-01-15] - Fix Binance OC Bucket Alignment for Alerts
+
+### Tổng quan
+Đảm bảo việc tính OC alert (Binance) bám đúng nến thực tế (1m/5m/15m/30m) bằng cách:
+1. Sửa `ts` cho stream `bookTicker` để dùng `receivedAt` thay vì `eventTime=0`
+2. Đồng bộ `ts` cho `trade`/`kline` với `eventTime` (fallback `receivedAt` khi thiếu)
+3. Thêm log debug bucket trong `RealtimeOCDetector` để so sánh trực tiếp với chart
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **bookTicker**:
+  - Trước đây: `_emitPrice({ ..., ts: eventTime })` với `eventTime=0` → `ts=0`, làm cho `RealtimeOCDetector` tính `bucketStart=0` và không lấy được open từ kline cache
+  - Sau khi sửa: `_emitPrice({ ..., ts: receivedAt })` để bucket của alert bám theo thời gian thực (phút hiện tại), khớp với `CandleAggregator`
+- **trade/kline**:
+  - Dùng `ts: eventTime || receivedAt` cho cả `ingestTick`/`ingestKline` và `_emitPrice` để ưu tiên timestamp từ Binance, fallback sang thời gian nhận khi thiếu
+
+#### 2. `src/services/RealtimeOCDetector.js`
+- **onAlertTick()**:
+  - Thêm log debug:
+    - Format: `[RealtimeOCDetector] 🔍 OC bucket debug | EXCHANGE SYMBOL INTERVAL bucketStart=... oc=X% open=Y current=Z source=...`
+    - Giúp verify bucketStart & open của alert khớp với nến thực tế trên chart (Binance Futures)
+
+### Lợi ích
+1. **OC alert align với nến**: Mỗi alert OC Binance sẽ dùng open đúng bucket 1m/5m/15m/30m từ WebSocket kline cache
+2. **Dễ debug sai lệch**: Có thể grep log `OC bucket debug` để so sánh trực tiếp open/oc với chart
+3. **Phân biệt rõ bug vs design**: Nếu OC alert thấp hơn max trong nến, có thể biết do thiết kế step/throttle hay do bucket/open sai
+
+---
+
 ## [2024-12-XX] - Indicator Warmup Implementation (Option C: REST Snapshot) - Updated with 5m Support
 
 ### Tổng quan

@@ -255,6 +255,12 @@ export class RealtimeOCDetector {
         const absThreshold = Math.abs(Number(w.threshold || 0));
         if (absThreshold <= 0) continue;
 
+        // Debug bucket info to verify OC vs nến thực tế
+        logger.info(
+          `[RealtimeOCDetector] 🔍 OC bucket debug | ${exchange.toUpperCase()} ${sym} ${interval} ` +
+          `bucketStart=${bucketStart} oc=${oc.toFixed(2)}% open=${open.toFixed(8)} current=${p.toFixed(8)} source=${source || 'unknown'}`
+        );
+
         const stateKey = `${w.cfgId}|${exchange}|${sym}|${interval}`;
         let state = this.alertState.get(stateKey);
         if (!state) {

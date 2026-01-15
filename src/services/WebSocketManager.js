@@ -28,7 +28,10 @@ class WebSocketManager {
     // - Tính toán: 200 streams = 45 + 200*20 = ~4045 ký tự (an toàn)
     // - Giới hạn 5 messages/s cho subscribe/unsubscribe/ping
     // - 300 connections mới mỗi 5 phút trên cùng IP
-    this.maxStreamsPerConn = 100; // Giảm xuống 100 để ổn định hơn và tránh quá tải/lỗi latency
+    // ✅ ROOT CAUSE FIX: Giảm streams/connection để giảm message rate và event loop backlog
+    // Với 100 streams, mỗi connection nhận ~100-200 messages/second → quá tải
+    // Giảm xuống 50 streams/connection → ~50-100 messages/second → dễ xử lý hơn
+    this.maxStreamsPerConn = 50; // Giảm từ 100 xuống 50 để giảm processing lag và latency
     this.maxUrlLength = 8000; // Max URL length (an toàn dưới 8192)
     this.maxReconnectAttempts = 10;
     this.maxPriceCacheSize = 1000; // Maximum number of symbols to cache (reduced from 5000 to save memory)
@@ -37,9 +40,10 @@ class WebSocketManager {
 
     // ✅ LATENCY MONITORING: Track latency và auto-reconnect nếu latency cao liên tục
     this.highLatencyThreshold = 2000; // 2 seconds - threshold để coi là "high latency"
-    this.extremeLatencyThreshold = 5000; // 5 seconds - extreme latency, reconnect immediately
-    this.highLatencyCountThreshold = 5; // Nếu có 5 lần latency cao liên tục → reconnect (giảm từ 10)
-    this.latencyCheckWindow = 10000; // 10 seconds window để check latency history (giảm từ 30s để phản ứng nhanh hơn)
+    this.extremeLatencyThreshold = 4000; // 4 seconds - extreme latency, reconnect (kline only)
+    this.highLatencyCountThreshold = 5; // Nếu có 5 lần latency cao liên tục → reconnect
+    this.latencyCheckWindow = 10000; // 10 seconds window để check latency history
+    this.latencyReconnectCooldownMs = 30000; // 30s cooldown after a latency-based reconnect (per-connection)
 
     // ✅ LIFO SYMBOL MANAGEMENT: Track symbol usage và unsubscribe symbols không được sử dụng
     this.symbolUsage = new Map(); // symbol -> { lastAccess, accessCount, streams: Set<string> }
@@ -73,9 +77,16 @@ class WebSocketManager {
     this.minReconnectDelayMs = Number(configService.getNumber('BINANCE_WS_RECONNECT_MIN_DELAY_MS', 1000));
     this.maxReconnectDelayMs = Number(configService.getNumber('BINANCE_WS_RECONNECT_MAX_DELAY_MS', 30000));
 
+    // ✅ RECONNECT STORM PREVENTION: Queue-based reconnect để tránh block event loop
+    this.reconnectQueue = []; // Queue of connections waiting to reconnect
+    this.reconnectInProgress = new Set(); // Track connections currently reconnecting
+    this.maxConcurrentReconnects = Number(configService.getNumber('BINANCE_WS_MAX_CONCURRENT_RECONNECTS', 2)); // Max 2 concurrent reconnects
+    this.reconnectQueueProcessorRunning = false;
+
     this._startCacheCleanup();
     this._startSymbolCleanup();
     this._startSubscribeQueueProcessor();
+    this._startReconnectQueueProcessor();
   }
 
   _startCacheCleanup() {
@@ -94,6 +105,67 @@ class WebSocketManager {
     this._subscribeQueueTimer = setInterval(() => {
       this._processSubscribeQueue();
     }, 200); // Check every 200ms (5 messages/s = 1 message per 200ms)
+  }
+
+  // ✅ Process reconnect queue để tránh reconnect storm (block event loop)
+  _startReconnectQueueProcessor() {
+    // Process queue mỗi 100ms để đảm bảo reconnect không block event loop
+    setInterval(() => {
+      this._processReconnectQueue();
+    }, 100);
+  }
+
+  _processReconnectQueue() {
+    // Chỉ process nếu có slot available và có connections trong queue
+    if (this.reconnectInProgress.size >= this.maxConcurrentReconnects) {
+      if (this.reconnectQueue.length > 0) {
+        logger.debug(`[Binance-WS] Reconnect queue full (${this.reconnectQueue.length} waiting, ${this.reconnectInProgress.size} in-progress)`);
+      }
+      return;
+    }
+    if (this.reconnectQueue.length === 0) return;
+
+    // Lấy connection đầu tiên từ queue
+    const conn = this.reconnectQueue.shift();
+    if (!conn) return;
+
+    // Mark as in progress
+    this.reconnectInProgress.add(conn);
+    logger.info(`[Binance-WS] 🔄 Processing reconnect from queue (remaining: ${this.reconnectQueue.length}, in-progress: ${this.reconnectInProgress.size}, streams: ${conn.streams.size})`);
+
+    // ✅ CRITICAL: Disconnect và reconnect hoàn toàn async để không block event loop
+    setImmediate(() => {
+      try {
+        // Disconnect đã được gọi trong _scheduleReconnect, nhưng đảm bảo cleanup
+        this._disconnect(conn);
+        
+        if (conn.reconnectAttempts >= this.maxReconnectAttempts) {
+          logger.error('[Binance-WS] Max reconnect attempts reached for a shard.');
+          this.reconnectInProgress.delete(conn);
+          return;
+        }
+
+        conn.reconnectAttempts += 1;
+        const baseDelay = Math.min(this.minReconnectDelayMs * Math.pow(2, conn.reconnectAttempts), this.maxReconnectDelayMs);
+        const jitter = Math.floor(Math.random() * Math.min(1000, baseDelay * 0.2));
+        const delay = Math.max(100, baseDelay + jitter); // Minimum 100ms delay
+
+        logger.info(`[Binance-WS] ⏱️ Scheduling reconnect in ${delay}ms (attempt ${conn.reconnectAttempts}/${this.maxReconnectAttempts})`);
+
+        // Schedule reconnect với delay
+        conn._reconnectTimer = setTimeout(() => {
+          try {
+            this._connect(conn);
+          } catch (err) {
+            logger.error(`[Binance-WS] Error during reconnect connect: ${err?.message || err}`);
+            this.reconnectInProgress.delete(conn);
+          }
+        }, delay);
+      } catch (err) {
+        logger.error(`[Binance-WS] Error in reconnect queue processor: ${err?.message || err}`);
+        this.reconnectInProgress.delete(conn);
+      }
+    });
   }
 
   _processSubscribeQueue() {
@@ -410,6 +482,8 @@ class WebSocketManager {
       _serverTimeSyncInFlight: false,
       _reconnectTimer: null,
       _latencyReconnectScheduled: false,
+      _lastLatencyReconnectAt: 0,
+      _lastLatencySummaryAt: 0,
       latencyHistory: []
     };
     this.connections.push(conn);
@@ -647,6 +721,14 @@ class WebSocketManager {
       conn.latencyHistory = [];
       conn._latencyReconnectScheduled = false;
 
+      // ✅ Remove from reconnect tracking khi connect thành công
+      this.reconnectInProgress.delete(conn);
+      const queueIndex = this.reconnectQueue.indexOf(conn);
+      if (queueIndex > -1) {
+        this.reconnectQueue.splice(queueIndex, 1);
+        logger.info(`[Binance-WS] ✅ Removed from reconnect queue (remaining: ${this.reconnectQueue.length}, in-progress: ${this.reconnectInProgress.size})`);
+      }
+
       // best-effort sync time on open
       this._syncServerTimeOffsetIfNeeded(conn).catch(() => {});
     });
@@ -685,34 +767,124 @@ class WebSocketManager {
           }
           conn.latencyHistory.push({ latency, timestamp: receivedAt });
 
-          const cutoff = receivedAt - this.latencyCheckWindow;
-          conn.latencyHistory = conn.latencyHistory.filter(h => h.timestamp > cutoff);
-
-          const extremeCount = conn.latencyHistory.filter(h => h.latency > this.extremeLatencyThreshold).length;
-          if (extremeCount >= 2 && !conn._latencyReconnectScheduled) {
-            logger.error(
-              `[Binance-WS] 🚨 EXTREME latency detected: ${latency}ms (threshold: ${this.extremeLatencyThreshold}ms) ` +
-                `| stream: ${streamName}. Reconnecting...`
-            );
-            conn._latencyReconnectScheduled = true;
-            setImmediate(() => {
-              this._scheduleReconnect(conn);
-            });
-            return;
+          // ✅ OPTIMIZE: Cleanup old entries nhưng không sort mỗi message (tốn CPU)
+          // Chỉ cleanup khi history quá lớn (>200 entries) để tránh memory leak
+          if (conn.latencyHistory.length > 200) {
+            const cutoff = receivedAt - this.latencyCheckWindow;
+            conn.latencyHistory = conn.latencyHistory.filter(h => h.timestamp > cutoff);
           }
 
-          const highLatencyCount = conn.latencyHistory.filter(h => h.latency > this.highLatencyThreshold).length;
-          if (highLatencyCount >= this.highLatencyCountThreshold && !conn._latencyReconnectScheduled) {
-            const avgLatency = conn.latencyHistory.reduce((sum, h) => sum + h.latency, 0) / conn.latencyHistory.length;
-            logger.warn(
-              `[Binance-WS] ⚠️ Persistent high latency detected: ${highLatencyCount} high-latency events in last ${this.latencyCheckWindow /
-                1000}s ` +
-                `(avg: ${avgLatency.toFixed(0)}ms, threshold: ${this.highLatencyThreshold}ms). Reconnecting...`
-            );
-            conn._latencyReconnectScheduled = true;
-            setImmediate(() => {
-              this._scheduleReconnect(conn);
-            });
+          const nowMs = receivedAt;
+
+          // Cooldown guard: avoid reconnect storm on transient spikes.
+          const lastLatencyReconnectAt = Number(conn._lastLatencyReconnectAt || 0);
+          const inCooldown = lastLatencyReconnectAt > 0 && (nowMs - lastLatencyReconnectAt) < this.latencyReconnectCooldownMs;
+
+          // ✅ OPTIMIZE: Chỉ tính stats khi cần (không phải mỗi message)
+          // Defer expensive calculation để không block message handler
+          // Chỉ tính khi:
+          // 1. Cần check reconnect (không trong cooldown và chưa scheduled)
+          // 2. Hoặc cần log summary (rate-limited)
+          let p95 = null;
+          let median = null;
+          let avgLatency = null;
+          let maxLatency = null;
+          const n = conn.latencyHistory.length;
+          
+          // ✅ OPTIMIZE: Chỉ tính stats khi cần check reconnect hoặc log summary
+          // Tính stats nếu:
+          // 1. Cần check reconnect (không trong cooldown và chưa scheduled)
+          // 2. Hoặc cần log summary (rate-limited, mỗi 10s)
+          const needsReconnectCheck = !inCooldown && !conn._latencyReconnectScheduled;
+          const needsSummaryLog = !inCooldown && n > 0 && (nowMs - Number(conn._lastLatencySummaryAt || 0)) > 10000;
+          const needsStats = needsReconnectCheck || needsSummaryLog;
+          
+          if (needsStats && n > 0) {
+            // ✅ OPTIMIZE: Sử dụng typed array và chỉ sort khi cần
+            const latArr = conn.latencyHistory.map(h => h.latency).filter(v => Number.isFinite(v));
+            if (latArr.length > 0) {
+              // Sort chỉ khi cần (không phải mỗi message)
+              latArr.sort((a, b) => a - b);
+              const sortedN = latArr.length;
+              p95 = latArr[Math.min(sortedN - 1, Math.floor(sortedN * 0.95))];
+              median = latArr[Math.floor(sortedN * 0.5)];
+              avgLatency = latArr.reduce((s, v) => s + v, 0) / sortedN;
+              maxLatency = latArr[sortedN - 1];
+            }
+          }
+
+          // Rate-limit summary logs (once per 10s per connection)
+          // ✅ OPTIMIZE: Chỉ tính stats khi cần log (đã tính ở trên nếu needsStats)
+          if (!inCooldown && n > 0 && (nowMs - Number(conn._lastLatencySummaryAt || 0)) > 10000) {
+            // Nếu chưa tính stats (vì không needsStats), tính lại cho log
+            if (avgLatency === null && n > 0) {
+              const latArr = conn.latencyHistory.map(h => h.latency).filter(v => Number.isFinite(v));
+              if (latArr.length > 0) {
+                latArr.sort((a, b) => a - b);
+                const sortedN = latArr.length;
+                p95 = latArr[Math.min(sortedN - 1, Math.floor(sortedN * 0.95))];
+                median = latArr[Math.floor(sortedN * 0.5)];
+                avgLatency = latArr.reduce((s, v) => s + v, 0) / sortedN;
+                maxLatency = latArr[sortedN - 1];
+              }
+            }
+            
+            conn._lastLatencySummaryAt = nowMs;
+            if (avgLatency !== null) {
+              logger.info(
+                `[Binance-WS] Latency window stats | streams=${conn.streams.size} n=${n} ` +
+                  `avg=${avgLatency.toFixed(0)}ms med=${median.toFixed(0)}ms p95=${p95.toFixed(0)}ms max=${maxLatency.toFixed(0)}ms ` +
+                  `threshold=${this.highLatencyThreshold}ms extreme=${this.extremeLatencyThreshold}ms offsetMs=${offsetMs.toFixed(0)}`
+              );
+            }
+          }
+
+          if (!conn._latencyReconnectScheduled && !inCooldown) {
+            // Extreme condition: p95 above extreme threshold (more robust than count)
+            if (p95 != null && p95 > this.extremeLatencyThreshold) {
+              logger.error(
+                `[Binance-WS] 🚨 EXTREME latency (p95) detected: p95=${p95.toFixed(0)}ms (threshold: ${this.extremeLatencyThreshold}ms) ` +
+                  `| stream: ${streamName}. Reconnecting...`
+              );
+              conn._latencyReconnectScheduled = true;
+              conn._lastLatencyReconnectAt = nowMs;
+              
+              // ✅ CRITICAL: Schedule reconnect trong next tick để không block message handler
+              // Điều này đảm bảo các messages khác vẫn được process
+              setImmediate(() => {
+                try {
+                  this._scheduleReconnect(conn);
+                } catch (err) {
+                  logger.error(`[Binance-WS] Error scheduling reconnect after EXTREME latency: ${err?.message || err}`);
+                  // Reset flag để có thể retry
+                  conn._latencyReconnectScheduled = false;
+                }
+              });
+              
+              // ✅ CRITICAL: Return ngay để không block message processing
+              // Các messages tiếp theo vẫn được process bình thường
+              return;
+            }
+
+            // Persistent condition: median above highLatencyThreshold (avoids a few spikes triggering reconnect)
+            if (median != null && median > this.highLatencyThreshold) {
+              logger.warn(
+                `[Binance-WS] ⚠️ Persistent high latency (median) detected: med=${median.toFixed(0)}ms ` +
+                  `(threshold: ${this.highLatencyThreshold}ms, p95=${p95?.toFixed(0) ?? 'n/a'}ms). Reconnecting...`
+              );
+              conn._latencyReconnectScheduled = true;
+              conn._lastLatencyReconnectAt = nowMs;
+              
+              // ✅ CRITICAL: Schedule reconnect trong next tick để không block message handler
+              setImmediate(() => {
+                try {
+                  this._scheduleReconnect(conn);
+                } catch (err) {
+                  logger.error(`[Binance-WS] Error scheduling reconnect after persistent high latency: ${err?.message || err}`);
+                  conn._latencyReconnectScheduled = false;
+                }
+              });
+            }
           }
 
           if (latency > 3000) {
@@ -728,6 +900,17 @@ class WebSocketManager {
         }
 
         setImmediate(() => {
+          const processedAt = Date.now();
+          const processingLagMs = processedAt - receivedAt;
+
+          // Only log processing lag when it is suspiciously high (helps distinguish network vs event-loop backlog)
+          if (processingLagMs > 250) {
+            logger.warn(
+              `[Binance-WS] ⚠️ Processing lag detected: ${processingLagMs}ms | stream=${streamName} ` +
+                `latencyMs=${latency >= 0 ? latency : 'n/a'} offsetMs=${offsetMs.toFixed(0)} streams=${conn.streams.size}`
+            );
+          }
+
           try {
             // bookTicker stream
             if (payload && payload.u && payload.s && payload.b && payload.a) {
@@ -735,9 +918,11 @@ class WebSocketManager {
               const bid = parseFloat(payload.b);
               const ask = parseFloat(payload.a);
               if (Number.isFinite(bid) && Number.isFinite(ask)) {
+                // For bookTicker, use receivedAt as ts so alert buckets (OC) align with real-time,
+                // because bookTicker does not carry a reliable eventTime.
                 this.priceCache.set(symbol, { price: bid, bid, ask, lastAccess: receivedAt });
                 this._trackSymbolUsage(symbol);
-                this._emitPrice({ symbol, price: bid, bid, ask, ts: eventTime });
+                this._emitPrice({ symbol, price: bid, bid, ask, ts: receivedAt });
               }
             }
             // trade stream
@@ -746,13 +931,13 @@ class WebSocketManager {
               const price = parseFloat(payload.p);
               const volume = parseFloat(payload.q);
               if (Number.isFinite(price) && Number.isFinite(volume)) {
-                this.candleAggregator.ingestTick({ symbol, price, volume, ts: eventTime });
+                this.candleAggregator.ingestTick({ symbol, price, volume, ts: eventTime || receivedAt });
                 const cached = this.priceCache.get(symbol) || { lastAccess: 0 };
                 cached.price = price;
                 cached.lastAccess = receivedAt;
                 this.priceCache.set(symbol, cached);
                 this._trackSymbolUsage(symbol);
-                this._emitPrice({ symbol, price, ts: eventTime });
+                this._emitPrice({ symbol, price, ts: eventTime || receivedAt });
               }
             }
             // kline stream
@@ -768,7 +953,7 @@ class WebSocketManager {
                 close: k.c,
                 volume: k.v,
                 isClosed: k.x,
-                ts: eventTime
+                ts: eventTime || receivedAt
               });
             }
           } catch (e) {
@@ -784,7 +969,12 @@ class WebSocketManager {
       const reasonStr = reason?.toString() || 'none';
       const codeStr = code || 'unknown';
       logger.warn(`[Binance-WS] Connection closed (code: ${codeStr}, reason: ${reasonStr}, streams: ${conn.streams.size})`);
-      this._scheduleReconnect(conn);
+      
+      // ✅ Cleanup reconnect tracking nếu connection đóng không phải do scheduled reconnect
+      // (scheduled reconnect đã cleanup trong _scheduleReconnect)
+      if (!this.reconnectQueue.includes(conn) && !this.reconnectInProgress.has(conn)) {
+        this._scheduleReconnect(conn);
+      }
     });
 
     conn.ws.on('error', err => {
@@ -808,37 +998,68 @@ class WebSocketManager {
       }
 
       if (conn.ws?.readyState !== WebSocket.CLOSED && conn.ws?.readyState !== WebSocket.CLOSING) {
-        this._scheduleReconnect(conn);
+        // ✅ Chỉ schedule reconnect nếu chưa trong queue/in-progress (tránh duplicate)
+        if (!this.reconnectQueue.includes(conn) && !this.reconnectInProgress.has(conn)) {
+          this._scheduleReconnect(conn);
+        }
       }
     });
   }
 
   _disconnect(conn) {
+    // ✅ CRITICAL: Đảm bảo disconnect không block event loop
+    // Clear timer trước
     if (conn._reconnectTimer) {
       clearTimeout(conn._reconnectTimer);
       conn._reconnectTimer = null;
     }
+    
+    // Disconnect WebSocket với error handling tốt hơn
     if (conn.ws) {
       try {
-        conn.ws.terminate();
-      } catch (_) {}
-      conn.ws = null;
+        // Check readyState trước khi terminate để tránh lỗi
+        if (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING) {
+          conn.ws.terminate();
+        }
+      } catch (err) {
+        // Ignore errors during terminate (connection might already be closed)
+        logger.debug(`[Binance-WS] Error during ws.terminate (non-critical): ${err?.message || err}`);
+      } finally {
+        // Always clear reference để tránh memory leak
+        conn.ws = null;
+      }
     }
   }
 
   _scheduleReconnect(conn) {
-    this._disconnect(conn);
+    // ✅ PREVENT RECONNECT STORM: Queue reconnect thay vì execute ngay lập tức
+    // Điều này tránh block event loop khi nhiều connections cùng reconnect
+    
+    // Skip nếu connection đã trong queue hoặc đang reconnect
+    if (this.reconnectQueue.includes(conn) || this.reconnectInProgress.has(conn)) {
+      logger.debug(`[Binance-WS] Connection already queued/in-progress for reconnect, skipping duplicate`);
+      return;
+    }
+
+    // Check max attempts trước khi queue
     if (conn.reconnectAttempts >= this.maxReconnectAttempts) {
       logger.error('[Binance-WS] Max reconnect attempts reached for a shard.');
       return;
     }
-    conn.reconnectAttempts += 1;
 
-    const baseDelay = Math.min(this.minReconnectDelayMs * Math.pow(2, conn.reconnectAttempts), this.maxReconnectDelayMs);
-    const jitter = Math.floor(Math.random() * Math.min(1000, baseDelay * 0.2));
-    const delay = baseDelay + jitter;
+    // ✅ CRITICAL: Disconnect async để không block event loop
+    // Wrap trong setImmediate để đảm bảo không block message handler
+    setImmediate(() => {
+      try {
+        this._disconnect(conn);
+      } catch (err) {
+        logger.error(`[Binance-WS] Error during async disconnect: ${err?.message || err}`);
+      }
+    });
 
-    conn._reconnectTimer = setTimeout(() => this._connect(conn), delay);
+    // Add to queue (sẽ được process bởi _processReconnectQueue với rate limiting)
+    this.reconnectQueue.push(conn);
+    logger.info(`[Binance-WS] 🔄 Queued connection for reconnect (queue size: ${this.reconnectQueue.length}, in-progress: ${this.reconnectInProgress.size}, streams: ${conn.streams.size})`);
   }
 
   _reconnect(conn) {
