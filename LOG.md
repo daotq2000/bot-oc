@@ -1,5 +1,82 @@
 # Changelog
 
+## [2026-01-15] - Improve WebSocket Latency Handling: Immediate Reconnect + Skip Stale Messages
+
+### Tổng quan
+Cải thiện xử lý latency cao trong WebSocket để phản ứng nhanh hơn và tránh sử dụng stale data:
+1. Immediate reconnect khi detect extreme latency (> 5s)
+2. Giảm thresholds để phản ứng nhanh hơn
+3. Skip stale messages (> 3s latency) để tránh sử dụng dữ liệu cũ
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **Thêm extreme latency threshold**: 5000ms - reconnect ngay lập tức khi detect
+- **Giảm highLatencyCountThreshold**: Từ 10 xuống 5 events
+- **Giảm latencyCheckWindow**: Từ 30s xuống 10s để phản ứng nhanh hơn
+- **Immediate reconnect**: Reconnect ngay khi latency > 5s (không chờ 5 events)
+- **Skip stale messages**: Bỏ qua messages có latency > 3s để tránh sử dụng stale data
+
+### Lợi ích
+1. **Phản ứng nhanh hơn**: Reconnect ngay khi detect extreme latency (> 5s)
+2. **Tránh stale data**: Skip messages có latency > 3s
+3. **Better thresholds**: Giảm thresholds để phát hiện và xử lý latency cao sớm hơn
+4. **Performance**: Không xử lý stale messages, giảm CPU load
+
+### Cấu hình
+- `highLatencyThreshold`: 2000ms (2 giây)
+- `extremeLatencyThreshold`: 5000ms (5 giây) - reconnect immediately
+- `highLatencyCountThreshold`: 5 events (giảm từ 10)
+- `latencyCheckWindow`: 10000ms (10 giây, giảm từ 30s)
+- Stale message threshold: 3000ms (3 giây) - skip messages
+
+### Lưu ý
+- Extreme latency (> 5s) sẽ trigger immediate reconnect
+- Messages có latency > 3s sẽ bị skip để tránh stale data
+- Persistent high latency (5+ events > 2s trong 10s) sẽ trigger reconnect
+
+---
+
+## [2026-01-15] - Optimize WebSocket Latency: Auto-Reconnect + Non-blocking Processing
+
+### Tổng quan
+Tối ưu hóa WebSocket để giảm latency và tự động reconnect khi latency cao liên tục:
+1. Thêm latency monitoring và auto-reconnect khi latency cao liên tục
+2. Tối ưu message processing để không block WebSocket event loop
+3. Kiểm tra network và server load
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **Thêm latency monitoring**: Track latency history trong 30 giây, tự động reconnect nếu có 10+ lần latency > 2000ms
+- **Non-blocking message processing**: Sử dụng `setImmediate()` để defer message processing, không block WebSocket event loop
+- **Auto-reconnect on persistent high latency**: Tự động reconnect khi detect latency cao liên tục
+- **Configurable thresholds**: 
+  - `highLatencyThreshold`: 2000ms (default)
+  - `highLatencyCountThreshold`: 10 events (default)
+  - `latencyCheckWindow`: 30000ms (30 seconds)
+
+### Lợi ích
+1. **Giảm latency**: Non-blocking processing giúp WebSocket nhận message nhanh hơn
+2. **Auto-recovery**: Tự động reconnect khi latency cao liên tục, không cần manual intervention
+3. **Better monitoring**: Track latency history để debug và optimize
+4. **Performance**: Không block WebSocket event loop, giúp xử lý message nhanh hơn
+
+### Kết quả kiểm tra
+- **Network**: Ping đến Binance bị block (ICMP), nhưng HTTP/WebSocket vẫn hoạt động (0.4s response time)
+- **Server Load**: 
+  - CPU: 16% user, 4.9% sys (load average: 1.95-2.21)
+  - Memory: 9.4GB/31GB used (30%), 20GB available
+  - Disk: 78% used (171GB/234GB)
+- **Status**: Server load bình thường, không có bottleneck
+
+### Lưu ý
+- Auto-reconnect chỉ trigger khi có 10+ lần latency > 2000ms trong 30 giây
+- Message vẫn được process ngay cả khi schedule reconnect
+- Reconnect được schedule async để không block message processing
+
+---
+
 ## [2026-01-15] - Optimize OC Detection: Real-time WebSocket Integration + Faster Polling
 
 ### Tổng quan

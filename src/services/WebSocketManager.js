@@ -9,7 +9,7 @@ import { CandleAggregator } from './CandleAggregator.js';
  */
 class WebSocketManager {
   constructor() {
-    this.connections = []; // [{ ws, streams:Set<string>, url, reconnectAttempts }]
+    this.connections = []; // [{ ws, streams:Set<string>, url, reconnectAttempts, latencyHistory }]
     this.priceCache = new Map(); // symbol -> { price, bid, ask, lastAccess }
     this._priceHandlers = new Set(); // listeners for price ticks
     this._latencyHandlers = new Set(); // listeners for ws latency
@@ -24,6 +24,13 @@ class WebSocketManager {
     this.maxPriceCacheSize = 1000; // Maximum number of symbols to cache (reduced from 5000 to save memory)
     this.priceCacheCleanupInterval = 1 * 60 * 1000; // Cleanup every 1 minute (reduced from 5 minutes)
     this._cleanupTimer = null;
+    
+    // ✅ LATENCY MONITORING: Track latency và auto-reconnect nếu latency cao liên tục
+    this.highLatencyThreshold = 2000; // 2 seconds - threshold để coi là "high latency"
+    this.extremeLatencyThreshold = 5000; // 5 seconds - extreme latency, reconnect immediately
+    this.highLatencyCountThreshold = 5; // Nếu có 5 lần latency cao liên tục → reconnect (giảm từ 10)
+    this.latencyCheckWindow = 10000; // 10 seconds window để check latency history (giảm từ 30s để phản ứng nhanh hơn)
+    
     this._startCacheCleanup();
   }
 
@@ -263,6 +270,9 @@ class WebSocketManager {
       logger.info(`[Binance-WS] ✅ Connected successfully (${conn.streams.size} streams)`);
       conn.reconnectAttempts = 0;
       conn._needsReconnect = false;
+      // ✅ Reset latency history và reconnect flag khi reconnect
+      conn.latencyHistory = [];
+      conn._latencyReconnectScheduled = false;
     });
 
     conn.ws.on('message', (raw) => {
@@ -274,53 +284,110 @@ class WebSocketManager {
         const latency = eventTime > 0 ? receivedAt - eventTime : -1;
         if (latency >= 0) {
           this._emitLatency({ stream: msg?.stream || 'unknown', latencyMs: latency, receivedAt, eventTime });
+          
+          // ✅ LATENCY MONITORING: Track latency history và check nếu cần reconnect
+          if (!conn.latencyHistory) {
+            conn.latencyHistory = [];
+          }
+          conn.latencyHistory.push({ latency, timestamp: receivedAt });
+          
+          // Cleanup old latency records (keep only last window)
+          const cutoff = receivedAt - this.latencyCheckWindow;
+          conn.latencyHistory = conn.latencyHistory.filter(h => h.timestamp > cutoff);
+          
+          // ✅ IMMEDIATE RECONNECT: Nếu latency cực cao (> 5s), reconnect ngay lập tức
+          if (latency > this.extremeLatencyThreshold && !conn._latencyReconnectScheduled) {
+            logger.error(
+              `[Binance-WS] 🚨 EXTREME latency detected: ${latency}ms (threshold: ${this.extremeLatencyThreshold}ms) ` +
+              `| stream: ${msg?.stream || 'unknown'}. Reconnecting immediately...`
+            );
+            conn._latencyReconnectScheduled = true;
+            // Reconnect immediately (async, không block message processing)
+            setImmediate(() => {
+              this._scheduleReconnect(conn);
+            });
+            // Skip processing this stale message
+            return;
+          }
+          
+          // ✅ PERSISTENT HIGH LATENCY: Check if we have too many high latency events
+          const highLatencyCount = conn.latencyHistory.filter(h => h.latency > this.highLatencyThreshold).length;
+          if (highLatencyCount >= this.highLatencyCountThreshold && !conn._latencyReconnectScheduled) {
+            const avgLatency = conn.latencyHistory.reduce((sum, h) => sum + h.latency, 0) / conn.latencyHistory.length;
+            logger.warn(
+              `[Binance-WS] ⚠️ Persistent high latency detected: ${highLatencyCount} high-latency events in last ${this.latencyCheckWindow/1000}s ` +
+              `(avg: ${avgLatency.toFixed(0)}ms, threshold: ${this.highLatencyThreshold}ms). Reconnecting...`
+            );
+            // Mark as scheduled để tránh multiple reconnect attempts
+            conn._latencyReconnectScheduled = true;
+            // Reconnect connection để cải thiện latency (async, không block message processing)
+            setImmediate(() => {
+              this._scheduleReconnect(conn);
+            });
+          }
+          
+          // ✅ SKIP STALE MESSAGES: Nếu latency quá cao (> 3s), skip message để tránh sử dụng stale data
+          if (latency > 3000) {
+            logger.debug(
+              `[Binance-WS] ⏭️ Skipping stale message: latency=${latency}ms > 3000ms | stream: ${msg?.stream || 'unknown'}`
+            );
+            return; // Skip processing stale message
+          }
         }
 
         if (latency > 1000) {
           logger.debug(`[Binance-WS] High latency detected: ${latency}ms | stream: ${msg?.stream || 'unknown'}`);
         }
 
-        // bookTicker stream
-        if (payload && payload.u && payload.s && payload.b && payload.a) {
-          const symbol = String(payload.s).toUpperCase();
-          const bid = parseFloat(payload.b);
-          const ask = parseFloat(payload.a);
-          if (Number.isFinite(bid) && Number.isFinite(ask)) {
-            this.priceCache.set(symbol, { price: bid, bid, ask, lastAccess: receivedAt });
-            this._emitPrice({ symbol, price: bid, bid, ask, ts: eventTime });
+        // ✅ OPTIMIZED: Process message asynchronously để không block WebSocket event loop
+        // Sử dụng setImmediate để defer processing, giúp WebSocket có thể nhận message tiếp theo ngay lập tức
+        setImmediate(() => {
+          try {
+            // bookTicker stream
+            if (payload && payload.u && payload.s && payload.b && payload.a) {
+              const symbol = String(payload.s).toUpperCase();
+              const bid = parseFloat(payload.b);
+              const ask = parseFloat(payload.a);
+              if (Number.isFinite(bid) && Number.isFinite(ask)) {
+                this.priceCache.set(symbol, { price: bid, bid, ask, lastAccess: receivedAt });
+                this._emitPrice({ symbol, price: bid, bid, ask, ts: eventTime });
+              }
+            }
+            // trade stream
+            else if (payload && payload.e === 'trade') {
+              const symbol = String(payload.s).toUpperCase();
+              const price = parseFloat(payload.p);
+              const volume = parseFloat(payload.q);
+              if (Number.isFinite(price) && Number.isFinite(volume)) {
+                this.candleAggregator.ingestTick({ symbol, price, volume, ts: eventTime });
+                // Also update price cache with last trade price
+                const cached = this.priceCache.get(symbol) || { lastAccess: 0 };
+                cached.price = price;
+                cached.lastAccess = receivedAt;
+                this.priceCache.set(symbol, cached);
+                this._emitPrice({ symbol, price, ts: eventTime });
+              }
+            }
+            // kline stream
+            else if (payload && payload.e === 'kline' && payload.s && payload.k) {
+              const k = payload.k;
+              this.candleAggregator.ingestKline({
+                symbol: k.s,
+                interval: k.i,
+                startTime: k.t,
+                open: k.o,
+                high: k.h,
+                low: k.l,
+                close: k.c,
+                volume: k.v,
+                isClosed: k.x,
+                ts: eventTime
+              });
+            }
+          } catch (e) {
+            logger.debug(`[Binance-WS] Error processing message payload: ${e?.message || e}`);
           }
-        }
-        // trade stream
-        else if (payload && payload.e === 'trade') {
-          const symbol = String(payload.s).toUpperCase();
-          const price = parseFloat(payload.p);
-          const volume = parseFloat(payload.q);
-          if (Number.isFinite(price) && Number.isFinite(volume)) {
-            this.candleAggregator.ingestTick({ symbol, price, volume, ts: eventTime });
-            // Also update price cache with last trade price
-            const cached = this.priceCache.get(symbol) || { lastAccess: 0 };
-            cached.price = price;
-            cached.lastAccess = receivedAt;
-            this.priceCache.set(symbol, cached);
-            this._emitPrice({ symbol, price, ts: eventTime });
-          }
-        }
-        // kline stream
-        else if (payload && payload.e === 'kline' && payload.s && payload.k) {
-          const k = payload.k;
-          this.candleAggregator.ingestKline({
-            symbol: k.s,
-            interval: k.i,
-            startTime: k.t,
-            open: k.o,
-            high: k.h,
-            low: k.l,
-            close: k.c,
-            volume: k.v,
-            isClosed: k.x,
-            ts: eventTime
-          });
-        }
+        });
       } catch (e) {
         logger.debug(`[Binance-WS] Failed to handle message: ${e?.message || e}`);
             }

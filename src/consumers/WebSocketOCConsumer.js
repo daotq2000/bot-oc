@@ -569,17 +569,32 @@ export class WebSocketOCConsumer {
       // WHY: OC spikes during sideways markets are often fakeouts; we only trade when
       // EMA alignment + ADX strength + RSI regime confirm the existing `direction`.
       // Indicators NEVER flip direction; they only validate/reject.
+      // NOTE: Only apply to Binance FOLLOWING_TREND strategies (MEXC doesn't have closed candle aggregation for ADX)
       if (!isReverseStrategy) {
         // Use exchange from match (more reliable than strategy.exchange which may be undefined)
         const matchExchange = match.exchange || strategy.exchange || 'binance';
-        const ind = this._getOrCreateTrendIndicators(matchExchange, strategy.symbol);
-        const verdict = isTrendConfirmed(direction, currentPrice, ind.state);
-        if (!verdict.ok) {
+        // Only gate Binance FOLLOWING_TREND strategies (consistent with PriceAlertScanner)
+        if (String(matchExchange).toLowerCase() === 'binance') {
+          const ind = this._getOrCreateTrendIndicators(matchExchange, strategy.symbol);
+          const verdict = isTrendConfirmed(direction, currentPrice, ind.state);
+          if (!verdict.ok) {
+            logger.info(
+              `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+              `direction=${direction} reason=${verdict.reason}`
+            );
+            return;
+          }
+          // ✅ Log when filter passes (for verification)
           logger.info(
-            `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
-            `direction=${direction} reason=${verdict.reason}`
+            `[WebSocketOCConsumer] ✅ Trend filter passed | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `direction=${direction} FOLLOWING_TREND confirmed`
           );
-          return;
+        } else {
+          // ✅ Log non-Binance FOLLOWING_TREND strategies (no filter applied)
+          logger.debug(
+            `[WebSocketOCConsumer] ⏭️ Skipping trend filter | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `exchange=${matchExchange} non-Binance FOLLOWING_TREND (no filter)`
+          );
         }
       }
 
