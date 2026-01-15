@@ -1,5 +1,179 @@
 # Changelog
 
+## [2026-01-15] - Fix 414 Error (URI Too Long): URL Length Limit & Connection Splitting
+
+### Tổng quan
+Sửa lỗi 414 "URI Too Long" do URL WebSocket quá dài khi có quá nhiều streams:
+1. Giảm maxStreamsPerConn từ 1000 xuống 200 để tránh URL quá dài
+2. Thêm URL length checking trước khi tạo connection
+3. Tự động split connection nếu URL quá dài
+4. Tính toán max streams dựa trên URL length limit
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **Giảm maxStreamsPerConn**: Từ 1000 xuống 200 streams/connection
+- **Thêm maxUrlLength**: 8000 ký tự (an toàn dưới 8192)
+- **URL length checking**: Check độ dài URL trước khi tạo connection
+- **Connection splitting**: Tự động split connection nếu URL quá dài
+- **Calculate max streams**: Tính toán max streams dựa trên URL length
+
+### Vấn đề
+- **Lỗi 414**: "URI Too Long" khi URL WebSocket quá dài
+- **Nguyên nhân**: Với 1000 streams, URL có thể dài > 20,000 ký tự
+- **Giới hạn URL**: Thường là 2048-8192 ký tự tùy server
+
+### Giải pháp
+1. **Giảm maxStreamsPerConn**: 200 streams/connection (thay vì 1000)
+2. **URL length check**: Check độ dài URL trước khi connect
+3. **Auto-split**: Tự động split connection nếu URL quá dài
+4. **Calculate max streams**: Tính toán dựa trên URL length limit
+
+### Tính toán
+- Base URL: ~45 ký tự
+- Mỗi stream: ~20 ký tự (ví dụ: `btcusdt@bookTicker/`)
+- Với 200 streams: 45 + 200*20 = ~4045 ký tự (an toàn)
+- Với 1000 streams: 45 + 1000*20 = ~20,045 ký tự (quá dài!)
+
+### Cấu hình
+- `maxStreamsPerConn`: 200 (giảm từ 1000)
+- `maxUrlLength`: 8000 ký tự (an toàn dưới 8192)
+
+### Lợi ích
+1. **Tránh 414 error**: URL không vượt quá giới hạn
+2. **Auto-split**: Tự động split connection nếu cần
+3. **URL monitoring**: Log warning khi URL gần giới hạn
+4. **Safe connection**: Mỗi connection có URL length hợp lý
+
+### Lưu ý
+- Mỗi connection tối đa 200 streams (thay vì 1000)
+- URL length được check trước khi connect
+- Connection tự động split nếu URL quá dài
+- Warning log khi URL > 7000 ký tự
+
+---
+
+## [2026-01-15] - Compliance với Binance WebSocket Limits: Rate Limiting & Connection Management
+
+### Tổng quan
+Cập nhật code để tuân thủ giới hạn WebSocket chính thức của Binance:
+1. Set maxStreamsPerConn = 200 (do URL length limit, không phải 1000)
+2. Implement rate limiting cho subscribe/unsubscribe (5 messages/s)
+3. Implement connection rate limiting (300 connections/5 phút)
+4. Queue-based subscribe/unsubscribe để tránh vượt quá giới hạn
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **maxStreamsPerConn**: 200 (do URL length limit, không thể dùng 1000)
+- **Subscribe rate limiting**: Queue-based với 5 messages/s limit
+- **Connection rate limiting**: Track và giới hạn 300 connections mới mỗi 5 phút
+- **Queue processor**: Process subscribe/unsubscribe queue mỗi 200ms (5 messages/s)
+- **Record connections**: Track connection history để enforce rate limit
+
+### Binance Limits (theo tài liệu chính thức)
+- **Max streams/connection**: 1024 streams (theo lý thuyết, nhưng bị giới hạn bởi URL length)
+- **URL length limit**: ~8000 ký tự (thực tế)
+- **Subscribe/unsubscribe rate**: 5 messages/s
+- **New connections**: 300 connections/5 phút trên cùng IP
+- **Total subscriptions**: 1000 active subscriptions/session (user data stream)
+
+### Cấu hình
+- `maxStreamsPerConn`: 200 (do URL length limit)
+- `maxUrlLength`: 8000 ký tự
+- `subscribeRateLimit`: 5 messages/s
+- `maxNewConnectionsPer5Min`: 300 connections/5 phút
+- `connectionHistoryWindow`: 5 phút
+
+### Lợi ích
+1. **Tuân thủ Binance limits**: Không bị disconnect do vượt quá giới hạn
+2. **Rate limiting**: Tránh vượt quá 5 messages/s cho subscribe/unsubscribe
+3. **Connection management**: Tránh tạo quá nhiều connections mới
+4. **Queue-based**: Subscribe/unsubscribe được queue và process theo rate limit
+
+### Cơ chế hoạt động
+1. **Subscribe rate limiting**: Queue subscribe/unsubscribe messages, process 1 message mỗi 200ms
+2. **Connection rate limiting**: Track connection history, block nếu đạt 300 connections/5 phút
+3. **Stream limit**: Mỗi connection tối đa 200 streams (do URL length limit)
+
+### Lưu ý
+- Subscribe/unsubscribe actions được queue và process theo rate limit
+- Connection creation được track và rate limited
+- Nếu đạt connection rate limit, sẽ log warning và block creation
+- **LƯU Ý**: maxStreamsPerConn = 200 (không phải 1000) do URL length limit
+
+---
+
+## [2026-01-15] - Implement LIFO Symbol Management: Reduce Latency by Unsubscribing Unused Symbols
+
+### Tổng quan
+Implement giải pháp triệt để để giảm latency bằng cách quản lý symbols theo LIFO (Last In First Out):
+1. Track symbol usage (lastAccess, accessCount)
+2. Max total streams limit (2000 streams) để tránh quá tải
+3. Auto-unsubscribe symbols không được sử dụng trong 10 phút
+4. Symbol priority system - unsubscribe symbols cũ nhất trước
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **Thêm LIFO symbol management**: Track symbol usage với `symbolUsage` Map
+- **Max total streams limit**: `maxTotalStreams = 2000` để tránh quá tải
+- **Auto cleanup unused symbols**: Unsubscribe symbols không được sử dụng trong 10 phút
+- **Track symbol usage**: Update `lastAccess` mỗi khi symbol được access (getPrice, getBook, price updates)
+- **Force cleanup**: Tự động cleanup khi đạt max streams limit
+- **Symbol cleanup timer**: Cleanup mỗi 2 phút
+
+### Cấu hình
+- `maxTotalStreams`: 2000 streams (giảm từ unlimited)
+- `symbolUnusedTimeout`: 10 phút - unsubscribe symbols không được sử dụng
+- `symbolCleanupInterval`: 2 phút - cleanup interval
+
+### Lợi ích
+1. **Giảm latency**: Giảm số lượng streams → giảm messages → giảm latency
+2. **Tự động cleanup**: Unsubscribe symbols không được sử dụng tự động
+3. **Tránh quá tải**: Max streams limit ngăn chặn quá tải WebSocket
+4. **LIFO priority**: Unsubscribe symbols cũ nhất trước (không ảnh hưởng symbols đang active)
+
+### Cơ chế hoạt động
+1. **Track usage**: Mỗi khi symbol được access (getPrice, getBook, price update), update `lastAccess`
+2. **Cleanup check**: Mỗi 2 phút, check symbols không được sử dụng > 10 phút
+3. **LIFO unsubscribe**: Sort symbols theo `lastAccess` (oldest first), unsubscribe từng symbol
+4. **Force cleanup**: Khi đạt max streams limit, force cleanup để free up 500 streams
+
+### Lưu ý
+- Symbols đang active (được access trong 10 phút) sẽ không bị unsubscribe
+- Cleanup tự động chạy mỗi 2 phút
+- Khi đạt max streams limit, sẽ tự động cleanup để free up space
+
+---
+
+## [2026-01-15] - Fix Error Logging: Prevent Serialization Issues in PositionWebSocketClient
+
+### Tổng quan
+Sửa lỗi serialize error message trong `PositionWebSocketClient` để tránh error message bị hiển thị sai trong log:
+1. Safely extract error message từ Error object
+2. Log error với metadata (code, status, stack) để dễ debug
+3. Tránh serialize error object trực tiếp gây ra vấn đề hiển thị
+
+### Files thay đổi
+
+#### 1. `src/services/PositionWebSocketClient.js`
+- **Sửa `createListenKey` error logging**: Safely extract error message, log với metadata
+- **Sửa `connect` error logging**: Safely extract error message, log với metadata
+- **Tránh serialize error object trực tiếp**: Convert error thành string một cách an toàn
+
+### Lợi ích
+1. **Error message rõ ràng**: Error message được hiển thị đúng trong log
+2. **Better debugging**: Log thêm metadata (code, status, stack) để dễ debug
+3. **Tránh serialization issues**: Không còn error message bị serialize sai như object với keys là số
+
+### Lưu ý
+- Error message sẽ được extract an toàn từ Error object
+- Metadata (code, status, stack) được log riêng để dễ đọc
+- Tránh serialize error object trực tiếp gây ra vấn đề hiển thị
+
+---
+
 ## [2026-01-15] - Improve WebSocket Latency Handling: Immediate Reconnect + Skip Stale Messages
 
 ### Tổng quan

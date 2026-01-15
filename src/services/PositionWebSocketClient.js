@@ -66,7 +66,13 @@ export class PositionWebSocketClient extends EventEmitter {
       logger.debug('[WS] Created listenKey');
       return this.listenKey;
     } catch (e) {
-      logger.error('[WS] createListenKey failed:', e?.message || e);
+      // ✅ FIX: Safely extract error message to avoid serialization issues
+      const errorMsg = e instanceof Error ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+      logger.error(`[WS] createListenKey failed: ${errorMsg}`, { 
+        code: e?.code, 
+        status: e?.status,
+        stack: e?.stack 
+      });
       throw e;
     }
   }
@@ -122,7 +128,13 @@ export class PositionWebSocketClient extends EventEmitter {
       try {
       await this.createListenKey();
       } catch (e) {
-        logger.error('[WS] Failed to create listenKey, will retry:', e?.message || e);
+        // ✅ FIX: Safely extract error message to avoid serialization issues
+        const errorMsg = e instanceof Error ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+        logger.error(`[WS] Failed to create listenKey, will retry: ${errorMsg}`, { 
+          code: e?.code, 
+          status: e?.status,
+          stack: e?.stack 
+        });
         this.state = 'idle';
         // Retry with new listenKey after backoff
         this.reconnect(true);

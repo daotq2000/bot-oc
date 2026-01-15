@@ -91,6 +91,7 @@ async function start() {
       await AppConfig.set('STRATEGIES_WS_SUBSCRIBE_INTERVAL_MS', '60000', 'Interval to update WebSocket subscriptions for Strategies (ms)');
       await AppConfig.set('WS_OC_SUBSCRIBE_INTERVAL_MS', '60000', 'Interval to update WebSocket subscriptions for OC detection (ms)');
       await AppConfig.set('REALTIME_OC_ENABLED', 'true', 'Enable realtime OC detection from WebSocket (no database candles)');
+      await AppConfig.set('WS_OC_GATE_LOG_ENABLED', 'true', 'Enable detailed gate decision logs for OC entries (pass/fail reasons). WARNING: can be noisy');
 
       // WebSocket OC high-performance configs
       await AppConfig.set('WS_MATCH_CONCURRENCY', '50', 'Max concurrency for processing matched strategies per tick (higher = faster entries, more CPU/API usage)');
