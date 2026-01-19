@@ -271,14 +271,14 @@ export class PriceAlertScanner {
 
     // Binance WebSocket price handler
     if (webSocketManager && typeof webSocketManager.onPrice === 'function') {
-      const binanceHandler = (symbol, price, ts = Date.now()) => {
+      const priceAlertScannerBinanceHandler = (symbol, price, ts = Date.now()) => {
         if (!this.isRunning) return;
         // Fire-and-forget: process price tick asynchronously
         this.handlePriceTick('binance', symbol, price, ts).catch(error => {
           logger.error(`[PriceAlertScanner] Error handling Binance price tick:`, error?.message || error);
         });
       };
-      webSocketManager.onPrice(binanceHandler);
+      webSocketManager.onPrice(priceAlertScannerBinanceHandler);
       logger.info('[PriceAlertScanner] ✅ Registered Binance WebSocket price handler (realtime OC detection)');
     }
   }
@@ -370,20 +370,25 @@ export class PriceAlertScanner {
     }
 
     this.isRunning = true;
+    logger.info(`[PriceAlertScanner] ✅ Setting isRunning=true`);
 
     // ✅ REALTIME: Register WebSocket price handlers for immediate OC detection
     this.registerPriceHandlers();
 
-    // ✅ PERFORMANCE: Polling chỉ là safety-net khi WS miss. 
-    // Giảm interval xuống 100ms để tăng tốc độ detect OC (từ 500ms)
-    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 100);
+    // ✅ PERFORMANCE: Polling chỉ là safety-net khi WS miss.
+    // Default 100ms is too aggressive and can overwhelm event loop when scanning many symbols.
+    const interval = configService.getNumber('PRICE_ALERT_SCAN_INTERVAL_MS', 1000);
+    logger.info(`[PriceAlertScanner] Scan interval: ${interval}ms`);
 
     const runLoop = async () => {
-      if (!this.isRunning) return;
+      if (!this.isRunning) {
+        logger.debug('[PriceAlertScanner] isRunning=false, stopping scan loop');
+        return;
+      }
       try {
         await this.scan();
       } catch (error) {
-        logger.error('PriceAlertScanner scan error:', error);
+        logger.error('PriceAlertScanner scan error:', error?.message || error, error?.stack);
       } finally {
         // ✅ Avoid timer pile-up: schedule next run only after finishing current scan
         if (this.isRunning) {
@@ -394,8 +399,8 @@ export class PriceAlertScanner {
 
     // First run asap
     this.scanInterval = setTimeout(runLoop, 0);
-
-    logger.info(`PriceAlertScanner started with interval ${interval}ms (WebSocket realtime + polling safety-net)`);
+    logger.info(`[PriceAlertScanner] ✅ Started with interval ${interval}ms (WebSocket realtime + polling safety-net)`);
+    logger.info(`[PriceAlertScanner] ✅ scanInterval=${this.scanInterval ? 'set' : 'null'}, isRunning=${this.isRunning}`);
   }
 
   /**
@@ -426,14 +431,16 @@ export class PriceAlertScanner {
     try {
       // Check master ENABLE_ALERTS switch first
       const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+      logger.debug(`[PriceAlertScanner] ENABLE_ALERTS=${alertsEnabled}`);
       if (!alertsEnabled) {
-        logger.debug('[PriceAlertScanner] Alerts disabled by ENABLE_ALERTS config, skipping scan');
+        logger.info('[PriceAlertScanner] Alerts disabled by ENABLE_ALERTS config, skipping scan'); // ✅ Changed to info for visibility
         return;
       }
 
       const enabled = configService.getBoolean('PRICE_ALERT_CHECK_ENABLED', true);
+      logger.debug(`[PriceAlertScanner] PRICE_ALERT_CHECK_ENABLED=${enabled}`);
       if (!enabled) {
-        logger.debug('[PriceAlertScanner] Price alert checking is disabled');
+        logger.info('[PriceAlertScanner] Price alert checking is disabled'); // ✅ Changed to info for visibility
         return;
       }
 
@@ -441,8 +448,9 @@ export class PriceAlertScanner {
       await this.refreshConfigsIfNeeded();
 
       const activeConfigs = this.cachedConfigs || [];
+      logger.debug(`[PriceAlertScanner] Active configs: ${activeConfigs.length}`);
       if (activeConfigs.length === 0) {
-        logger.debug('[PriceAlertScanner] No active price alert configs');
+        logger.info('[PriceAlertScanner] No active price alert configs'); // ✅ Changed to info for visibility
         return;
       }
 
@@ -565,28 +573,63 @@ export class PriceAlertScanner {
       const now = Date.now();
       const bucket = Math.floor(now / intervalMs);
 
-      // State per exchange-symbol-interval
+      // ✅ FIX: Use getAccurateOpen() to get correct open price from WebSocket cache or REST API
+      // This ensures OC calculation matches actual candle open price, not just first tick price
+      const { realtimeOCDetector } = await import('../services/RealtimeOCDetector.js');
+      let { open, source: openSource } = await realtimeOCDetector.getAccurateOpen(exchange, symbol, interval, price, now);
+      
+      // ✅ CRITICAL FIX: Fallback to current price if getAccurateOpen fails
+      // This ensures alerts still work even when WebSocket data is unavailable
+      // OC will be 0% initially, but will update as price moves within the bucket
+      if (!Number.isFinite(open) || open <= 0) {
+        logger.debug(
+          `[PriceAlertScanner] ⚠️ getAccurateOpen failed for ${exchange} ${symbol} ${interval}, ` +
+          `using current price as fallback (OC will be 0% initially)`
+        );
+        open = price; // Use current price as fallback
+        openSource = 'fallback_current_price';
+      }
+
+      // State per exchange-symbol-interval (for dedupe and throttling only)
       const stateKey = `${exchange}_${symbol}_${interval}`;
       if (!this.alertStates.has(stateKey)) {
         this.alertStates.set(stateKey, {
-          openPrice: price,
+          openPrice: open, // Use accurate open price
           bucket,
           lastAlertTime: 0,
           alerted: false,
           lastSeenAt: now
         });
-        return; // first tick initializes bucket open
       }
 
       const state = this.alertStates.get(stateKey);
       state.lastSeenAt = now;
 
-      // New bucket -> reset openPrice and alerted flag
+      // New bucket -> update openPrice with accurate value and reset alerted flag
       if (state.bucket !== bucket) {
-        state.openPrice = price;
+        // Get fresh accurate open price for new bucket (only when bucket changes)
+        let { open: newOpen, source: newOpenSource } = await realtimeOCDetector.getAccurateOpen(exchange, symbol, interval, price, now);
+        
+        // ✅ CRITICAL FIX: Fallback to current price if getAccurateOpen fails
+        // This ensures alerts continue working even when WebSocket data is unavailable
+        if (!Number.isFinite(newOpen) || newOpen <= 0) {
+          logger.debug(
+            `[PriceAlertScanner] ⚠️ getAccurateOpen failed for new bucket ${bucket} (${exchange} ${symbol} ${interval}), ` +
+            `using current price as fallback`
+          );
+          newOpen = price; // Use current price as fallback
+          newOpenSource = 'fallback_current_price';
+        }
+        
+        state.openPrice = newOpen;
+        logger.debug(
+          `[PriceAlertScanner] New bucket ${bucket} for ${exchange} ${symbol} ${interval}: ` +
+          `open=${newOpen.toFixed(8)} (source=${newOpenSource || 'unknown'})`
+        );
         state.bucket = bucket;
         state.alerted = false;
       }
+      // Same bucket - reuse cached openPrice (no need to call getAccurateOpen again)
 
       const openPrice = state.openPrice;
       if (!openPrice || Number(openPrice) === 0) return;
@@ -597,7 +640,8 @@ export class PriceAlertScanner {
       // ✅ Log OC detection for visibility
       logger.info(
         `[PriceAlertScanner] 🔍 detectOC | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
-        `OC=${oc.toFixed(2)}% (open=${openPrice}, current=${price})`
+        `OC=${oc.toFixed(2)}% (open=${openPrice.toFixed(8)}, current=${price.toFixed(8)}, ` +
+        `source=${openSource || 'unknown'}, bucket=${bucket})`
       );
 
       // 1) ALWAYS execute signal for any OC (no threshold gate)
@@ -616,13 +660,19 @@ export class PriceAlertScanner {
       const nowMs = now;
       const minAlertInterval = 60000; // 1 minute between alerts
 
-      // ✅ Debug: Log threshold check
+      // ✅ Debug: Log threshold check with detailed info (use info level for visibility)
+      logger.info(
+        `[PriceAlertScanner] 🔍 Threshold check | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+        `OC=${ocAbs.toFixed(2)}% threshold=${threshold}% config_id=${configId} chat_id=${telegramChatId || 'N/A'} ` +
+        `(OC ${ocAbs >= threshold ? '>= threshold ✅' : '< threshold ❌'})`
+      );
+      
       if (ocAbs >= threshold) {
         const timeSinceLastAlert = nowMs - state.lastAlertTime;
         if (!state.alerted || timeSinceLastAlert >= minAlertInterval) {
           logger.info(
             `[PriceAlertScanner] ✅ Threshold met | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
-            `OC=${ocAbs.toFixed(2)}% >= threshold=${threshold}% | Sending alert to chat_id=${telegramChatId}`
+            `OC=${ocAbs.toFixed(2)}% >= threshold=${threshold}% | Sending alert to chat_id=${telegramChatId} config_id=${configId}`
           );
           // Fire-and-forget: do not block strategy execution
           this.sendPriceAlert(
@@ -635,22 +685,23 @@ export class PriceAlertScanner {
             telegramChatId,
             configId
           ).catch((e) => {
-            logger.warn(`[PriceAlertScanner] Failed to send volatility alert for ${exchange} ${symbol} ${interval}: ${e?.message || e}`);
+            logger.error(`[PriceAlertScanner] ❌ Failed to send volatility alert for ${exchange} ${symbol} ${interval}: ${e?.message || e}`);
           });
           state.lastAlertTime = nowMs;
           state.alerted = true;
         } else {
-          logger.debug(
+          logger.info(
             `[PriceAlertScanner] ⏭️ Alert throttled | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
             `OC=${ocAbs.toFixed(2)}% >= threshold=${threshold}% but timeSinceLastAlert=${timeSinceLastAlert}ms < minAlertInterval=${minAlertInterval}ms`
           );
         }
       } else {
         // Reset alerted flag when oc drops below threshold
-        if (state.alerted) {
-          logger.debug(
+        // Only log when OC is close to threshold (within 0.5%) to reduce noise
+        if (state.alerted || (ocAbs >= threshold * 0.5)) {
+          logger.info(
             `[PriceAlertScanner] ⏭️ OC below threshold | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
-            `OC=${ocAbs.toFixed(2)}% < threshold=${threshold}% | Resetting alerted flag`
+            `OC=${ocAbs.toFixed(2)}% < threshold=${threshold}% | ${state.alerted ? 'Resetting alerted flag' : 'Waiting for threshold'}`
           );
         }
         state.alerted = false;
@@ -872,10 +923,32 @@ export class PriceAlertScanner {
         continue;
       }
 
-      const orderService = this.orderServices.get(strategy.bot_id);
+      let orderService = this.orderServices.get(strategy.bot_id);
       if (!orderService) {
-        logger.warn(`[PriceAlertScanner] No OrderService for bot ${strategy.bot_id}`);
-        continue;
+        // ✅ AUTO-FIX: Try to create OrderService for this bot if missing
+        logger.warn(`[PriceAlertScanner] ⚠️ No OrderService for bot ${strategy.bot_id}, attempting to create one...`);
+        try {
+          const { Bot } = await import('../models/Bot.js');
+          const { ExchangeService } = await import('../services/ExchangeService.js');
+          const { OrderService } = await import('../services/OrderService.js');
+          const bot = await Bot.findById(strategy.bot_id);
+          if (!bot) {
+            logger.warn(`[PriceAlertScanner] Bot ${strategy.bot_id} not found in database, skipping strategy ${strategy.id}`);
+            continue;
+          }
+          if (!bot.is_active && bot.is_active !== 1) {
+            logger.warn(`[PriceAlertScanner] Bot ${strategy.bot_id} is not active, skipping strategy ${strategy.id}`);
+            continue;
+          }
+          const exchangeService = new ExchangeService(bot);
+          await exchangeService.initialize();
+          orderService = new OrderService(exchangeService, this.telegramService);
+          this.orderServices.set(strategy.bot_id, orderService);
+          logger.info(`[PriceAlertScanner] ✅ Auto-created OrderService for bot ${strategy.bot_id}`);
+        } catch (error) {
+          logger.error(`[PriceAlertScanner] ❌ Failed to auto-create OrderService for bot ${strategy.bot_id}:`, error?.message || error);
+          continue;
+        }
       }
 
       // mark as sent BEFORE execute to prevent concurrent duplicate fires
@@ -893,35 +966,118 @@ export class PriceAlertScanner {
         });
 
         if (signal) {
-          // ✅ Gate by short-term trend confirmation (FOLLOWING_TREND only)
+          // ✅ CRITICAL: ALL orders MUST pass through trend filter gate
           // WHY: scanner is a safety-net; without gating it can execute on sideways OC spikes.
-          if (Boolean(strategy.is_reverse_strategy) === false && String(exchange).toLowerCase() === 'binance') {
+          const exchangeLower = String(exchange).toLowerCase();
+          const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
+          
+          if (exchangeLower === 'binance') {
+            // ✅ Binance: Full filter (EMA + ADX + RSI)
             const ind = this._getOrCreateTrendIndicators(exchange, symbol);
+            const snap = ind.state.snapshot();
             const verdict = isTrendConfirmed(direction, currentPrice, ind.state);
             if (!verdict.ok) {
               logger.info(
-                `[PriceAlertScanner] ⏭️ Trend filters rejected entry | strategy=${strategy.id} ` +
-                `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) reason=${verdict.reason}`
+                `[PriceAlertScanner] ⏭️ Trend filters REJECTED entry | strategy=${strategy.id} ` +
+                `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} ` +
+                `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) reason=${verdict.reason} | ` +
+                `EMA20=${snap.ema20?.toFixed(4) || 'N/A'} EMA50=${snap.ema50?.toFixed(4) || 'N/A'} ` +
+                `EMA20Slope=${snap.ema20Slope?.toFixed(4) || 'N/A'} ` +
+                `ADX=${snap.adx14?.toFixed(2) || 'N/A'} RSI=${snap.rsi14?.toFixed(2) || 'N/A'} ` +
+                `price=${currentPrice.toFixed(4)}`
               );
               continue;
             }
-            // ✅ Log when filter passes (for verification)
+            // ✅ Log when filter passes with ALL conditions and values
+            const emaCondition = direction === 'bullish'
+              ? `price(${currentPrice.toFixed(4)}) > EMA20(${snap.ema20?.toFixed(4)}) > EMA50(${snap.ema50?.toFixed(4)}) AND EMA20Slope(${snap.ema20Slope?.toFixed(4)}) > 0`
+              : `price(${currentPrice.toFixed(4)}) < EMA20(${snap.ema20?.toFixed(4)}) < EMA50(${snap.ema50?.toFixed(4)}) AND EMA20Slope(${snap.ema20Slope?.toFixed(4)}) < 0`;
+            const adxCondition = `ADX(${snap.adx14?.toFixed(2)}) >= 20`;
+            const rsiCondition = direction === 'bullish'
+              ? `RSI(${snap.rsi14?.toFixed(2)}) >= 55`
+              : `RSI(${snap.rsi14?.toFixed(2)}) <= 45`;
             logger.info(
-              `[PriceAlertScanner] ✅ Trend filter passed | strategy=${strategy.id} ` +
-              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) FOLLOWING_TREND confirmed`
+              `[PriceAlertScanner] ✅ Trend filter PASSED | strategy=${strategy.id} ` +
+              `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} ` +
+              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) | ` +
+              `CONDITIONS: ${emaCondition} ✓ ${adxCondition} ✓ ${rsiCondition} ✓`
             );
-          } else if (Boolean(strategy.is_reverse_strategy) === true) {
-            // ✅ Log COUNTER_TREND strategies (no filter applied)
-            logger.debug(
-              `[PriceAlertScanner] ⏭️ Skipping trend filter | strategy=${strategy.id} ` +
-              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) COUNTER_TREND (no filter)`
+          } else if (exchangeLower === 'mexc') {
+            // ✅ MEXC: Partial filter (EMA + RSI only, no ADX)
+            const ind = this._getOrCreateTrendIndicators(exchange, symbol);
+            const snap = ind.state.snapshot();
+            const ema20 = Number(snap.ema20);
+            const ema50 = Number(snap.ema50);
+            const ema20Slope = Number(snap.ema20Slope);
+            const rsi14 = Number(snap.rsi14);
+            
+            // Check if indicators are ready
+            if (!Number.isFinite(ema20) || !Number.isFinite(ema50) || !Number.isFinite(ema20Slope)) {
+              logger.info(
+                `[PriceAlertScanner] ⏭️ Trend filters REJECTED entry | strategy=${strategy.id} ` +
+                `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} ` +
+                `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) reason=ema_not_ready | ` +
+                `EMA20=${ema20.toFixed(4) || 'N/A'} EMA50=${ema50.toFixed(4) || 'N/A'} EMA20Slope=${ema20Slope.toFixed(4) || 'N/A'}`
+              );
+              continue;
+            }
+            if (!Number.isFinite(rsi14)) {
+              logger.info(
+                `[PriceAlertScanner] ⏭️ Trend filters REJECTED entry | strategy=${strategy.id} ` +
+                `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} ` +
+                `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) reason=rsi_not_ready | ` +
+                `RSI=${rsi14.toFixed(2) || 'N/A'}`
+              );
+              continue;
+            }
+            
+            // EMA filter
+            const emaOk = direction === 'bullish'
+              ? (currentPrice > ema20 && ema20 > ema50 && ema20Slope > 0)
+              : (currentPrice < ema20 && ema20 < ema50 && ema20Slope < 0);
+            
+            if (!emaOk) {
+              logger.info(
+                `[PriceAlertScanner] ⏭️ Trend filters REJECTED entry | strategy=${strategy.id} ` +
+                `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} ` +
+                `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) reason=ema_filter | ` +
+                `price=${currentPrice.toFixed(4)} EMA20=${ema20.toFixed(4)} EMA50=${ema50.toFixed(4)} EMA20Slope=${ema20Slope.toFixed(4)}`
+              );
+              continue;
+            }
+            
+            // RSI filter
+            const rsiOk = direction === 'bullish' ? (rsi14 >= 55) : (rsi14 <= 45);
+            if (!rsiOk) {
+              logger.info(
+                `[PriceAlertScanner] ⏭️ Trend filters REJECTED entry | strategy=${strategy.id} ` +
+                `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} ` +
+                `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) reason=rsi_regime | ` +
+                `RSI=${rsi14.toFixed(2)} (required: ${direction === 'bullish' ? '>= 55' : '<= 45'})`
+              );
+              continue;
+            }
+            
+            // ✅ Log when filter passes with ALL conditions
+            const emaCondition = direction === 'bullish'
+              ? `price(${currentPrice.toFixed(4)}) > EMA20(${ema20.toFixed(4)}) > EMA50(${ema50.toFixed(4)}) AND EMA20Slope(${ema20Slope.toFixed(4)}) > 0`
+              : `price(${currentPrice.toFixed(4)}) < EMA20(${ema20.toFixed(4)}) < EMA50(${ema50.toFixed(4)}) AND EMA20Slope(${ema20Slope.toFixed(4)}) < 0`;
+            const rsiCondition = direction === 'bullish'
+              ? `RSI(${rsi14.toFixed(2)}) >= 55`
+              : `RSI(${rsi14.toFixed(2)}) <= 45`;
+            logger.info(
+              `[PriceAlertScanner] ✅ Trend filter PASSED (MEXC) | strategy=${strategy.id} ` +
+              `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} ` +
+              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) | ` +
+              `CONDITIONS: ${emaCondition} ✓ ${rsiCondition} ✓`
             );
-          } else if (String(exchange).toLowerCase() !== 'binance') {
-            // ✅ Log non-Binance strategies (no filter applied)
-            logger.debug(
-              `[PriceAlertScanner] ⏭️ Skipping trend filter | strategy=${strategy.id} ` +
-              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) non-Binance (no filter)`
+          } else {
+            // ✅ Unknown exchange - reject for safety
+            logger.warn(
+              `[PriceAlertScanner] ⏭️ Trend filters rejected entry | strategy=${strategy.id} ` +
+              `(${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%) unknown exchange (no filter available)`
             );
+            continue;
           }
 
           logger.info(`[PriceAlertScanner] 🚀 Sending signal to OrderService for strategy ${strategy.id} (${exchange} ${symbol} ${normalizedInterval} ${oc.toFixed(2)}%)`);
@@ -968,10 +1124,14 @@ export class PriceAlertScanner {
       const direction = bullish ? 'bullish' : 'bearish';
 
       // Use compact line format via TelegramService
-      logger.info(`[PriceAlertScanner] Sending alert for ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%) to chat_id=${telegramChatId} (config_id=${configId})`);
+      logger.info(
+        `[PriceAlertScanner] 📤 Sending alert for ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+        `(OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}, direction=${direction}) ` +
+        `to chat_id=${telegramChatId} (config_id=${configId})`
+      );
 
       try {
-        await this.telegramService.sendVolatilityAlert(telegramChatId, {
+        const alertData = {
           symbol,
           interval: this.normalizeInterval(interval) || '1m',
           oc: ocPercent,
@@ -979,10 +1139,22 @@ export class PriceAlertScanner {
           currentPrice,
           direction,
           exchange // ✅ CRITICAL: Pass exchange to determine correct alertType (price_mexc vs price_binance)
-        });
-        logger.info(`[PriceAlertScanner] ✅ Alert queued: ${exchange.toUpperCase()} ${symbol} ${interval} (OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) to chat_id=${telegramChatId}`);
+        };
+        
+        logger.debug(`[PriceAlertScanner] Alert data: ${JSON.stringify(alertData)}`);
+        
+        await this.telegramService.sendVolatilityAlert(telegramChatId, alertData);
+        logger.info(
+          `[PriceAlertScanner] ✅ Alert queued successfully: ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+          `(OC: ${ocPercent.toFixed(2)}%, open=${openPrice}, current=${currentPrice}) ` +
+          `to chat_id=${telegramChatId} config_id=${configId}`
+        );
       } catch (error) {
-        logger.error(`[PriceAlertScanner] ❌ Failed to send alert to chat_id=${telegramChatId}:`, error?.message || error);
+        logger.error(
+          `[PriceAlertScanner] ❌ Failed to send alert to chat_id=${telegramChatId} config_id=${configId}: ` +
+          `${error?.message || error} ${error?.stack ? `\nStack: ${error.stack}` : ''}`
+        );
+        throw error; // Re-throw to be caught by caller
       }
     } catch (error) {
       logger.error(`Failed to send price alert for ${symbol}:`, error);

@@ -275,23 +275,63 @@ export class PositionMonitor {
         return;
       }
 
-      // Get the actual fill price from the exchange (abstract method, not exchange-specific)
+      // OPTIMIZATION: Get the actual fill price from the exchange with multiple fallbacks
+      // Priority: 1) Order fill price, 2) Exchange position entry price, 3) DB entry price
       // CRITICAL FIX: Check order_id before querying exchange (synced positions have order_id=null)
       let fillPrice = null;
+      let priceSource = 'unknown';
+      
+      // Method 1: Get from order fill price (most accurate for new positions)
       if (position.order_id) {
         try {
           fillPrice = await exchangeService.getOrderAverageFillPrice(position.symbol, position.order_id);
+          if (fillPrice && Number.isFinite(fillPrice) && fillPrice > 0) {
+            priceSource = 'order_fill';
+            logger.info(`[Place TP/SL] ✅ Got fill price from order ${position.order_id}: ${fillPrice}`);
+          }
         } catch (e) {
-          logger.debug(`[Place TP/SL] Failed to get fill price from exchange for position ${position.id} (order_id=${position.order_id}): ${e?.message || e}`);
+          logger.debug(`[Place TP/SL] Failed to get fill price from order for position ${position.id} (order_id=${position.order_id}): ${e?.message || e}`);
         }
       } else {
-        logger.debug(`[Place TP/SL] Position ${position.id} has no order_id (synced position), skipping getOrderAverageFillPrice`);
+        logger.debug(`[Place TP/SL] Position ${position.id} has no order_id (synced position), trying exchange position data`);
       }
       
+      // Method 2: Get from exchange position data (for synced positions)
       if (!fillPrice || !Number.isFinite(fillPrice) || fillPrice <= 0) {
-        // Fallback to position.entry_price if available
+        try {
+          const exchangePositions = await exchangeService.getOpenPositions(position.symbol);
+          if (Array.isArray(exchangePositions) && exchangePositions.length > 0) {
+            const normalizedSymbol = (exchangeService?.binanceDirectClient?.normalizeSymbol && 
+                                     exchangeService.binanceDirectClient.normalizeSymbol(position.symbol)) || position.symbol;
+            const expectedPositionSide = position.side === 'long' ? 'LONG' : 'SHORT';
+            
+            const matchingPos = exchangePositions.find(p => {
+              const symOk = (p.symbol === normalizedSymbol || p.symbol === position.symbol);
+              if (!symOk) return false;
+              if (p.positionSide && String(p.positionSide).toUpperCase() !== expectedPositionSide) return false;
+              const amt = Math.abs(parseFloat(p.positionAmt ?? p.contracts ?? 0));
+              return amt > 0;
+            });
+            
+            if (matchingPos) {
+              const exEntryPrice = parseFloat(matchingPos.entryPrice || matchingPos.info?.entryPrice || 0);
+              if (exEntryPrice && Number.isFinite(exEntryPrice) && exEntryPrice > 0) {
+                fillPrice = exEntryPrice;
+                priceSource = 'exchange_position';
+                logger.info(`[Place TP/SL] ✅ Got entry price from exchange position data: ${fillPrice}`);
+              }
+            }
+          }
+        } catch (e) {
+          logger.debug(`[Place TP/SL] Failed to get entry price from exchange position data: ${e?.message || e}`);
+        }
+      }
+      
+      // Method 3: Fallback to DB entry_price
+      if (!fillPrice || !Number.isFinite(fillPrice) || fillPrice <= 0) {
         if (position.entry_price && Number.isFinite(Number(position.entry_price)) && Number(position.entry_price) > 0) {
           fillPrice = Number(position.entry_price);
+          priceSource = 'db_entry_price';
           logger.info(
             `[Place TP/SL] Using entry_price from DB for position ${position.id} ` +
             `(order_id=${position.order_id || 'null'}, synced position or order not found): ${fillPrice}`
@@ -302,11 +342,33 @@ export class PositionMonitor {
           await this._releasePositionLock(position.id);
           return;
         }
-      } else {
-        // Update position with the real entry price
+      }
+      
+      // OPTIMIZATION: Verify entry price accuracy and update if needed
+      // If price from exchange differs significantly from DB, update DB
+      const dbEntryPrice = Number(position.entry_price || 0);
+      if (dbEntryPrice > 0 && fillPrice > 0 && priceSource !== 'db_entry_price') {
+        const priceDiffPercent = Math.abs((fillPrice - dbEntryPrice) / dbEntryPrice) * 100;
+        if (priceDiffPercent > 1) { // More than 1% difference
+          logger.warn(
+            `[Place TP/SL] ⚠️ Entry price mismatch for position ${position.id}: ` +
+            `DB=${dbEntryPrice.toFixed(8)}, ${priceSource}=${fillPrice.toFixed(8)}, diff=${priceDiffPercent.toFixed(2)}%`
+          );
+          // Update DB with accurate price
+          await Position.update(position.id, { entry_price: fillPrice });
+          position.entry_price = fillPrice;
+          logger.info(`[Place TP/SL] ✅ Updated position ${position.id} entry_price from ${dbEntryPrice.toFixed(8)} to ${fillPrice.toFixed(8)} (source: ${priceSource})`);
+        } else if (priceSource === 'order_fill' || priceSource === 'exchange_position') {
+          // Always update if we got price from exchange (more accurate)
+          await Position.update(position.id, { entry_price: fillPrice });
+          position.entry_price = fillPrice;
+          logger.debug(`[Place TP/SL] Updated position ${position.id} with verified entry price: ${fillPrice} (source: ${priceSource})`);
+        }
+      } else if (priceSource === 'order_fill' || priceSource === 'exchange_position') {
+        // Update if we got price from exchange and DB doesn't have it
         await Position.update(position.id, { entry_price: fillPrice });
         position.entry_price = fillPrice;
-        logger.info(`[Place TP/SL] Updated position ${position.id} with actual fill price: ${fillPrice}`);
+        logger.info(`[Place TP/SL] Updated position ${position.id} with entry price: ${fillPrice} (source: ${priceSource})`);
       }
 
       // Get strategy to access oc, take_profit, stoploss

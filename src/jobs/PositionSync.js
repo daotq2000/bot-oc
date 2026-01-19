@@ -604,6 +604,11 @@ export class PositionSync {
             await EntryOrder.markFilled(entry.id);
             
           logger.info(`[PositionSync] ✅ Created Position ${position.id} from entry_order ${entry.id} for ${normalizedSymbol} ${side}`);
+          
+          // OPTIMIZATION: Trigger immediate TP/SL placement for newly created position
+          // This reduces unprotected time window from 30-60s to < 5s
+          await this._triggerImmediateTPSLPlacement(position, exchangeService);
+          
             return true;
         } catch (error) {
           // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)
@@ -689,6 +694,11 @@ export class PositionSync {
           `[PositionSync] ✅ Created missing Position ${position.id} for ${normalizedSymbol} ${side} on bot ${botId} ` +
           `(synced from exchange, order_id=null because position already existed on exchange, not from new order)`
         );
+        
+        // OPTIMIZATION: Trigger immediate TP/SL placement for newly created position
+        // This reduces unprotected time window from 30-60s to < 5s
+        await this._triggerImmediateTPSLPlacement(position, exchangeService);
+        
         return true;
       } catch (error) {
         // OPTIMISTIC LOCK: Handle duplicate gracefully (race condition detected)
@@ -806,6 +816,46 @@ export class PositionSync {
       }
     } catch (error) {
       logger.warn(`[PositionSync] Error verifying position ${dbPos.id}:`, error?.message || error);
+    }
+  }
+
+  /**
+   * Trigger immediate TP/SL placement for newly created position
+   * OPTIMIZATION: Sets tp_sl_pending flag to ensure PositionMonitor processes it with high priority
+   * This reduces unprotected time window from 30-60s to < 5s (next PositionMonitor cycle)
+   * @param {Object} position - Position object
+   * @param {ExchangeService} exchangeService - Exchange service instance
+   */
+  async _triggerImmediateTPSLPlacement(position, exchangeService) {
+    try {
+      // Set tp_sl_pending flag to ensure PositionMonitor processes this position with high priority
+      // PositionMonitor already has logic to prioritize positions with tp_sl_pending = true
+      try {
+        await Position.update(position.id, { tp_sl_pending: true });
+        logger.info(
+          `[PositionSync] 🚀 Set tp_sl_pending flag for position ${position.id} ` +
+          `(${position.symbol} ${position.side}) to trigger immediate TP/SL placement in next PositionMonitor cycle`
+        );
+      } catch (updateError) {
+        // If tp_sl_pending column doesn't exist, that's okay - PositionMonitor will still handle it
+        const errorMsg = updateError?.message || String(updateError);
+        if (errorMsg.includes("Unknown column 'tp_sl_pending'") || errorMsg.includes("tp_sl_pending")) {
+          logger.debug(
+            `[PositionSync] tp_sl_pending column not available for position ${position.id}, ` +
+            `PositionMonitor will still process it in next cycle`
+          );
+        } else {
+          logger.warn(
+            `[PositionSync] Failed to set tp_sl_pending flag for position ${position.id}: ${errorMsg}`
+          );
+        }
+      }
+    } catch (error) {
+      // Non-critical: if we can't set flag, PositionMonitor will still handle it
+      logger.debug(
+        `[PositionSync] Could not trigger immediate TP/SL placement for position ${position.id}: ` +
+        `${error?.message || error}. Will be handled by PositionMonitor in next cycle.`
+      );
     }
   }
 

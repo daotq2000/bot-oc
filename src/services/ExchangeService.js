@@ -942,6 +942,95 @@ export class ExchangeService {
                                 msg.includes('Position does not exist') ||
                                 msg.includes('Insufficient position');
       
+      // ✅ CRITICAL FIX: Handle -1106 error (reduceOnly not required) by retrying without reduceOnly
+      const isReduceOnlyNotRequired = msg.includes('-1106') || 
+                                      msg.includes("Parameter 'reduceonly' sent when not required");
+      
+      if (isReduceOnlyNotRequired) {
+        // Retry without reduceOnly parameter (one-way mode doesn't need it)
+        logger.warn(
+          `[ExchangeService] Retrying close position without reduceOnly for bot ${this.bot.id} (${symbol}): ${msg}`
+        );
+        try {
+          // ✅ CRITICAL FIX: Recalculate qty in retry logic to ensure it's available
+          if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+            const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+            const positions = await this.binanceDirectClient.getOpenPositions(normalizedSymbol);
+            const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+            
+            // Find matching position
+            let pos = null;
+            if (Array.isArray(positions)) {
+              pos = positions.find(p => p.symbol === normalizedSymbol && (p.positionSide ? p.positionSide === positionSide : true));
+              if (!pos) pos = positions.find(p => p.symbol === normalizedSymbol && parseFloat(p.positionAmt) !== 0);
+            }
+            
+            const posAmt = pos ? Math.abs(parseFloat(pos.positionAmt || 0)) : 0;
+            if (!pos || posAmt === 0) {
+              logger.warn(`[ExchangeService] No open position to close for ${normalizedSymbol} in retry, skip close.`);
+              return { skipped: true };
+            }
+            
+            // Recalculate qty
+            const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
+            const qtyStr = this.binanceDirectClient.formatQuantity(posAmt, stepSize);
+            const retryQty = parseFloat(qtyStr);
+            if (retryQty <= 0) {
+              logger.warn(`[ExchangeService] Computed close quantity <= 0 for ${normalizedSymbol} in retry, skip.`);
+              return { skipped: true };
+            }
+            
+            // Retry with reduceOnly=false
+            const closeSide = side === 'long' ? 'SELL' : 'BUY';
+            const order = await this.binanceDirectClient.placeMarketOrder(
+              normalizedSymbol,
+              closeSide,
+              retryQty,
+              positionSide,
+              false // Don't use reduceOnly
+            );
+            
+            logger.info(
+              `[ExchangeService] ✅ Successfully closed position (retry without reduceOnly) for bot ${this.bot.id} (${symbol}): orderId=${order.orderId} qty=${retryQty}`
+            );
+            return { ...order, avgFillPrice: null };
+          } else {
+            // For other exchanges, retry with reduceOnly=false
+            const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
+            const positions = await this.exchange.fetchPositions();
+            const pos = Array.isArray(positions)
+              ? positions.find(p => (p.symbol === marketSymbol || p.symbol === symbol || p.info?.symbol === marketSymbol || p.info?.symbol === symbol) && ((p.contracts ?? Math.abs(parseFloat(p.positionAmt || 0))) > 0))
+              : null;
+            
+            const contracts = pos ? (pos.contracts ?? Math.abs(parseFloat(pos.positionAmt || 0))) : 0;
+            if (!contracts || contracts <= 0) {
+              logger.warn(`[ExchangeService] No open position to close for ${marketSymbol} in retry, skip close.`);
+              return { skipped: true };
+            }
+            
+            const retryQtyStr = this.exchange.amountToPrecision(marketSymbol, contracts);
+            const retryQty = parseFloat(retryQtyStr);
+            if (!retryQty || retryQty <= 0) {
+              logger.warn(`[ExchangeService] Computed close quantity <= 0 for ${marketSymbol} in retry, skip.`);
+              return { skipped: true };
+            }
+            
+            const orderSide = side === 'long' ? 'sell' : 'buy';
+            const order = await this.exchange.createOrder(marketSymbol, 'market', orderSide, retryQty);
+            
+            logger.info(
+              `[ExchangeService] ✅ Successfully closed position (retry without reduceOnly) for bot ${this.bot.id} (${symbol}): orderId=${order.id} qty=${retryQty}`
+            );
+            return order;
+          }
+        } catch (retryError) {
+          logger.error(
+            `[ExchangeService] ❌ Retry without reduceOnly also failed for bot ${this.bot.id} (${symbol}): ${retryError?.message || retryError}`
+          );
+          throw retryError;
+        }
+      }
+      
       if (isReduceOnlyError) {
         // Race condition: position already reduced/closed by TP/SL or other order
         logger.warn(`ReduceOnly close skipped for bot ${this.bot.id} (${symbol}): ${msg}`);
@@ -1179,8 +1268,12 @@ export class ExchangeService {
         params.type = marketType;
       }
 
-      // For Binance: use direct client (production data)
-      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+      // CRITICAL FIX: For Binance, ALWAYS use direct client (never CCXT)
+      // This ensures all Binance klines requests go through centralized rate limiting
+      if (this.bot.exchange === 'binance') {
+        if (!this.binanceDirectClient) {
+          throw new Error(`BinanceDirectClient not initialized for bot ${this.bot.id}. Cannot fetch klines without rate limit protection.`);
+        }
         const klines = await this.binanceDirectClient.getKlines(symbol, timeframe, limit);
         // Convert to CCXT format
         return klines.map(candle => [
@@ -1194,9 +1287,11 @@ export class ExchangeService {
       }
       
       // For other exchanges: use CCXT
-      const exchange = (this.bot.exchange === 'binance' && this.publicExchange) 
-        ? this.publicExchange 
-        : this.exchange;
+      const exchange = this.exchange;
+      
+      if (!exchange) {
+        throw new Error(`Exchange not initialized for bot ${this.bot.id}`);
+      }
       
       const candles = await exchange.fetchOHLCV(
         marketSymbol,

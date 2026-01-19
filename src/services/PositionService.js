@@ -3,6 +3,7 @@ import { calculatePnL, calculatePnLPercent, calculateDynamicStopLoss, calculateT
 import { exchangeInfoService } from './ExchangeInfoService.js';
 import { configService } from './ConfigService.js';
 import { orderStatusCache } from './OrderStatusCache.js';
+import { riskManagementService } from './RiskManagementService.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -104,9 +105,95 @@ export class PositionService {
         return position; // Return original position without changes
       }
 
+      // Calculate PnL first (needed for both checks)
+      const pnl = calculatePnL(
+        position.entry_price,
+        currentPrice,
+        position.amount,
+        position.side
+      );
+
+      // ✅ CRITICAL FIX: Check if PnL has reached take_profit threshold from strategy FIRST
+      // This is more accurate than price-based check because it uses actual PnL
+      // take_profit in strategy can be either:
+      // 1. Percentage (e.g., 50 = 5%) - calculate expected PnL from amount
+      // 2. USDT amount (e.g., 85) - compare directly with PnL
+      try {
+        const { Strategy } = await import('../models/Strategy.js');
+        const strategy = await Strategy.findById(position.strategy_id);
+        
+        if (strategy && strategy.take_profit !== undefined && strategy.take_profit !== null) {
+          const takeProfitValue = Number(strategy.take_profit);
+          
+          if (Number.isFinite(takeProfitValue) && takeProfitValue > 0) {
+            // Check if take_profit is USDT amount (>= 10) or percentage (< 10)
+            // If take_profit >= 10, treat as USDT amount
+            // If take_profit < 10, treat as percentage (e.g., 5 = 5%)
+            const isUSDTAmount = takeProfitValue >= 10;
+            
+            let expectedPnL = 0;
+            if (isUSDTAmount) {
+              // take_profit is USDT amount (e.g., 85 USDT)
+              expectedPnL = takeProfitValue;
+            } else {
+              // take_profit is percentage (e.g., 50 = 5%)
+              const tpPercent = takeProfitValue / 10; // 50 -> 5%
+              expectedPnL = (position.amount * tpPercent) / 100;
+            }
+            
+            // Check if PnL has reached or exceeded expected take profit
+            if (pnl >= expectedPnL) {
+              logger.info(
+                `[PositionService] ✅ Take Profit reached (PnL-based) | pos=${position.id} ` +
+                `symbol=${position.symbol} pnl=${pnl.toFixed(2)} USDT >= expected=${expectedPnL.toFixed(2)} USDT ` +
+                `(strategy.take_profit=${takeProfitValue} ${isUSDTAmount ? 'USDT' : '%'}) ` +
+                `→ Closing position immediately`
+              );
+              
+              // Guard: ensure there is an actual exchange position to close
+              try {
+                const qty = await getCachedClosableQty();
+                if (!qty || qty <= 0) {
+                  logger.warn(`[CloseGuard] Skip TP close for position ${position.id} (${position.symbol}) - no exchange exposure`);
+                  return position;
+                }
+              } catch (e) {
+                logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+                return position;
+              }
+              
+              try {
+                const closedPosition = await this.closePosition(position, currentPrice, pnl, 'tp_hit_pnl');
+                logger.info(
+                  `[PositionService] ✅ Position ${position.id} closed immediately (PnL-based) | ` +
+                  `price=${currentPrice.toFixed(8)} pnl=${pnl.toFixed(2)} reason=tp_hit_pnl`
+                );
+                return closedPosition;
+              } catch (closeError) {
+                logger.error(
+                  `[PositionService] ❌ Failed to close position immediately (PnL-based) | pos=${position.id} ` +
+                  `error=${closeError?.message || closeError}`
+                );
+                // Continue with normal update flow if close fails
+              }
+            } else {
+              logger.debug(
+                `[PositionService] TP check (PnL-based) | pos=${position.id} ` +
+                `pnl=${pnl.toFixed(2)} USDT < expected=${expectedPnL.toFixed(2)} USDT ` +
+                `(strategy.take_profit=${takeProfitValue} ${isUSDTAmount ? 'USDT' : '%'})`
+              );
+            }
+          }
+        }
+      } catch (tpCheckError) {
+        logger.warn(`[PositionService] Error checking take profit (PnL-based) for position ${position.id}: ${tpCheckError?.message || tpCheckError}`);
+        // Continue with normal flow if TP check fails
+      }
+
       // CRITICAL FIX: Check if price has exceeded initial TP and should close immediately
       // This handles the case where position already has TP order but price exceeded initial TP
       // Logic: If initial_tp_price exists OR we can calculate it from strategy, and current price exceeded it, close immediately
+      // NOTE: This is a fallback check - PnL-based check above should catch most cases
       let initialTP = null;
       
       // Try to get initial TP from position.initial_tp_price first
@@ -135,15 +222,7 @@ export class PositionService {
             `[PositionService] 🚨 Price exceeded initial TP during monitoring | pos=${position.id} ` +
             `symbol=${position.symbol} side=${position.side} ` +
             `initialTP=${initialTP.toFixed(8)} currentPrice=${currentPrice.toFixed(8)} ` +
-            `→ Closing immediately with MARKET order to lock in better profit`
-          );
-          
-          // Calculate PnL for the close
-          const pnl = calculatePnL(
-            position.entry_price,
-            currentPrice,
-            position.amount,
-            position.side
+            `pnl=${pnl.toFixed(2)} USDT → Closing immediately with MARKET order to lock in better profit`
           );
           
           try {
@@ -164,13 +243,69 @@ export class PositionService {
         }
       }
 
-      // Calculate PnL
-      const pnl = calculatePnL(
-        position.entry_price,
-        currentPrice,
-        position.amount,
-        position.side
-      );
+      // ✅ CRITICAL FIX: Check if PnL has reached take_profit threshold from strategy
+      // take_profit in strategy can be either:
+      // 1. Percentage (e.g., 50 = 5%) - calculate expected PnL from amount
+      // 2. USDT amount (e.g., 85) - compare directly with PnL
+      // We check both interpretations to ensure we don't miss TP
+      try {
+        const { Strategy } = await import('../models/Strategy.js');
+        const strategy = await Strategy.findById(position.strategy_id);
+        
+        if (strategy && strategy.take_profit !== undefined && strategy.take_profit !== null) {
+          const takeProfitValue = Number(strategy.take_profit);
+          
+          if (Number.isFinite(takeProfitValue) && takeProfitValue > 0) {
+            // Check if take_profit is USDT amount (>= 10) or percentage (< 10)
+            // If take_profit >= 10, treat as USDT amount
+            // If take_profit < 10, treat as percentage (e.g., 5 = 5%)
+            const isUSDTAmount = takeProfitValue >= 10;
+            
+            let expectedPnL = 0;
+            if (isUSDTAmount) {
+              // take_profit is USDT amount (e.g., 85 USDT)
+              expectedPnL = takeProfitValue;
+            } else {
+              // take_profit is percentage (e.g., 50 = 5%)
+              const tpPercent = takeProfitValue / 10; // 50 -> 5%
+              expectedPnL = (position.amount * tpPercent) / 100;
+            }
+            
+            // Check if PnL has reached or exceeded expected take profit
+            if (pnl >= expectedPnL) {
+              logger.info(
+                `[PositionService] ✅ Take Profit reached (PnL-based) | pos=${position.id} ` +
+                `symbol=${position.symbol} pnl=${pnl.toFixed(2)} USDT >= expected=${expectedPnL.toFixed(2)} USDT ` +
+                `(strategy.take_profit=${takeProfitValue} ${isUSDTAmount ? 'USDT' : '%'}) ` +
+                `→ Closing position immediately`
+              );
+              
+              // Guard: ensure there is an actual exchange position to close
+              try {
+                const qty = await getCachedClosableQty();
+                if (!qty || qty <= 0) {
+                  logger.warn(`[CloseGuard] Skip TP close for position ${position.id} (${position.symbol}) - no exchange exposure`);
+                  return position;
+                }
+              } catch (e) {
+                logger.warn(`[CloseGuard] Unable to verify exchange exposure for position ${position.id}: ${e?.message || e}`);
+                return position;
+              }
+              
+              return await this.closePosition(position, currentPrice, pnl, 'tp_hit_pnl');
+            } else {
+              logger.debug(
+                `[PositionService] TP check (PnL-based) | pos=${position.id} ` +
+                `pnl=${pnl.toFixed(2)} USDT < expected=${expectedPnL.toFixed(2)} USDT ` +
+                `(strategy.take_profit=${takeProfitValue} ${isUSDTAmount ? 'USDT' : '%'})`
+              );
+            }
+          }
+        }
+      } catch (tpCheckError) {
+        logger.warn(`[PositionService] Error checking take profit (PnL-based) for position ${position.id}: ${tpCheckError?.message || tpCheckError}`);
+        // Continue with normal flow if TP check fails
+      }
 
       // Check if TP hit (price-based check as fallback) - DISABLED to prevent premature closing
       // if (this.isTakeProfitHit(position, currentPrice)) {
@@ -301,14 +436,55 @@ export class PositionService {
         logger.debug(`[TP Trail] pos=${position.id} Using increment-based calculation: prevMinutes=${prevMinutes} -> actualMinutesElapsed=${actualMinutesElapsed}, minutesToProcess=${minutesToProcess}`);
       }
       
+      // ✅ RISK MANAGEMENT: Check if SL should be moved to breakeven or trailed
       // Only set initial SL if it doesn't exist (SL should NOT be moved after initial setup)
       const prevSL = Number(position.stop_loss_price || 0);
       let updatedSL = null;
       if (prevSL <= 0) {
+        // Set initial SL if not exists
         updatedSL = await this.calculateUpdatedStopLoss(position);
         if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0) {
           await Position.update(position.id, { stop_loss_price: updatedSL });
           logger.debug(`[TP Trail] Set initial SL for position ${position.id}: ${updatedSL}`);
+        }
+      } else {
+        // ✅ NEW: Risk Management - Move SL to breakeven or trail SL
+        // Priority 1: Check if should move to breakeven (when profit >= 1%)
+        const breakevenCheck = riskManagementService.shouldMoveSLToBreakeven(position, currentPrice);
+        if (breakevenCheck.shouldMove) {
+          updatedSL = breakevenCheck.newSL;
+          logger.info(
+            `[RiskManagement] ✅ Moving SL to breakeven | pos=${position.id} ` +
+            `currentSL=${prevSL.toFixed(8)} → breakeven=${updatedSL.toFixed(8)} reason=${breakevenCheck.reason}`
+          );
+        } else {
+          // Priority 2: Check if should trail SL (when profit >= 2%)
+          const trailingCheck = riskManagementService.calculateTrailingSL(position, currentPrice);
+          if (trailingCheck.shouldTrail) {
+            updatedSL = trailingCheck.newSL;
+            logger.info(
+              `[RiskManagement] ✅ Trailing SL | pos=${position.id} ` +
+              `currentSL=${prevSL.toFixed(8)} → newSL=${updatedSL.toFixed(8)} reason=${trailingCheck.reason}`
+            );
+          }
+        }
+
+        // Update SL if changed
+        if (updatedSL !== null && Number.isFinite(updatedSL) && updatedSL > 0 && updatedSL !== prevSL) {
+          try {
+            // Update SL in database
+            await Position.update(position.id, { stop_loss_price: updatedSL });
+            logger.debug(`[RiskManagement] Updated SL in DB | pos=${position.id} newSL=${updatedSL.toFixed(8)}`);
+            
+            // Note: SL order update on exchange will be handled by PositionMonitor
+            // when it detects SL price change in next monitoring cycle
+          } catch (slUpdateError) {
+            logger.error(
+              `[RiskManagement] ❌ Failed to update SL | pos=${position.id} ` +
+              `error=${slUpdateError?.message || slUpdateError}`
+            );
+            // Continue with normal flow even if SL update fails
+          }
         }
       }
 
@@ -1227,10 +1403,12 @@ export class PositionService {
       // - price_exceeded_initial_tp: Price exceeded initial TP, close with MARKET to lock in better profit
       // - tp_trailing_loss_zone: TP trailing into loss zone, force close to prevent worse loss
       // - tp_sl_cancelled_force_close: TP/SL order cancelled but position needs to be closed (risk management)
+      // - tp_hit_pnl: PnL reached take_profit threshold, force close to lock in profit
       const isForceClose = reason === 'tp_cross_entry_force_close' || 
                           reason === 'price_exceeded_initial_tp' ||
                           reason === 'tp_trailing_loss_zone' ||
-                          reason === 'tp_sl_cancelled_force_close';
+                          reason === 'tp_sl_cancelled_force_close' ||
+                          reason === 'tp_hit_pnl';
       
       if (isForceClose) {
         logger.info(`[CloseGuard] ⚠️ FORCE CLOSE: Skipping CloseGuard for position ${position.id} (reason: ${reason})`);

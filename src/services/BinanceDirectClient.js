@@ -682,17 +682,56 @@ export class BinanceDirectClient {
   /**
    * Make request for MARKET DATA only (always uses production API)
    * This ensures all analysis uses real market data regardless of trading mode
+   * 
+   * ⚠️ CRITICAL FIX: Added aggressive rate limiting to prevent IP ban
    */
   async makeMarketDataRequest(endpoint, method = 'GET', params = {}) {
-    // Rate limiting: ensure minimum interval between requests (increased for market data)
-    const marketDataMinInterval = Number(configService.getNumber('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', 200)); // 200ms default for market data
+    // CRITICAL FIX: Check if rate limited before making request
+    if (!this._checkRateLimitBlock()) {
+      const blockedMs = Math.max(0, this._rateLimitBlockedUntil - Date.now());
+      throw new Error(`Rate limit blocked - requests blocked until ${new Date(this._rateLimitBlockedUntil).toISOString()} (${Math.ceil(blockedMs / 1000)}s remaining)`);
+    }
+    
+    // CRITICAL FIX: Check circuit breaker state
+    if (!this._checkCircuitBreaker()) {
+      const cooldownMs = Math.max(0, this._circuitBreakerTimeout - (Date.now() - this._circuitBreakerLastFailure));
+      throw new Error(`Circuit breaker OPEN - cooling down for ${Math.ceil(cooldownMs / 1000)}s`);
+    }
+    
+    // CRITICAL FIX: Use centralized request scheduler for market data
+    // This ensures proper rate limiting across all instances
+    const useScheduler = configService.getBoolean('BINANCE_USE_SCHEDULER_FOR_MARKET_DATA', true);
+    
+    if (useScheduler) {
+      return await binanceRequestScheduler.enqueue({
+        isMainnet: true, // Market data always from mainnet
+        requiresAuth: false, // Market data doesn't need auth
+        fn: async () => {
+          return await this._makeMarketDataRequestInternal(endpoint, method, params);
+        },
+        label: `market_data:${endpoint}`
+      });
+    }
+    
+    // Fallback: direct request with rate limiting (legacy mode)
+    // Rate limiting: ensure minimum interval between requests (INCREASED for market data)
+    const marketDataMinInterval = Number(configService.getNumber('BINANCE_MARKET_DATA_MIN_INTERVAL_MS', 500)); // INCREASED from 200ms to 500ms
     const now = Date.now();
     const timeSinceLastRequest = now - this.lastRequestTime;
-    const requiredInterval = marketDataMinInterval; // Use longer interval for market data
+    const requiredInterval = marketDataMinInterval;
     if (timeSinceLastRequest < requiredInterval) {
       await new Promise(resolve => setTimeout(resolve, requiredInterval - timeSinceLastRequest));
     }
     this.lastRequestTime = Date.now();
+    
+    return await this._makeMarketDataRequestInternal(endpoint, method, params);
+  }
+
+  /**
+   * Internal method to actually make the market data request
+   * @private
+   */
+  async _makeMarketDataRequestInternal(endpoint, method = 'GET', params = {}) {
 
     const url = new URL(endpoint, this.productionDataURL);
     

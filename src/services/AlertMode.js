@@ -15,6 +15,6 @@ export const alertMode = {
   },
   useWebSocket() {
     // ⚠️ Disable RealtimeOCDetector để tránh duplicate alerts/orders
-    return configService.getBoolean('PRICE_ALERT_USE_WEBSOCKET', false);
+    return configService.getBoolean('PRICE_ALERT_USE_WEBSOCKET', true);
   }
 };

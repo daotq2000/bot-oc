@@ -1,5 +1,255 @@
 # Changelog
 
+## [2026-01-15] - CRITICAL FIX: Tick Queue + Dedicated TickProcessor (Backpressure + Profiling + Starvation Reconnect)
+
+### Tổng quan
+Cập nhật kiến trúc xử lý tick để WS thread **không bao giờ bị block**:
+1. **WS onMessage** chỉ: parse → update cache/candle → enqueue tick → return
+2. **TickProcessor** drain queue theo batch, chạy handlers tách khỏi WS thread
+3. **Backpressure**: giới hạn queue size, drop-oldest khi quá tải
+4. **Profiling**: cảnh báo handler chậm
+5. **Reconnect** dựa trên starvation (thiếu tick) thay vì chỉ dựa latency
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **Tick queue**: `tickQueue`, `maxTickQueueSize`, drop-oldest + counters
+- **Tick processor**: `_drainTickQueue()` batch drain + per-handler async invoke
+- **WS isolation**: WS thread enqueue tick thay vì emit trực tiếp
+- **Profiling**: log warn nếu handler > `BINANCE_WS_PRICE_HANDLER_SLOW_MS`
+- **Starvation reconnect**: nếu `now - lastProcessedAt > BINANCE_WS_TICK_STARVATION_MS` thì trigger drain/reconnect
+
+### Cấu hình
+- `BINANCE_WS_MAX_TICK_QUEUE_SIZE` (default 10000)
+- `BINANCE_WS_TICK_DRAIN_BATCH_SIZE` (default 500)
+- `BINANCE_WS_TICK_STARVATION_MS` (default 5000)
+- `BINANCE_WS_PRICE_HANDLER_SLOW_MS` (default 20)
+
+### Lợi ích
+- WS thread cực nhanh, không phụ thuộc consumer
+- Không backlog vô hạn (có backpressure)
+- Bot có thể lag nhưng không “đứng”
+- Dễ truy ra handler gây chậm bằng profiling
+
+---
+
+## [2026-01-15] - CRITICAL FIX: Asynchronous Price Event Emission to Prevent Bot Blocking
+
+### Tổng quan
+**CRITICAL FIX**: 修复bot停止工作的根本原因 - price handlers阻塞消息处理：
+1. **CRITICAL**: `_emitPrice`改为异步执行，使用setImmediate
+2. 价格缓存仍然同步更新，确保`getPrice()`立即获取最新价格
+3. Price handlers异步执行，不会阻塞消息处理流程
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **CRITICAL FIX**: `_emitPrice`改为异步执行（asynchronous）
+- **Price cache sync**: 价格缓存仍然同步更新
+- **Handlers async**: Price handlers异步执行，不阻塞消息处理
+
+### Vấn đề
+- **Bot vẫn ngừng hoạt động**: 虽然价格缓存更新了，但price handlers阻塞了消息处理
+- **Handlers阻塞**: Price handlers同步执行，如果某个handler很慢，会阻塞整个消息处理
+- **消息处理延迟**: 由于handlers阻塞，后续消息无法及时处理
+
+### Nguyên nhân
+1. **同步handlers**: `_emitPrice`同步执行所有handlers，如果某个handler很慢，会阻塞消息处理
+2. **Handler阻塞**: 某些price handlers（如RealtimeOCDetector, PriceAlertScanner）可能执行很慢
+3. **消息处理阻塞**: 由于handlers阻塞，WebSocket消息处理被阻塞
+
+### Giải pháp
+1. **异步handlers**: `_emitPrice`改为异步执行，使用setImmediate
+2. **价格缓存同步**: 价格缓存仍然同步更新，确保`getPrice()`立即获取最新价格
+3. **不阻塞消息处理**: Handlers异步执行，不会阻塞消息处理流程
+
+### Cấu hình
+- 无配置变更
+
+### Lợi ích
+1. **Bot不阻塞**: Price handlers异步执行，不会阻塞消息处理
+2. **价格缓存立即更新**: 价格缓存仍然同步更新，`getPrice()`可以立即获取最新价格
+3. **消息处理流畅**: 即使handlers很慢，消息处理也不会被阻塞
+
+### Cơ chế hoạt động
+1. **价格缓存同步更新**: 收到消息后立即更新priceCache
+2. **异步触发handlers**: `_emitPrice`使用setImmediate异步触发handlers
+3. **不阻塞消息处理**: 即使handlers很慢，也不会阻塞后续消息处理
+
+### Lưu ý
+- 价格缓存更新是同步的，确保`getPrice()`可以立即获取最新价格
+- Price handlers是异步的，不会阻塞消息处理
+- 如果handler出错，会记录错误但不会crash bot
+
+---
+
+## [2026-01-15] - CRITICAL FIX: Synchronous Price Updates to Prevent Bot Stopping
+
+### Tổng quan
+**CRITICAL FIX**: 修复bot停止工作的根本原因 - setImmediate队列延迟导致价格更新不及时：
+1. **CRITICAL**: 价格更新改为同步执行，不再使用setImmediate
+2. 只将非关键操作（logging）放在setImmediate中
+3. 确保价格更新立即执行，不被event loop阻塞
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **CRITICAL FIX**: Price updates改为同步执行（synchronous）
+- **setImmediate only for logging**: 只将logging操作放在setImmediate中
+- **Immediate price cache update**: 价格缓存立即更新，不等待setImmediate
+
+### Vấn đề
+- **Bot vẫn ngừng hoạt động**: 虽然消息被处理了，但价格更新被延迟
+- **setImmediate延迟**: 当event loop被阻塞时，setImmediate队列中的任务可能不会及时执行
+- **价格更新延迟**: 价格更新在setImmediate中，导致bot无法及时获取最新价格
+
+### Nguyên nhân
+1. **setImmediate队列阻塞**: 当有很多消息时，setImmediate队列可能被阻塞
+2. **价格更新延迟**: 价格更新在setImmediate中，导致延迟
+3. **Event loop阻塞**: latency检查的计算可能阻塞event loop
+
+### Giải pháp
+1. **同步价格更新**: 价格更新改为同步执行，立即更新priceCache和emit price events
+2. **setImmediate only for logging**: 只将非关键操作（logging）放在setImmediate中
+3. **立即处理**: 确保价格更新立即执行，不被event loop阻塞
+
+### Cấu hình
+- 无配置变更
+
+### Lợi ích
+1. **Bot不停止**: 价格更新立即执行，bot可以及时获取最新价格
+2. **No delay**: 价格更新不再被setImmediate延迟
+3. **Immediate updates**: 价格缓存和事件立即更新
+
+### Cơ chế hoạt động
+1. **同步价格更新**: 收到消息后立即更新priceCache和emit price events
+2. **异步logging**: 只将logging操作放在setImmediate中
+3. **立即处理**: 确保关键操作不被延迟
+
+### Lưu ý
+- 价格更新现在是同步的，可能稍微增加event loop负载
+- 但这是必要的，以确保bot及时获取价格
+- Logging操作仍然是异步的，不会阻塞
+
+---
+
+## [2026-01-15] - Fix Bot Stopping Completely: Remove Stale Message Skip & Add Message Processing Monitoring
+
+### Tổng quan
+Sửa lỗi bot hoàn toàn ngừng hoạt động khi latency tăng:
+1. **CRITICAL FIX**: Không skip message ngay cả khi latency > 3000ms (stale message)
+2. Thêm message processing monitoring để track bot hoạt động
+3. Cải thiện error handling để không crash bot khi có lỗi
+4. Thêm message stats vào getStatus() để monitor
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **CRITICAL FIX**: Removed return khi latency > 3000ms - bot sẽ tiếp tục process message
+- **Message monitoring**: Thêm `_messageStats` để track received/processed/errors
+- **Error handling**: Improved error handling trong message processing, không throw để tránh crash
+- **Status monitoring**: Thêm message stats vào getStatus() để monitor bot hoạt động
+
+### Vấn đề
+- **Bot hoàn toàn ngừng hoạt động**: Khi latency tăng, bot ngừng xử lý messages
+- **Stale message skip**: Code return khi latency > 3000ms, skip toàn bộ message processing
+- **No monitoring**: Không có cách nào biết bot có đang process messages không
+- **Error crash**: Một lỗi trong message processing có thể crash toàn bộ bot
+
+### Nguyên nhân
+1. **Stale message return**: Khi latency > 3000ms, code return ở dòng 907, skip toàn bộ message processing (setImmediate ở dòng 915)
+2. **No error recovery**: Lỗi trong message processing có thể crash bot
+3. **No monitoring**: Không có stats để biết bot có đang hoạt động không
+
+### Giải pháp
+1. **Không skip stale message**: Chỉ log warning khi latency > 3000ms, nhưng vẫn process message
+2. **Message monitoring**: Track totalReceived, totalProcessed, totalErrors, lastMessageAt, lastProcessedAt
+3. **Error recovery**: Wrap message processing trong try-catch, log error nhưng không throw
+4. **Status monitoring**: Thêm message stats vào getStatus() để có thể monitor bot hoạt động
+
+### Cấu hình
+- `_messageStats`: Track message processing stats
+- `getStatus().messageStats`: Hiển thị message processing stats trong status
+
+### Lợi ích
+1. **Bot không ngừng hoạt động**: Message luôn được process, ngay cả khi latency cao
+2. **No data loss**: Không skip message, đảm bảo không mất dữ liệu giá
+3. **Monitoring**: Có thể monitor bot hoạt động qua message stats
+4. **Error recovery**: Bot không crash khi có lỗi trong message processing
+
+### Cơ chế hoạt động
+1. **Message processing**: Tất cả messages được process trong setImmediate, không skip
+2. **Latency warning**: Log warning khi latency > 3000ms, nhưng vẫn process
+3. **Error handling**: Try-catch trong message processing, log error nhưng không throw
+4. **Stats tracking**: Track received/processed/errors để monitor bot hoạt động
+
+### Lưu ý
+- Message luôn được process, ngay cả khi latency cao (>3000ms)
+- Stale message chỉ log warning, không skip
+- Error trong message processing không crash bot
+- Message stats có thể được monitor qua getStatus()
+
+---
+
+## [2026-01-15] - Fix Bot Stopping When Latency Increases: Message Processing & Reconnect Storm Prevention
+
+### Tổng quan
+Sửa lỗi bot ngừng hoạt động khi latency tăng cao:
+1. Không skip message processing khi phát hiện EXTREME latency
+2. Thêm reconnect queue size limit để tránh reconnect storm
+3. Thêm connection health check trước khi schedule reconnect
+4. Cải thiện logic xử lý latency để không làm gián đoạn message processing
+
+### Files thay đổi
+
+#### 1. `src/services/WebSocketManager.js`
+- **Fix message processing**: Không return khi phát hiện EXTREME latency, tiếp tục process message
+- **Reconnect queue limit**: Thêm maxReconnectQueueSize (default: 50) để tránh reconnect storm
+- **Connection health check**: Check connection state trước khi schedule reconnect
+- **Improved error handling**: Better error handling trong reconnect scheduling
+
+### Vấn đề
+- **Bot ngừng hoạt động**: Khi latency tăng cao, bot ngừng nhận và xử lý price updates
+- **Message loss**: Khi phát hiện EXTREME latency, code return sớm, bỏ qua message hiện tại
+- **Reconnect storm**: Nhiều connections cùng reconnect, gây quá tải và có thể bị Binance limit
+- **Connection disconnect**: Connections bị đứt do reconnect storm hoặc Binance rate limiting
+
+### Nguyên nhân
+1. **Message processing bị skip**: Khi phát hiện EXTREME latency (p95 > 4000ms), code return ở dòng 866, bỏ qua message hiện tại
+2. **Reconnect storm**: Không có giới hạn queue size, nhiều connections cùng reconnect
+3. **Không check connection state**: Schedule reconnect ngay cả khi connection đã đóng
+
+### Giải pháp
+1. **Tiếp tục process message**: Không return khi phát hiện EXTREME latency, chỉ schedule reconnect
+2. **Reconnect queue limit**: Giới hạn queue size (default: 50), skip reconnect nếu queue đầy
+3. **Connection health check**: Check connection state (OPEN/CONNECTING) trước khi schedule reconnect
+4. **Better error handling**: Improved error handling trong reconnect scheduling
+
+### Cấu hình
+- `maxReconnectQueueSize`: 50 (default, có thể config qua BINANCE_WS_MAX_RECONNECT_QUEUE_SIZE)
+- `extremeLatencyThreshold`: 4000ms (không đổi)
+- `latencyReconnectCooldownMs`: 30s (không đổi)
+
+### Lợi ích
+1. **Bot không ngừng hoạt động**: Message vẫn được process ngay cả khi latency cao
+2. **Tránh reconnect storm**: Queue limit ngăn quá nhiều connections cùng reconnect
+3. **Better connection management**: Health check đảm bảo chỉ reconnect connections hợp lệ
+4. **No message loss**: Message không bị skip khi phát hiện latency cao
+
+### Cơ chế hoạt động
+1. **Latency detection**: Khi phát hiện EXTREME latency, schedule reconnect nhưng vẫn tiếp tục process message
+2. **Reconnect queue**: Connections được queue và process theo maxConcurrentReconnects (default: 2)
+3. **Queue limit**: Nếu queue đầy (>50), skip reconnect và reset flag để retry sau
+4. **Health check**: Chỉ schedule reconnect nếu connection state là OPEN hoặc CONNECTING
+
+### Lưu ý
+- Message processing không bị gián đoạn khi phát hiện latency cao
+- Reconnect queue có giới hạn để tránh storm
+- Connection state được check trước khi schedule reconnect
+- Bot vẫn hoạt động bình thường ngay cả khi có nhiều connections cần reconnect
+
+---
+
 ## [2026-01-15] - Fix 414 Error (URI Too Long): URL Length Limit & Connection Splitting
 
 ### Tổng quan

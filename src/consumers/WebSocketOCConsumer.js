@@ -8,6 +8,17 @@ import logger from '../utils/logger.js';
 import { TrendIndicatorsState } from '../indicators/TrendIndicatorsState.js';
 import { isTrendConfirmed } from '../indicators/trendFilter.js';
 import { IndicatorWarmup } from '../indicators/IndicatorWarmup.js';
+import { checkPullbackConfirmation, checkVolatilityFilter } from '../indicators/entryFilters.js';
+import {
+  calculateTakeProfit,
+  calculateInitialStopLoss,
+  calculateInitialStopLossByAmount,
+  calculateLongEntryPrice,
+  calculateShortEntryPrice
+} from '../utils/calculator.js';
+import { determineSide } from '../utils/sideSelector.js';
+import { Position } from '../models/Position.js';
+import { shouldLogSampled } from '../utils/logGate.js';
 
 /**
  * WebSocketOCConsumer
@@ -35,16 +46,18 @@ export class WebSocketOCConsumer {
     this.openPositionsCache = new Map(); // strategyId -> { hasOpenPosition: boolean, lastCheck: timestamp }
     this.openPositionsCacheTTL = 5000; // 5 seconds TTL
     
-    // ✅ OPTIMIZED: Batch processing for price ticks
-    this._tickQueue = [];
-    this._batchSize = Number(configService.getNumber('WS_TICK_BATCH_SIZE', 20));
-    this._batchTimeout = Number(configService.getNumber('WS_TICK_BATCH_TIMEOUT_MS', 50));
-    this._processing = false;
-    this._batchTimer = null;
+    // ✅ TRIỆT ĐỂ FIX: Debounce ticks per symbol to handle high-frequency streams (bookTicker)
+    // This ensures only the latest tick in a burst is processed, reducing load significantly.
+    this._debounceTimers = new Map(); // key -> timerId
+    this._debounceInterval = Number(configService.getNumber('WS_OC_DEBOUNCE_MS', 200));
     
-    // ✅ OPTIMIZED: Throttling per symbol
-    this._lastProcessed = new Map(); // exchange|symbol -> timestamp
-    this._minTickInterval = Number(configService.getNumber('WS_TICK_MIN_INTERVAL_MS', 100));
+    // ✅ RATE LIMIT PROTECTION: Cooldown mechanism to prevent API rate limits
+    this._processingQueue = []; // Queue of ticks waiting to be processed
+    this._processing = false; // Flag to indicate if currently processing
+    this._lastProcessedAt = 0; // Timestamp of last processed tick
+    this._cooldownMs = Number(configService.getNumber('WS_OC_COOLDOWN_MS', 50)); // Minimum time between processing ticks
+    this._maxConcurrent = Number(configService.getNumber('WS_OC_MAX_CONCURRENT', 3)); // Max concurrent detections
+    this._activeDetections = 0; // Number of active detection operations
 
     // SHORT-TERM trend indicators cache (FOLLOWING_TREND filter only)
     this._trendIndicators = new Map(); // exchange|symbol -> { state, lastTs, warmedUp }
@@ -52,10 +65,25 @@ export class WebSocketOCConsumer {
     this._trendIndicatorsCleanupEveryMs = Number(configService.getNumber('TREND_INDICATORS_CLEANUP_MS', 5 * 60 * 1000));
     this._trendIndicatorsLastCleanupAt = 0;
 
+    // ✅ ENHANCED: 15m trend indicators cache for multi-timeframe gate
+    this._trendIndicators15m = new Map(); // exchange|symbol -> { state, lastTs, warmedUp, lastClosed15mStart }
+    this._trendIndicators15mTTL = Number(configService.getNumber('TREND_INDICATORS_15M_TTL_MS', 30 * 60 * 1000));
+    this._trendIndicators15mCleanupEveryMs = Number(configService.getNumber('TREND_INDICATORS_15M_CLEANUP_MS', 5 * 60 * 1000));
+    this._trendIndicators15mLastCleanupAt = 0;
+    this._warmedUpSymbols15m = new Set();
+
+    // ✅ ENHANCED: 5m trend indicators cache for pullback confirmation
+    this._trendIndicators5m = new Map(); // exchange|symbol -> { state, lastTs, warmedUp, lastClosed5mStart }
+    this._trendIndicators5mTTL = Number(configService.getNumber('TREND_INDICATORS_5M_TTL_MS', 30 * 60 * 1000));
+    this._trendIndicators5mCleanupEveryMs = Number(configService.getNumber('TREND_INDICATORS_5M_CLEANUP_MS', 5 * 60 * 1000));
+    this._trendIndicators5mLastCleanupAt = 0;
+    this._warmedUpSymbols5m = new Set();
+
     // Pre-warm service (Option C: REST snapshot to achieve "ready" status quickly)
+    // ✅ OPTIMIZED: Giảm concurrency để tránh rate limit (chấp nhận warmup trong 5-10 phút)
     this._warmupService = new IndicatorWarmup();
     this._warmupEnabled = configService.getBoolean('INDICATORS_WARMUP_ENABLED', true);
-    this._warmupConcurrency = Number(configService.getNumber('INDICATORS_WARMUP_CONCURRENCY', 5));
+    this._warmupConcurrency = Number(configService.getNumber('INDICATORS_WARMUP_CONCURRENCY', 2)); // Giảm từ 5 xuống 2
     
     // Track which symbols have been warmed up (to avoid re-warming)
     this._warmedUpSymbols = new Set(); // exchange|symbol keys
@@ -129,14 +157,14 @@ export class WebSocketOCConsumer {
 
     // Binance WebSocket handler
     try {
-      const binanceHandler = ({ symbol, price, ts }) => {
+      const webSocketOCConsumerBinanceHandler = ({ symbol, price, ts }) => {
         // Don't check isRunning here - let handlePriceTick check it
         // This allows handler to be registered even if consumer not started yet
         this.handlePriceTick('binance', symbol, price, ts).catch(error => {
           logger.error(`[WebSocketOCConsumer] Error handling Binance price tick:`, error?.message || error);
         });
       };
-      webSocketManager.onPrice?.(binanceHandler);
+      webSocketManager.onPrice?.(webSocketOCConsumerBinanceHandler);
       logger.info('[WebSocketOCConsumer] Registered Binance WebSocket price handler');
     } catch (error) {
       logger.warn('[WebSocketOCConsumer] Failed to register Binance handler:', error?.message || error);
@@ -173,6 +201,48 @@ export class WebSocketOCConsumer {
     return cached;
   }
 
+  /**
+   * ✅ ENHANCED: Get or create 15m trend indicators for multi-timeframe gate
+   */
+  _getOrCreateTrendIndicators15m(exchange, symbol) {
+    const key = this._getTrendKey(exchange, symbol);
+    const now = Date.now();
+    let cached = this._trendIndicators15m.get(key);
+    if (!cached) {
+      cached = { 
+        state: new TrendIndicatorsState({ adxInterval: '15m' }), 
+        lastTs: now, 
+        lastClosed15mStart: null,
+        warmedUp: false
+      };
+      this._trendIndicators15m.set(key, cached);
+      return cached;
+    }
+    cached.lastTs = now;
+    return cached;
+  }
+
+  /**
+   * ✅ ENHANCED: Get or create 5m trend indicators for pullback confirmation
+   */
+  _getOrCreateTrendIndicators5m(exchange, symbol) {
+    const key = this._getTrendKey(exchange, symbol);
+    const now = Date.now();
+    let cached = this._trendIndicators5m.get(key);
+    if (!cached) {
+      cached = {
+        state: new TrendIndicatorsState({ adxInterval: '5m' }),
+        lastTs: now,
+        lastClosed5mStart: null,
+        warmedUp: false
+      };
+      this._trendIndicators5m.set(key, cached);
+      return cached;
+    }
+    cached.lastTs = now;
+    return cached;
+  }
+
   _cleanupTrendIndicatorsIfNeeded(now = Date.now()) {
     if (now - (this._trendIndicatorsLastCleanupAt || 0) < this._trendIndicatorsCleanupEveryMs) return;
     this._trendIndicatorsLastCleanupAt = now;
@@ -191,33 +261,63 @@ export class WebSocketOCConsumer {
    */
   async _warmupIndicatorsForSubscribedSymbols() {
     try {
+      // ✅ SOLUTION 3: Chỉ warmup symbols đang active (có strategies trong cache)
       // Get all symbols from strategy cache (these are the ones we'll subscribe to)
       await strategyCache.refresh();
       
       const symbolsToWarmup = new Map(); // exchange|symbol -> state
+      const skippedReasons = { notBinance: 0, counterTrend: 0, alreadyWarmed: 0 };
       
       for (const [key, strategy] of strategyCache.cache.entries()) {
         const [exchange, symbol] = key.split('|');
         if (!exchange || !symbol) continue;
         
         // Only warmup Binance for now (MEXC needs separate endpoint)
-        if (String(exchange).toLowerCase() !== 'binance') continue;
+        if (String(exchange).toLowerCase() !== 'binance') {
+          skippedReasons.notBinance++;
+          continue;
+        }
         
         // Only warmup if strategy is FOLLOWING_TREND (is_reverse_strategy=false)
         // Counter-trend strategies don't use trend filters, so no need to warmup
-        if (Boolean(strategy.is_reverse_strategy) === true) continue;
+        if (Boolean(strategy.is_reverse_strategy) === true) {
+          skippedReasons.counterTrend++;
+          continue;
+        }
+        
+        // Check if already warmed up
+        const warmupKey = this._getTrendKey(exchange, symbol);
+        if (this._warmedUpSymbols.has(warmupKey)) {
+          skippedReasons.alreadyWarmed++;
+          continue;
+        }
         
         const state = this._getOrCreateTrendIndicators(exchange, symbol);
-        const warmupKey = this._getTrendKey(exchange, symbol);
         symbolsToWarmup.set(warmupKey, state.state);
+        
+        // ✅ ENHANCED: Also warmup 15m state for multi-timeframe gate
+        const state15m = this._getOrCreateTrendIndicators15m(exchange, symbol);
+        const warmupKey15m = `${warmupKey}_15m`;
+        symbolsToWarmup.set(warmupKey15m, state15m.state);
+
+        // ✅ ENHANCED: Also warmup 5m state for pullback confirmation
+        const state5m = this._getOrCreateTrendIndicators5m(exchange, symbol);
+        const warmupKey5m = `${warmupKey}_5m`;
+        symbolsToWarmup.set(warmupKey5m, state5m.state);
       }
 
       if (symbolsToWarmup.size === 0) {
-        logger.info('[WebSocketOCConsumer] No symbols to warmup (no FOLLOWING_TREND strategies for Binance)');
+        logger.info(
+          `[WebSocketOCConsumer] No symbols to warmup | ` +
+          `skipped: notBinance=${skippedReasons.notBinance} counterTrend=${skippedReasons.counterTrend} alreadyWarmed=${skippedReasons.alreadyWarmed}`
+        );
         return;
       }
 
-      logger.info(`[WebSocketOCConsumer] 🔥 Starting indicator warmup for ${symbolsToWarmup.size} symbols...`);
+      logger.info(
+        `[WebSocketOCConsumer] 🔥 Starting indicator warmup for ${symbolsToWarmup.size} states (1m + 15m) | ` +
+        `skipped: notBinance=${skippedReasons.notBinance} counterTrend=${skippedReasons.counterTrend} alreadyWarmed=${skippedReasons.alreadyWarmed}`
+      );
       const warmupStart = Date.now();
 
       const results = await this._warmupService.warmupBatch(symbolsToWarmup, this._warmupConcurrency);
@@ -225,9 +325,24 @@ export class WebSocketOCConsumer {
       // Mark symbols as warmed up
       for (const [key, state] of symbolsToWarmup.entries()) {
         if (state.isWarmedUp && state.isWarmedUp()) {
-          this._warmedUpSymbols.add(key);
-          const cached = this._trendIndicators.get(key);
-          if (cached) cached.warmedUp = true;
+          if (key.endsWith('_15m')) {
+            // 15m state
+            const baseKey = key.replace('_15m', '');
+            this._warmedUpSymbols15m.add(baseKey);
+            const cached = this._trendIndicators15m.get(baseKey);
+            if (cached) cached.warmedUp = true;
+          } else if (key.endsWith('_5m')) {
+            // 5m state
+            const baseKey = key.replace('_5m', '');
+            this._warmedUpSymbols5m.add(baseKey);
+            const cached = this._trendIndicators5m.get(baseKey);
+            if (cached) cached.warmedUp = true;
+          } else {
+            // 1m state
+            this._warmedUpSymbols.add(key);
+            const cached = this._trendIndicators.get(key);
+            if (cached) cached.warmedUp = true;
+          }
         }
       }
 
@@ -252,40 +367,64 @@ export class WebSocketOCConsumer {
     if (!this._warmupEnabled) return;
 
     try {
+      // ✅ SOLUTION 3: Chỉ warmup symbols mới đang active
       const symbolsToWarmup = new Map(); // exchange|symbol -> state
+      const skippedReasons = { notBinance: 0, counterTrend: 0, alreadyWarmed: 0 };
       
       for (const [key, strategy] of strategyCache.cache.entries()) {
         const [exchange, symbol] = key.split('|');
         if (!exchange || !symbol) continue;
         
         // Only warmup Binance for now (MEXC needs separate endpoint)
-        if (String(exchange).toLowerCase() !== 'binance') continue;
+        if (String(exchange).toLowerCase() !== 'binance') {
+          skippedReasons.notBinance++;
+          continue;
+        }
         
         // Only warmup if strategy is FOLLOWING_TREND (is_reverse_strategy=false)
-        if (Boolean(strategy.is_reverse_strategy) === true) continue;
+        if (Boolean(strategy.is_reverse_strategy) === true) {
+          skippedReasons.counterTrend++;
+          continue;
+        }
         
         const warmupKey = this._getTrendKey(exchange, symbol);
         
         // Skip if already warmed up
-        if (this._warmedUpSymbols.has(warmupKey)) continue;
+        if (this._warmedUpSymbols.has(warmupKey)) {
+          skippedReasons.alreadyWarmed++;
+          continue;
+        }
         
         // Check if indicator state exists and is already warmed up
         const cached = this._trendIndicators.get(warmupKey);
         if (cached && cached.warmedUp) {
           this._warmedUpSymbols.add(warmupKey);
+          skippedReasons.alreadyWarmed++;
           continue;
         }
         
         // Get or create indicator state
         const state = this._getOrCreateTrendIndicators(exchange, symbol);
         symbolsToWarmup.set(warmupKey, state.state);
+        
+        // ✅ ENHANCED: Also warmup 15m state for multi-timeframe gate
+        const state15m = this._getOrCreateTrendIndicators15m(exchange, symbol);
+        const warmupKey15m = `${warmupKey}_15m`;
+        symbolsToWarmup.set(warmupKey15m, state15m.state);
       }
 
       if (symbolsToWarmup.size === 0) {
+        logger.debug(
+          `[WebSocketOCConsumer] No new symbols to warmup | ` +
+          `skipped: notBinance=${skippedReasons.notBinance} counterTrend=${skippedReasons.counterTrend} alreadyWarmed=${skippedReasons.alreadyWarmed}`
+        );
         return; // No new symbols to warmup
       }
 
-      logger.info(`[WebSocketOCConsumer] 🔥 Warming up ${symbolsToWarmup.size} new FOLLOWING_TREND symbols...`);
+      logger.info(
+        `[WebSocketOCConsumer] 🔥 Warming up ${symbolsToWarmup.size} new states (1m + 15m) | ` +
+        `skipped: notBinance=${skippedReasons.notBinance} counterTrend=${skippedReasons.counterTrend} alreadyWarmed=${skippedReasons.alreadyWarmed}`
+      );
       const warmupStart = Date.now();
 
       const results = await this._warmupService.warmupBatch(symbolsToWarmup, this._warmupConcurrency);
@@ -293,9 +432,18 @@ export class WebSocketOCConsumer {
       // Mark symbols as warmed up
       for (const [key, state] of symbolsToWarmup.entries()) {
         if (state.isWarmedUp && state.isWarmedUp()) {
-          this._warmedUpSymbols.add(key);
-          const cached = this._trendIndicators.get(key);
-          if (cached) cached.warmedUp = true;
+          if (key.endsWith('_15m')) {
+            // 15m state
+            const baseKey = key.replace('_15m', '');
+            this._warmedUpSymbols15m.add(baseKey);
+            const cached = this._trendIndicators15m.get(baseKey);
+            if (cached) cached.warmedUp = true;
+          } else {
+            // 1m state
+            this._warmedUpSymbols.add(key);
+            const cached = this._trendIndicators.get(key);
+            if (cached) cached.warmedUp = true;
+          }
         }
       }
 
@@ -314,26 +462,56 @@ export class WebSocketOCConsumer {
   _updateTrendIndicatorsFromTick(exchange, symbol, price, timestamp) {
     try {
       const ex = String(exchange || '').toLowerCase();
-      const cached = this._getOrCreateTrendIndicators(ex, symbol);
-      cached.state.updateTick(price, timestamp);
+      
+      // ✅ ENHANCED: Update 1m, 5m, and 15m states
+      const cached1m = this._getOrCreateTrendIndicators(ex, symbol);
+      cached1m.state.updateTick(price, timestamp);
 
-      // ADX uses CLOSED 1m candles aggregated from WebSocket streams.
-      // This avoids tick noise and blocks sideways/fake OC spikes.
-      let candle = null;
+      const cached5m = this._getOrCreateTrendIndicators5m(ex, symbol);
+      cached5m.state.updateTick(price, timestamp);
+
+      const cached15m = this._getOrCreateTrendIndicators15m(ex, symbol);
+      cached15m.state.updateTick(price, timestamp);
+
+      // Update ADX/ATR from CLOSED candles (1m, 5m, 15m)
       if (ex === 'binance') {
-        candle = webSocketManager.getLatestCandle(symbol, '1m');
-      } else if (ex === 'mexc') {
-        // MexcWebSocketManager currently exposes kline open/close caches but not a candle object.
-        // For safety and no extra REST/DB calls, we only update ADX on Binance where closed 1m candle is available.
-        candle = null;
-      }
-
-      if (candle && candle.isClosed === true) {
-        const start = Number(candle.startTime);
-        if (Number.isFinite(start) && start > 0 && cached.lastClosed1mStart !== start) {
-          cached.lastClosed1mStart = start;
-          cached.state.updateClosedCandle(candle);
+        // Update 1m state
+        const candle1m = webSocketManager.getLatestCandle(symbol, '1m');
+        if (candle1m && candle1m.isClosed === true) {
+          const start1m = Number(candle1m.startTime);
+          if (Number.isFinite(start1m) && start1m > 0 && cached1m.lastClosed1mStart !== start1m) {
+            cached1m.lastClosed1mStart = start1m;
+            cached1m.state.updateClosedCandle(candle1m);
+          }
         }
+
+        // Update 5m state
+        const candle5m = webSocketManager.getLatestCandle(symbol, '5m');
+        if (candle5m && candle5m.isClosed === true) {
+          const start5m = Number(candle5m.startTime);
+          if (Number.isFinite(start5m) && start5m > 0 && cached5m.lastClosed5mStart !== start5m) {
+            cached5m.lastClosed5mStart = start5m;
+            // For 5m state: feed close as tick and update closed candle for ATR
+            cached5m.state.updateTick(candle5m.close, start5m + 300000);
+            cached5m.state.updateClosedCandle(candle5m);
+          }
+        }
+        
+        // Update 15m state
+        const candle15m = webSocketManager.getLatestCandle(symbol, '15m');
+        if (candle15m && candle15m.isClosed === true) {
+          const start15m = Number(candle15m.startTime);
+          if (Number.isFinite(start15m) && start15m > 0 && cached15m.lastClosed15mStart !== start15m) {
+            cached15m.lastClosed15mStart = start15m;
+            // For 15m state: feed close as tick and update closed candle for ADX/ATR
+            cached15m.state.updateTick(candle15m.close, start15m + 900000);
+            cached15m.state.updateClosedCandle(candle15m);
+          }
+        }
+      } else if (ex === 'mexc') {
+        // MEXC: Only update 1m state (no 5m/15m candle support yet)
+        // MexcWebSocketManager currently exposes kline open/close caches but not a candle object.
+        // For safety and no extra REST/DB calls, we only update closed-candle indicators on Binance.
       }
 
       this._cleanupTrendIndicatorsIfNeeded(timestamp);
@@ -344,102 +522,145 @@ export class WebSocketOCConsumer {
 
   async handlePriceTick(exchange, symbol, price, timestamp = Date.now()) {
     try {
-      if (!this.isRunning) {
-        if (symbol?.toUpperCase().includes('PIPPIN')) {
-          logger.warn(`[WebSocketOCConsumer] ⚠️ Skipping price tick for ${exchange} ${symbol} - NOT RUNNING! isRunning=${this.isRunning}`);
-        }
-        return; // Skip if not running
+      if (!this.isRunning || !price || !Number.isFinite(price) || price <= 0) {
+        return;
       }
 
-      if (!price || !Number.isFinite(price) || price <= 0) {
-        if (symbol?.toUpperCase().includes('PIPPIN')) {
-          logger.warn(`[WebSocketOCConsumer] ⚠️ Invalid price for ${exchange} ${symbol}: ${price}`);
-        }
-        return; // Invalid price
-      }
-
-      // ✅ OPTIMIZED: Throttle - chỉ process mỗi symbol mỗi N ms
-      const key = `${exchange}|${symbol}`;
-      const lastProcessed = this._lastProcessed.get(key);
-      if (lastProcessed && (timestamp - lastProcessed) < this._minTickInterval) {
-        this.skippedCount++;
-        return; // Skip - too soon
-      }
-
-      // ✅ Update short-term trend indicators (non-blocking)
+      // ✅ Update lightweight trend indicators immediately (non-blocking)
       this._updateTrendIndicatorsFromTick(exchange, symbol, price, timestamp);
 
-      // ✅ OPTIMIZED: Add to batch queue
-      this._tickQueue.push({ exchange, symbol, price, timestamp });
-
-      // Process batch nếu đủ size
-      if (this._tickQueue.length >= this._batchSize) {
-        await this._processBatch();
-      } else if (!this._batchTimer) {
-        // Schedule batch processing after timeout
-        this._batchTimer = setTimeout(() => {
-          this._batchTimer = null;
-          this._processBatch();
-        }, this._batchTimeout);
+      // ✅ TRIỆT ĐỂ FIX: Debounce heavy processing to handle high-frequency ticks
+      const key = `${exchange}|${symbol}`;
+      
+      // Clear previous timer for this symbol
+      if (this._debounceTimers.has(key)) {
+        clearTimeout(this._debounceTimers.get(key));
       }
+
+      // ✅ FIX: Create a safe copy with explicit values to avoid closure issues
+      const tickData = {
+        exchange: String(exchange),
+        symbol: String(symbol),
+        price: Number(price),
+        timestamp: Number(timestamp),
+        key: key
+      };
+
+      // Set a new timer to enqueue the latest tick after the interval
+      const timerId = setTimeout(() => {
+        // Enqueue tick for rate-limited processing
+        this._enqueueForProcessing(tickData);
+        this._debounceTimers.delete(key);
+      }, this._debounceInterval);
+
+      this._debounceTimers.set(key, timerId);
+
     } catch (error) {
-      logger.error(`[WebSocketOCConsumer] Error in handlePriceTick:`, error?.message || error);
+      logger.error(`[WebSocketOCConsumer] Error in handlePriceTick for ${exchange}|${symbol}:`, error?.message || error);
     }
   }
 
   /**
-   * ✅ OPTIMIZED: Process batch of price ticks
-   * Deduplicates ticks (only latest per symbol) and processes in parallel
+   * ✅ RATE LIMIT PROTECTION: Enqueue tick for rate-limited processing
    */
-  async _processBatch() {
-    if (this._processing || this._tickQueue.length === 0) return;
+  _enqueueForProcessing(tickData) {
+    // ✅ FIX: Validate and create a safe copy to prevent closure issues
+    const { exchange, symbol, price, timestamp, key } = tickData;
     
+    // Validate required fields
+    if (!exchange || !symbol || !price || !timestamp) {
+      logger.warn(`[WebSocketOCConsumer] Invalid tick data received: ${JSON.stringify(tickData)}`);
+      return;
+    }
+    
+    // Create a safe copy with all required fields
+    const safeTickData = {
+      exchange: String(exchange),
+      symbol: String(symbol),
+      price: Number(price),
+      timestamp: Number(timestamp),
+      key: key || `${exchange}|${symbol}`
+    };
+    
+    // Deduplicate: Remove any existing entry for this symbol in queue
+    this._processingQueue = this._processingQueue.filter(item => item.key !== safeTickData.key);
+    
+    // Add to queue
+    this._processingQueue.push(safeTickData);
+    
+    // Start processing if not already running
+    if (!this._processing) {
+      this._processQueue();
+    }
+  }
+
+  /**
+   * ✅ RATE LIMIT PROTECTION: Process queue with cooldown and concurrency limits
+   */
+  async _processQueue() {
+    if (this._processing || this._processingQueue.length === 0) {
+      return;
+    }
+
     this._processing = true;
-    const startTime = Date.now();
 
     try {
-      const batch = this._tickQueue.splice(0, this._batchSize);
-      
-      // ✅ Deduplicate: Chỉ lấy tick mới nhất cho mỗi symbol
-      const latest = new Map();
-      for (const tick of batch) {
-        const key = `${tick.exchange}|${tick.symbol}`;
-        const existing = latest.get(key);
-        if (!existing || existing.timestamp < tick.timestamp) {
-          latest.set(key, tick);
+      while (this._processingQueue.length > 0) {
+        // Check cooldown: wait if needed
+        const now = Date.now();
+        const timeSinceLastProcess = now - this._lastProcessedAt;
+        if (timeSinceLastProcess < this._cooldownMs) {
+          await new Promise(resolve => setTimeout(resolve, this._cooldownMs - timeSinceLastProcess));
         }
-      }
 
-      // Process unique symbols in parallel (limited concurrency)
-      const concurrency = Number(configService.getNumber('WS_TICK_CONCURRENCY', 10));
-      const ticks = Array.from(latest.values());
-      
-      for (let i = 0; i < ticks.length; i += concurrency) {
-        const batch = ticks.slice(i, i + concurrency);
-        const results = await Promise.allSettled(
-          batch.map(tick => this._detectAndProcess(tick))
-        );
+        // Check concurrency limit: wait if too many active
+        while (this._activeDetections >= this._maxConcurrent) {
+          await new Promise(resolve => setTimeout(resolve, 10)); // Check every 10ms
+        }
+
+        // Get next tick from queue
+        const tickData = this._processingQueue.shift();
+        if (!tickData) {
+          continue;
+        }
+
+        // ✅ FIX: Validate and create a safe copy of tick data
+        const { exchange, symbol, price, timestamp, key } = tickData;
         
-        // Update last processed timestamps
-        batch.forEach(tick => {
-          this._lastProcessed.set(`${tick.exchange}|${tick.symbol}`, tick.timestamp);
-        });
-      }
+        // Validate required fields
+        if (!exchange || !symbol || !price || !timestamp) {
+          logger.warn(`[WebSocketOCConsumer] Invalid tick data in queue: ${JSON.stringify(tickData)}`);
+          continue;
+        }
 
-      this.processedCount += latest.size;
-      
-      const duration = Date.now() - startTime;
-      if (duration > 100) {
-        logger.debug(`[WebSocketOCConsumer] Processed batch of ${latest.size} ticks in ${duration}ms`);
+        // Create a safe copy for processing
+        const tick = { exchange, symbol, price, timestamp };
+
+        // Process tick asynchronously (don't await to allow concurrent processing)
+        this._lastProcessedAt = Date.now();
+        this.processedCount++;
+        this._activeDetections++;
+
+        // Process without awaiting to allow concurrent processing
+        this._detectAndProcess(tick)
+          .catch(error => {
+            const errorMsg = error?.message || String(error);
+            const errorStack = error?.stack || '';
+            logger.error(
+              `[WebSocketOCConsumer] Error in rate-limited _detectAndProcess for ${key || `${exchange}|${symbol}`}: ${errorMsg}`,
+              errorStack ? { stack: errorStack } : undefined
+            );
+          })
+          .finally(() => {
+            this._activeDetections--;
+          });
       }
-    } catch (error) {
-      logger.error('[WebSocketOCConsumer] Batch processing error:', error?.message || error);
     } finally {
       this._processing = false;
       
-      // Process remaining nếu có
-      if (this._tickQueue.length > 0) {
-        setTimeout(() => this._processBatch(), this._batchTimeout);
+      // If queue has more items, process them (recursive call)
+      if (this._processingQueue.length > 0) {
+        setImmediate(() => this._processQueue());
       }
     }
   }
@@ -448,8 +669,29 @@ export class WebSocketOCConsumer {
    * ✅ OPTIMIZED: Detect OC and process matches for a single tick
    */
   async _detectAndProcess(tick) {
+    // ✅ FIX: Declare variables outside try block so they're available in catch block
+    let exchange = '';
+    let symbol = '';
+    let price = 0;
+    let timestamp = Date.now();
+
     try {
-      const { exchange, symbol, price, timestamp } = tick;
+      // ✅ FIX: Validate and extract tick data safely
+      if (!tick || typeof tick !== 'object') {
+        logger.error(`[WebSocketOCConsumer] Invalid tick data: ${JSON.stringify(tick)}`);
+        return;
+      }
+
+      exchange = String(tick.exchange || '').trim();
+      symbol = String(tick.symbol || '').trim();
+      price = Number(tick.price);
+      timestamp = Number(tick.timestamp) || Date.now();
+
+      // Validate required fields
+      if (!exchange || !symbol || !Number.isFinite(price) || price <= 0) {
+        logger.error(`[WebSocketOCConsumer] Invalid tick data fields: exchange=${exchange}, symbol=${symbol}, price=${price}, timestamp=${timestamp}`);
+        return;
+      }
 
       // Detect OC and match with strategies
       const matches = await realtimeOCDetector.detectOC(exchange, symbol, price, timestamp, 'WebSocketOCConsumer');
@@ -460,7 +702,9 @@ export class WebSocketOCConsumer {
 
       this.matchCount += matches.length;
 
-      logger.info(`[WebSocketOCConsumer] 🎯 Found ${matches.length} match(es) for ${exchange} ${symbol}: ${matches.map(m => `strategy ${m.strategy.id} (OC=${m.oc.toFixed(2)}%)`).join(', ')}`);
+      if (shouldLogSampled('WS_MATCHES', 50)) {
+        logger.info(`[WebSocketOCConsumer] 🎯 Found ${matches.length} match(es) for ${exchange} ${symbol}: ${matches.map(m => `strategy ${m.strategy.id} (OC=${m.oc.toFixed(2)}%)`).join(', ')}`);
+      }
 
       // PRIORITY QUEUE: Sort matches by mainnet/testnet priority
       // Mainnet (binance_testnet=false/null) = priority 1 (highest), Testnet = priority 0 (lower)
@@ -504,7 +748,14 @@ export class WebSocketOCConsumer {
         });
       }
     } catch (error) {
-      logger.error(`[WebSocketOCConsumer] ❌ Error handling price tick for ${exchange} ${symbol}:`, error?.message || error, error?.stack);
+      // ✅ FIX: Use safe fallback if variables not set
+      const exchangeStr = exchange || (tick?.exchange ? String(tick.exchange) : 'unknown');
+      const symbolStr = symbol || (tick?.symbol ? String(tick.symbol) : 'unknown');
+      logger.error(
+        `[WebSocketOCConsumer] ❌ Error handling price tick for ${exchangeStr} ${symbolStr}:`,
+        error?.message || error,
+        error?.stack
+      );
     }
   }
 
@@ -517,13 +768,45 @@ export class WebSocketOCConsumer {
       const { strategy, oc, direction, currentPrice, interval } = match;
       const botId = strategy.bot_id;
 
-      logger.info(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
+      if (shouldLogSampled('PROCESS_MATCH', 100)) {
+        logger.info(`[WebSocketOCConsumer] 🔍 Processing match: strategy ${strategy.id}, bot_id=${botId}, symbol=${strategy.symbol}, OC=${oc.toFixed(2)}%`);
+      }
 
       // Get OrderService for this bot
-      const orderService = this.orderServices.get(botId);
+      let orderService = this.orderServices.get(botId);
       if (!orderService) {
-        logger.error(`[WebSocketOCConsumer] ❌ No OrderService found for bot ${botId}, skipping strategy ${strategy.id}. Available bots: ${Array.from(this.orderServices.keys()).join(', ')}`);
-        return;
+        // ✅ AUTO-FIX: Try to create OrderService for this bot if missing
+        logger.warn(`[WebSocketOCConsumer] ⚠️ No OrderService found for bot ${botId}, attempting to create one...`);
+        try {
+          const { Bot } = await import('../models/Bot.js');
+          const { ExchangeService } = await import('../services/ExchangeService.js');
+          const bot = await Bot.findById(botId);
+          if (!bot) {
+            logger.error(`[WebSocketOCConsumer] ❌ Bot ${botId} not found in database, skipping strategy ${strategy.id}`);
+            return;
+          }
+          if (!bot.is_active && bot.is_active !== 1) {
+            logger.warn(`[WebSocketOCConsumer] ⚠️ Bot ${botId} is not active, skipping strategy ${strategy.id}`);
+            return;
+          }
+          const exchangeService = new ExchangeService(bot);
+          await exchangeService.initialize();
+          // Try to get telegramService from various sources
+          let telegramService = null;
+          try {
+            const { telegramService: tgService } = await import('../services/TelegramService.js');
+            telegramService = tgService;
+          } catch (e) {
+            // If singleton doesn't exist, try to get from StrategiesWorker or create a minimal one
+            logger.warn(`[WebSocketOCConsumer] Could not get TelegramService singleton, OrderService will work without Telegram notifications`);
+          }
+          orderService = new OrderService(exchangeService, telegramService);
+          this.orderServices.set(botId, orderService);
+          logger.info(`[WebSocketOCConsumer] ✅ Auto-created OrderService for bot ${botId}`);
+        } catch (error) {
+          logger.error(`[WebSocketOCConsumer] ❌ Failed to auto-create OrderService for bot ${botId}:`, error?.message || error);
+          return;
+        }
       }
 
       // Check if strategy already has open position (with cache to reduce DB queries)
@@ -534,10 +817,6 @@ export class WebSocketOCConsumer {
       }
       
       logger.info(`[WebSocketOCConsumer] ✅ Strategy ${strategy.id} has no open position, proceeding...`);
-
-      // Import calculator functions for TP/SL calculation
-      const { calculateTakeProfit, calculateInitialStopLoss, calculateInitialStopLossByAmount, calculateLongEntryPrice, calculateShortEntryPrice } = await import('../utils/calculator.js');
-      const { determineSide } = await import('../utils/sideSelector.js');
 
       // Determine side based on direction, trade_type and is_reverse_strategy from bot
       const side = determineSide(direction, strategy.trade_type, strategy.is_reverse_strategy);
@@ -565,37 +844,175 @@ export class WebSocketOCConsumer {
       // - Trend-following (is_reverse_strategy = false): Use current price with MARKET order
       const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
 
-      // ✅ FOLLOWING_TREND short-term trend confirmation filters (1m–5m scalping)
+      // ✅ CRITICAL: ALL orders MUST pass through trend filter gate
       // WHY: OC spikes during sideways markets are often fakeouts; we only trade when
       // EMA alignment + ADX strength + RSI regime confirm the existing `direction`.
       // Indicators NEVER flip direction; they only validate/reject.
-      // NOTE: Only apply to Binance FOLLOWING_TREND strategies (MEXC doesn't have closed candle aggregation for ADX)
-      if (!isReverseStrategy) {
-        // Use exchange from match (more reliable than strategy.exchange which may be undefined)
-        const matchExchange = match.exchange || strategy.exchange || 'binance';
-        // Only gate Binance FOLLOWING_TREND strategies (consistent with PriceAlertScanner)
-        if (String(matchExchange).toLowerCase() === 'binance') {
-          const ind = this._getOrCreateTrendIndicators(matchExchange, strategy.symbol);
-          const verdict = isTrendConfirmed(direction, currentPrice, ind.state);
-          if (!verdict.ok) {
+      const matchExchange = match.exchange || strategy.exchange || 'binance';
+      const exchangeLower = String(matchExchange).toLowerCase();
+      
+      // Store indicator state for logging when order is triggered
+      let filterIndicatorState = null;
+      
+      // ✅ ENHANCED: Apply multi-timeframe filter to ALL strategies
+      // For Binance: Full filter (EMA + ADX + RSI) on 15m + pullback + volatility
+      // For MEXC: Partial filter (EMA + RSI) on 1m + pullback + volatility
+      if (exchangeLower === 'binance') {
+        // ✅ ENHANCED: Use 15m state for trend/regime gate
+        const ind15m = this._getOrCreateTrendIndicators15m(matchExchange, strategy.symbol);
+        const ind1m = this._getOrCreateTrendIndicators(matchExchange, strategy.symbol);
+        
+        // Update 15m indicators with currentPrice
+        ind15m.state.updateTick(currentPrice, match.timestamp || Date.now());
+        
+        // Get latest closed 15m candle for ADX/ATR update
+        const candle15m = webSocketManager.getLatestCandle(strategy.symbol, '15m');
+        if (candle15m && candle15m.isClosed === true) {
+          const start15m = Number(candle15m.startTime);
+          if (Number.isFinite(start15m) && start15m > 0 && ind15m.lastClosed15mStart !== start15m) {
+            ind15m.lastClosed15mStart = start15m;
+            ind15m.state.updateClosedCandle(candle15m);
+          }
+        }
+        
+        // ✅ ENHANCED: Check trend confirmation with 15m state (trend/regime gate)
+        const verdict = isTrendConfirmed(direction, currentPrice, ind1m.state, ind15m.state);
+        
+        if (!verdict.ok) {
+          const snap15m = ind15m.state.snapshot();
+          if (shouldLogSampled('FILTER_REJECT', 100)) {
             logger.info(
-              `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
-              `direction=${direction} reason=${verdict.reason}`
+              `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry (15m gate) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+              `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} reason=${verdict.reason} | ` +
+              `15m: EMA20=${snap15m.ema20?.toFixed(4) || 'N/A'} EMA50=${snap15m.ema50?.toFixed(4) || 'N/A'} ` +
+              `ADX=${snap15m.adx14?.toFixed(2) || 'N/A'} RSI=${snap15m.rsi14?.toFixed(2) || 'N/A'} ` +
+              `price=${currentPrice.toFixed(4)}`
             );
+          }
+          return;
+        }
+        
+        // ✅ ENHANCED: Check volatility filter (ATR% on 15m)
+        const snap15m = ind15m.state.snapshot();
+        const volCheck = checkVolatilityFilter(snap15m.atr14, currentPrice);
+        if (!volCheck.ok) {
+          if (shouldLogSampled('FILTER_REJECT', 100)) {
+            logger.info(
+              `[WebSocketOCConsumer] ⏭️ Volatility filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+              `reason=${volCheck.reason} ATR%=${volCheck.atrPercent?.toFixed(2) || 'N/A'}%`
+            );
+          }
+          return;
+        }
+        
+        // ✅ ENHANCED: Check pullback confirmation (5m EMA20)
+        const ind5m = this._getOrCreateTrendIndicators5m(matchExchange, strategy.symbol);
+        ind5m.state.updateTick(currentPrice, match.timestamp || Date.now());
+        const candle5m = webSocketManager.getLatestCandle(strategy.symbol, '5m');
+        if (candle5m) {
+          const snap5m = ind5m.state.snapshot();
+          const pullbackCheck = checkPullbackConfirmation(direction, currentPrice, candle5m, snap5m.ema20);
+          if (!pullbackCheck.ok) {
+            if (shouldLogSampled('FILTER_REJECT', 100)) {
+              logger.info(
+                `[WebSocketOCConsumer] ⏭️ Pullback filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+                `reason=${pullbackCheck.reason} EMA20_5m=${snap5m.ema20?.toFixed(4) || 'N/A'}`
+              );
+            }
             return;
           }
-          // ✅ Log when filter passes (for verification)
+        }
+        
+        // ✅ Log when all filters pass
+        filterIndicatorState = snap15m; // Store 15m state for logging
+        const emaCondition = direction === 'bullish'
+          ? `price(${currentPrice.toFixed(4)}) > EMA20_15m(${snap15m.ema20?.toFixed(4)}) > EMA50_15m(${snap15m.ema50?.toFixed(4)}) AND EMA20Slope > 0`
+          : `price(${currentPrice.toFixed(4)}) < EMA20_15m(${snap15m.ema20?.toFixed(4)}) < EMA50_15m(${snap15m.ema50?.toFixed(4)}) AND EMA20Slope < 0`;
+        const adxCondition = `ADX_15m(${snap15m.adx14?.toFixed(2)}) >= 25`;
+        const rsiCondition = direction === 'bullish'
+          ? `RSI_15m(${snap15m.rsi14?.toFixed(2)}) >= 55`
+          : `RSI_15m(${snap15m.rsi14?.toFixed(2)}) <= 45`;
+        if (shouldLogSampled('FILTER_PASS', 50)) {
           logger.info(
-            `[WebSocketOCConsumer] ✅ Trend filter passed | strategy=${strategy.id} symbol=${strategy.symbol} ` +
-            `direction=${direction} FOLLOWING_TREND confirmed`
-          );
-        } else {
-          // ✅ Log non-Binance FOLLOWING_TREND strategies (no filter applied)
-          logger.debug(
-            `[WebSocketOCConsumer] ⏭️ Skipping trend filter | strategy=${strategy.id} symbol=${strategy.symbol} ` +
-            `exchange=${matchExchange} non-Binance FOLLOWING_TREND (no filter)`
+            `[WebSocketOCConsumer] ✅ All filters PASSED (15m gate) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} | ` +
+            `CONDITIONS: ${emaCondition} ✓ ${adxCondition} ✓ ${rsiCondition} ✓ ` +
+            `ATR%=${volCheck.atrPercent?.toFixed(2)}% ✓ Pullback ✓`
           );
         }
+      } else if (exchangeLower === 'mexc') {
+        // ✅ MEXC: Apply partial filter (EMA + RSI only, no ADX)
+        // WHY: MEXC doesn't have closed candle aggregation for ADX calculation
+        const ind = this._getOrCreateTrendIndicators(matchExchange, strategy.symbol);
+        ind.state.updateTick(currentPrice, match.timestamp || Date.now());
+        
+        const snap = ind.state.snapshot();
+        const ema20 = Number(snap.ema20);
+        const ema50 = Number(snap.ema50);
+        const ema20Slope = Number(snap.ema20Slope);
+        const rsi14 = Number(snap.rsi14);
+        
+        // Check if indicators are ready
+        if (!Number.isFinite(ema20) || !Number.isFinite(ema50) || !Number.isFinite(ema20Slope)) {
+          logger.info(
+            `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} reason=ema_not_ready`
+          );
+          return;
+        }
+        if (!Number.isFinite(rsi14)) {
+          logger.info(
+            `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} reason=rsi_not_ready`
+          );
+          return;
+        }
+        
+        // EMA filter
+        const emaOk = direction === 'bullish'
+          ? (currentPrice > ema20 && ema20 > ema50 && ema20Slope > 0)
+          : (currentPrice < ema20 && ema20 < ema50 && ema20Slope < 0);
+        
+        if (!emaOk) {
+          logger.info(
+            `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} reason=ema_filter | ` +
+            `EMA20=${ema20.toFixed(4)} EMA50=${ema50.toFixed(4)} EMA20Slope=${ema20Slope.toFixed(4)} price=${currentPrice.toFixed(4)}`
+          );
+          return;
+        }
+        
+        // RSI filter
+        const rsiOk = direction === 'bullish' ? (rsi14 >= 55) : (rsi14 <= 45);
+        if (!rsiOk) {
+          logger.info(
+            `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+            `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} reason=rsi_regime | ` +
+            `RSI=${rsi14.toFixed(2)}`
+          );
+          return;
+        }
+        
+        // ✅ Log when filter passes with ALL conditions
+        filterIndicatorState = { ema20, ema50, ema20Slope, rsi14 }; // Store for later logging
+        const emaCondition = direction === 'bullish'
+          ? `price(${currentPrice.toFixed(4)}) > EMA20(${ema20.toFixed(4)}) > EMA50(${ema50.toFixed(4)}) AND EMA20Slope(${ema20Slope.toFixed(4)}) > 0`
+          : `price(${currentPrice.toFixed(4)}) < EMA20(${ema20.toFixed(4)}) < EMA50(${ema50.toFixed(4)}) AND EMA20Slope(${ema20Slope.toFixed(4)}) < 0`;
+        const rsiCondition = direction === 'bullish'
+          ? `RSI(${rsi14.toFixed(2)}) >= 55`
+          : `RSI(${rsi14.toFixed(2)}) <= 45`;
+        logger.info(
+          `[WebSocketOCConsumer] ✅ Trend filter PASSED (MEXC) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+          `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} | ` +
+          `CONDITIONS: ${emaCondition} ✓ ${rsiCondition} ✓`
+        );
+      } else {
+        // ✅ Unknown exchange - reject for safety
+        logger.warn(
+          `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+          `exchange=${matchExchange} unknown exchange (no filter available)`
+        );
+        return;
       }
 
       let entryPrice;
@@ -613,10 +1030,12 @@ export class WebSocketOCConsumer {
         // Trend-following: Use current price directly, force MARKET order
         entryPrice = currentPrice;
         forceMarket = true;
-        logger.info(
-          `[WebSocketOCConsumer] Trend-following strategy ${strategy.id}: ` +
-          `entry=${entryPrice} (using current price), forceMarket=true`
-        );
+        if (shouldLogSampled('ENTRY_INFO', 100)) {
+          logger.info(
+            `[WebSocketOCConsumer] Trend-following strategy ${strategy.id}: ` +
+            `entry=${entryPrice} (using current price), forceMarket=true`
+          );
+        }
       }
 
       // Pre-calculate extend distance (only for counter-trend)
@@ -717,7 +1136,20 @@ export class WebSocketOCConsumer {
         }
       }
 
-      logger.info(`[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ${signal.side} @ ${currentPrice}, OC=${oc.toFixed(2)}%`);
+      // ✅ Log order execution with all filter conditions that passed
+      let filterSummary = '';
+      if (filterIndicatorState) {
+        if (exchangeLower === 'binance') {
+          filterSummary = `EMA20=${filterIndicatorState.ema20?.toFixed(4)} EMA50=${filterIndicatorState.ema50?.toFixed(4)} EMA20Slope=${filterIndicatorState.ema20Slope?.toFixed(4)} ADX=${filterIndicatorState.adx14?.toFixed(2)} RSI=${filterIndicatorState.rsi14?.toFixed(2)}`;
+        } else if (exchangeLower === 'mexc') {
+          filterSummary = `EMA20=${filterIndicatorState.ema20?.toFixed(4)} EMA50=${filterIndicatorState.ema50?.toFixed(4)} EMA20Slope=${filterIndicatorState.ema20Slope?.toFixed(4)} RSI=${filterIndicatorState.rsi14?.toFixed(2)}`;
+        }
+      }
+      logger.info(
+        `[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ` +
+        `${signal.side.toUpperCase()} @ ${currentPrice.toFixed(4)}, OC=${oc.toFixed(2)}% | ` +
+        `FILTER PASSED: ${filterSummary || 'N/A'}`
+      );
 
       // Trigger order immediately
       const result = await orderService.executeSignal(signal).catch(error => {
@@ -754,7 +1186,6 @@ export class WebSocketOCConsumer {
     }
     
     // Query database
-    const { Position } = await import('../models/Position.js');
     const openPositions = await Position.findOpen(strategyId);
     const hasOpenPosition = openPositions.length > 0;
     
@@ -875,6 +1306,11 @@ export class WebSocketOCConsumer {
       isRunning: this.isRunning,
       processedCount: this.processedCount,
       matchCount: this.matchCount,
+      skippedCount: this.skippedCount,
+      queueSize: this._processingQueue.length,
+      activeDetections: this._activeDetections,
+      maxConcurrent: this._maxConcurrent,
+      cooldownMs: this._cooldownMs,
       ocDetectorStats: realtimeOCDetector.getStats(),
       strategyCacheSize: strategyCache.size()
     };

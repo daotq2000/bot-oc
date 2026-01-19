@@ -38,6 +38,74 @@ export class RealtimeOCDetector {
 
   startCacheCleanup() {
     setInterval(() => this.cleanupOldCacheEntries(), 5 * 60 * 1000);
+    
+    // ✅ NEW: Periodic refresh of open price cache using IndicatorWarmup
+    // This helps maintain accurate open prices even when WebSocket data is unavailable
+    const refreshInterval = Number(configService.getNumber('OC_OPEN_PRICE_REFRESH_INTERVAL_MS', 5 * 60 * 1000)); // Default 5 minutes
+    if (refreshInterval > 0) {
+      setInterval(() => {
+        this.refreshOpenPriceCache().catch(error => {
+          logger.debug(`[RealtimeOCDetector] Failed to refresh open price cache: ${error?.message || error}`);
+        });
+      }, refreshInterval);
+      logger.info(`[RealtimeOCDetector] ✅ Open price cache refresh enabled (interval: ${refreshInterval}ms)`);
+    }
+  }
+
+  /**
+   * ✅ NEW: Refresh open price cache for active symbols using IndicatorWarmup
+   * This fetches latest candles and caches open prices without warmup indicators
+   */
+  async refreshOpenPriceCache() {
+    try {
+      const { IndicatorWarmup } = await import('../indicators/IndicatorWarmup.js');
+      const { strategyCache } = await import('./StrategyCache.js');
+      const warmupService = new IndicatorWarmup();
+
+      // Get all active symbols from strategy cache
+      await strategyCache.refresh();
+      const symbols = new Set();
+      const symbolIntervals = new Map(); // symbol -> Set<intervals>
+
+      for (const [key, strategy] of strategyCache.cache.entries()) {
+        const [exchange, symbol] = key.split('|');
+        if (!exchange || !symbol) continue;
+        if (String(exchange).toLowerCase() !== 'binance') continue; // Only Binance for now
+
+        const symbolKey = `${exchange}|${symbol}`;
+        if (!symbolIntervals.has(symbolKey)) {
+          symbolIntervals.set(symbolKey, new Set());
+        }
+        const intervals = symbolIntervals.get(symbolKey);
+        intervals.add(strategy.interval || '1m');
+      }
+
+      if (symbolIntervals.size === 0) {
+        logger.debug(`[RealtimeOCDetector] No active symbols to refresh open price cache`);
+        return;
+      }
+
+      // Convert to array format for fetchAndCacheOpenPrices
+      const symbolsToRefresh = Array.from(symbolIntervals.entries()).map(([key, intervals]) => {
+        const [exchange, symbol] = key.split('|');
+        return {
+          exchange: exchange || 'binance',
+          symbol: symbol || '',
+          intervals: Array.from(intervals)
+        };
+      });
+
+      const concurrency = Number(configService.getNumber('OC_OPEN_PRICE_REFRESH_CONCURRENCY', 5));
+      const results = await warmupService.fetchAndCacheOpenPrices(symbolsToRefresh, concurrency);
+
+      logger.debug(
+        `[RealtimeOCDetector] ✅ Open price cache refresh complete | ` +
+        `Succeeded: ${results.succeeded} Failed: ${results.failed} | ` +
+        `Symbols: ${symbolsToRefresh.length}`
+      );
+    } catch (error) {
+      logger.debug(`[RealtimeOCDetector] Error refreshing open price cache: ${error?.message || error}`);
+    }
   }
 
   cleanupOldCacheEntries() {
@@ -118,11 +186,54 @@ export class RealtimeOCDetector {
           }
         }
 
-        // 3) Fallback: previous bucket close as current bucket open
+        // 3) DISABLED: REST API fallback removed to prevent rate limiting
+        // ⚠️ CRITICAL FIX: REST API was causing massive rate limit issues
+        // - With 541 symbols and WebSocket failures, this created hundreds of requests/second
+        // - Binance IP banned us for "Way too many requests"
+        // - Solution: Rely only on WebSocket data + prev_close fallback
+        // - WebSocket should be fixed to provide reliable data instead
+        
+        // If REST API fallback is absolutely needed, it must:
+        // 1. Check if client is rate limited first
+        // 2. Use aggressive caching (minutes, not seconds)
+        // 3. Use centralized request scheduler
+        // 4. Have circuit breaker that disables it when 429 detected
+        
+        // Keeping code commented for reference:
+        /*
+        const restFallbackEnabled = configService.getBoolean('OC_REST_FALLBACK_ENABLED', false);
+        if (restFallbackEnabled) {
+          try {
+            const { BinanceDirectClient } = await import('./BinanceDirectClient.js');
+            const binanceClient = new BinanceDirectClient(null, null, false, null);
+            
+            // Check if rate limited before making request
+            if (binanceClient._rateLimitBlocked) {
+              logger.debug(`[RealtimeOCDetector] Skipping REST fallback - rate limited`);
+            } else {
+              const intervalMs = this.getIntervalMs(interval);
+              const endTime = bucketStart + intervalMs;
+              const params = { symbol: sym, interval: interval, limit: 2, endTime: endTime };
+              
+              const klinesData = await binanceClient.makeMarketDataRequest('/fapi/v1/klines', 'GET', params);
+              // ... rest of logic
+            }
+          } catch (restErr) {
+            logger.debug(`[RealtimeOCDetector] REST API fallback failed: ${restErr?.message || restErr}`);
+          }
+        }
+        */
+
+        // 4) Fallback: previous bucket close as current bucket open (LAST RESORT)
+        // ⚠️ WARNING: This is less accurate and may cause OC calculation errors
         const intervalMs = this.getIntervalMs(interval);
         const prevBucketStart = bucketStart - intervalMs;
         const prevClose = webSocketManager.getKlineClose(sym, interval, prevBucketStart);
         if (Number.isFinite(prevClose) && prevClose > 0) {
+          logger.warn(
+            `[RealtimeOCDetector] ⚠️ Using prev_close as open (less accurate) | ${sym} ${interval} ` +
+            `bucketStart=${bucketStart} prevClose=${prevClose.toFixed(8)}`
+          );
           this.openPriceCache.set(key, { open: prevClose, bucketStart, lastUpdate: timestamp, source: 'binance_ws_prev_close' });
           return { open: prevClose, error: null, source: 'binance_ws_prev_close' };
         }
@@ -173,11 +284,12 @@ export class RealtimeOCDetector {
     
     try {
       const { webSocketManager } = await import('./WebSocketManager.js');
-      webSocketManager.onPrice(({ symbol, price, ts }) => {
+      const realtimeOCDetectorBinanceHandler = ({ symbol, price, ts }) => {
         this.onAlertTick('binance', symbol, price, ts).catch(error => {
           logger.error(`[RealtimeOCDetector] Error in Binance alert tick:`, error?.message || error);
         });
-      });
+      };
+      webSocketManager.onPrice(realtimeOCDetectorBinanceHandler);
       logger.info(`[RealtimeOCDetector] ✅ Registered Binance alert price handler`);
     } catch (error) {
       logger.error(`[RealtimeOCDetector] ❌ Failed to register Binance alert handler:`, error?.message || error);
@@ -247,8 +359,19 @@ export class RealtimeOCDetector {
 
       for (const interval of w.intervals) {
         const bucketStart = this.getBucketStart(interval, ts);
-        const { open, source } = await this.getAccurateOpen(w.exchange, sym, interval, p, ts);
-        if (!Number.isFinite(open) || open <= 0) continue;
+        let { open, source } = await this.getAccurateOpen(w.exchange, sym, interval, p, ts);
+        
+        // ✅ CRITICAL FIX: Fallback to current price if getAccurateOpen fails
+        // This ensures alerts still work even when WebSocket data is unavailable
+        // OC will be 0% initially, but will update as price moves within the bucket
+        if (!Number.isFinite(open) || open <= 0) {
+          logger.debug(
+            `[RealtimeOCDetector] ⚠️ getAccurateOpen failed for ${exchange.toUpperCase()} ${sym} ${interval}, ` +
+            `using current price as fallback (OC will be 0% initially)`
+          );
+          open = p; // Use current price as fallback
+          source = 'fallback_current_price';
+        }
 
         const oc = ((p - open) / open) * 100;
         const absOc = Math.abs(oc);
@@ -282,7 +405,8 @@ export class RealtimeOCDetector {
             if (this.telegramService) {
               this.telegramService.sendVolatilityAlert(w.chatId, {
                 symbol: sym, interval, oc, open, currentPrice: p,
-                direction: oc >= 0 ? 'bullish' : 'bearish'
+                direction: oc >= 0 ? 'bullish' : 'bearish',
+                exchange: w.exchange // ✅ FIX: Use w.exchange instead of undefined 'ex'
               }).catch(e => logger.error(`[Telegram] Failed to send alert to ${w.chatId}:`, e));
             }
             state.lastAlertTime = Date.now();
@@ -295,6 +419,97 @@ export class RealtimeOCDetector {
         }
       }
     }
+  }
+
+  /**
+   * Detect OC and match with strategies for WebSocketOCConsumer
+   * @param {string} exchange - Exchange name (e.g., 'binance', 'mexc')
+   * @param {string} symbol - Symbol (e.g., 'BTCUSDT')
+   * @param {number} price - Current price
+   * @param {number} timestamp - Timestamp (default: Date.now())
+   * @param {string} source - Source identifier (e.g., 'WebSocketOCConsumer')
+   * @returns {Promise<Array>} Array of match objects: { strategy, oc, direction, currentPrice, interval, exchange, openPrice, timestamp }
+   */
+  async detectOC(exchange, symbol, price, timestamp = Date.now(), source = 'unknown') {
+    try {
+      const ex = (exchange || '').toLowerCase();
+      const sym = String(symbol || '').toUpperCase().replace(/[/:_]/g, '');
+      const p = Number(price);
+      const ts = Number(timestamp) || Date.now();
+
+      if (!ex || !sym || !Number.isFinite(p) || p <= 0) {
+        return [];
+      }
+
+      // Get strategies for this exchange and symbol
+      const strategies = strategyCache.getStrategies(ex, sym);
+      if (!strategies || strategies.length === 0) {
+        return [];
+      }
+
+      const matches = [];
+
+      // Process each strategy
+      for (const strategy of strategies) {
+        // Skip inactive strategies
+        if (!strategy.is_active || strategy.bot?.is_active === false) {
+          continue;
+        }
+
+        // Get strategy interval
+        const strategyInterval = String(strategy.interval || '1m').toLowerCase();
+        if (!strategyInterval) {
+          continue;
+        }
+
+        // Get accurate open price for this interval
+        const { open, source: openSource } = await this.getAccurateOpen(ex, sym, strategyInterval, p, ts);
+        if (!Number.isFinite(open) || open <= 0) {
+          // Skip if we can't get open price
+          continue;
+        }
+
+        // Calculate OC
+        const oc = ((p - open) / open) * 100;
+        const ocAbs = Math.abs(oc);
+        const direction = oc >= 0 ? 'bullish' : 'bearish';
+
+        // Check if OC meets strategy threshold
+        const strategyOcThreshold = Number(strategy.oc || 0);
+        if (ocAbs < strategyOcThreshold) {
+          continue;
+        }
+
+        // Create match object
+        matches.push({
+          strategy,
+          oc,
+          direction,
+          currentPrice: p,
+          interval: strategyInterval,
+          exchange: ex,
+          openPrice: open,
+          timestamp: ts
+        });
+      }
+
+      return matches;
+    } catch (error) {
+      logger.error(`[RealtimeOCDetector] Error in detectOC for ${exchange} ${symbol}:`, error?.message || error);
+      return [];
+    }
+  }
+
+  /**
+   * Get stats for monitoring
+   */
+  getStats() {
+    return {
+      openPriceCacheSize: this.openPriceCache.size,
+      openFetchCacheSize: this.openFetchCache.size,
+      alertStateSize: this.alertState.size,
+      alertWatchersCount: this.alertWatchers?.length || 0
+    };
   }
 }
 

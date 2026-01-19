@@ -142,7 +142,7 @@ export class PriceAlertWorker {
   /**
    * Start Price Alert Worker
    */
-  start() {
+  async start() {
     if (this.isRunning) {
       logger.warn('[PriceAlertWorker] Already running');
       return;
@@ -150,6 +150,7 @@ export class PriceAlertWorker {
 
     // Check master ENABLE_ALERTS switch
     const alertsEnabled = configService.getBoolean('ENABLE_ALERTS', true);
+    logger.info(`[PriceAlertWorker] ENABLE_ALERTS=${alertsEnabled}`);
     if (!alertsEnabled) {
       logger.info('[PriceAlertWorker] ENABLE_ALERTS=false, Price Alert Worker will not start');
       return;
@@ -158,13 +159,49 @@ export class PriceAlertWorker {
     try {
       this.isRunning = true;
 
+      const scannerEnabled = alertMode.useScanner();
+      const websocketEnabled = alertMode.useWebSocket();
+      logger.info(`[PriceAlertWorker] Starting... mode: scanner=${scannerEnabled} websocket=${websocketEnabled}`);
+
       // Start PriceAlertScanner (polling) if enabled
-      if (this.priceAlertScanner) {
-        this.priceAlertScanner.start();
+      if (scannerEnabled) {
+        if (!this.priceAlertScanner) {
+          // Defensive: initialize scanner lazily if not present
+          logger.warn('[PriceAlertWorker] Scanner mode enabled but priceAlertScanner is null. Creating a new instance...');
+          this.priceAlertScanner = new PriceAlertScanner();
+          // NOTE: initialize() should normally run before start(). If it didn't, scanner will run with limited functionality.
+          // We still start it to ensure alerts are not silently dead.
+          try {
+            if (this.telegramService) {
+              await this.priceAlertScanner.initialize(this.telegramService, this.orderServices);
+              logger.info('[PriceAlertWorker] ✅ Lazily initialized PriceAlertScanner in start()');
+            } else {
+              logger.warn('[PriceAlertWorker] telegramService is null; starting scanner without initialization');
+            }
+          } catch (e) {
+            logger.error('[PriceAlertWorker] ❌ Failed to lazily initialize PriceAlertScanner:', e?.message || e);
+          }
+        }
+
+        try {
+          logger.info('[PriceAlertWorker] Starting PriceAlertScanner...');
+          this.priceAlertScanner.start();
+          logger.info(`[PriceAlertWorker] ✅ PriceAlertScanner.start() called (scanner.isRunning=${this.priceAlertScanner.isRunning})`);
+          
+          // ✅ NEW: Verify scanner is actually running
+          if (!this.priceAlertScanner.isRunning) {
+            logger.error('[PriceAlertWorker] ❌ PriceAlertScanner.start() was called but scanner.isRunning is still false!');
+          } else {
+            logger.info('[PriceAlertWorker] ✅ PriceAlertScanner is confirmed running');
+          }
+        } catch (e) {
+          logger.error('[PriceAlertWorker] ❌ PriceAlertScanner.start() failed:', e?.message || e, e?.stack);
+        }
+      } else {
+        logger.info('[PriceAlertWorker] Scanner mode disabled; not starting PriceAlertScanner');
       }
 
       // WebSocket alerts are event-driven; no scan loop needed.
-
       logger.info('[PriceAlertWorker] ✅ Price Alert system started');
     } catch (error) {
       logger.error('[PriceAlertWorker] ❌ Failed to start Price Alert system:', error?.message || error);
@@ -237,20 +274,43 @@ export class PriceAlertWorker {
       if (mexcSymbols.length > 0) {
         logger.info(`[PriceAlertWorker] Subscribing MEXC WS to ${mexcSymbols.length} Price Alert symbols`);
         try {
-          // Ensure WebSocket is connected before subscribing
-          const mexcStatus = mexcPriceWs.getStatus();
+          // CRITICAL FIX: Ensure WebSocket is connected before subscribing
+          // Retry connection up to 3 times with exponential backoff
+          let mexcStatus = mexcPriceWs.getStatus();
           if (!mexcStatus?.connected) {
-            logger.info(`[PriceAlertWorker] MEXC WebSocket not connected (state: ${mexcStatus?.readyState}), ensuring connection...`);
+            logger.warn(`[PriceAlertWorker] ⚠️ MEXC WebSocket not connected (state: ${mexcStatus?.readyState}), attempting to connect...`);
             mexcPriceWs.ensureConnected();
-            // Wait a bit for connection to establish
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Wait for connection with retry (max 3 attempts, 2s each)
+            let connected = false;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1))); // 2s, 4s, 6s
+              mexcStatus = mexcPriceWs.getStatus();
+              if (mexcStatus?.connected) {
+                connected = true;
+                logger.info(`[PriceAlertWorker] ✅ MEXC WebSocket connected after ${attempt + 1} attempt(s)`);
+                break;
+              }
+            }
+            
+            if (!connected) {
+              logger.error(`[PriceAlertWorker] ❌ MEXC WebSocket failed to connect after 3 attempts. Status: ${JSON.stringify(mexcStatus)}`);
+              // Continue anyway - subscription will be retried on next cycle
+            }
+          } else {
+            logger.debug(`[PriceAlertWorker] ✅ MEXC WebSocket already connected`);
           }
           
-          // Subscribe symbols
-          mexcPriceWs.subscribe(mexcSymbols);
-          logger.debug(`[PriceAlertWorker] MEXC WebSocket subscribed to ${mexcSymbols.length} symbols`);
+          // Subscribe symbols (only if connected)
+          mexcStatus = mexcPriceWs.getStatus();
+          if (mexcStatus?.connected) {
+            mexcPriceWs.subscribe(mexcSymbols);
+            logger.info(`[PriceAlertWorker] ✅ MEXC WebSocket subscribed to ${mexcSymbols.length} symbols`);
+          } else {
+            logger.warn(`[PriceAlertWorker] ⚠️ Cannot subscribe MEXC symbols: WebSocket not connected (state: ${mexcStatus?.readyState})`);
+          }
         } catch (error) {
-          logger.error(`[PriceAlertWorker] Failed to subscribe MEXC symbols:`, error?.message || error);
+          logger.error(`[PriceAlertWorker] ❌ Failed to subscribe MEXC symbols:`, error?.message || error, error?.stack);
         }
       } else {
         logger.debug(`[PriceAlertWorker] No MEXC symbols to subscribe`);
@@ -261,20 +321,43 @@ export class PriceAlertWorker {
       if (binanceSymbols.length > 0) {
         logger.info(`[PriceAlertWorker] Subscribing Binance WS to ${binanceSymbols.length} Price Alert symbols`);
         try {
-          // Ensure WebSocket is connected before subscribing
-          const status = webSocketManager.getStatus();
-          if (status.connectedCount === 0) {
-            logger.info(`[PriceAlertWorker] Binance WebSocket not connected, calling connect()...`);
+          // CRITICAL FIX: Ensure WebSocket is connected before subscribing
+          // Retry connection up to 3 times with exponential backoff
+          let binanceStatus = webSocketManager.getStatus();
+          if (binanceStatus.connectedCount === 0) {
+            logger.warn(`[PriceAlertWorker] ⚠️ Binance WebSocket not connected (connectedCount: ${binanceStatus.connectedCount}), attempting to connect...`);
             webSocketManager.connect();
-            // Wait a bit for connection to establish
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Wait for connection with retry (max 3 attempts, 2s each)
+            let connected = false;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1))); // 2s, 4s, 6s
+              binanceStatus = webSocketManager.getStatus();
+              if (binanceStatus.connectedCount > 0) {
+                connected = true;
+                logger.info(`[PriceAlertWorker] ✅ Binance WebSocket connected after ${attempt + 1} attempt(s) (${binanceStatus.connectedCount} streams)`);
+                break;
+              }
+            }
+            
+            if (!connected) {
+              logger.error(`[PriceAlertWorker] ❌ Binance WebSocket failed to connect after 3 attempts. Status: ${JSON.stringify(binanceStatus)}`);
+              // Continue anyway - subscription will be retried on next cycle
+            }
+          } else {
+            logger.debug(`[PriceAlertWorker] ✅ Binance WebSocket already connected (${binanceStatus.connectedCount} streams)`);
           }
           
-          // Subscribe symbols
-          webSocketManager.subscribe(binanceSymbols);
-          logger.debug(`[PriceAlertWorker] Binance WebSocket subscribed to ${binanceSymbols.length} symbols`);
+          // Subscribe symbols (only if connected)
+          binanceStatus = webSocketManager.getStatus();
+          if (binanceStatus.connectedCount > 0) {
+            webSocketManager.subscribe(binanceSymbols);
+            logger.info(`[PriceAlertWorker] ✅ Binance WebSocket subscribed to ${binanceSymbols.length} symbols`);
+          } else {
+            logger.warn(`[PriceAlertWorker] ⚠️ Cannot subscribe Binance symbols: WebSocket not connected (connectedCount: ${binanceStatus.connectedCount})`);
+          }
         } catch (error) {
-          logger.error(`[PriceAlertWorker] Failed to subscribe Binance symbols:`, error?.message || error);
+          logger.error(`[PriceAlertWorker] ❌ Failed to subscribe Binance symbols:`, error?.message || error, error?.stack);
         }
       } else {
         logger.debug(`[PriceAlertWorker] No Binance symbols to subscribe`);

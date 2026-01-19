@@ -41,6 +41,15 @@ export class CandleAggregator {
 
     for (const interval of this.intervals) {
       const bucketStart = this._bucketStart(interval, t);
+      const latestKey = this._latestKey(sym, interval);
+      const prev = this._latest.get(latestKey);
+
+      // If bucket changed, mark previous candle as closed
+      if (prev && prev.startTime !== bucketStart && prev.isClosed !== true) {
+        prev.isClosed = true;
+        prev.closeTime = prev.startTime + this._intervalMs(interval);
+      }
+
       const k = this._key(sym, interval, bucketStart);
       let c = this._candles.get(k);
       if (!c) {
@@ -54,6 +63,7 @@ export class CandleAggregator {
           close: p,
           volume: 0,
           ticks: 0,
+          isClosed: false,
           lastUpdate: t
         };
         this._candles.set(k, c);
@@ -65,7 +75,7 @@ export class CandleAggregator {
       c.ticks += 1;
       c.lastUpdate = t;
 
-      this._latest.set(this._latestKey(sym, interval), c);
+      this._latest.set(latestKey, c);
     }
 
     // Soft cleanup

@@ -96,7 +96,7 @@ async function start() {
       // WebSocket OC high-performance configs
       await AppConfig.set('WS_MATCH_CONCURRENCY', '50', 'Max concurrency for processing matched strategies per tick (higher = faster entries, more CPU/API usage)');
       await AppConfig.set('PRICE_ALERTS_STRATEGY_FIRST', 'false', 'If true: when there are active strategies, PriceAlertScanner yields to SignalScanner (strategy-first). If false: always run standalone price alerts.');
-      await AppConfig.set('OC_ALERT_SCAN_INTERVAL_MS', '1000', 'Interval for OC alert scan (ms)');
+      await AppConfig.set('OC_ALERT_SCAN_INTERVAL_MS', '5000', 'Interval for OC alert scan (ms)');
       await AppConfig.set('OC_ALERT_TICK_MIN_INTERVAL_MS', '0', 'Min interval per symbol/interval between alerts on WS tick (ms)');
       await AppConfig.set('PRICE_ALERT_MIN_INTERVAL_MS', '400', 'Min interval per symbol/interval between alerts (ms)');
       await AppConfig.set('PRICE_ALERT_USE_SYMBOL_FILTERS', 'true', 'Use symbol_filters table for price alerts when symbols not specified');
@@ -155,7 +155,7 @@ async function start() {
       await AppConfig.set('BINANCE_DEFAULT_MARGIN_TYPE', 'CROSSED', 'Default margin type for Binance (ISOLATED or CROSSED)');
       await AppConfig.set('BINANCE_DEFAULT_LEVERAGE', '5', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_USE_SCANNER', 'true', 'Default leverage for Binance positions');
-      await AppConfig.set('PRICE_ALERT_USE_WEBSOCKET', 'false', 'Default leverage for Binance positions');
+      await AppConfig.set('PRICE_ALERT_USE_WEBSOCKET', 'true', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_SCAN_INTERVAL_MS', '100', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_CONFIG_BATCH_SIZE', '10', 'Default leverage for Binance positions');
       await AppConfig.set('PRICE_ALERT_SYMBOL_BATCH_SIZE', '20', 'Default leverage for Binance positions');
@@ -320,6 +320,24 @@ async function start() {
         logger.error('Strategies system failed - Price Alert will continue to work independently');
       }
     }, 5000); // Delay 5 seconds
+
+    // ============================================
+    // POSITION MONITOR (Always-on)
+    // ============================================
+    setTimeout(async () => {
+      logger.info('='.repeat(60));
+      logger.info('Initializing Position Monitor...');
+      logger.info('='.repeat(60));
+      try {
+        const { PositionMonitor } = await import('./jobs/PositionMonitor.js');
+        const positionMonitor = new PositionMonitor();
+        await positionMonitor.initialize(telegramService);
+        positionMonitor.start();
+        logger.info('✅ Position Monitor started successfully');
+      } catch (error) {
+        logger.error('❌ Failed to start Position Monitor:', error?.message || error);
+      }
+    }, 6000); // Delay 6 seconds
 
     // Delay Symbols Updater to reduce startup CPU load
     setTimeout(async () => {
