@@ -72,8 +72,8 @@ class WebSocketManager {
     // - 300 connections mới mỗi 5 phút trên cùng IP
     // ✅ ROOT CAUSE FIX: Giảm streams/connection để giảm message rate và event loop backlog
     // Với 100 streams, mỗi connection nhận ~100-200 messages/second → quá tải
-    // Giảm xuống 50 streams/connection → ~50-100 messages/second → dễ xử lý hơn
-    this.maxStreamsPerConn = 50; // Giảm từ 100 xuống 50 để giảm processing lag và latency
+    // Giảm xuống 20 streams/connection → ~20-40 messages/second → tối ưu tối đa cho OC scanning và giảm latency
+    this.maxStreamsPerConn = 20; // Giảm từ 30 xuống 20 để tối ưu tối đa OC scanning và giảm latency
     this.maxUrlLength = 8000; // Max URL length (an toàn dưới 8192)
     this.maxReconnectAttempts = 10;
     this.maxPriceCacheSize = 1000; // Maximum number of symbols to cache (reduced from 5000 to save memory)

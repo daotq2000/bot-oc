@@ -86,6 +86,7 @@ export class PositionSync {
       let totalCreated = 0;
       let totalClosed = 0;
       let totalErrors = 0;
+      let syncIssuesDetected = 0; // ✅ Track sync issues
 
       for (const [botId, exchangeService] of this.exchangeServices.entries()) {
         try {
@@ -94,6 +95,7 @@ export class PositionSync {
             totalProcessed += result.processed || 0;
             totalCreated += result.created || 0;
             totalClosed += result.closed || 0;
+            syncIssuesDetected += result.syncIssuesDetected || 0;
           }
         } catch (error) {
           totalErrors++;
@@ -104,8 +106,21 @@ export class PositionSync {
       const duration = Date.now() - startTime;
       logger.info(
         `[PositionSync] Position sync completed in ${duration}ms: ` +
-        `processed=${totalProcessed}, created=${totalCreated}, closed=${totalClosed}, errors=${totalErrors}`
+        `processed=${totalProcessed}, created=${totalCreated}, closed=${totalClosed}, ` +
+        `sync_issues=${syncIssuesDetected}, errors=${totalErrors}`
       );
+      
+      // ✅ IMPROVEMENT: Alert if sync issues detected
+      if (syncIssuesDetected > 5 && this.telegramService) {
+        try {
+          await this.telegramService.sendMessage(
+            `⚠️ PositionSync detected ${syncIssuesDetected} sync issue(s) in this cycle. ` +
+            `Please check logs for details.`
+          );
+        } catch (alertError) {
+          logger.debug(`[PositionSync] Could not send Telegram alert: ${alertError?.message || alertError}`);
+        }
+      }
     } catch (error) {
       logger.error('[PositionSync] Error in syncPositions:', error);
     } finally {
@@ -340,10 +355,11 @@ export class PositionSync {
       }
       
       // CRITICAL: Close positions that exist in DB but not on exchange
+      // ✅ IMPROVEMENT: Verify TP/SL orders before closing to avoid false positives
       let closedCount = 0;
       for (const dbPos of dbPositions) {
         if (!matchedDbPositionIds.has(dbPos.id) && dbPos.status === 'open') {
-          // This position exists in DB but not on exchange - close it
+          // This position exists in DB but not on exchange - verify TP/SL orders first
           try {
             const pool = (await import('../config/database.js')).default;
             // Try to acquire lock before updating
@@ -356,11 +372,56 @@ export class PositionSync {
             );
             
             if (lockResult.affectedRows > 0) {
-              // Lock acquired, proceed with update
+              // Lock acquired, proceed with verification and update
               try {
-                logger.warn(
-                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, closing via PositionService`
-                );
+                // ✅ IMPROVEMENT: Verify TP/SL orders before closing
+                let tpOrderFilled = false;
+                let slOrderFilled = false;
+                let closeReason = 'sync_not_on_exchange';
+                
+                // Check TP order
+                if (dbPos.exit_order_id) {
+                  try {
+                    const tpOrderStatus = await exchangeService.getOrderStatus(dbPos.symbol, dbPos.exit_order_id);
+                    const tpStatus = (tpOrderStatus?.status || '').toLowerCase();
+                    if (tpStatus === 'filled' || tpOrderStatus?.executedQty > 0) {
+                      tpOrderFilled = true;
+                      closeReason = 'tp_hit'; // TP was hit, not a sync issue
+                      logger.info(`[PositionSync] ✅ TP order ${dbPos.exit_order_id} was FILLED for position ${dbPos.id}, closing as TP_HIT`);
+                    }
+                  } catch (tpError) {
+                    // Order might not exist (already filled and removed), check if it was filled
+                    logger.debug(`[PositionSync] Could not verify TP order ${dbPos.exit_order_id} for position ${dbPos.id}: ${tpError?.message || tpError}`);
+                  }
+                }
+                
+                // Check SL order
+                if (!tpOrderFilled && dbPos.sl_order_id) {
+                  try {
+                    const slOrderStatus = await exchangeService.getOrderStatus(dbPos.symbol, dbPos.sl_order_id);
+                    const slStatus = (slOrderStatus?.status || '').toLowerCase();
+                    if (slStatus === 'filled' || slOrderStatus?.executedQty > 0) {
+                      slOrderFilled = true;
+                      closeReason = 'sl_hit'; // SL was hit, not a sync issue
+                      logger.info(`[PositionSync] ✅ SL order ${dbPos.sl_order_id} was FILLED for position ${dbPos.id}, closing as SL_HIT`);
+                    }
+                  } catch (slError) {
+                    // Order might not exist (already filled and removed), check if it was filled
+                    logger.debug(`[PositionSync] Could not verify SL order ${dbPos.sl_order_id} for position ${dbPos.id}: ${slError?.message || slError}`);
+                  }
+                }
+                
+                // If TP or SL was filled, use appropriate close reason
+                if (tpOrderFilled || slOrderFilled) {
+                  logger.info(
+                    `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) was closed via ${tpOrderFilled ? 'TP' : 'SL'} order, not sync issue`
+                  );
+                } else {
+                  logger.warn(
+                    `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange (no TP/SL filled), closing via PositionService`
+                  );
+                }
+                
                 // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
                 try {
                   const { PositionService } = await import('../services/PositionService.js');
@@ -377,9 +438,9 @@ export class PositionSync {
                   const { calculatePnL } = await import('../utils/calculator.js');
                   const pnl = calculatePnL(dbPos.entry_price, closePrice, dbPos.amount, dbPos.side);
                   
-                  await positionService.closePosition(dbPos, closePrice, pnl, 'sync_not_on_exchange');
+                  await positionService.closePosition(dbPos, closePrice, pnl, closeReason);
                   closedCount++;
-                  logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (Telegram alert should be sent)`);
+                  logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (reason: ${closeReason}, Telegram alert should be sent)`);
                 } catch (closeError) {
                   // Fallback to direct update if PositionService fails
                   logger.error(
@@ -388,7 +449,7 @@ export class PositionSync {
                   );
                   await Position.update(dbPos.id, {
                     status: 'closed',
-                    close_reason: 'sync_not_on_exchange',
+                    close_reason: closeReason,
                     closed_at: new Date()
                   });
                   closedCount++;
@@ -412,9 +473,51 @@ export class PositionSync {
             // If is_processing column doesn't exist, proceed without lock (backward compatibility)
             logger.debug(`[PositionSync] Could not acquire lock for position ${dbPos.id}: ${lockError?.message || lockError}`);
             try {
-              logger.warn(
-                `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange, closing via PositionService`
-              );
+              // ✅ IMPROVEMENT: Verify TP/SL orders before closing (same logic as above)
+              let tpOrderFilled = false;
+              let slOrderFilled = false;
+              let closeReason = 'sync_not_on_exchange';
+              
+              // Check TP order
+              if (dbPos.exit_order_id) {
+                try {
+                  const tpOrderStatus = await exchangeService.getOrderStatus(dbPos.symbol, dbPos.exit_order_id);
+                  const tpStatus = (tpOrderStatus?.status || '').toLowerCase();
+                  if (tpStatus === 'filled' || tpOrderStatus?.executedQty > 0) {
+                    tpOrderFilled = true;
+                    closeReason = 'tp_hit';
+                    logger.info(`[PositionSync] ✅ TP order ${dbPos.exit_order_id} was FILLED for position ${dbPos.id}, closing as TP_HIT`);
+                  }
+                } catch (tpError) {
+                  logger.debug(`[PositionSync] Could not verify TP order ${dbPos.exit_order_id} for position ${dbPos.id}: ${tpError?.message || tpError}`);
+                }
+              }
+              
+              // Check SL order
+              if (!tpOrderFilled && dbPos.sl_order_id) {
+                try {
+                  const slOrderStatus = await exchangeService.getOrderStatus(dbPos.symbol, dbPos.sl_order_id);
+                  const slStatus = (slOrderStatus?.status || '').toLowerCase();
+                  if (slStatus === 'filled' || slOrderStatus?.executedQty > 0) {
+                    slOrderFilled = true;
+                    closeReason = 'sl_hit';
+                    logger.info(`[PositionSync] ✅ SL order ${dbPos.sl_order_id} was FILLED for position ${dbPos.id}, closing as SL_HIT`);
+                  }
+                } catch (slError) {
+                  logger.debug(`[PositionSync] Could not verify SL order ${dbPos.sl_order_id} for position ${dbPos.id}: ${slError?.message || slError}`);
+                }
+              }
+              
+              if (tpOrderFilled || slOrderFilled) {
+                logger.info(
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) was closed via ${tpOrderFilled ? 'TP' : 'SL'} order, not sync issue`
+                );
+              } else {
+                logger.warn(
+                  `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange (no TP/SL filled), closing via PositionService`
+                );
+              }
+              
               // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
               try {
                 const { PositionService } = await import('../services/PositionService.js');
@@ -431,9 +534,9 @@ export class PositionSync {
                 const { calculatePnL } = await import('../utils/calculator.js');
                 const pnl = calculatePnL(dbPos.entry_price, closePrice, dbPos.amount, dbPos.side);
                 
-                await positionService.closePosition(dbPos, closePrice, pnl, 'sync_not_on_exchange');
+                await positionService.closePosition(dbPos, closePrice, pnl, closeReason);
                 closedCount++;
-                logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (Telegram alert should be sent)`);
+                logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (reason: ${closeReason}, Telegram alert should be sent)`);
               } catch (closeError) {
                 // Fallback to direct update if PositionService fails
                 logger.error(
@@ -442,7 +545,7 @@ export class PositionSync {
                 );
                 await Position.update(dbPos.id, {
                   status: 'closed',
-                  close_reason: 'sync_not_on_exchange',
+                  close_reason: closeReason,
                   closed_at: new Date()
                 });
                 closedCount++;
@@ -480,7 +583,8 @@ export class PositionSync {
       return {
         processed: processedCount,
         created: createdCount,
-        closed: closedCount
+        closed: closedCount,
+        syncIssuesDetected: closedCount // ✅ Track positions closed due to sync issues
       };
     } catch (error) {
       logger.error(`[PositionSync] Error syncing bot ${botId}:`, error?.message || error);

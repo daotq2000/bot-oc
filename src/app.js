@@ -37,6 +37,69 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ✅ ENHANCED: Detailed health check endpoint for monitoring
+app.get('/health/detailed', async (req, res) => {
+  try {
+    const { webSocketOCConsumer } = await import('./consumers/WebSocketOCConsumer.js');
+    const wsStatus = webSocketManager.getStatus();
+    const ocStats = webSocketOCConsumer.getStats();
+    
+    const health = {
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+        rss: Math.round(process.memoryUsage().rss / 1024 / 1024)
+      },
+      modules: {
+        priceAlertWorker: priceAlertWorker ? {
+          isRunning: priceAlertWorker.isRunning || false,
+          scannerRunning: priceAlertWorker.scanner?.isRunning || false
+        } : null,
+        positionSync: positionSyncJob ? {
+          isRunning: positionSyncJob.isRunning || false
+        } : null,
+        webSocketOC: {
+          isRunning: ocStats.isRunning,
+          ticksReceived: ocStats.stats?.ticksReceived || 0,
+          ticksProcessed: ocStats.stats?.ticksProcessed || 0,
+          matchesFound: ocStats.stats?.matchesFound || 0,
+          queueSize: ocStats.queueSize,
+          timeSinceLastTick: ocStats.stats?.timeSinceLastTick || null,
+          timeSinceLastProcessed: ocStats.stats?.timeSinceLastProcessed || null,
+          timeSinceLastMatch: ocStats.stats?.timeSinceLastMatch || null
+        },
+        webSocketManager: {
+          connections: wsStatus.connectedCount,
+          totalConnections: wsStatus.totalConnections,
+          totalStreams: wsStatus.totalStreams,
+          tickQueue: wsStatus.tickQueue,
+          reconnectQueue: wsStatus.reconnectQueue,
+          messageStats: wsStatus.messageStats
+        }
+      }
+    };
+    
+    // Determine overall health status
+    const isHealthy = 
+      ocStats.isRunning &&
+      wsStatus.connectedCount > 0 &&
+      (ocStats.stats?.timeSinceLastTick === null || ocStats.stats.timeSinceLastTick < 60000); // Last tick within 1 minute
+    
+    health.status = isHealthy ? 'ok' : 'degraded';
+    
+    res.json(health);
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error?.message || String(error),
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 // API routes
 app.use('/api', routes);
 

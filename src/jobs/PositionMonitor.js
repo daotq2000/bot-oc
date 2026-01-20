@@ -8,6 +8,7 @@ import { SCAN_INTERVALS } from '../config/constants.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
 import { ScanCycleCache } from '../utils/ScanCycleCache.js';
+import { calculatePnL, calculatePnLPercent } from '../utils/calculator.js';
 
 /**
  * Position Monitor Job - Monitor and update open positions
@@ -20,11 +21,174 @@ export class PositionMonitor {
     this.telegramService = null;
     this.isRunning = false;
     this._lastLogTime = null; // For throttling debug logs
+    this._lastSummary = null; // Cache last summary for diff logging
+    this._pnlAlertTimer = null; // Timer for realtime PnL alerts
 
     // Scan-cycle caches (cleared at the start of every monitorAllPositions run)
     this._scanCache = new ScanCycleCache();
     this._priceCache = new ScanCycleCache();
     this._closableQtyCache = new ScanCycleCache();
+  }
+
+  /**
+   * Send realtime PnL alerts for active Binance positions to Telegram
+   * Interval controlled by PNL_ALERT_INTERVAL_MS (default 10s)
+   */
+  async _sendRealtimePnlAlerts() {
+    const chatId = configService.getString('TELEGRAM_BOT_TOKEN_POSITION_MONITOR_BINANCE_CHANEL');
+    if (!chatId) {
+      logger.debug('[PositionMonitor] PnL alert skipped: chatId not configured');
+      return;
+    }
+    if (!this.telegramService || !this.telegramService.initialized) {
+      logger.debug('[PositionMonitor] PnL alert skipped: telegramService not initialized');
+      return;
+    }
+
+    try {
+      const openPositions = await Position.findOpen();
+      if (!openPositions || openPositions.length === 0) {
+        logger.debug('[PositionMonitor] PnL alert: no open positions');
+        return;
+      }
+      
+      const maxPositions = Number(configService.getNumber('PNL_ALERT_MAX_POSITIONS', 40)); // per bot cap
+      const maxChunkChars = Number(configService.getNumber('PNL_ALERT_MAX_CHARS', 3500)); // Telegram hard limit ~4096, keep headroom
+      const maxMessagesPerRun = Number(configService.getNumber('PNL_ALERT_MAX_MESSAGES', 3)); // per bot
+
+      // Group by bot for exchange lookups
+      const positionsByBot = new Map();
+      for (const pos of openPositions) {
+        if (!pos.bot_id) continue;
+        if (!positionsByBot.has(pos.bot_id)) positionsByBot.set(pos.bot_id, []);
+        positionsByBot.get(pos.bot_id).push(pos);
+      }
+
+      for (const [botId, botPositions] of positionsByBot.entries()) {
+        const exchangeService = this.exchangeServices.get(botId);
+        if (!exchangeService || exchangeService.bot?.exchange !== 'binance') {
+          continue; // only Binance as yêu cầu
+        }
+        const botName = exchangeService.bot?.bot_name || `bot_${botId}`;
+
+        // Fetch open positions on exchange once to verify active
+        let exPositions = [];
+        try {
+          const raw = await exchangeService.getOpenPositions();
+          exPositions = Array.isArray(raw) ? raw : [];
+        } catch (e) {
+          logger.warn(`[PositionMonitor] PnL alert: could not fetch exchange positions for bot ${botId}: ${e?.message || e}`);
+          continue;
+        }
+
+        const activeMap = new Map(); // key: symbol|side -> true
+        for (const ex of exPositions) {
+          const sym = ex.symbol || ex.info?.symbol;
+          const rawAmt = parseFloat(ex.positionAmt ?? ex.contracts ?? ex.size ?? 0);
+          if (!sym || !rawAmt) continue;
+          const side = rawAmt > 0 ? 'long' : rawAmt < 0 ? 'short' : null;
+          if (!side) continue;
+          activeMap.set(`${sym}|${side}`, true);
+        }
+
+        const botMessages = [];
+        for (const pos of botPositions) {
+          const side = pos.side || (pos.amount > 0 ? 'long' : 'short');
+          const key = `${pos.symbol}|${side}`;
+          if (!activeMap.has(key)) {
+            // Not active on exchange, skip alert
+            continue;
+          }
+
+          let currentPrice = null;
+          try {
+            currentPrice = await exchangeService.getTickerPrice(pos.symbol);
+          } catch (e) {
+            logger.warn(`[PositionMonitor] PnL alert: cannot get price for ${pos.symbol}: ${e?.message || e}`);
+            continue;
+          }
+          if (!Number.isFinite(Number(currentPrice))) continue;
+
+          const entryPrice = Number(pos.entry_price);
+          const amount = Number(pos.amount);
+          const pnl = calculatePnL(entryPrice, currentPrice, amount, side);
+          const pnlPct = calculatePnLPercent(entryPrice, currentPrice, side);
+
+          // Estimate PnL at TP/SL if available
+          const tpPrice = Number(pos.take_profit_price || pos.initial_tp_price || 0) || null;
+          const slPrice = Number(pos.stop_loss_price || pos.sl_price || pos.sl || pos.stoploss || 0) || null;
+          const pnlTp = tpPrice ? calculatePnL(entryPrice, tpPrice, amount, side) : null;
+          const pnlSl = slPrice ? calculatePnL(entryPrice, slPrice, amount, side) : null;
+
+          const fmt = (v, digits = 5) => Number(v).toFixed(digits);
+          const fmtPnl = (v) => `${v >= 0 ? '' : ''}${fmt(v, 5)}$`;
+          const sideLabel = side ? side.charAt(0).toUpperCase() + side.slice(1) : 'N/A';
+
+          const lines = [];
+          lines.push(`• ${pos.symbol} | ${sideLabel}: ${fmt(currentPrice, 5)} | PNL: ${fmtPnl(pnl)} (${fmt(pnlPct, 3)}%)`);
+          lines.push(`  Open: ${fmt(entryPrice, 5)}`);
+          lines.push(`  Close: ${fmt(currentPrice, 5)}`);
+          if (pnlTp !== null || pnlSl !== null) {
+            const tpPart = pnlTp !== null ? `TP≈${fmtPnl(pnlTp)}` : '';
+            const slPart = pnlSl !== null ? `SL≈${fmtPnl(pnlSl)}` : '';
+            const est = [tpPart, slPart].filter(Boolean).join(' | ');
+            if (est) {
+              lines.push(`  PNL_Estimate: ${est}`);
+            }
+          }
+
+          botMessages.push(lines.join('\n'));
+        }
+        
+        if (botMessages.length === 0) {
+          logger.info(`[PositionMonitor] PnL alert: no active Binance positions to report for ${botName}`);
+          continue;
+        }
+
+        // Sort by PnL asc (worst first) to surface risk
+        botMessages.sort((a, b) => {
+          const pa = parseFloat(a.match(/PNL: ([+-]?\d+(\.\d+)?)/)?.[1] || 0);
+          const pb = parseFloat(b.match(/PNL: ([+-]?\d+(\.\d+)?)/)?.[1] || 0);
+          return pa - pb;
+        });
+
+        const total = botMessages.length;
+        const limited = botMessages.slice(0, maxPositions);
+        const truncated = total - limited.length;
+
+        // Chunk into multiple Telegram messages under length limit
+        let chunks = [];
+        let current = [];
+        let currentLen = 0;
+        for (const line of limited) {
+          const projected = currentLen + line.length + 1;
+          if (projected > maxChunkChars && current.length > 0) {
+            chunks.push(current);
+            current = [];
+            currentLen = 0;
+          }
+          current.push(line);
+          currentLen += line.length + 1;
+          if (chunks.length >= maxMessagesPerRun - 1 && projected > maxChunkChars) break; // protect from spam
+        }
+        if (current.length) chunks.push(current);
+        chunks = chunks.slice(0, maxMessagesPerRun); // hard cap messages per run
+
+        let sentCount = 0;
+        for (let i = 0; i < chunks.length; i++) {
+          const lines = chunks[i];
+          const header = `📊 Position | ${botName} (Total active: ${total}, showing ${sentCount + lines.length}${truncated > 0 ? `, truncated ${truncated}` : ''})\n`;
+          const body = lines.join('\n');
+          const msg = `${header}${body}`;
+          await this.telegramService.sendMessage(chatId, msg, { alertType: 'position_monitor_binance' });
+          sentCount += lines.length;
+        }
+
+        logger.info(`[PositionMonitor] PnL alert sent for ${botName} with ${Math.min(total, maxPositions)} position(s) over ${chunks.length} message(s), truncated=${truncated}`);
+      }
+    } catch (err) {
+      logger.error('[PositionMonitor] PnL alert error:', err?.message || err);
+    }
   }
 
   /**
@@ -36,18 +200,48 @@ export class PositionMonitor {
     try {
       const { Bot } = await import('../models/Bot.js');
       const bots = await Bot.findAll(true); // Active bots only
+      
+      logger.info(`[PositionMonitor] Found ${bots.length} active bot(s) to initialize: ${bots.map(b => `bot ${b.id}`).join(', ')}`);
 
       // Initialize bots sequentially with delay to reduce CPU load
       for (let i = 0; i < bots.length; i++) {
+        logger.debug(`[PositionMonitor] Initializing bot ${bots[i].id} (${i + 1}/${bots.length})...`);
         await this.addBot(bots[i]);
         // Add delay between bot initializations to avoid CPU spike
         if (i < bots.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 600)); // 600ms delay
         }
       }
+      
+      logger.info(`[PositionMonitor] ✅ Initialized ${this.exchangeServices.size} ExchangeService(s) for ${bots.length} bot(s)`);
     } catch (error) {
       logger.error('Failed to initialize PositionMonitor:', error);
     }
+  }
+
+  /**
+   * Small helper to retry getOrderStatus to handle transient API errors
+   */
+  async _getOrderStatusWithRetry(exchangeService, symbol, orderId, label, maxRetries = 3, baseDelayMs = 200) {
+    let attempt = 0;
+    let lastError;
+    while (attempt < maxRetries) {
+      try {
+        const res = await exchangeService.getOrderStatus(symbol, orderId);
+        return res;
+      } catch (err) {
+        lastError = err;
+        attempt++;
+        const delay = baseDelayMs * attempt;
+        logger.debug(
+          `[OrderStatusRetry] ${label} attempt ${attempt}/${maxRetries} failed: ${err?.message || err}. ` +
+          `Retrying in ${delay}ms...`
+        );
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    logger.warn(`[OrderStatusRetry] ${label} failed after ${maxRetries} attempts: ${lastError?.message || lastError}`);
+    throw lastError;
   }
 
   /**
@@ -56,9 +250,11 @@ export class PositionMonitor {
    */
   async addBot(bot) {
     try {
+      logger.debug(`[PositionMonitor] Creating ExchangeService for bot ${bot.id} (${bot.exchange || 'unknown'}, testnet=${bot.binance_testnet || 'false'})...`);
       const exchangeService = new ExchangeService(bot);
       await exchangeService.initialize();
       this.exchangeServices.set(bot.id, exchangeService);
+      logger.debug(`[PositionMonitor] ✅ ExchangeService created for bot ${bot.id}`);
 
       const positionService = new PositionService(exchangeService, this.telegramService, {
         scanCache: this._scanCache,
@@ -70,9 +266,10 @@ export class PositionMonitor {
       const orderService = new OrderService(exchangeService, this.telegramService);
       this.orderServices.set(bot.id, orderService);
 
-      logger.info(`PositionMonitor initialized for bot ${bot.id}`);
+      logger.info(`[PositionMonitor] ✅ Initialized for bot ${bot.id} (${bot.exchange || 'unknown'}, testnet=${bot.binance_testnet || 'false'})`);
     } catch (error) {
-      logger.error(`Failed to initialize PositionMonitor for bot ${bot.id}:`, error);
+      logger.error(`[PositionMonitor] ❌ Failed to initialize for bot ${bot.id}:`, error?.message || error, error?.stack);
+      // Don't throw - continue with other bots
     }
   }
 
@@ -197,7 +394,12 @@ export class PositionMonitor {
       try {
         const exchangeService = this.exchangeServices.get(position.bot_id);
         if (exchangeService) {
-          const orderStatus = await exchangeService.getOrderStatus(position.symbol, position.exit_order_id);
+          const orderStatus = await this._getOrderStatusWithRetry(
+            exchangeService,
+            position.symbol,
+            position.exit_order_id,
+            `TP order ${position.exit_order_id} pos=${position.id}`
+          );
           const status = (orderStatus?.status || '').toLowerCase();
           // If order is filled, canceled, or expired, we need to recreate it
           if (status === 'filled' || status === 'canceled' || status === 'cancelled' || status === 'expired') {
@@ -209,11 +411,20 @@ export class PositionMonitor {
           }
         }
       } catch (e) {
-        // If we can't check order status, assume it might be missing and try to recreate
-        logger.warn(`[Place TP/SL] Could not verify TP order ${position.exit_order_id} for position ${position.id}: ${e?.message || e}. Will try to recreate.`);
-        needsTp = true;
-        await Position.update(position.id, { exit_order_id: null });
-        position.exit_order_id = null;
+        // If we can't check order status, do NOT clear order id; mark pending to retry next cycle
+        logger.warn(
+          `[Place TP/SL] Could not verify TP order ${position.exit_order_id} for position ${position.id}: ${e?.message || e}. ` +
+          `Marking tp_sl_pending and will retry without clearing order_id.`
+        );
+        needsTp = true; // try to replace if needed
+        try {
+          if (Position?.rawAttributes?.tp_sl_pending) {
+            await Position.update(position.id, { tp_sl_pending: true });
+            position.tp_sl_pending = true;
+          }
+        } catch (flagErr) {
+          logger.debug(`[Place TP/SL] Could not set tp_sl_pending after TP status error: ${flagErr?.message || flagErr}`);
+        }
       }
     }
 
@@ -222,7 +433,12 @@ export class PositionMonitor {
       try {
         const exchangeService = this.exchangeServices.get(position.bot_id);
         if (exchangeService) {
-          const orderStatus = await exchangeService.getOrderStatus(position.symbol, position.sl_order_id);
+          const orderStatus = await this._getOrderStatusWithRetry(
+            exchangeService,
+            position.symbol,
+            position.sl_order_id,
+            `SL order ${position.sl_order_id} pos=${position.id}`
+          );
           const status = (orderStatus?.status || '').toLowerCase();
           // If order is filled, canceled, or expired, we need to recreate it
           if (status === 'filled' || status === 'canceled' || status === 'cancelled' || status === 'expired') {
@@ -234,11 +450,20 @@ export class PositionMonitor {
           }
         }
       } catch (e) {
-        // If we can't check order status, assume it might be missing and try to recreate
-        logger.warn(`[Place TP/SL] Could not verify SL order ${position.sl_order_id} for position ${position.id}: ${e?.message || e}. Will try to recreate.`);
-        needsSl = true;
-        await Position.update(position.id, { sl_order_id: null });
-        position.sl_order_id = null;
+        // If we can't check order status, do NOT clear order id; mark pending to retry next cycle
+        logger.warn(
+          `[Place TP/SL] Could not verify SL order ${position.sl_order_id} for position ${position.id}: ${e?.message || e}. ` +
+          `Marking tp_sl_pending and will retry without clearing order_id.`
+        );
+        needsSl = true; // try to replace if needed
+        try {
+          if (Position?.rawAttributes?.tp_sl_pending) {
+            await Position.update(position.id, { tp_sl_pending: true });
+            position.tp_sl_pending = true;
+          }
+        } catch (flagErr) {
+          logger.debug(`[Place TP/SL] Could not set tp_sl_pending after SL status error: ${flagErr?.message || flagErr}`);
+        }
       }
     }
 
@@ -267,12 +492,38 @@ export class PositionMonitor {
     }
 
     try {
-      const exchangeService = this.exchangeServices.get(position.bot_id);
+      let exchangeService = this.exchangeServices.get(position.bot_id);
       if (!exchangeService) {
-        logger.warn(`[Place TP/SL] ExchangeService not found for bot ${position.bot_id}`);
-        // Release lock before returning
-        await this._releasePositionLock(position.id);
-        return;
+        // ✅ AUTO-FIX: Try to initialize ExchangeService for this bot if missing
+        logger.warn(`[Place TP/SL] ExchangeService not found for bot ${position.bot_id}, attempting to initialize...`);
+        try {
+          const { Bot } = await import('../models/Bot.js');
+          const bot = await Bot.findById(position.bot_id);
+          if (!bot) {
+            logger.error(`[Place TP/SL] Bot ${position.bot_id} not found in database, skipping position ${position.id}`);
+            await this._releasePositionLock(position.id);
+            return;
+          }
+          if (!bot.is_active && bot.is_active !== 1) {
+            logger.warn(`[Place TP/SL] Bot ${position.bot_id} is not active, skipping position ${position.id}`);
+            await this._releasePositionLock(position.id);
+            return;
+          }
+          // Initialize ExchangeService for this bot
+          await this.addBot(bot);
+          exchangeService = this.exchangeServices.get(position.bot_id);
+          if (exchangeService) {
+            logger.info(`[Place TP/SL] ✅ Successfully initialized ExchangeService for bot ${position.bot_id}`);
+          } else {
+            logger.error(`[Place TP/SL] ❌ Failed to initialize ExchangeService for bot ${position.bot_id} after addBot`);
+            await this._releasePositionLock(position.id);
+            return;
+          }
+        } catch (error) {
+          logger.error(`[Place TP/SL] ❌ Error initializing ExchangeService for bot ${position.bot_id}:`, error?.message || error);
+          await this._releasePositionLock(position.id);
+          return;
+        }
       }
 
       // OPTIMIZATION: Get the actual fill price from the exchange with multiple fallbacks
@@ -1138,6 +1389,11 @@ export class PositionMonitor {
     this._priceCache.clear();
     this._closableQtyCache.clear();
 
+    const cycleStart = Date.now();
+    let totalHighPriority = 0;
+    let totalLowPriority = 0;
+    let totalBotsProcessed = 0;
+    let totalPositionsProcessed = 0;
     try {
       const openPositions = await Position.findOpen();
       
@@ -1236,14 +1492,17 @@ export class PositionMonitor {
               `FORCING TP/SL creation immediately to prevent deep loss!`
             );
             highPriorityPositions.push(pos);
+            totalHighPriority++;
             continue;
           }
         }
         
         if (needsTPSL) {
           highPriorityPositions.push(pos);
+          totalHighPriority++;
         } else {
           lowPriorityPositions.push(pos);
+          totalLowPriority++;
         }
       }
       
@@ -1257,6 +1516,8 @@ export class PositionMonitor {
       const botProcessingPromises = botEntries.map(async ([botId, botPositions]) => {
         const startTime = Date.now();
         try {
+          totalBotsProcessed++;
+          totalPositionsProcessed += botPositions.length;
           // Split bot positions by priority
           const botHighPriority = botPositions.filter(p => 
             !p.exit_order_id || !p.sl_order_id || p.tp_sl_pending === true || p.tp_sl_pending === 1
@@ -1362,9 +1623,14 @@ export class PositionMonitor {
       // Wait for all bots to complete (parallel processing)
       await Promise.allSettled(botProcessingPromises);
 
-      // Log monitoring summary
+      // Log monitoring summary (per-cycle)
+      const cycleTime = Date.now() - cycleStart;
       if (openPositions.length > 0 || !this._lastLogTime || (Date.now() - this._lastLogTime) > 60000) {
-        logger.info(`[PositionMonitor] ✅ Monitored ${openPositions.length} open positions (interval: ${Date.now() - (this._lastLogTime || Date.now())}ms)`);
+        logger.info(
+          `[PositionMonitor] ✅ Cycle summary: positions=${openPositions.length}, bots=${positionsByBot.size}, ` +
+          `high_pri=${totalHighPriority}, low_pri=${totalLowPriority}, bots_processed=${totalBotsProcessed}, ` +
+          `positions_processed=${totalPositionsProcessed}, duration_ms=${cycleTime}`
+        );
         this._lastLogTime = Date.now();
       }
     } catch (error) {
@@ -1381,11 +1647,25 @@ export class PositionMonitor {
     // Get interval from config or use default 30 seconds
     // Changed from cron (1 minute) to setInterval (30 seconds) for faster TP order updates
     const intervalMs = Number(configService.getNumber('POSITION_MONITOR_INTERVAL_MS', SCAN_INTERVALS.POSITION_MONITOR));
+    const pnlIntervalMs = Number(configService.getNumber('PNL_ALERT_INTERVAL_MS', 10000)); // default 10s
     
     // Run immediately on start
     this.monitorAllPositions().catch(err => {
       logger.error('[PositionMonitor] Error in initial monitor run:', err);
     });
+
+    // Start PnL realtime alerts (Binance only)
+    if (pnlIntervalMs > 0) {
+      this._sendRealtimePnlAlerts().catch(err => {
+        logger.error('[PositionMonitor] PnL alert run failed:', err?.message || err);
+      });
+      this._pnlAlertTimer = setInterval(() => {
+        this._sendRealtimePnlAlerts().catch(err => {
+          logger.error('[PositionMonitor] PnL alert run failed:', err?.message || err);
+        });
+      }, pnlIntervalMs);
+      logger.info(`[PositionMonitor] PnL realtime alerts started with interval ${pnlIntervalMs}ms`);
+    }
     
     // Then run every intervalMs
     setInterval(async () => {

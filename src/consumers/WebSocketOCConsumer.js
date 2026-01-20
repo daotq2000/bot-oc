@@ -42,6 +42,25 @@ export class WebSocketOCConsumer {
     this.matchCount = 0;
     this.skippedCount = 0; // Track skipped ticks due to throttling
     
+    // ✅ MONITORING: Stats for OC scanning performance
+    this._stats = {
+      ticksReceived: 0,
+      ticksProcessed: 0,
+      ticksDropped: 0,
+      matchesFound: 0,
+      matchesProcessed: 0,
+      lastTickAt: 0,
+      lastProcessedAt: 0,
+      lastMatchAt: 0,
+      queueSize: 0,
+      maxQueueSize: 0,
+      avgProcessingTime: 0,
+      processingTimeSamples: []
+    };
+    this._statsLogInterval = Number(configService.getNumber('OC_SCAN_STATS_LOG_INTERVAL_MS', 60000)); // 1 minute
+    this._lastStatsLogAt = 0;
+    this._startStatsLogger();
+    
     // Cache for open positions to avoid excessive DB queries
     this.openPositionsCache = new Map(); // strategyId -> { hasOpenPosition: boolean, lastCheck: timestamp }
     this.openPositionsCacheTTL = 5000; // 5 seconds TTL
@@ -87,6 +106,48 @@ export class WebSocketOCConsumer {
     
     // Track which symbols have been warmed up (to avoid re-warming)
     this._warmedUpSymbols = new Set(); // exchange|symbol keys
+  }
+
+  /**
+   * ✅ MONITORING: Start periodic stats logger
+   */
+  _startStatsLogger() {
+    setInterval(() => {
+      const now = Date.now();
+      if (now - this._lastStatsLogAt < this._statsLogInterval) return;
+      this._lastStatsLogAt = now;
+
+      const stats = this._stats;
+      const timeSinceLastTick = stats.lastTickAt > 0 ? now - stats.lastTickAt : null;
+      const timeSinceLastProcessed = stats.lastProcessedAt > 0 ? now - stats.lastProcessedAt : null;
+      const timeSinceLastMatch = stats.lastMatchAt > 0 ? now - stats.lastMatchAt : null;
+      
+      // Calculate average processing time
+      let avgProcessingTime = 0;
+      if (stats.processingTimeSamples.length > 0) {
+        const sum = stats.processingTimeSamples.reduce((a, b) => a + b, 0);
+        avgProcessingTime = sum / stats.processingTimeSamples.length;
+        // Keep only last 100 samples
+        if (stats.processingTimeSamples.length > 100) {
+          stats.processingTimeSamples = stats.processingTimeSamples.slice(-100);
+        }
+      }
+
+      logger.info(
+        `[WebSocketOCConsumer] 📊 OC Scan Stats | ` +
+        `ticks: received=${stats.ticksReceived} processed=${stats.ticksProcessed} dropped=${stats.ticksDropped} ` +
+        `matches: found=${stats.matchesFound} processed=${stats.matchesProcessed} ` +
+        `queue: size=${this._processingQueue.length} max=${stats.maxQueueSize} ` +
+        `active=${this._activeDetections}/${this._maxConcurrent} ` +
+        `avgProcTime=${avgProcessingTime.toFixed(1)}ms ` +
+        `lastTick=${timeSinceLastTick !== null ? Math.round(timeSinceLastTick / 1000) + 's ago' : 'never'} ` +
+        `lastProcessed=${timeSinceLastProcessed !== null ? Math.round(timeSinceLastProcessed / 1000) + 's ago' : 'never'} ` +
+        `lastMatch=${timeSinceLastMatch !== null ? Math.round(timeSinceLastMatch / 1000) + 's ago' : 'never'}`
+      );
+
+      // Reset max queue size for next interval
+      stats.maxQueueSize = 0;
+    }, 10000); // Check every 10 seconds
   }
 
   /**
@@ -522,7 +583,12 @@ export class WebSocketOCConsumer {
 
   async handlePriceTick(exchange, symbol, price, timestamp = Date.now()) {
     try {
+      // ✅ MONITORING: Track tick received
+      this._stats.ticksReceived++;
+      this._stats.lastTickAt = Date.now();
+
       if (!this.isRunning || !price || !Number.isFinite(price) || price <= 0) {
+        this._stats.ticksDropped++;
         return;
       }
 
@@ -570,6 +636,7 @@ export class WebSocketOCConsumer {
     // Validate required fields
     if (!exchange || !symbol || !price || !timestamp) {
       logger.warn(`[WebSocketOCConsumer] Invalid tick data received: ${JSON.stringify(tickData)}`);
+      this._stats.ticksDropped++;
       return;
     }
     
@@ -587,6 +654,12 @@ export class WebSocketOCConsumer {
     
     // Add to queue
     this._processingQueue.push(safeTickData);
+    
+    // ✅ MONITORING: Track queue size
+    this._stats.queueSize = this._processingQueue.length;
+    if (this._processingQueue.length > this._stats.maxQueueSize) {
+      this._stats.maxQueueSize = this._processingQueue.length;
+    }
     
     // Start processing if not already running
     if (!this._processing) {
@@ -640,6 +713,9 @@ export class WebSocketOCConsumer {
         this._lastProcessedAt = Date.now();
         this.processedCount++;
         this._activeDetections++;
+        
+        // ✅ MONITORING: Track processing start
+        const processingStartTime = Date.now();
 
         // Process without awaiting to allow concurrent processing
         this._detectAndProcess(tick)
@@ -653,6 +729,12 @@ export class WebSocketOCConsumer {
           })
           .finally(() => {
             this._activeDetections--;
+            // ✅ MONITORING: Track processing time
+            const processingTime = Date.now() - processingStartTime;
+            this._stats.processingTimeSamples.push(processingTime);
+            if (this._stats.processingTimeSamples.length > 1000) {
+              this._stats.processingTimeSamples = this._stats.processingTimeSamples.slice(-100);
+            }
           });
       }
     } finally {
@@ -696,11 +778,18 @@ export class WebSocketOCConsumer {
       // Detect OC and match with strategies
       const matches = await realtimeOCDetector.detectOC(exchange, symbol, price, timestamp, 'WebSocketOCConsumer');
 
+      // ✅ MONITORING: Track processed tick
+      this._stats.ticksProcessed++;
+      this._stats.lastProcessedAt = Date.now();
+
       if (matches.length === 0) {
         return; // No matches
       }
 
       this.matchCount += matches.length;
+      // ✅ MONITORING: Track matches found
+      this._stats.matchesFound += matches.length;
+      this._stats.lastMatchAt = Date.now();
 
       if (shouldLogSampled('WS_MATCHES', 50)) {
         logger.info(`[WebSocketOCConsumer] 🎯 Found ${matches.length} match(es) for ${exchange} ${symbol}: ${matches.map(m => `strategy ${m.strategy.id} (OC=${m.oc.toFixed(2)}%)`).join(', ')}`);
@@ -738,9 +827,10 @@ export class WebSocketOCConsumer {
         )
       );
       
-      // Log results for debugging
+      // ✅ MONITORING: Track matches processed
       const succeeded = results.filter(r => r.status === 'fulfilled').length;
       const failed = results.filter(r => r.status === 'rejected').length;
+      this._stats.matchesProcessed += succeeded;
       if (failed > 0) {
         logger.warn(`[WebSocketOCConsumer] Processed ${matches.length} matches: ${succeeded} succeeded, ${failed} failed`);
         results.filter(r => r.status === 'rejected').forEach((r, i) => {
@@ -1302,6 +1392,11 @@ export class WebSocketOCConsumer {
    * @returns {Object} Consumer statistics
    */
   getStats() {
+    const now = Date.now();
+    const avgProcessingTime = this._stats.processingTimeSamples.length > 0
+      ? this._stats.processingTimeSamples.reduce((a, b) => a + b, 0) / this._stats.processingTimeSamples.length
+      : 0;
+
     return {
       isRunning: this.isRunning,
       processedCount: this.processedCount,
@@ -1312,7 +1407,20 @@ export class WebSocketOCConsumer {
       maxConcurrent: this._maxConcurrent,
       cooldownMs: this._cooldownMs,
       ocDetectorStats: realtimeOCDetector.getStats(),
-      strategyCacheSize: strategyCache.size()
+      strategyCacheSize: strategyCache.size(),
+      // ✅ MONITORING: Enhanced stats
+      stats: {
+        ticksReceived: this._stats.ticksReceived,
+        ticksProcessed: this._stats.ticksProcessed,
+        ticksDropped: this._stats.ticksDropped,
+        matchesFound: this._stats.matchesFound,
+        matchesProcessed: this._stats.matchesProcessed,
+        maxQueueSize: this._stats.maxQueueSize,
+        avgProcessingTime: avgProcessingTime,
+        timeSinceLastTick: this._stats.lastTickAt > 0 ? now - this._stats.lastTickAt : null,
+        timeSinceLastProcessed: this._stats.lastProcessedAt > 0 ? now - this._stats.lastProcessedAt : null,
+        timeSinceLastMatch: this._stats.lastMatchAt > 0 ? now - this._stats.lastMatchAt : null
+      }
     };
   }
 }

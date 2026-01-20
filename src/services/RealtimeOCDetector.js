@@ -379,7 +379,8 @@ export class RealtimeOCDetector {
         if (absThreshold <= 0) continue;
 
         // Debug bucket info to verify OC vs nến thực tế
-        logger.info(
+        // ✅ Changed to debug level to reduce log spam
+        logger.debug(
           `[RealtimeOCDetector] 🔍 OC bucket debug | ${exchange.toUpperCase()} ${sym} ${interval} ` +
           `bucketStart=${bucketStart} oc=${oc.toFixed(2)}% open=${open.toFixed(8)} current=${p.toFixed(8)} source=${source || 'unknown'}`
         );

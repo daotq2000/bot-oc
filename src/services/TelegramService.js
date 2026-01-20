@@ -71,6 +71,19 @@ export class TelegramService {
         logger.warn('TELEGRAM_BOT_TOKEN_SEND_ALERT_BINANCE not configured');
       }
 
+      // 4. Position Monitor PnL Alerts (Binance)
+      const pmBinanceToken = configService.getString('TELEGRAM_BOT_TOKEN_POSITION_MONITOR_BINANCE');
+      const pmBinanceChat = configService.getString('TELEGRAM_BOT_TOKEN_POSITION_MONITOR_BINANCE_CHANEL');
+      if (pmBinanceToken && pmBinanceChat) {
+        this.clients.set('position_monitor_binance', {
+          bot: new Telegraf(pmBinanceToken),
+          chatId: pmBinanceChat
+        });
+        logger.info('Telegram client initialized for Position Monitor Binance alerts');
+      } else {
+        logger.warn('Position Monitor Binance Telegram token/chat not configured');
+      }
+
       if (this.clients.size === 0) {
         logger.error('No Telegram clients could be initialized. Alerts will not be sent.');
         return false;
