@@ -292,4 +292,29 @@ export class Position {
     );
     return rows[0]?.count || 0;
   }
+
+  /**
+   * Get consecutive losses for a bot from latest closed positions.
+   * @param {number} botId
+   * @param {number} limit - how many latest closed positions to inspect
+   * @returns {Promise<number>} consecutive losing trades count
+   */
+  static async getConsecutiveLosses(botId, limit = 20) {
+    const lim = Math.max(1, Number(limit) || 20);
+    const [rows] = await pool.execute(
+      `SELECT COALESCE(p.pnl, 0) AS pnl
+       FROM positions p
+       WHERE p.bot_id = ? AND p.status = 'closed'
+       ORDER BY p.closed_at DESC
+       LIMIT ${lim}`,
+      [botId]
+    );
+    let streak = 0;
+    for (const r of rows || []) {
+      const pnl = Number(r.pnl || 0);
+      if (pnl < 0) streak += 1;
+      else break;
+    }
+    return streak;
+  }
 }

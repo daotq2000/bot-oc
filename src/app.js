@@ -13,6 +13,8 @@ import { AppConfig } from './models/AppConfig.js';
 import routes from './routes/index.js';
 import logger from './utils/logger.js';
 import { webSocketManager } from './services/WebSocketManager.js';
+import { watchdogService } from './services/WatchdogService.js';
+import { candleDbFlusher } from './services/CandleDbFlusher.js';
 
 // Load environment variables
 dotenv.config();
@@ -43,6 +45,7 @@ app.get('/health/detailed', async (req, res) => {
     const { webSocketOCConsumer } = await import('./consumers/WebSocketOCConsumer.js');
     const wsStatus = webSocketManager.getStatus();
     const ocStats = webSocketOCConsumer.getStats();
+    const candleFlushStats = candleDbFlusher.getStats();
     
     const health = {
       status: 'ok',
@@ -78,7 +81,8 @@ app.get('/health/detailed', async (req, res) => {
           tickQueue: wsStatus.tickQueue,
           reconnectQueue: wsStatus.reconnectQueue,
           messageStats: wsStatus.messageStats
-        }
+        },
+        candleDbFlusher: candleFlushStats
       }
     };
     
@@ -251,6 +255,11 @@ async function start() {
       // Symbols refresh configs
       await AppConfig.set('ENABLE_SYMBOLS_REFRESH', 'true', 'Enable periodic symbols/filters refresh for exchanges');
       await AppConfig.set('SYMBOLS_REFRESH_CRON', '*/15 * * * *', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('ADV_TPSL_MTF_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('ADV_TPSL_AUTO_OPTIMIZE_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('ADV_TPSL_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('ADV_TPSL_SR_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('ADV_TPSL_MTF_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);
     }
@@ -310,6 +319,15 @@ async function start() {
     // Initialize Binance WebSocket connection for price data
     logger.info('Initializing Binance WebSocket manager...');
     webSocketManager.connect();
+
+    // Start auto DB persistence for closed candles (Aggregator -> DB) after WS init
+    setTimeout(() => {
+      try {
+        candleDbFlusher.start();
+      } catch (e) {
+        logger.warn(`[App] Failed to start CandleDbFlusher (non-critical): ${e?.message || e}`);
+      }
+    }, 3000);
 
     // Initialize MEXC WebSocket connection for price data
     logger.info('Initializing MEXC WebSocket manager...');
@@ -446,6 +464,13 @@ async function start() {
       logger.info(`Server started on port ${PORT}`);
       logger.info(`API available at http://localhost:${PORT}/api`);
       logger.info('Bot trading system is running...');
+      // Start watchdog after server is up
+      watchdogService.start({
+        sampleIntervalMs: Number(process.env.WATCHDOG_SAMPLE_MS || 10000),
+        thresholdMs: Number(process.env.WATCHDOG_DELAY_THRESHOLD_MS || 400),
+        consecutiveTriggers: Number(process.env.WATCHDOG_CONSECUTIVE || 3),
+        degradeDurationMs: Number(process.env.WATCHDOG_DEGRADE_MS || 10 * 60 * 1000)
+      });
     }).on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
         logger.error(`❌ Port ${PORT} is already in use. Please stop the existing process or use a different port.`);
@@ -461,6 +486,13 @@ async function start() {
     process.on('SIGTERM', async () => {
       logger.info('SIGTERM received, shutting down gracefully...');
       
+      // Stop CandleDbFlusher
+      try {
+        candleDbFlusher.stop();
+      } catch (e) {
+        logger.warn('Error stopping CandleDbFlusher:', e?.message || e);
+      }
+
       // Stop Price Alert Worker
       if (priceAlertWorker) {
         try {
@@ -528,6 +560,13 @@ async function start() {
     process.on('SIGINT', async () => {
       logger.info('SIGINT received, shutting down gracefully...');
       
+      // Stop CandleDbFlusher
+      try {
+        candleDbFlusher.stop();
+      } catch (e) {
+        logger.warn('Error stopping CandleDbFlusher:', e?.message || e);
+      }
+
       // Stop Price Alert Worker
       if (priceAlertWorker) {
         try {

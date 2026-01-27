@@ -622,10 +622,10 @@ export class PriceAlertScanner {
         }
         
         state.openPrice = newOpen;
-        logger.debug(
-          `[PriceAlertScanner] New bucket ${bucket} for ${exchange} ${symbol} ${interval}: ` +
+          logger.debug(
+            `[PriceAlertScanner] New bucket ${bucket} for ${exchange} ${symbol} ${interval}: ` +
           `open=${newOpen.toFixed(8)} (source=${newOpenSource || 'unknown'})`
-        );
+          );
         state.bucket = bucket;
         state.alerted = false;
       }
@@ -660,14 +660,13 @@ export class PriceAlertScanner {
       const nowMs = now;
       const minAlertInterval = 60000; // 1 minute between alerts
 
-      // ✅ Debug: Log threshold check with detailed info (use info level for visibility)
-      logger.info(
-        `[PriceAlertScanner] 🔍 Threshold check | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
-        `OC=${ocAbs.toFixed(2)}% threshold=${threshold}% config_id=${configId} chat_id=${telegramChatId || 'N/A'} ` +
-        `(OC ${ocAbs >= threshold ? '>= threshold ✅' : '< threshold ❌'})`
-      );
-      
+      // ✅ Debug: Log threshold check ONLY when OC >= threshold (reduce log spam)
       if (ocAbs >= threshold) {
+        logger.info(
+          `[PriceAlertScanner] 🔍 Threshold check | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+          `OC=${ocAbs.toFixed(2)}% threshold=${threshold}% config_id=${configId} chat_id=${telegramChatId || 'N/A'} ` +
+          `(OC >= threshold ✅)`
+        );
         const timeSinceLastAlert = nowMs - state.lastAlertTime;
         if (!state.alerted || timeSinceLastAlert >= minAlertInterval) {
           logger.info(

@@ -417,9 +417,9 @@ export class PositionSync {
                     `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) was closed via ${tpOrderFilled ? 'TP' : 'SL'} order, not sync issue`
                   );
                 } else {
-                  logger.warn(
+                logger.warn(
                     `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange (no TP/SL filled), closing via PositionService`
-                  );
+                );
                 }
                 
                 // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent
@@ -513,9 +513,9 @@ export class PositionSync {
                   `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) was closed via ${tpOrderFilled ? 'TP' : 'SL'} order, not sync issue`
                 );
               } else {
-                logger.warn(
+              logger.warn(
                   `[PositionSync] Position ${dbPos.id} (${dbPos.symbol} ${dbPos.side}) exists in DB but not on exchange (no TP/SL filled), closing via PositionService`
-                );
+              );
               }
               
               // CRITICAL FIX: Use PositionService.closePosition() instead of Position.update() to ensure Telegram alert is sent

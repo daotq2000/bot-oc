@@ -8,6 +8,20 @@ class ConfigService {
     this.lastLoadedAt = 0;
   }
 
+  /**
+   * For some runtime toggles we want ENV to override DB (for quick tests).
+   * Example: ADV_TPSL_* toggles.
+   */
+  _shouldPreferEnv(key) {
+    const k = String(key || '').toUpperCase();
+    return (
+      k.startsWith('ADV_TPSL_') ||
+      k.startsWith('PNL_ALERT_') ||
+      k.startsWith('ENTRY_GATE_TRACE_') ||
+      k.startsWith('WS_OC_GATE_')
+    );
+  }
+
   async loadAll() {
     try {
       const rows = await AppConfig.findAll();
@@ -32,11 +46,15 @@ class ConfigService {
   }
 
   getString(key, defVal = null) {
+    const envKey = String(key).toUpperCase();
+    const envVal = process.env[envKey];
+    if (this._shouldPreferEnv(key) && envVal !== undefined && envVal !== '') {
+      return String(envVal);
+    }
+
     const v = this.getRaw(key);
     if (v === null || v === undefined || v === '') {
       // Fallback to environment variable if not found in database
-      const envKey = key.toUpperCase();
-      const envVal = process.env[envKey];
       if (envVal !== undefined && envVal !== '') {
         return String(envVal);
       }
@@ -46,16 +64,40 @@ class ConfigService {
   }
 
   getNumber(key, defVal = 0) {
-    const v = this.getRaw(key);
-    if (v === null || v === undefined || v === '') return defVal;
-    const n = Number(v);
+    const envKey = String(key).toUpperCase();
+    const envVal = process.env[envKey];
+    if (this._shouldPreferEnv(key) && envVal !== undefined && envVal !== '') {
+      const n = Number(envVal);
+      return Number.isFinite(n) ? n : defVal;
+    }
+
+    const raw = this.getRaw(key);
+    let source = raw;
+    if (raw === null || raw === undefined || raw === '') {
+      if (envVal === undefined || envVal === '') return defVal;
+      source = envVal;
+    }
+    const n = Number(source);
     return Number.isFinite(n) ? n : defVal;
   }
 
   getBoolean(key, defVal = false) {
-    const v = this.getRaw(key);
-    if (v === null || v === undefined || v === '') return defVal;
-    const s = String(v).toLowerCase().trim();
+    const envKey = String(key).toUpperCase();
+    const envVal = process.env[envKey];
+    if (this._shouldPreferEnv(key) && envVal !== undefined && envVal !== '') {
+      const s = String(envVal).toLowerCase().trim();
+      if (['1','true','yes','y','on'].includes(s)) return true;
+      if (['0','false','no','n','off'].includes(s)) return false;
+      return defVal;
+    }
+
+    const raw = this.getRaw(key);
+    let source = raw;
+    if (raw === null || raw === undefined || raw === '') {
+      if (envVal === undefined || envVal === '') return defVal;
+      source = envVal;
+    }
+    const s = String(source).toLowerCase().trim();
     if (['1','true','yes','y','on'].includes(s)) return true;
     if (['0','false','no','n','off'].includes(s)) return false;
     return defVal;

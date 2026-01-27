@@ -116,7 +116,7 @@ export class PositionService {
       // ✅ CRITICAL FIX: Check if PnL has reached take_profit threshold from strategy FIRST
       // This is more accurate than price-based check because it uses actual PnL
       // take_profit in strategy can be either:
-      // 1. Percentage (e.g., 50 = 5%) - calculate expected PnL from amount
+      // 1. Percentage (e.g., 50 = 5%) - calculate expected PnL from entry price and amount
       // 2. USDT amount (e.g., 85) - compare directly with PnL
       try {
         const { Strategy } = await import('../models/Strategy.js');
@@ -138,8 +138,36 @@ export class PositionService {
             } else {
               // take_profit is percentage (e.g., 50 = 5%)
               const tpPercent = takeProfitValue / 10; // 50 -> 5%
+              // CRITICAL FIX: Calculate expected PnL correctly for percentage-based TP
+              // Use calculateTakeProfit to get TP price, then calculatePnL to get expected PnL
+              const entryPrice = Number(position.entry_price || 0);
+              if (entryPrice > 0 && position.amount > 0) {
+                // Calculate expected price at TP
+                const tpPrice = calculateTakeProfit(entryPrice, takeProfitValue, position.side);
+                // Calculate expected PnL using the same formula as calculatePnL
+                expectedPnL = calculatePnL(entryPrice, tpPrice, position.amount, position.side);
+                logger.debug(
+                  `[PositionService] TP PnL calculation | pos=${position.id} ` +
+                  `entry=${entryPrice.toFixed(8)} tpPrice=${tpPrice.toFixed(8)} ` +
+                  `amount=${position.amount} side=${position.side} expectedPnL=${expectedPnL.toFixed(2)}`
+                );
+              } else {
+                // Fallback: use simple percentage calculation (less accurate)
               expectedPnL = (position.amount * tpPercent) / 100;
+                logger.warn(
+                  `[PositionService] Using fallback PnL calculation | pos=${position.id} ` +
+                  `entryPrice=${entryPrice} amount=${position.amount} tpPercent=${tpPercent}% expectedPnL=${expectedPnL.toFixed(2)}`
+                );
+              }
             }
+            
+            // CRITICAL FIX: Log PnL check for debugging
+            logger.debug(
+              `[PositionService] TP PnL check | pos=${position.id} ` +
+              `pnl=${pnl.toFixed(2)} expectedPnL=${expectedPnL.toFixed(2)} ` +
+              `take_profit=${takeProfitValue} ${isUSDTAmount ? 'USDT' : '%'} ` +
+              `threshold_met=${pnl >= expectedPnL}`
+            );
             
             // Check if PnL has reached or exceeded expected take profit
             if (pnl >= expectedPnL) {
@@ -147,7 +175,7 @@ export class PositionService {
                 `[PositionService] ✅ Take Profit reached (PnL-based) | pos=${position.id} ` +
                 `symbol=${position.symbol} pnl=${pnl.toFixed(2)} USDT >= expected=${expectedPnL.toFixed(2)} USDT ` +
                 `(strategy.take_profit=${takeProfitValue} ${isUSDTAmount ? 'USDT' : '%'}) ` +
-                `→ Closing position immediately`
+                `→ Closing position immediately with MARKET order`
               );
               
               // Guard: ensure there is an actual exchange position to close
@@ -493,8 +521,29 @@ export class PositionService {
           const prevTP = Number(position.take_profit_price || 0);
           const entryPrice = Number(position.entry_price || 0);
           const marketPrice = Number(currentPrice);
-          const reduce = Number(position.reduce || 0);
-          const upReduce = Number(position.up_reduce || 0);
+          
+          // CRITICAL FIX: Ensure reduce/up_reduce are loaded from strategy
+          // Position model should have these from JOIN, but double-check
+          let reduce = Number(position.reduce || 0);
+          let upReduce = Number(position.up_reduce || 0);
+          
+          // If reduce/up_reduce are 0 or missing, try to load from strategy directly
+          if ((reduce === 0 && upReduce === 0) || (!position.reduce && !position.up_reduce)) {
+            try {
+              const { Strategy } = await import('../models/Strategy.js');
+              const strategy = await Strategy.findById(position.strategy_id);
+              if (strategy) {
+                reduce = Number(strategy.reduce || 0);
+                upReduce = Number(strategy.up_reduce || 0);
+                logger.debug(
+                  `[TP Trail] Loaded reduce/up_reduce from strategy | pos=${position.id} ` +
+                  `reduce=${reduce} upReduce=${upReduce} (was missing from position object)`
+                );
+              }
+            } catch (strategyError) {
+              logger.warn(`[TP Trail] Could not load strategy for reduce/up_reduce: ${strategyError?.message || strategyError}`);
+            }
+          }
           
           // CRITICAL FIX: Use minutesToProcess (1 minute) instead of actualMinutesElapsed (total minutes)
           // This ensures TP trails incrementally, not jumping based on total time elapsed
@@ -624,9 +673,20 @@ export class PositionService {
             
             const trailingPercent = position.side === 'long' ? upReduce : reduce;
             
-            // CRITICAL FIX: Only trail TP if there are minutes to process
+            // CRITICAL FIX: Log trailing configuration for debugging
+            if (trailingPercent <= 0) {
+              logger.warn(
+                `[TP Trail] ⚠️ Trailing disabled: trailingPercent=${trailingPercent}% | pos=${position.id} ` +
+                `side=${position.side} reduce=${reduce} upReduce=${upReduce} ` +
+                `→ TP will remain static at ${prevTP.toFixed(8)}`
+              );
+            }
+            
+            // CRITICAL FIX: Only trail TP if there are minutes to process AND trailingPercent > 0
             if (minutesForTrailing <= 0) {
               logger.debug(`[TP Trail] pos=${position.id} minutesToProcess=${minutesForTrailing}, skipping TP trail calculation`);
+            } else if (trailingPercent <= 0) {
+              logger.debug(`[TP Trail] pos=${position.id} trailingPercent=${trailingPercent}%, skipping TP trail (static mode)`);
             } else {
               // Calculate next TP: trails from initial TP towards entry
               // Trailing is TIME-BASED ONLY (not price-based) for predictable behavior

@@ -1032,11 +1032,94 @@ export class ExchangeService {
       }
       
       if (isReduceOnlyError) {
-        // Race condition: position already reduced/closed by TP/SL or other order
-        logger.warn(`ReduceOnly close skipped for bot ${this.bot.id} (${symbol}): ${msg}`);
-        return { skipped: true };
+        // CRITICAL FIX: -2022 error can occur when:
+        // 1. Position already closed/reduced by TP/SL
+        // 2. Position size is 0 (already fully closed)
+        // 3. Position doesn't exist
+        // We should verify position state before returning skipped
+        try {
+          if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+            const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+            const positions = await this.binanceDirectClient.getOpenPositions(normalizedSymbol);
+            const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+            
+            const pos = Array.isArray(positions) 
+              ? positions.find(p => p.symbol === normalizedSymbol && (p.positionSide ? p.positionSide === positionSide : true))
+              : null;
+            
+            const posAmt = pos ? Math.abs(parseFloat(pos.positionAmt || 0)) : 0;
+            if (!pos || posAmt === 0) {
+              logger.info(`[ExchangeService] Position already closed/reduced for ${normalizedSymbol} (${side}), skipping close. Error: ${msg}`);
+              return { skipped: true, reason: 'position_already_closed' };
+            } else {
+              // Position still exists but reduceOnly failed - this is unexpected
+              logger.warn(`[ExchangeService] ⚠️ ReduceOnly error but position still exists for ${normalizedSymbol} (${side}), amount=${posAmt}. Error: ${msg}`);
+              // Don't retry without reduceOnly here as it might cause issues - let PositionMonitor handle it
+              return { skipped: true, reason: 'reduceonly_error_position_exists' };
+            }
+          }
+        } catch (verifyError) {
+          logger.warn(`[ExchangeService] Could not verify position state after -2022 error: ${verifyError?.message || verifyError}`);
+        }
+        
+        // Fallback: assume position is already closed
+        logger.warn(`[ExchangeService] ReduceOnly close skipped for bot ${this.bot.id} (${symbol}): ${msg}`);
+        return { skipped: true, reason: 'reduceonly_error' };
       }
       logger.error(`Failed to close position for bot ${this.bot.id}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Close PART of a position (reduceOnly).
+   * Used by Partial TP. For Binance it uses direct client with stepSize formatting.
+   *
+   * @param {string} symbol
+   * @param {'long'|'short'} side
+   * @param {number} qty - quantity (contracts) to close (NOT USDT)
+   */
+  async closePositionQty(symbol, side, qty) {
+    try {
+      if (!Number.isFinite(Number(qty)) || Number(qty) <= 0) {
+        throw new Error(`Invalid qty: ${qty}`);
+      }
+
+      if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
+        const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
+        const positionSide = side === 'long' ? 'LONG' : 'SHORT';
+
+        const stepSize = await this.binanceDirectClient.getStepSize(normalizedSymbol);
+        const qtyStr = this.binanceDirectClient.formatQuantity(qty, stepSize);
+        const qtyNum = parseFloat(qtyStr);
+        if (!Number.isFinite(qtyNum) || qtyNum <= 0) {
+          throw new Error(`Computed close qty <= 0 after stepSize. qty=${qty} stepSize=${stepSize}`);
+        }
+
+        const closeSide = side === 'long' ? 'SELL' : 'BUY';
+        const order = await this.binanceDirectClient.placeMarketOrder(
+          normalizedSymbol,
+          closeSide,
+          qtyNum,
+          positionSide,
+          true // reduceOnly
+        );
+        let avgFillPrice = null;
+        try {
+          avgFillPrice = await this.binanceDirectClient.getOrderAverageFillPrice(normalizedSymbol, order.orderId);
+        } catch (_) {}
+
+        return { ...order, avgFillPrice };
+      }
+
+      // Other exchanges: best effort using createMarketOrder with reduceOnly if supported
+      const marketSymbol = this.formatSymbolForExchange(symbol, 'swap');
+      const orderSide = side === 'long' ? 'sell' : 'buy';
+      const params = { reduceOnly: true };
+      const order = await this.exchange.createMarketOrder(marketSymbol, orderSide, qty, undefined, params);
+      return order;
+    } catch (error) {
+      logger.error(`[ExchangeService] Failed to closePositionQty for bot ${this.bot.id} ${symbol}:`, error?.message || error);
       throw error;
     }
   }

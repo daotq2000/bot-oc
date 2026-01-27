@@ -41,23 +41,32 @@ export class RealtimeOCDetector {
     
     // ✅ NEW: Periodic refresh of open price cache using IndicatorWarmup
     // This helps maintain accurate open prices even when WebSocket data is unavailable
-    const refreshInterval = Number(configService.getNumber('OC_OPEN_PRICE_REFRESH_INTERVAL_MS', 5 * 60 * 1000)); // Default 5 minutes
+    // CRITICAL FIX: Increased default interval from 5 minutes to 15 minutes to reduce load
+    const refreshInterval = Number(configService.getNumber('OC_OPEN_PRICE_REFRESH_INTERVAL_MS', 15 * 60 * 1000)); // Default 15 minutes (increased from 5 minutes)
     if (refreshInterval > 0) {
       setInterval(() => {
         this.refreshOpenPriceCache().catch(error => {
           logger.debug(`[RealtimeOCDetector] Failed to refresh open price cache: ${error?.message || error}`);
         });
       }, refreshInterval);
-      logger.info(`[RealtimeOCDetector] ✅ Open price cache refresh enabled (interval: ${refreshInterval}ms)`);
+      logger.info(`[RealtimeOCDetector] ✅ Open price cache refresh enabled (interval: ${refreshInterval}ms = ${refreshInterval / 60000} minutes)`);
     }
   }
 
   /**
    * ✅ NEW: Refresh open price cache for active symbols using IndicatorWarmup
    * This fetches latest candles and caches open prices without warmup indicators
+   * CRITICAL FIX: Throttled to prevent event loop blocking
    */
   async refreshOpenPriceCache() {
     try {
+      // CRITICAL FIX: Skip refresh if system is degraded (event loop delay high)
+      const { watchdogService } = await import('./WatchdogService.js');
+      if (watchdogService?.isDegraded?.()) {
+        logger.warn('[RealtimeOCDetector] ⚠️ System degraded, skipping open price cache refresh to protect event loop');
+        return;
+      }
+
       const { IndicatorWarmup } = await import('../indicators/IndicatorWarmup.js');
       const { strategyCache } = await import('./StrategyCache.js');
       const warmupService = new IndicatorWarmup();
@@ -86,7 +95,7 @@ export class RealtimeOCDetector {
       }
 
       // Convert to array format for fetchAndCacheOpenPrices
-      const symbolsToRefresh = Array.from(symbolIntervals.entries()).map(([key, intervals]) => {
+      const allSymbolsToRefresh = Array.from(symbolIntervals.entries()).map(([key, intervals]) => {
         const [exchange, symbol] = key.split('|');
         return {
           exchange: exchange || 'binance',
@@ -95,13 +104,78 @@ export class RealtimeOCDetector {
         };
       });
 
-      const concurrency = Number(configService.getNumber('OC_OPEN_PRICE_REFRESH_CONCURRENCY', 5));
-      const results = await warmupService.fetchAndCacheOpenPrices(symbolsToRefresh, concurrency);
+      // CRITICAL FIX: Limit symbols per refresh to prevent blocking (staggering approach)
+      const MAX_SYMBOLS_PER_REFRESH = Number(configService.getNumber('OC_OPEN_PRICE_MAX_SYMBOLS_PER_REFRESH', 20)); // Default: 20 symbols per refresh
+      const REFRESH_BATCH_SIZE = Number(configService.getNumber('OC_OPEN_PRICE_REFRESH_BATCH_SIZE', 5)); // Process 5 symbols in parallel
+      const REFRESH_BATCH_DELAY_MS = Number(configService.getNumber('OC_OPEN_PRICE_REFRESH_BATCH_DELAY_MS', 200)); // 200ms delay between batches
+
+      // Shuffle symbols to avoid always updating the same ones first (prevent stale local cache)
+      const shuffled = allSymbolsToRefresh.sort(() => Math.random() - 0.5);
+      
+      // Only refresh a subset of symbols each time (staggering)
+      const symbolsToRefresh = shuffled.slice(0, MAX_SYMBOLS_PER_REFRESH);
+      
+      if (allSymbolsToRefresh.length > MAX_SYMBOLS_PER_REFRESH) {
+        logger.debug(
+          `[RealtimeOCDetector] Throttling refresh: processing ${symbolsToRefresh.length}/${allSymbolsToRefresh.length} symbols ` +
+          `(remaining will be refreshed in next cycle)`
+        );
+      }
+
+      // CRITICAL FIX: Process in batches with yielding to prevent event loop blocking
+      let succeeded = 0;
+      let failed = 0;
+
+      for (let i = 0; i < symbolsToRefresh.length; i += REFRESH_BATCH_SIZE) {
+        // Check degrade mode again (may have changed during processing)
+        if (watchdogService?.isDegraded?.()) {
+          logger.warn(`[RealtimeOCDetector] ⚠️ System degraded during refresh, stopping at ${i}/${symbolsToRefresh.length} symbols`);
+          break;
+        }
+
+        const batch = symbolsToRefresh.slice(i, i + REFRESH_BATCH_SIZE);
+        
+        // Process batch in parallel
+        const batchResults = await Promise.allSettled(
+          batch.map(async (symbolData) => {
+            try {
+              await warmupService.fetchAndCacheOpenPrices([symbolData], 1);
+              return { success: true };
+            } catch (error) {
+              logger.debug(`[RealtimeOCDetector] Failed to refresh ${symbolData.symbol}: ${error?.message || error}`);
+              return { success: false };
+            }
+          })
+        );
+
+        // Count results
+        batchResults.forEach(result => {
+          if (result.status === 'fulfilled' && result.value?.success) {
+            succeeded++;
+          } else {
+            failed++;
+          }
+        });
+
+        // CRITICAL: Yield to event loop after each batch
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Optional: Additional delay if system is under stress
+        if (i + REFRESH_BATCH_SIZE < symbolsToRefresh.length) {
+          if (watchdogService?.isDegraded?.()) {
+            // System degraded, add extra delay
+            await new Promise(resolve => setTimeout(resolve, REFRESH_BATCH_DELAY_MS * 2));
+          } else {
+            // Normal delay between batches
+            await new Promise(resolve => setTimeout(resolve, REFRESH_BATCH_DELAY_MS));
+          }
+        }
+      }
 
       logger.debug(
         `[RealtimeOCDetector] ✅ Open price cache refresh complete | ` +
-        `Succeeded: ${results.succeeded} Failed: ${results.failed} | ` +
-        `Symbols: ${symbolsToRefresh.length}`
+        `Succeeded: ${succeeded} Failed: ${failed} | ` +
+        `Processed: ${symbolsToRefresh.length}/${allSymbolsToRefresh.length} symbols`
       );
     } catch (error) {
       logger.debug(`[RealtimeOCDetector] Error refreshing open price cache: ${error?.message || error}`);
@@ -230,8 +304,9 @@ export class RealtimeOCDetector {
         const prevBucketStart = bucketStart - intervalMs;
         const prevClose = webSocketManager.getKlineClose(sym, interval, prevBucketStart);
         if (Number.isFinite(prevClose) && prevClose > 0) {
-          logger.warn(
-            `[RealtimeOCDetector] ⚠️ Using prev_close as open (less accurate) | ${sym} ${interval} ` +
+          // CRITICAL FIX: Reduce log level from warn to debug to prevent log spam
+          logger.debug(
+            `[RealtimeOCDetector] Using prev_close as open (less accurate) | ${sym} ${interval} ` +
             `bucketStart=${bucketStart} prevClose=${prevClose.toFixed(8)}`
           );
           this.openPriceCache.set(key, { open: prevClose, bucketStart, lastUpdate: timestamp, source: 'binance_ws_prev_close' });

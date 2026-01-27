@@ -1082,11 +1082,11 @@ class WebSocketManager {
             
             conn._lastLatencySummaryAt = nowMs;
             if (avgLatency !== null) {
-              logger.info(
-                `[Binance-WS] Latency window stats | streams=${conn.streams.size} n=${n} ` +
-                  `avg=${avgLatency.toFixed(0)}ms med=${median.toFixed(0)}ms p95=${p95.toFixed(0)}ms max=${maxLatency.toFixed(0)}ms ` +
-                  `threshold=${this.highLatencyThreshold}ms extreme=${this.extremeLatencyThreshold}ms offsetMs=${offsetMs.toFixed(0)}`
-              );
+              // logger.info(
+              //   `[Binance-WS] Latency window stats | streams=${conn.streams.size} n=${n} ` +
+              //     `avg=${avgLatency.toFixed(0)}ms med=${median.toFixed(0)}ms p95=${p95.toFixed(0)}ms max=${maxLatency.toFixed(0)}ms ` +
+              //     `threshold=${this.highLatencyThreshold}ms extreme=${this.extremeLatencyThreshold}ms offsetMs=${offsetMs.toFixed(0)}`
+              // );
             }
           }
 
@@ -1097,7 +1097,7 @@ class WebSocketManager {
 
             // Extreme condition (p95) - chỉ log
             if (p95 != null && p95 > this.extremeLatencyThreshold) {
-              logger.error(
+              logger.debug(
                 `[Binance-WS] 🚨 EXTREME latency (p95) detected: p95=${p95.toFixed(0)}ms (threshold: ${this.extremeLatencyThreshold}ms) ` +
                   `| stream: ${streamName}. (no reconnect - latency is metric only)`
               );
@@ -1105,7 +1105,7 @@ class WebSocketManager {
 
             // Persistent condition (median) - chỉ log
             if (median != null && median > this.highLatencyThreshold) {
-              logger.warn(
+              logger.debug(
                 `[Binance-WS] ⚠️ Persistent high latency (median) detected: med=${median.toFixed(0)}ms ` +
                   `(threshold: ${this.highLatencyThreshold}ms, p95=${p95?.toFixed(0) ?? 'n/a'}ms). (no reconnect - latency is metric only)`
               );
@@ -1115,7 +1115,7 @@ class WebSocketManager {
           // ✅ FIX: Không skip message ngay cả khi latency cao
           // Chỉ log warning, nhưng vẫn process message để không mất dữ liệu
           if (latency > 3000) {
-            logger.warn(
+            logger.debug(
               `[Binance-WS] ⚠️ Stale message detected: latency=${latency}ms > 3000ms | stream: ${streamName}. ` +
               `Still processing to avoid data loss.`
             );

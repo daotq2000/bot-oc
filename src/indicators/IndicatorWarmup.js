@@ -1,6 +1,7 @@
 import logger from '../utils/logger.js';
 import { TrendIndicatorsState } from './TrendIndicatorsState.js';
 import { configService } from '../services/ConfigService.js';
+import { candleService } from '../services/CandleService.js';
 
 /**
  * Pre-warm indicators using historical kline data from REST API.
@@ -70,115 +71,17 @@ export class IndicatorWarmup {
 
   async fetchBinanceKlines(symbol, interval = '1m', limit = 100) {
     try {
+      // Still keep local throttle counter to avoid overwhelming CandleService/REST
       await this._checkAndThrottleRequests();
 
       const sym = String(symbol || '').toUpperCase();
       const intv = String(interval || '1m').toLowerCase();
       if (!sym) return [];
 
-      // CRITICAL FIX: Use BinanceDirectClient with proper rate limiting instead of raw fetch
-      // This ensures centralized rate limit handling and prevents IP ban
-      const useLegacyFetch = configService.getBoolean('INDICATOR_WARMUP_USE_LEGACY_FETCH', false);
-      
-      if (!useLegacyFetch) {
-        // Use BinanceDirectClient which has circuit breaker, rate limit blocking, and scheduler
-        const { BinanceDirectClient } = await import('../services/BinanceDirectClient.js');
-        const client = new BinanceDirectClient(null, null, false, null);
-        
-        try {
-          const params = { symbol: sym, interval: intv, limit };
-          const data = await client.makeMarketDataRequest('/fapi/v1/klines', 'GET', params);
-          
-          // Success - reset backoff delay
-          this._rateLimitRetryDelay = Number(configService.getNumber('INDICATORS_WARMUP_429_RETRY_DELAY_MS', 10000));
-          
-          return data.map(k => ({
-            startTime: Number(k[0]),
-            open: parseFloat(k[1]),
-            high: parseFloat(k[2]),
-            low: parseFloat(k[3]),
-            close: parseFloat(k[4]),
-            isClosed: true
-          })).filter(c =>
-            Number.isFinite(c.startTime) &&
-            Number.isFinite(c.open) &&
-            Number.isFinite(c.high) &&
-            Number.isFinite(c.low) &&
-            Number.isFinite(c.close) &&
-            c.open > 0 && c.close > 0
-          );
-        } catch (error) {
-          // Handle rate limit errors
-          if (error?.status === 429 || error?.code === 'RATE_LIMIT_BLOCKED' || /rate limit/i.test(error?.message || '')) {
-            logger.error(
-              `[IndicatorWarmup] ⚠️ Rate limit hit for ${symbol} ${interval}. ` +
-              `Waiting ${this._rateLimitRetryDelay / 1000}s before retry...`
-            );
-            await new Promise(resolve => setTimeout(resolve, this._rateLimitRetryDelay));
-            this._rateLimitRetryDelay = Math.min(
-              this._rateLimitRetryDelay * this._rateLimitBackoffMultiplier,
-              60000
-            );
-            this._requestCount = Math.max(0, this._requestCount - 1);
-            return this.fetchBinanceKlines(symbol, interval, limit);
-          }
-          throw error;
-        }
-      }
-
-      // Legacy direct fetch (not recommended, kept for compatibility)
-      const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=${intv}&limit=${limit}`;
-
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: { 'Content-Type': 'application/json' }
-      });
-
-      if (!response.ok) {
-        if (response.status === 429) {
-          logger.error(
-            `[IndicatorWarmup] ⚠️ Rate limit hit for ${symbol} ${interval}. ` +
-            `Waiting ${this._rateLimitRetryDelay / 1000}s before retry...`
-          );
-          await new Promise(resolve => setTimeout(resolve, this._rateLimitRetryDelay));
-          this._rateLimitRetryDelay = Math.min(
-            this._rateLimitRetryDelay * this._rateLimitBackoffMultiplier,
-            60000
-          );
-          this._requestCount = Math.max(0, this._requestCount - 1);
-          return this.fetchBinanceKlines(symbol, interval, limit);
-        }
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      this._rateLimitRetryDelay = Number(configService.getNumber('INDICATORS_WARMUP_429_RETRY_DELAY_MS', 10000));
-
-      const responseText = await response.text();
-      let data;
-      try {
-        data = JSON.parse(responseText);
-      } catch (e) {
-        logger.error(`[IndicatorWarmup] Failed to parse JSON from Binance API for ${symbol}. Response: ${responseText}`);
-        throw new Error(`Failed to parse JSON from Binance API: ${e.message}`);
-      }
-
-      return data.map(k => ({
-        startTime: Number(k[0]),
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        isClosed: true
-      })).filter(c =>
-        Number.isFinite(c.startTime) &&
-        Number.isFinite(c.open) &&
-        Number.isFinite(c.high) &&
-        Number.isFinite(c.low) &&
-        Number.isFinite(c.close) &&
-        c.open > 0 && c.close > 0
-      );
+      const candles = await candleService.getHistoricalCandles('binance', sym, intv, limit);
+      return candles;
     } catch (error) {
-      logger.warn(`[IndicatorWarmup] Failed to fetch ${interval} klines for ${symbol}: ${error?.message || error}`);
+      logger.warn(`[IndicatorWarmup] Failed to fetch ${interval} klines for ${symbol} via CandleService: ${error?.message || error}`);
       return [];
     }
   }

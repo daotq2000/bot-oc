@@ -943,6 +943,19 @@ export class WebSocketOCConsumer {
       
       // Store indicator state for logging when order is triggered
       let filterIndicatorState = null;
+      // Store full filter trace for INFO logs and order execution logs
+      const filterTrace = {
+        exchange: exchangeLower,
+        direction,
+        price: currentPrice,
+        trend: null,
+        volatility: null,
+        pullback: null
+      };
+
+      const filterInfoEnabled = configService.getBoolean('FILTER_DECISION_LOG_ENABLED', true);
+      const filterRejectSampleN = Number(configService.getNumber('FILTER_DECISION_REJECT_SAMPLE_N', 100));
+      const filterPassSampleN = Number(configService.getNumber('FILTER_DECISION_PASS_SAMPLE_N', 50));
       
       // ✅ ENHANCED: Apply multi-timeframe filter to ALL strategies
       // For Binance: Full filter (EMA + ADX + RSI) on 15m + pullback + volatility
@@ -967,10 +980,21 @@ export class WebSocketOCConsumer {
         
         // ✅ ENHANCED: Check trend confirmation with 15m state (trend/regime gate)
         const verdict = isTrendConfirmed(direction, currentPrice, ind1m.state, ind15m.state);
+        const snap15mPre = ind15m.state.snapshot();
+        filterTrace.trend = {
+          ok: verdict.ok,
+          reason: verdict.reason,
+          timeframe: '15m',
+          ema20: snap15mPre.ema20,
+          ema50: snap15mPre.ema50,
+          ema20Slope: snap15mPre.ema20Slope,
+          adx14: snap15mPre.adx14,
+          rsi14: snap15mPre.rsi14
+        };
         
         if (!verdict.ok) {
-          const snap15m = ind15m.state.snapshot();
-          if (shouldLogSampled('FILTER_REJECT', 100)) {
+          const snap15m = snap15mPre;
+          if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
             logger.info(
               `[WebSocketOCConsumer] ⏭️ Trend filters rejected entry (15m gate) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
               `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} reason=${verdict.reason} | ` +
@@ -983,10 +1007,19 @@ export class WebSocketOCConsumer {
         }
         
         // ✅ ENHANCED: Check volatility filter (ATR% on 15m)
-        const snap15m = ind15m.state.snapshot();
+        const snap15m = snap15mPre;
         const volCheck = checkVolatilityFilter(snap15m.atr14, currentPrice);
+        filterTrace.volatility = {
+          ok: volCheck.ok,
+          reason: volCheck.reason,
+          timeframe: '15m',
+          atr14: snap15m.atr14,
+          atrPercent: volCheck.atrPercent,
+          minPct: Number(configService.getNumber('VOL_ATR_MIN_PCT', 0.15)),
+          maxPct: Number(configService.getNumber('VOL_ATR_MAX_PCT', 2.0))
+        };
         if (!volCheck.ok) {
-          if (shouldLogSampled('FILTER_REJECT', 100)) {
+          if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
             logger.info(
               `[WebSocketOCConsumer] ⏭️ Volatility filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
               `reason=${volCheck.reason} ATR%=${volCheck.atrPercent?.toFixed(2) || 'N/A'}%`
@@ -1002,8 +1035,20 @@ export class WebSocketOCConsumer {
         if (candle5m) {
           const snap5m = ind5m.state.snapshot();
           const pullbackCheck = checkPullbackConfirmation(direction, currentPrice, candle5m, snap5m.ema20);
+          filterTrace.pullback = {
+            ok: pullbackCheck.ok,
+            reason: pullbackCheck.reason,
+            timeframe: '5m',
+            ema20: snap5m.ema20,
+            candle: {
+              high: candle5m.high,
+              low: candle5m.low,
+              close: candle5m.close,
+              isClosed: candle5m.isClosed
+            }
+          };
           if (!pullbackCheck.ok) {
-            if (shouldLogSampled('FILTER_REJECT', 100)) {
+            if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
               logger.info(
                 `[WebSocketOCConsumer] ⏭️ Pullback filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
                 `reason=${pullbackCheck.reason} EMA20_5m=${snap5m.ema20?.toFixed(4) || 'N/A'}`
@@ -1022,7 +1067,7 @@ export class WebSocketOCConsumer {
         const rsiCondition = direction === 'bullish'
           ? `RSI_15m(${snap15m.rsi14?.toFixed(2)}) >= 55`
           : `RSI_15m(${snap15m.rsi14?.toFixed(2)}) <= 45`;
-        if (shouldLogSampled('FILTER_PASS', 50)) {
+        if (filterInfoEnabled && shouldLogSampled('FILTER_PASS', filterPassSampleN)) {
           logger.info(
             `[WebSocketOCConsumer] ✅ All filters PASSED (15m gate) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
             `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} | ` +
@@ -1091,7 +1136,7 @@ export class WebSocketOCConsumer {
         const rsiCondition = direction === 'bullish'
           ? `RSI(${rsi14.toFixed(2)}) >= 55`
           : `RSI(${rsi14.toFixed(2)}) <= 45`;
-        logger.info(
+        if (filterInfoEnabled) logger.info(
           `[WebSocketOCConsumer] ✅ Trend filter PASSED (MEXC) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
           `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} | ` +
           `CONDITIONS: ${emaCondition} ✓ ${rsiCondition} ✓`
@@ -1235,10 +1280,26 @@ export class WebSocketOCConsumer {
           filterSummary = `EMA20=${filterIndicatorState.ema20?.toFixed(4)} EMA50=${filterIndicatorState.ema50?.toFixed(4)} EMA20Slope=${filterIndicatorState.ema20Slope?.toFixed(4)} RSI=${filterIndicatorState.rsi14?.toFixed(2)}`;
         }
       }
+      // Full trace for "why we executed order" (indicator values + thresholds)
+      const traceStr = (() => {
+        try {
+          const t = filterTrace.trend;
+          const v = filterTrace.volatility;
+          const p = filterTrace.pullback;
+          const parts = [];
+          if (t) parts.push(`trend(${t.timeframe}) ok=${t.ok} reason=${t.reason} ema20=${Number(t.ema20).toFixed(4)} ema50=${Number(t.ema50).toFixed(4)} slope=${Number(t.ema20Slope).toFixed(6)} adx=${Number(t.adx14).toFixed(2)} rsi=${Number(t.rsi14).toFixed(2)}`);
+          if (v) parts.push(`vol(${v.timeframe}) ok=${v.ok} reason=${v.reason} atr14=${Number(v.atr14).toFixed(8)} atr%=${Number(v.atrPercent).toFixed(3)} min=${Number(v.minPct).toFixed(3)} max=${Number(v.maxPct).toFixed(3)}`);
+          if (p) parts.push(`pullback(${p.timeframe}) ok=${p.ok} reason=${p.reason} ema20=${Number(p.ema20).toFixed(4)} candleClose=${Number(p.candle?.close).toFixed(4)} hi=${Number(p.candle?.high).toFixed(4)} lo=${Number(p.candle?.low).toFixed(4)}`);
+          return parts.join(' | ');
+        } catch (_) {
+          return '';
+        }
+      })();
+
       logger.info(
         `[WebSocketOCConsumer] 🚀 Triggering order for strategy ${strategy.id} (${strategy.symbol}): ` +
         `${signal.side.toUpperCase()} @ ${currentPrice.toFixed(4)}, OC=${oc.toFixed(2)}% | ` +
-        `FILTER PASSED: ${filterSummary || 'N/A'}`
+        `FILTER PASSED: ${filterSummary || 'N/A'} | TRACE: ${traceStr || 'N/A'}`
       );
 
       // Trigger order immediately

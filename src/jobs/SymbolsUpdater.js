@@ -102,6 +102,24 @@ export class SymbolsUpdater {
     }
   }
 
+  /**
+   * Helper to wrap promise with timeout
+   * @param {Promise} promise - Promise to wrap
+   * @param {number} ms - Timeout in milliseconds
+   * @param {string} label - Label for logging
+   * @returns {Promise} Promise that rejects on timeout
+   */
+  _withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`${label} timeout after ${ms}ms`));
+        }, ms);
+      })
+    ]);
+  }
+
   async runOnce() {
     if (this.isRunning) {
       logger.debug('[SymbolsUpdater] Already running, skip.');
@@ -109,16 +127,17 @@ export class SymbolsUpdater {
     }
     this.isRunning = true;
 
-    // CRITICAL FIX: Watchdog timeout to prevent isRunning lock forever
+    // CRITICAL FIX: Reduce watchdog timeout from 10 minutes to 5 minutes
     const { enabled, watchdogTimeoutMs } = this.getConfig();
+    const reducedWatchdogTimeout = Math.min(watchdogTimeoutMs, 5 * 60 * 1000); // Max 5 minutes
     this._watchdogTimer = setTimeout(() => {
-      logger.error(`[SymbolsUpdater] Watchdog timeout after ${watchdogTimeoutMs}ms, forcing unlock`);
+      logger.error(`[SymbolsUpdater] Watchdog timeout after ${reducedWatchdogTimeout}ms, forcing unlock`);
       this.isRunning = false;
       if (this._watchdogTimer) {
         clearTimeout(this._watchdogTimer);
         this._watchdogTimer = null;
       }
-    }, watchdogTimeoutMs);
+    }, reducedWatchdogTimeout);
 
     try {
       if (!enabled) {
@@ -132,41 +151,73 @@ export class SymbolsUpdater {
       const shouldSkipBinance = this._shouldSkipExchange('binance');
       const shouldSkipMexc = this._shouldSkipExchange('mexc');
 
-      // CRITICAL FIX: Run updates in parallel for better performance
+      // CRITICAL FIX: Per-exchange timeout (10 seconds) to prevent blocking
+      const EXCHANGE_TIMEOUT_MS = Number(configService.getNumber('SYMBOLS_UPDATE_EXCHANGE_TIMEOUT_MS', 10000)); // 10 seconds
+
+      // CRITICAL FIX: Run updates in parallel with individual timeouts (fail-fast)
       const updatePromises = [];
       
       if (!shouldSkipBinance) {
-        updatePromises.push(
-          exchangeInfoService.updateFiltersFromExchange()
+        const binancePromise = this._withTimeout(
+          exchangeInfoService.updateFiltersFromExchange(),
+          EXCHANGE_TIMEOUT_MS,
+          'Binance update'
+        )
             .then(() => {
               this._recordExchangeSuccess('binance');
-        logger.info('[SymbolsUpdater] Binance symbol filters updated');
+            logger.info('[SymbolsUpdater] ✅ Binance symbol filters updated');
             })
             .catch((e) => {
               this._recordExchangeFailure('binance');
-        logger.error('[SymbolsUpdater] Binance update failed:', e?.message || e);
-            })
-        );
+            // Don't log timeout as error (expected behavior)
+            if (e.message.includes('timeout')) {
+              logger.warn(`[SymbolsUpdater] ⚠️ Binance update timeout after ${EXCHANGE_TIMEOUT_MS}ms (will retry next cycle)`);
+            } else {
+              logger.error('[SymbolsUpdater] ❌ Binance update failed:', e?.message || e);
+            }
+          });
+        updatePromises.push(binancePromise);
+      } else {
+        logger.debug('[SymbolsUpdater] Skipping Binance (backoff active)');
       }
 
       if (!shouldSkipMexc) {
-        updatePromises.push(
-          exchangeInfoService.updateMexcFiltersFromExchange()
+        const mexcPromise = this._withTimeout(
+          exchangeInfoService.updateMexcFiltersFromExchange(),
+          EXCHANGE_TIMEOUT_MS,
+          'MEXC update'
+        )
             .then(() => {
               this._recordExchangeSuccess('mexc');
-        logger.info('[SymbolsUpdater] MEXC symbol filters updated');
+            logger.info('[SymbolsUpdater] ✅ MEXC symbol filters updated');
             })
             .catch((e) => {
               this._recordExchangeFailure('mexc');
-        logger.error('[SymbolsUpdater] MEXC update failed:', e?.message || e);
-            })
-        );
+            // CRITICAL: Handle MEXC 404 error specifically (known issue)
+            if (e?.message?.includes('404') || e?.code === 404) {
+              logger.warn('[SymbolsUpdater] ⚠️ MEXC API 404 error (known issue, backing off for 30 minutes)');
+              // Extend backoff for MEXC 404
+              this._exchangeFailures.mexc.lastFailure = Date.now();
+              this._exchangeFailures.mexc.count = this._maxFailuresBeforeBackoff;
+            } else if (e.message.includes('timeout')) {
+              logger.warn(`[SymbolsUpdater] ⚠️ MEXC update timeout after ${EXCHANGE_TIMEOUT_MS}ms (will retry next cycle)`);
+            } else {
+              logger.error('[SymbolsUpdater] ❌ MEXC update failed:', e?.message || e);
+            }
+          });
+        updatePromises.push(mexcPromise);
+      } else {
+        logger.debug('[SymbolsUpdater] Skipping MEXC (backoff active)');
       }
 
-      // Wait for all updates to complete (or fail)
-      await Promise.allSettled(updatePromises);
+      // Wait for all updates to complete (or fail) - allSettled ensures no crash
+      const results = await Promise.allSettled(updatePromises);
 
-      logger.info('[SymbolsUpdater] Refresh cycle completed');
+      // Log summary
+      const succeeded = results.filter(r => r.status === 'fulfilled').length;
+      const failed = results.filter(r => r.status === 'rejected').length;
+      logger.info(`[SymbolsUpdater] Refresh cycle completed: ${succeeded} succeeded, ${failed} failed`);
+
     } catch (error) {
       // This should rarely happen, but catch any unexpected errors
       logger.error('[SymbolsUpdater] Unexpected error in runOnce:', error?.message || error);

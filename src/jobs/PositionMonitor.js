@@ -9,6 +9,14 @@ import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
 import { ScanCycleCache } from '../utils/ScanCycleCache.js';
 import { calculatePnL, calculatePnLPercent } from '../utils/calculator.js';
+import { StrategyAdvancedSettings } from '../models/StrategyAdvancedSettings.js';
+import { ATRTrailingService } from '../services/ATRTrailingService.js';
+import { PartialTakeProfitService } from '../services/PartialTakeProfitService.js';
+import { RiskManagementService } from '../services/RiskManagementService.js';
+import { SupportResistanceService } from '../services/SupportResistanceService.js';
+import { MultiTimeframeService } from '../services/MultiTimeframeService.js';
+import { LossStreakService } from '../services/LossStreakService.js';
+import { AutoOptimizeService } from '../services/AutoOptimizeService.js';
 
 /**
  * Position Monitor Job - Monitor and update open positions
@@ -18,11 +26,22 @@ export class PositionMonitor {
     this.exchangeServices = new Map(); // botId -> ExchangeService
     this.positionServices = new Map(); // botId -> PositionService
     this.orderServices = new Map(); // botId -> OrderService
+    this.atrTrailingServices = new Map(); // botId -> ATRTrailingService
+    this.partialTPServices = new Map(); // botId -> PartialTakeProfitService
+    this.riskMgmtServices = new Map(); // botId -> RiskManagementService
+    this.srServices = new Map(); // botId -> SupportResistanceService
+    this.mtfServices = new Map(); // botId -> MultiTimeframeService
+    this._autoOptimize = new AutoOptimizeService();
     this.telegramService = null;
     this.isRunning = false;
     this._lastLogTime = null; // For throttling debug logs
     this._lastSummary = null; // Cache last summary for diff logging
     this._pnlAlertTimer = null; // Timer for realtime PnL alerts
+
+    // ADV_TPSL throttling (prevents API/CPU storms -> WS stale messages)
+    this._advLastAppliedAt = new Map(); // posId -> ts
+    this._advInFlight = 0;
+    this._advProcessedThisCycle = 0;
 
     // Scan-cycle caches (cleared at the start of every monitorAllPositions run)
     this._scanCache = new ScanCycleCache();
@@ -121,23 +140,21 @@ export class PositionMonitor {
           const pnlSl = slPrice ? calculatePnL(entryPrice, slPrice, amount, side) : null;
 
           const fmt = (v, digits = 5) => Number(v).toFixed(digits);
-          const fmtPnl = (v) => `${v >= 0 ? '' : ''}${fmt(v, 5)}$`;
-          const sideLabel = side ? side.charAt(0).toUpperCase() + side.slice(1) : 'N/A';
+          const fmt2 = (v) => Number(v).toFixed(2);
+          const sideLabel = side ? side.toUpperCase() : 'N/A';
 
-          const lines = [];
-          lines.push(`• ${pos.symbol} | ${sideLabel}: ${fmt(currentPrice, 5)} | PNL: ${fmtPnl(pnl)} (${fmt(pnlPct, 3)}%)`);
-          lines.push(`  Open: ${fmt(entryPrice, 5)}`);
-          lines.push(`  Close: ${fmt(currentPrice, 5)}`);
-          if (pnlTp !== null || pnlSl !== null) {
-            const tpPart = pnlTp !== null ? `TP≈${fmtPnl(pnlTp)}` : '';
-            const slPart = pnlSl !== null ? `SL≈${fmtPnl(pnlSl)}` : '';
-            const est = [tpPart, slPart].filter(Boolean).join(' | ');
-            if (est) {
-              lines.push(`  PNL_Estimate: ${est}`);
-            }
-          }
+          const tpLine = pnlTp !== null ? `🎯 TP Est: ≈ ${fmt2(pnlTp)} USDT` : null;
+          const slLine = pnlSl !== null ? `🛡️ SL Est: ≈ ${fmt2(pnlSl)} USDT` : null;
 
-          botMessages.push(lines.join('\n'));
+          const block = [
+            `📊 ${pos.symbol} | ${sideLabel}`,
+            `🟢 Entry: ${fmt(entryPrice, 5)} → 🔴 Mark: ${fmt(currentPrice, 5)}`,
+            `💥 PNL: ${fmt2(pnl)} USDT (${fmt2(pnlPct)}%)`,
+            tpLine || slLine ? [tpLine, slLine].filter(Boolean).join(' | ') : null
+          ].filter(Boolean).join('\n');
+
+          // Prepend bot header per chunk later; here keep per-position block
+          botMessages.push(block);
         }
         
         if (botMessages.length === 0) {
@@ -178,7 +195,7 @@ export class PositionMonitor {
         for (let i = 0; i < chunks.length; i++) {
           const lines = chunks[i];
           const header = `📊 Position | ${botName} (Total active: ${total}, showing ${sentCount + lines.length}${truncated > 0 ? `, truncated ${truncated}` : ''})\n`;
-          const body = lines.join('\n');
+          const body = lines.join('\n\n');
           const msg = `${header}${body}`;
           await this.telegramService.sendMessage(chatId, msg, { alertType: 'position_monitor_binance' });
           sentCount += lines.length;
@@ -266,6 +283,13 @@ export class PositionMonitor {
       const orderService = new OrderService(exchangeService, this.telegramService);
       this.orderServices.set(bot.id, orderService);
 
+      // Advanced TP/SL services (toggle at runtime via env)
+      this.atrTrailingServices.set(bot.id, new ATRTrailingService(exchangeService));
+      this.partialTPServices.set(bot.id, new PartialTakeProfitService(exchangeService));
+      this.riskMgmtServices.set(bot.id, new RiskManagementService(exchangeService));
+      this.srServices.set(bot.id, new SupportResistanceService(exchangeService));
+      this.mtfServices.set(bot.id, new MultiTimeframeService(exchangeService));
+
       logger.info(`[PositionMonitor] ✅ Initialized for bot ${bot.id} (${bot.exchange || 'unknown'}, testnet=${bot.binance_testnet || 'false'})`);
     } catch (error) {
       logger.error(`[PositionMonitor] ❌ Failed to initialize for bot ${bot.id}:`, error?.message || error, error?.stack);
@@ -281,6 +305,11 @@ export class PositionMonitor {
     this.exchangeServices.delete(botId);
     this.positionServices.delete(botId);
     this.orderServices.delete(botId);
+    this.atrTrailingServices.delete(botId);
+    this.partialTPServices.delete(botId);
+    this.riskMgmtServices.delete(botId);
+    this.srServices.delete(botId);
+    this.mtfServices.delete(botId);
     logger.info(`Removed bot ${botId} from PositionMonitor`);
   }
 
@@ -303,6 +332,89 @@ export class PositionMonitor {
         return;
       }
       this._scanCache.set(scanKey, true);
+
+      // Advanced TP/SL manager (safe no-op if disabled / no settings table)
+      // CRITICAL: TP/SL placement (placeExitOrder) is independent of ADV_TPSL and watchdog degrade mode
+      // This ensures basic TP/SL protection is always available even when advanced features are disabled
+      if (configService.getBoolean('ADV_TPSL_ENABLED', false) && position.status === 'open') {
+        try {
+          // Check watchdog degrade mode - if degraded, skip ADV_TPSL to protect WS
+          const { watchdogService } = await import('../services/WatchdogService.js');
+          const watchdogLimits = watchdogService?.getAdvLimits?.() || null;
+          if (watchdogLimits && watchdogLimits.maxPerCycle === 0) {
+            // Degraded mode active - skip ADV_TPSL to protect WebSocket
+            logger.debug(`[ADV_TPSL] Skipping advanced features for position ${position.id} (watchdog degrade mode active)`);
+          } else {
+            // Throttle ADV_TPSL to avoid API storms that cause WS stale messages/extreme latency.
+            const advMaxPerCycle = watchdogLimits?.maxPerCycle ?? Number(configService.getNumber('ADV_TPSL_MAX_POSITIONS_PER_CYCLE', 25));
+            const advCooldownMs = watchdogLimits?.cooldownMs ?? Number(configService.getNumber('ADV_TPSL_POSITION_COOLDOWN_MS', 120000)); // 2m
+            const advMaxConcurrent = watchdogLimits?.maxConcurrent ?? Number(configService.getNumber('ADV_TPSL_MAX_CONCURRENT', 2));
+            const allowWithoutProtection = configService.getBoolean('ADV_TPSL_ALLOW_WHEN_NO_TPSL', false);
+
+            if (this._advProcessedThisCycle >= advMaxPerCycle) {
+              // skip - protect bot health
+            } else if (this._advInFlight >= advMaxConcurrent) {
+              // skip when saturated
+            } else {
+              const lastAt = this._advLastAppliedAt.get(position.id) || 0;
+              if (Date.now() - lastAt < advCooldownMs) {
+                // skip until cooldown passes
+              } else {
+                const hasBasicProtection = Boolean(position.exit_order_id) && Boolean(position.sl_order_id);
+                if (!hasBasicProtection && !allowWithoutProtection) {
+                  // skip heavy OHLCV analysis until TP/SL orders exist
+                } else {
+                  this._advInFlight += 1;
+                  this._advProcessedThisCycle += 1;
+                  this._advLastAppliedAt.set(position.id, Date.now());
+
+                  const settings = await StrategyAdvancedSettings.getByStrategyId(position.strategy_id);
+                  const atrSvc = this.atrTrailingServices.get(botId);
+                  const riskSvc = this.riskMgmtServices.get(botId);
+                  const ptpSvc = this.partialTPServices.get(botId);
+                  const srSvc = this.srServices.get(botId);
+                  const mtfSvc = this.mtfServices.get(botId);
+
+                  // Loss streak guard (optional): if too many consecutive losses, close bad losers faster.
+                  if (configService.getBoolean('ADV_TPSL_LOSS_STREAK_ENABLED', false) && settings?.loss_streak_enabled === true) {
+                    const streak = await LossStreakService.getLossStreak(botId);
+                    const maxLosses = Number(settings.max_consecutive_losses ?? configService.getNumber('ADV_TPSL_MAX_CONSECUTIVE_LOSSES', 3));
+                    const forceCloseNegPct = Number(configService.getNumber('ADV_TPSL_LOSS_STREAK_FORCE_CLOSE_NEG_PCT', 3.0));
+                    if (streak >= maxLosses) {
+                      const current = Number(await this.exchangeServices.get(botId)?.getTickerPrice(position.symbol));
+                      const entry = Number(position.entry_price);
+                      const dir = (position.side || (Number(position.amount) > 0 ? 'long' : 'short')) === 'long' ? 1 : -1;
+                      const pnlPct = Number.isFinite(current) && Number.isFinite(entry) && entry > 0 ? ((current - entry) / entry) * 100 * dir : 0;
+                      if (pnlPct <= -Math.abs(forceCloseNegPct)) {
+                        await this.exchangeServices.get(botId)?.closePosition(position.symbol, position.side, position.amount);
+                        logger.warn(`[ADV_TPSL][LossStreak] bot=${botId} streak=${streak} forced close pos=${position.id} pnlPct=${pnlPct.toFixed(2)}%`);
+                        return;
+                      }
+                    }
+                  }
+
+                  // Auto optimize (throttled; safe, DB-only)
+                  if (configService.getBoolean('ADV_TPSL_AUTO_OPTIMIZE_ENABLED', false) && settings?.auto_optimize_enabled === true) {
+                    await this._autoOptimize.maybeOptimize(position.strategy_id);
+                  }
+
+                  // Order: ATR -> Risk(breakeven/RR/volume/lowvol...) -> Partial TP
+                  if (atrSvc) await atrSvc.apply(position, settings);
+                  if (riskSvc) await riskSvc.apply(position, settings);
+                  if (srSvc) await srSvc.apply(position, settings);
+                  if (mtfSvc) await mtfSvc.apply(position, settings);
+                  if (ptpSvc) await ptpSvc.apply(position, settings);
+
+                  this._advInFlight -= 1;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          if (this._advInFlight > 0) this._advInFlight -= 1;
+          logger.warn(`[ADV_TPSL] Failed to apply advanced TP/SL for pos=${position.id}: ${e?.message || e}`);
+        }
+      }
 
       // Update position (checks TP/SL and updates dynamic SL)
       const updated = await positionService.updatePosition(position);
@@ -333,9 +445,10 @@ export class PositionMonitor {
       return;
     }
 
-    // CRITICAL SAFETY CHECK: If position has been open > 30s without TP/SL, force create immediately
+    // CRITICAL SAFETY CHECK: If position has been open > 10s without TP/SL, force create immediately
     // This prevents positions from being exposed to market risk without protection
-    const SAFETY_CHECK_MS = 30000; // 30 seconds
+    // Reduced from 30s to 10s for faster protection
+    const SAFETY_CHECK_MS = 10000; // 10 seconds (reduced from 30s)
     if (position.opened_at) {
       const openedAt = new Date(position.opened_at).getTime();
       const timeSinceOpened = Date.now() - openedAt;
@@ -361,25 +474,40 @@ export class PositionMonitor {
     }
 
     // RACE CONDITION FIX: Use soft lock to prevent concurrent TP/SL placement
-    // Try to acquire lock by setting is_processing flag
+    // Try to acquire lock by setting is_processing flag (with retry mechanism)
+    let lockAcquired = false;
     try {
       const { pool } = await import('../config/database.js');
-      const [result] = await pool.execute(
-        `UPDATE positions 
-         SET is_processing = 1 
-         WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
-         LIMIT 1`,
-        [position.id]
-      );
+      // Retry lock up to 3 times with 100ms delay
+      for (let retry = 0; retry < 3; retry++) {
+        const [result] = await pool.execute(
+          `UPDATE positions 
+           SET is_processing = 1 
+           WHERE id = ? AND status = 'open' AND (is_processing = 0 OR is_processing IS NULL)
+           LIMIT 1`,
+          [position.id]
+        );
+        
+        if (result.affectedRows > 0) {
+          lockAcquired = true;
+          break;
+        }
+        
+        // Wait before retry (except last attempt)
+        if (retry < 2) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
       
-      // If no rows updated, another process is already handling this position
-      if (result.affectedRows === 0) {
-        logger.debug(`[Place TP/SL] Position ${position.id} is already being processed by another instance, skipping...`);
+      // If no rows updated after retries, another process is already handling this position
+      if (!lockAcquired) {
+        logger.debug(`[Place TP/SL] Position ${position.id} is already being processed by another instance (after 3 retries), skipping...`);
         return;
       }
     } catch (lockError) {
       // If is_processing column doesn't exist, continue without lock (backward compatibility)
       logger.debug(`[Place TP/SL] Could not acquire lock for position ${position.id} (column may not exist): ${lockError?.message || lockError}`);
+      lockAcquired = true; // Continue processing if column doesn't exist
     }
 
     // Check if TP/SL orders still exist on exchange
@@ -389,8 +517,13 @@ export class PositionMonitor {
     let needsTp = !position.exit_order_id || isTPSLPending;
     let needsSl = !position.sl_order_id || isTPSLPending;
 
-    // If exit_order_id exists, verify it's still active on exchange
-    if (position.exit_order_id) {
+    // OPTIMIZATION: Skip order verification for newly opened positions (< 5s)
+    // New positions won't have orders yet, so verification is unnecessary
+    const timeSinceOpened = position.opened_at ? Date.now() - new Date(position.opened_at).getTime() : 0;
+    const isNewPosition = timeSinceOpened < 5000; // Less than 5 seconds
+
+    // If exit_order_id exists, verify it's still active on exchange (skip for new positions)
+    if (position.exit_order_id && !isNewPosition) {
       try {
         const exchangeService = this.exchangeServices.get(position.bot_id);
         if (exchangeService) {
@@ -428,8 +561,8 @@ export class PositionMonitor {
       }
     }
 
-    // If sl_order_id exists, verify it's still active on exchange
-    if (position.sl_order_id) {
+    // If sl_order_id exists, verify it's still active on exchange (skip for new positions)
+    if (position.sl_order_id && !isNewPosition) {
       try {
         const exchangeService = this.exchangeServices.get(position.bot_id);
         if (exchangeService) {
@@ -501,8 +634,8 @@ export class PositionMonitor {
           const bot = await Bot.findById(position.bot_id);
           if (!bot) {
             logger.error(`[Place TP/SL] Bot ${position.bot_id} not found in database, skipping position ${position.id}`);
-            await this._releasePositionLock(position.id);
-            return;
+        await this._releasePositionLock(position.id);
+        return;
           }
           if (!bot.is_active && bot.is_active !== 1) {
             logger.warn(`[Place TP/SL] Bot ${position.bot_id} is not active, skipping position ${position.id}`);
@@ -672,9 +805,24 @@ export class PositionMonitor {
       }
       
       // Get the exact quantity of the position first (needed for SL calculation)
+      // CRITICAL FIX: Skip positions without closable quantity immediately (no retry)
+      // These positions are likely already closed on exchange but not synced in DB
       const quantity = await exchangeService.getClosableQuantity(position.symbol, position.side);
       if (!quantity || quantity <= 0) {
-        logger.warn(`[Place TP/SL] No closable quantity found for position ${position.id}, cannot place TP/SL.`);
+        logger.warn(
+          `[Place TP/SL] ⚠️ No closable quantity found for position ${position.id} (${position.symbol}), ` +
+          `position likely already closed on exchange. Skipping TP/SL placement (will be synced by PositionSync).`
+        );
+        
+        // CRITICAL: Mark position as needing sync (don't retry TP/SL placement)
+        try {
+          await Position.update(position.id, { 
+            tp_sl_pending: false // Clear pending flag to prevent retry loops
+          });
+        } catch (e) {
+          // Ignore if column doesn't exist
+        }
+        
         // Release lock before returning
         await this._releasePositionLock(position.id);
         return;
@@ -846,6 +994,15 @@ export class PositionMonitor {
                 `${finalTPPrice !== tpPrice ? `(adjusted from ${tpPrice.toFixed(8)} due to trailing TP)` : ''} ` +
                 `timestamp=${new Date().toISOString()}`
               );
+            
+            // CRITICAL: If TP is placed but SL is still needed, ensure SL will be created
+            // Don't clear tp_sl_pending if SL is still missing
+            if (needsSl && (!position.sl_order_id || position.sl_order_id.trim() === '')) {
+              logger.warn(
+                `[Place TP/SL] ⚠️ TP placed but SL still missing for position ${position.id}. ` +
+                `Will attempt to create SL after delay.`
+              );
+            }
               
               // CRITICAL FIX: Run dedupe AFTER successfully creating new order to clean up old duplicate orders
               // This ensures new order exists before cancelling old ones, preventing miss hit TP
@@ -948,15 +1105,19 @@ export class PositionMonitor {
         // This is better than having no protection at all
       }
 
-      // Delay before placing SL order to avoid rate limits
-      const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 10000);
-      if (delayMs > 0) {
-        logger.info(`[Place TP/SL] Waiting ${delayMs}ms before placing SL order for position ${position.id}...`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
-
+      // OPTIMIZATION: Place TP and SL in parallel (no delay needed by default)
+      // Binance supports concurrent order placement, and parallel placement is faster
+      // Only use delay if explicitly configured (for backward compatibility or rate limit concerns)
+      const delayMs = configService.getNumber('TP_SL_PLACEMENT_DELAY_MS', 0); // Default: 0 (parallel placement)
+      
       // Place SL order (only if slPrice is valid, i.e., stoploss > 0)
+      // If delay is 0, place immediately (parallel with TP that was already placed above)
       if (needsSl && slPrice !== null && Number.isFinite(slPrice) && slPrice > 0) {
+        // Add delay only if configured (for backward compatibility)
+        if (delayMs > 0) {
+          logger.debug(`[Place TP/SL] Waiting ${delayMs}ms before placing SL order for position ${position.id}...`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
         // Safety check: If SL is invalid (SL <= entry for SHORT or SL >= entry for LONG), force close position immediately
         const entryPrice = Number(fillPrice);
         const slPriceNum = Number(slPrice);
@@ -1027,10 +1188,39 @@ export class PositionMonitor {
             }
           }
         } catch (e) {
+          const errorMsg = e?.message || String(e);
           logger.error(
-            `[Place TP/SL] ❌ CRITICAL: Failed to create SL order for position ${position.id}: ${e?.message || e}. ` +
+            `[Place TP/SL] ❌ CRITICAL: Failed to create SL order for position ${position.id}: ${errorMsg}. ` +
             `Position is exposed to unlimited loss risk! Will retry on next cycle.`
           );
+          
+          // CRITICAL: Handle Binance API Error -2022 gracefully
+          // This error can occur when position is already closed or reduced
+          if (errorMsg.includes('-2022') || errorMsg.includes('ReduceOnly')) {
+            try {
+              // Verify if position still exists on exchange
+              const exchangeService = this.exchangeServices.get(position.bot_id);
+              if (exchangeService) {
+                const positions = await exchangeService.getOpenPositions();
+                const pos = Array.isArray(positions) 
+                  ? positions.find(p => (p.symbol || p.info?.symbol) === position.symbol && 
+                                       Math.abs(parseFloat(p.positionAmt || p.contracts || 0)) > 0)
+                  : null;
+                
+                if (!pos || Math.abs(parseFloat(pos.positionAmt || pos.contracts || 0)) === 0) {
+                  logger.info(
+                    `[Place TP/SL] Position ${position.id} (${position.symbol}) already closed/reduced on exchange. ` +
+                    `SL creation failed but position is safe.`
+                  );
+                  // Position is already closed, no need to retry
+                  return;
+                }
+              }
+            } catch (verifyError) {
+              logger.warn(`[Place TP/SL] Could not verify position state after -2022 error: ${verifyError?.message || verifyError}`);
+            }
+          }
+          
           // CRITICAL: Set tp_sl_pending to true to ensure retry on next cycle
           try {
             if (Position?.rawAttributes?.tp_sl_pending) {
@@ -1388,6 +1578,7 @@ export class PositionMonitor {
     this._scanCache.clear();
     this._priceCache.clear();
     this._closableQtyCache.clear();
+    this._advProcessedThisCycle = 0;
 
     const cycleStart = Date.now();
     let totalHighPriority = 0;
@@ -1470,22 +1661,35 @@ export class PositionMonitor {
 
       // CRITICAL OPTIMIZATION: Separate positions into priority queues
       // High priority: positions without TP/SL (need immediate attention)
-      // CRITICAL FIX: Also check positions that have been open for > 30s without TP/SL (safety check)
+      // CRITICAL FIX: Position Age SLA - Emergency TP/SL placement (HARD RULE, không phụ thuộc degrade mode)
       // Low priority: positions with TP/SL (can be monitored less frequently)
       const highPriorityPositions = [];
+      const emergencyPositions = []; // Positions that exceed SLA (must be processed IMMEDIATELY)
       const lowPriorityPositions = [];
       const now = Date.now();
-      const SAFETY_CHECK_MS = 30000; // 30 seconds - force create TP/SL if missing
+      const SAFETY_CHECK_MS = Number(configService.getNumber('POSITION_AGE_SLA_MS', 30000)); // 30 seconds - Position Age SLA
+      const EMERGENCY_SLA_MS = Number(configService.getNumber('POSITION_EMERGENCY_SLA_MS', 10 * 1000)); // 10 seconds - Emergency threshold
       
       for (const pos of openPositions) {
         const needsTPSL = !pos.exit_order_id || !pos.sl_order_id || pos.tp_sl_pending === true || pos.tp_sl_pending === 1;
         
-        // CRITICAL SAFETY CHECK: If position has been open > 30s without TP/SL, force it to high priority
-        if (!needsTPSL && pos.opened_at) {
+        if (pos.opened_at) {
           const openedAt = new Date(pos.opened_at).getTime();
           const timeSinceOpened = now - openedAt;
-          if (timeSinceOpened > SAFETY_CHECK_MS) {
-            // Position has been open for > 30s without TP/SL - CRITICAL RISK!
+          
+          // 🚨 EMERGENCY SLA: Position > 10s without TP/SL = EMERGENCY (bypass all throttling)
+          if (needsTPSL && timeSinceOpened > EMERGENCY_SLA_MS) {
+            logger.error(
+              `[PositionMonitor] 🚨🚨🚨 EMERGENCY SLA BREACH: Position ${pos.id} (${pos.symbol}) has been open for ${Math.floor(timeSinceOpened / 1000)}s ` +
+              `without TP/SL! exit_order_id=${pos.exit_order_id || 'NULL'}, sl_order_id=${pos.sl_order_id || 'NULL'}. ` +
+              `EMERGENCY TP/SL placement (bypassing all throttling and degrade mode)!`
+            );
+            emergencyPositions.push({ ...pos, ageMs: timeSinceOpened });
+            continue;
+          }
+          
+          // CRITICAL SAFETY CHECK: If position has been open > 30s without TP/SL, force it to high priority
+          if (!needsTPSL && timeSinceOpened > SAFETY_CHECK_MS) {
             logger.error(
               `[PositionMonitor] 🚨 CRITICAL: Position ${pos.id} (${pos.symbol}) has been open for ${Math.floor(timeSinceOpened / 1000)}s ` +
               `without TP/SL! exit_order_id=${pos.exit_order_id || 'NULL'}, sl_order_id=${pos.sl_order_id || 'NULL'}. ` +
@@ -1504,6 +1708,50 @@ export class PositionMonitor {
           lowPriorityPositions.push(pos);
           totalLowPriority++;
         }
+      }
+      
+      // CRITICAL: Process emergency positions FIRST (bypass all throttling, degrade mode, etc.)
+      // BUT: Limit concurrent processing to prevent event loop blocking
+      if (emergencyPositions.length > 0) {
+        logger.error(
+          `[PositionMonitor] 🚨🚨🚨 EMERGENCY MODE: ${emergencyPositions.length} positions exceed Emergency SLA! ` +
+          `Processing with LIMITED CONCURRENCY to prevent event loop blocking...`
+        );
+        
+        // Sort by age (oldest first = highest priority)
+        emergencyPositions.sort((a, b) => b.ageMs - a.ageMs);
+        
+        // CRITICAL FIX: Limit concurrent emergency processing to prevent blocking
+        // Process in small batches with yielding
+        const EMERGENCY_BATCH_SIZE = Number(configService.getNumber('POSITION_MONITOR_EMERGENCY_BATCH_SIZE', 5)); // Max 5 concurrent
+        const EMERGENCY_BATCH_DELAY_MS = Number(configService.getNumber('POSITION_MONITOR_EMERGENCY_BATCH_DELAY_MS', 100)); // 100ms delay
+        
+        for (let i = 0; i < emergencyPositions.length; i += EMERGENCY_BATCH_SIZE) {
+          const batch = emergencyPositions.slice(i, i + EMERGENCY_BATCH_SIZE);
+          
+          // Process batch in parallel
+          await Promise.allSettled(
+            batch.map(pos => {
+              logger.error(
+                `[PositionMonitor] 🚨 EMERGENCY: Processing position ${pos.id} (${pos.symbol}) ` +
+                `age=${Math.floor(pos.ageMs / 1000)}s - BYPASSING THROTTLING (batch ${Math.floor(i / EMERGENCY_BATCH_SIZE) + 1})`
+              );
+              return this.placeExitOrder(pos);
+            })
+          );
+          
+          // CRITICAL: Yield to event loop after each batch
+          await new Promise(resolve => setImmediate(resolve));
+          
+          // Small delay between batches
+          if (i + EMERGENCY_BATCH_SIZE < emergencyPositions.length) {
+            await new Promise(resolve => setTimeout(resolve, EMERGENCY_BATCH_DELAY_MS));
+          }
+        }
+        
+        logger.info(
+          `[PositionMonitor] ✅ Emergency processing complete: ${emergencyPositions.length} positions processed in batches`
+        );
       }
       
       logger.info(
@@ -1548,32 +1796,103 @@ export class PositionMonitor {
           if (botHighPriority.length > 0) {
             logger.info(`[PositionMonitor] 🔥 Processing ${botHighPriority.length} high-priority positions for bot ${botId} (TP/SL placement, sorted by newest first)`);
             
-            // Process TP/SL placement in larger parallel batches (faster)
-            for (let i = 0; i < botHighPriority.length; i += tpPlacementBatchSize) {
+            // CRITICAL FIX: Adaptive Chunking & Yielding to prevent event loop blocking
+            // Process TP/SL placement in chunks with setImmediate() to yield to event loop
+            // ADAPTIVE: Adjust batch size based on event loop delay
+            const { watchdogService } = await import('../services/WatchdogService.js');
+            const eventLoopMetrics = watchdogService?.getMetrics?.() || { mean: 0, max: 0 };
+            const eventLoopDelay = eventLoopMetrics.mean || 0;
+            
+            // Adaptive batch size: reduce if event loop is under stress
+            let adaptiveBatchSize = tpPlacementBatchSize;
+            if (eventLoopDelay > 50) {
+              adaptiveBatchSize = Math.max(2, Math.floor(tpPlacementBatchSize / 2)); // Reduce by half if delay > 50ms
+              logger.warn(
+                `[PositionMonitor] ⚠️ Event loop delay high (${eventLoopDelay.toFixed(1)}ms), ` +
+                `reducing batch size from ${tpPlacementBatchSize} to ${adaptiveBatchSize}`
+              );
+            }
+            
+            const BATCH_DELAY_MS = Number(configService.getNumber('POSITION_MONITOR_TP_BATCH_DELAY_MS', 50));
+            const MAX_POSITIONS_PER_CYCLE = Number(configService.getNumber('POSITION_MONITOR_MAX_TP_SL_PER_CYCLE', 50)); // Increased from 20 to 50 for faster throughput
+            
+            // Limit positions to process in this cycle (prevent 6-8 minute cycles)
+            const positionsToProcess = botHighPriority.slice(0, MAX_POSITIONS_PER_CYCLE);
+            if (botHighPriority.length > MAX_POSITIONS_PER_CYCLE) {
+              logger.warn(
+                `[PositionMonitor] ⚠️ Limiting TP/SL placement to ${MAX_POSITIONS_PER_CYCLE} positions ` +
+                `(${botHighPriority.length - MAX_POSITIONS_PER_CYCLE} will be processed in next cycle)`
+              );
+            }
+            
+            for (let i = 0; i < positionsToProcess.length; i += adaptiveBatchSize) {
               const elapsed = Date.now() - startTime;
               if (elapsed > maxProcessingTimeMs) {
                 logger.warn(`[PositionMonitor] ⏱️ Max time reached for bot ${botId}, stopping high-priority processing`);
                 break;
               }
               
-              const batch = botHighPriority.slice(i, i + tpPlacementBatchSize);
+              // CRITICAL: Re-check event loop delay before each batch (adaptive)
+              const currentMetrics = watchdogService?.getMetrics?.() || { mean: 0, max: 0 };
+              const currentDelay = currentMetrics.mean || 0;
+              
+              // Break if event loop delay is too high (prevent further blocking)
+              if (currentDelay > 100) {
+                logger.warn(
+                  `[PositionMonitor] ⚠️ Event loop delay too high (${currentDelay.toFixed(1)}ms), ` +
+                  `stopping batch processing at ${i}/${positionsToProcess.length} to prevent further blocking`
+                );
+                break;
+              }
+              
+              const batch = positionsToProcess.slice(i, i + adaptiveBatchSize);
+              
+              // CRITICAL: Check if TP/SL placement should be degraded (should NEVER be degraded)
+              // But we still respect adaptive chunking to prevent blocking
+              const shouldDegrade = watchdogService?.shouldDegradeJob?.('TP_PLACEMENT');
+              if (shouldDegrade) {
+                logger.error(
+                  `[PositionMonitor] 🚨 WARNING: Watchdog tried to degrade TP_PLACEMENT! ` +
+                  `This should NEVER happen (TP/SL is safety-critical). Proceeding anyway...`
+                );
+              }
               
               // Parallel TP/SL placement (no delay between positions in batch)
               await Promise.allSettled(
                 batch.map(p => this.placeExitOrder(p))
               );
               
-              // Small delay between batches only
-              if (i + tpPlacementBatchSize < botHighPriority.length) {
-                const delayMs = Number(configService.getNumber('POSITION_MONITOR_TP_BATCH_DELAY_MS', 300)); // Reduced from 2000ms to 300ms
-                await new Promise(resolve => setTimeout(resolve, delayMs));
+              // CRITICAL: Yield to event loop after each batch
+              await new Promise(resolve => setImmediate(resolve));
+              
+              // Adaptive delay based on event loop state
+              if (watchdogService?.isDegraded?.()) {
+                // System is degraded, add extra delay to reduce load
+                await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS * 2));
+              } else if (currentDelay > 20) {
+                // Event loop under moderate stress, add small delay
+                await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+              } else if (i + adaptiveBatchSize < positionsToProcess.length) {
+                // Normal state, minimal delay
+                await new Promise(resolve => setTimeout(resolve, Math.max(10, BATCH_DELAY_MS / 2)));
               }
             }
           }
           
           // PHASE 2: Process all positions for monitoring (can be done in parallel with smaller batches)
-          const allPositionsForMonitoring = [...botHighPriority, ...botLowPriority];
+          // CRITICAL FIX: Limit positions per cycle to prevent long cycles
+          const MAX_MONITORING_PER_CYCLE = Number(configService.getNumber('POSITION_MONITOR_MAX_MONITORING_PER_CYCLE', 50)); // Limit monitoring per cycle
+          const allPositionsForMonitoring = [...botHighPriority, ...botLowPriority].slice(0, MAX_MONITORING_PER_CYCLE);
+          
+          if (botHighPriority.length + botLowPriority.length > MAX_MONITORING_PER_CYCLE) {
+            logger.warn(
+              `[PositionMonitor] ⚠️ Limiting monitoring to ${MAX_MONITORING_PER_CYCLE} positions ` +
+              `(${(botHighPriority.length + botLowPriority.length) - MAX_MONITORING_PER_CYCLE} will be processed in next cycle)`
+            );
+          }
+          
           const monitoringBatchSize = Number(configService.getNumber('POSITION_MONITOR_MONITORING_BATCH_SIZE', 8)); // Parallel monitoring
+          const MONITORING_BATCH_DELAY_MS = Number(configService.getNumber('POSITION_MONITOR_MONITORING_BATCH_DELAY_MS', 50)); // Reduced to 50ms
           
           for (let i = 0; i < allPositionsForMonitoring.length; i += monitoringBatchSize) {
             const elapsed = Date.now() - startTime;
@@ -1603,10 +1922,17 @@ export class PositionMonitor {
               batch.map(p => this.checkUnfilledOrders(p))
             );
 
-            // Reduced delay between monitoring batches
-            if (i + monitoringBatchSize < allPositionsForMonitoring.length) {
-              const delayMs = Number(configService.getNumber('POSITION_MONITOR_MONITORING_BATCH_DELAY_MS', 200)); // Reduced delay
-              await new Promise(resolve => setTimeout(resolve, delayMs));
+            // CRITICAL: Yield to event loop after each batch
+            await new Promise(resolve => setImmediate(resolve));
+            
+            // Optional: Additional delay if event loop is under stress
+            const { watchdogService } = await import('../services/WatchdogService.js');
+            if (watchdogService?.isDegraded?.()) {
+              // System is degraded, add extra delay
+              await new Promise(resolve => setTimeout(resolve, MONITORING_BATCH_DELAY_MS * 2));
+            } else if (i + monitoringBatchSize < allPositionsForMonitoring.length) {
+              // Normal delay between batches
+              await new Promise(resolve => setTimeout(resolve, MONITORING_BATCH_DELAY_MS));
             }
           }
           
@@ -1647,14 +1973,27 @@ export class PositionMonitor {
     // Get interval from config or use default 30 seconds
     // Changed from cron (1 minute) to setInterval (30 seconds) for faster TP order updates
     const intervalMs = Number(configService.getNumber('POSITION_MONITOR_INTERVAL_MS', SCAN_INTERVALS.POSITION_MONITOR));
-    const pnlIntervalMs = Number(configService.getNumber('PNL_ALERT_INTERVAL_MS', 10000)); // default 10s
+    const pnlIntervalMs = Number(configService.getNumber('PNL_ALERT_INTERVAL_MS', 0)); // default 0 (disabled) - set > 0 to enable
     
     // Run immediately on start
     this.monitorAllPositions().catch(err => {
       logger.error('[PositionMonitor] Error in initial monitor run:', err);
     });
 
+    // Log effective ADV_TPSL toggles (once) for debugging
+    try {
+      logger.info(
+        `[ADV_TPSL] Effective toggles: enabled=${configService.getBoolean('ADV_TPSL_ENABLED', false)} ` +
+        `atr=${configService.getBoolean('ADV_TPSL_ATR_ENABLED', true)} ` +
+        `sr=${configService.getBoolean('ADV_TPSL_SR_ENABLED', false)} ` +
+        `mtf=${configService.getBoolean('ADV_TPSL_MTF_ENABLED', false)} ` +
+        `lossStreak=${configService.getBoolean('ADV_TPSL_LOSS_STREAK_ENABLED', false)} ` +
+        `autoOptimize=${configService.getBoolean('ADV_TPSL_AUTO_OPTIMIZE_ENABLED', false)}`
+      );
+    } catch (_) {}
+
     // Start PnL realtime alerts (Binance only)
+    // CRITICAL: Disabled by default - set PNL_ALERT_INTERVAL_MS > 0 to enable
     if (pnlIntervalMs > 0) {
       this._sendRealtimePnlAlerts().catch(err => {
         logger.error('[PositionMonitor] PnL alert run failed:', err?.message || err);
@@ -1665,6 +2004,8 @@ export class PositionMonitor {
         });
       }, pnlIntervalMs);
       logger.info(`[PositionMonitor] PnL realtime alerts started with interval ${pnlIntervalMs}ms`);
+    } else {
+      logger.info(`[PositionMonitor] PnL realtime alerts DISABLED (PNL_ALERT_INTERVAL_MS=${pnlIntervalMs}ms)`);
     }
     
     // Then run every intervalMs
