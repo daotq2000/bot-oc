@@ -2071,7 +2071,7 @@ export class BinanceDirectClient {
     }
     
     // Determine order side and position side
-    const orderSide = side === 'long' ? 'BUY' : 'SELL';
+    const orderSide = side === 'long' ? 'SELL' : 'BUY';
     const positionSide = side === 'long' ? 'LONG' : 'SHORT';
     
     logger.debug(`Entry trigger order: quantity=${formattedQuantity}, stopPrice=${formattedPrice}, notional=${notional.toFixed(2)} USDT`);
@@ -2231,7 +2231,8 @@ export class BinanceDirectClient {
           type: 'LIMIT',
           price: limitPriceStr,
           timeInForce: 'GTC',
-          reduceOnly: 'true'
+          // reduceOnly is intentionally omitted: Binance may reject reduceOnly for TP fallback with -2022.
+          // Use explicit quantity/closePosition to ensure this order is a closing order.
         };
         
         // Only include positionSide in dual-side (hedge) mode
@@ -2714,6 +2715,35 @@ export class BinanceDirectClient {
       }
     }
 
+    // Guard: Binance rejects closePosition/reduceOnly exits when there is no position to reduce.
+    // This can happen due to races (position already closed by another order/TP/SL) while the bot still thinks it's open.
+    // We verify the position on-exchange before creating an exit order to avoid -2022 ReduceOnly Order is rejected.
+    try {
+      const openPositions = await this.getOpenPositions(normalizedSymbol);
+      const posSideFilter = dualSide ? positionSide : null;
+      const posMatch = Array.isArray(openPositions)
+        ? openPositions.find(
+            p =>
+              p.symbol === normalizedSymbol &&
+              (posSideFilter ? p.positionSide === posSideFilter : true) &&
+              Math.abs(parseFloat(p.positionAmt || 0)) > 0
+          )
+        : null;
+      if (!posMatch) {
+        logger.warn(
+          `[Exit Guard] ⚠️ Skip createCloseStopMarket because no open position found on exchange | ` +
+          `symbol=${normalizedSymbol} side=${side} dualSide=${dualSide} pos=${position?.id || 'N/A'}`
+        );
+        return null;
+      }
+    } catch (e) {
+      // If we can't verify, we still attempt to place the order to preserve previous behavior.
+      logger.debug(
+        `[Exit Guard] Could not verify open position before createCloseStopMarket (non-fatal) | ` +
+        `symbol=${normalizedSymbol} pos=${position?.id || 'N/A'} error=${e?.message || e}`
+      );
+    }
+
     const params = {
       symbol: normalizedSymbol,
       side: orderSide,
@@ -2824,6 +2854,35 @@ export class BinanceDirectClient {
       }
     }
 
+    // Guard: Binance rejects closePosition/reduceOnly exits when there is no position to reduce.
+    // This can happen due to races (position already closed by another order/TP/SL) while the bot still thinks it's open.
+    // We verify the position on-exchange before creating an exit order to avoid -2022 ReduceOnly Order is rejected.
+    try {
+      const openPositions = await this.getOpenPositions(normalizedSymbol);
+      const posSideFilter = dualSide ? positionSide : null;
+      const posMatch = Array.isArray(openPositions)
+        ? openPositions.find(
+            p =>
+              p.symbol === normalizedSymbol &&
+              (posSideFilter ? p.positionSide === posSideFilter : true) &&
+              Math.abs(parseFloat(p.positionAmt || 0)) > 0
+          )
+        : null;
+      if (!posMatch) {
+        logger.warn(
+          `[Exit Guard] ⚠️ Skip createCloseTakeProfitMarket because no open position found on exchange | ` +
+          `symbol=${normalizedSymbol} side=${side} dualSide=${dualSide} pos=${position?.id || 'N/A'}`
+        );
+        return null;
+      }
+    } catch (e) {
+      // If we can't verify, we still attempt to place the order to preserve previous behavior.
+      logger.debug(
+        `[Exit Guard] Could not verify open position before createCloseTakeProfitMarket (non-fatal) | ` +
+        `symbol=${normalizedSymbol} pos=${position?.id || 'N/A'} error=${e?.message || e}`
+      );
+    }
+
     const params = {
       symbol: normalizedSymbol,
       side: orderSide,
@@ -2855,15 +2914,16 @@ export class BinanceDirectClient {
       const errorMsg = error?.message || String(error);
       const errorCode = error?.code || error?.status;
       
-      // Handle -4120: Order type not supported → fallback to LIMIT order with reduceOnly
+      // Handle -4120: Order type not supported → fallback to LIMIT order
       if (errorCode === -4120 || errorCode === '-4120' || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
         logger.warn(
           `[TP Fallback] TAKE_PROFIT_MARKET order type not supported for ${normalizedSymbol}, ` +
           `using LIMIT order with reduceOnly instead | pos=${position?.id || 'N/A'} stopPrice=${finalStop}`
         );
         
-        // Fallback: Use LIMIT order. Must include EITHER quantity or closePosition=true.
-        // IMPORTANT: Binance does not allow reduceOnly together with closePosition=true.
+        // Fallback: Prefer LIMIT order with explicit quantity derived from current position.
+        // NOTE: Some accounts reject LIMIT + closePosition=true for TP purposes; and reduceOnly may be rejected when
+        // there is no matching position. So we derive quantity from the exchange and only proceed if position exists.
         const fallbackParams = {
           symbol: normalizedSymbol,
           side: orderSide,
@@ -2914,10 +2974,16 @@ export class BinanceDirectClient {
 
         if (fallbackQuantity) {
           fallbackParams.quantity = fallbackQuantity;
-          fallbackParams.reduceOnly = 'true';
+          // IMPORTANT: reduceOnly is optional for LIMIT; some accounts/endpoints reject it.
+          // For safety, rely on explicit quantity without reduceOnly to avoid -1106.
         } else {
-          // Last resort: closePosition=true (may be rejected with -4136, but we surface the error)
-          fallbackParams.closePosition = 'true';
+          // CRITICAL FIX: If no quantity can be derived, it means the position is likely closed.
+          // Do NOT attempt to place an order with closePosition=true as it will likely fail with -2022.
+          // Instead, log and return null to signal that no order was placed.
+          logger.warn(
+            `[TP Fallback] ⚠️ Skipping LIMIT fallback for pos=${position?.id || 'N/A'} because no closable quantity was found on the exchange. The position is likely already closed.`
+          );
+          return null;
         }
         
         try {
@@ -2928,9 +2994,39 @@ export class BinanceDirectClient {
           );
           return fallbackData;
         } catch (fallbackError) {
+          const feMsg = fallbackError?.message || String(fallbackError);
+          const feCode = fallbackError?.code;
+
+          // CRITICAL: -4116 ClientOrderId duplicated.
+          // This often means the previous request actually succeeded but we didn't receive/handle the response.
+          // Recover by querying the order by origClientOrderId.
+          if (feCode === -4116 || feCode === '-4116' || feMsg.includes('-4116')) {
+            const clientId = fallbackParams?.newClientOrderId;
+            if (clientId) {
+              try {
+                const existing = await this.makeRequest('/fapi/v1/order', 'GET', {
+                  symbol: normalizedSymbol,
+                  origClientOrderId: clientId
+                }, true);
+                if (existing?.orderId) {
+                  logger.warn(
+                    `[TP Fallback] ⚠️ Recovered duplicated clientOrderId by fetching existing order | ` +
+                    `pos=${position?.id || 'N/A'} origClientOrderId=${clientId} orderId=${existing.orderId}`
+                  );
+                  return existing;
+                }
+              } catch (fetchErr) {
+                logger.error(
+                  `[TP Fallback] ❌ Failed to recover duplicated clientOrderId (GET by origClientOrderId failed) | ` +
+                  `pos=${position?.id || 'N/A'} origClientOrderId=${clientId} error=${fetchErr?.message || fetchErr}`
+                );
+              }
+            }
+          }
+
           logger.error(
             `[TP Fallback] ❌ Failed to create LIMIT order (fallback) | pos=${position?.id || 'N/A'} ` +
-            `error=${fallbackError?.message || fallbackError}`
+            `error=${feMsg}`
           );
           throw fallbackError;
         }

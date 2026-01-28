@@ -48,7 +48,7 @@ class WebSocketManager {
     this.wsPongTimeoutMs = Number(configService.getNumber('BINANCE_WS_PONG_TIMEOUT_MS', 15000));
 
     // ✅ PRICE HANDLER PROFILING
-    this.priceHandlerSlowThresholdMs = Number(configService.getNumber('BINANCE_WS_PRICE_HANDLER_SLOW_MS', 20));
+    this.priceHandlerSlowThresholdMs = Number(configService.getNumber('BINANCE_WS_PRICE_HANDLER_SLOW_MS', 30));
 
     // ✅ LOG RATE LIMITING
     this.processingLagLogIntervalMs = Number(configService.getNumber('BINANCE_WS_PROCESSING_LAG_LOG_INTERVAL_MS', 10000));
@@ -985,10 +985,13 @@ class WebSocketManager {
       this._messageStats.lastMessageAt = receivedAt;
       // ✅ Per-connection heartbeat
       conn._lastWsMessageAt = receivedAt;
-      
-      try {
-        const msg = JSON.parse(raw);
-        const payload = msg?.data || msg;
+
+      // Keep the WS callback ultra-light: defer JSON.parse + processing to the next tick.
+      // This reduces event-loop backlog when many streams burst simultaneously.
+      setImmediate(() => {
+        try {
+          const msg = JSON.parse(raw);
+          const payload = msg?.data || msg;
 
         // Keep time offset fresh (best-effort, throttled)
         this._syncServerTimeOffsetIfNeeded(conn).catch(() => {});
@@ -1190,10 +1193,48 @@ class WebSocketManager {
           const processingLagMs = processedAt - receivedAt;
 
           // Only log processing lag when it is suspiciously high (helps distinguish network vs event-loop backlog)
-          // ✅ Rate-limit log để tránh spam khi event loop bị nghẽn
-          if (processingLagMs > 250) {
+          // ✅ Rate-limit + aggregate to avoid log spam when event loop is congested
+          const thresholdMs = Number(configService.getNumber('BINANCE_WS_PROCESSING_LAG_WARN_MS', 250));
+          if (processingLagMs > thresholdMs) {
             const now = Date.now();
             const intervalMs = Math.max(1000, Number(this.processingLagLogIntervalMs || 10000));
+
+            // aggregate by stream in the current window
+            if (!this._processingLagAgg) {
+              this._processingLagAgg = {
+                windowStart: now,
+                count: 0,
+                maxMs: 0,
+                sampleStream: null,
+                sampleOffsetMs: 0,
+                sampleConnStreams: 0
+              };
+            }
+            if (!this._processingLagAgg.windowStart || (now - this._processingLagAgg.windowStart) >= intervalMs) {
+              if (this._processingLagAgg.count > 0) {
+                logger.warn(
+                  `[Binance-WS] ⚠️ Processing lag (window) | count=${this._processingLagAgg.count} ` +
+                    `max=${this._processingLagAgg.maxMs}ms sampleStream=${this._processingLagAgg.sampleStream || 'n/a'} ` +
+                    `offsetMs=${Number(this._processingLagAgg.sampleOffsetMs || 0).toFixed(0)} streams=${this._processingLagAgg.sampleConnStreams || 0}`
+                );
+              }
+              this._processingLagAgg.windowStart = now;
+              this._processingLagAgg.count = 0;
+              this._processingLagAgg.maxMs = 0;
+              this._processingLagAgg.sampleStream = null;
+              this._processingLagAgg.sampleOffsetMs = 0;
+              this._processingLagAgg.sampleConnStreams = 0;
+            }
+
+            this._processingLagAgg.count++;
+            if (processingLagMs > this._processingLagAgg.maxMs) {
+              this._processingLagAgg.maxMs = processingLagMs;
+              this._processingLagAgg.sampleStream = streamName;
+              this._processingLagAgg.sampleOffsetMs = offsetMs;
+              this._processingLagAgg.sampleConnStreams = conn.streams.size;
+            }
+
+            // Backwards-compatible single log (still rate-limited by interval)
             if (now - Number(this._lastProcessingLagLogAt || 0) >= intervalMs) {
               this._lastProcessingLagLogAt = now;
               logger.warn(
@@ -1212,6 +1253,7 @@ class WebSocketManager {
         );
         // ✅ FIX: Không throw để không crash bot, tiếp tục process messages tiếp theo
       }
+      });
     });
 
     conn.ws.on('close', (code, reason) => {

@@ -1,7 +1,7 @@
 import { Strategy } from '../models/Strategy.js';
 import { Bot } from '../models/Bot.js';
 import { PositionMonitor } from '../jobs/PositionMonitor.js';
-import { EntryOrderMonitor } from '../jobs/EntryOrderMonitor.js';
+import { EntryOrderMonitor } from '../jobs/PositionUpdateHandler.js';
 import { BalanceManager } from '../jobs/BalanceManager.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { OrderService } from '../services/OrderService.js';

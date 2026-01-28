@@ -17,6 +17,7 @@ import { SupportResistanceService } from '../services/SupportResistanceService.j
 import { MultiTimeframeService } from '../services/MultiTimeframeService.js';
 import { LossStreakService } from '../services/LossStreakService.js';
 import { AutoOptimizeService } from '../services/AutoOptimizeService.js';
+import { LifoAsyncQueue } from '../utils/LifoAsyncQueue.js';
 
 /**
  * Position Monitor Job - Monitor and update open positions
@@ -47,6 +48,10 @@ export class PositionMonitor {
     this._scanCache = new ScanCycleCache();
     this._priceCache = new ScanCycleCache();
     this._closableQtyCache = new ScanCycleCache();
+
+    // TP/SL placement queue (LIFO): newest positions get protected first.
+    // Per-bot queues to avoid cross-bot starvation and reduce rate-limit collisions.
+    this._tpslQueues = new Map(); // botId -> LifoAsyncQueue
   }
 
   /**
@@ -439,7 +444,44 @@ export class PositionMonitor {
    * Uses soft lock to prevent race conditions when multiple instances run concurrently.
    * @param {Object} position - Position object
    */
+  _getTpSlQueue(botId) {
+    const id = String(botId);
+    if (this._tpslQueues.has(id)) return this._tpslQueues.get(id);
+
+    const concurrency = Number(configService.getNumber('TPSL_QUEUE_CONCURRENCY_PER_BOT', 2));
+    const maxSize = Number(configService.getNumber('TPSL_QUEUE_MAX_SIZE_PER_BOT', 500));
+
+    const q = new LifoAsyncQueue({
+      concurrency,
+      maxSize,
+      name: `TPSLQueue(bot=${id})`
+    });
+
+    this._tpslQueues.set(id, q);
+    return q;
+  }
+
   async placeExitOrder(position) {
+    const botId = position?.bot_id;
+    const q = this._getTpSlQueue(botId);
+
+    // Dedupe per position: only keep the latest TP/SL placement request.
+    // Priority: emergency positions go first.
+    const openedAt = position?.opened_at ? new Date(position.opened_at).getTime() : 0;
+    const ageMs = openedAt ? Date.now() - openedAt : 0;
+    const emergencyMs = Number(configService.getNumber('POSITION_EMERGENCY_SLA_MS', 10 * 1000));
+    const priority = ageMs > emergencyMs ? 10 : 0;
+
+    return q.push({
+      key: `tpsl:${position?.id}`,
+      priority,
+      maxRetries: Number(configService.getNumber('TPSL_QUEUE_MAX_RETRIES', 3)),
+      baseDelayMs: Number(configService.getNumber('TPSL_QUEUE_BASE_DELAY_MS', 200)),
+      fn: async () => this._placeExitOrderCore(position)
+    });
+  }
+
+  async _placeExitOrderCore(position) {
     // Skip if position is not open
     if (position.status !== 'open') {
       return;
@@ -894,6 +936,14 @@ export class PositionMonitor {
           );
           
           const placed = await mgr.placeOrReplaceExitOrder(position, tpPrice);
+
+          // CRITICAL FIX: After replacement, the new order ID must be persisted immediately.
+          // The 'placed' object contains the new orderId. We must update the DB here.
+          if (placed && placed.orderId) {
+            await Position.update(position.id, { exit_order_id: placed.orderId });
+            position.exit_order_id = placed.orderId; // Update in-memory object as well
+            logger.info(`[Place TP/SL] ✅ Successfully updated exit_order_id to ${placed.orderId} for pos=${position.id} after replacement.`);
+          }
           
           // CRITICAL: Check if ExitOrderManager signals to close position immediately
           // This happens when price has already exceeded initial TP before order placement
@@ -1081,6 +1131,40 @@ export class PositionMonitor {
             `(order may have been created on exchange but DB update failed - check logs above) ` +
             `timestamp=${new Date().toISOString()}`
           );
+
+          // SELF-HEALING: If error is -2022, check if position is already closed
+          const errorMsg = e?.message || String(e);
+          if (errorMsg.includes('-2022') || errorMsg.includes('ReduceOnly')) {
+            try {
+              const exchangeService = this.exchangeServices.get(position.bot_id);
+              if (exchangeService) {
+                const positions = await exchangeService.getOpenPositions();
+                const pos = Array.isArray(positions) 
+                  ? positions.find(p => (p.symbol || p.info?.symbol) === position.symbol && 
+                                       Math.abs(parseFloat(p.positionAmt || p.contracts || 0)) > 0)
+                  : null;
+                
+                if (!pos || Math.abs(parseFloat(pos.positionAmt || pos.contracts || 0)) === 0) {
+                  logger.info(
+                    `[Place TP/SL] Position ${position.id} (${position.symbol}) already closed on exchange. ` +
+                    `TP creation failed with -2022, but position is safe. Updating local status to 'closed'.`
+                  );
+                  await Position.update(position.id, { 
+                    status: 'closed', 
+                    close_reason: 'sync_closed_on_exchange',
+                    closed_at: new Date(),
+                    tp_sl_pending: false
+                  });
+                  // Release lock and exit early
+                  await this._releasePositionLock(position.id);
+                  return;
+                }
+              }
+            } catch (verifyError) {
+              logger.warn(`[Place TP/SL] Could not verify position state after -2022 error on TP placement: ${verifyError?.message || verifyError}`);
+            }
+          }
+
           try {
             const currentPosition = await Position.findById(position.id);
             const shouldPreserveInitialTP = currentPosition?.initial_tp_price && 
@@ -1210,9 +1294,15 @@ export class PositionMonitor {
                 if (!pos || Math.abs(parseFloat(pos.positionAmt || pos.contracts || 0)) === 0) {
                   logger.info(
                     `[Place TP/SL] Position ${position.id} (${position.symbol}) already closed/reduced on exchange. ` +
-                    `SL creation failed but position is safe.`
+                    `SL creation failed but position is safe. Updating local status to 'closed'.`
                   );
-                  // Position is already closed, no need to retry
+                  // SELF-HEALING: Mark position as closed in DB to prevent retry loops
+                  await Position.update(position.id, { 
+                    status: 'closed', 
+                    close_reason: 'sync_closed_on_exchange',
+                    closed_at: new Date(),
+                    tp_sl_pending: false // Ensure no more retries
+                  });
                   return;
                 }
               }

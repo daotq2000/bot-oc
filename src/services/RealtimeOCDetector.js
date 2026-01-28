@@ -227,6 +227,18 @@ export class RealtimeOCDetector {
   }
 
   async getAccurateOpen(exchange, symbol, interval, currentPrice, timestamp = Date.now()) {
+    // Fast-path memoization within the same event-loop turn / burst (avoids repeated WS reads per tick)
+    if (!this._accurateOpenMemo) this._accurateOpenMemo = new Map();
+    const memoNow = Date.now();
+    const memoTtlMs = Number(configService.getNumber('OC_ACCURATE_OPEN_MEMO_TTL_MS', 1000));
+    const exMemo = (exchange || '').toLowerCase();
+    const symMemo = String(symbol || '').toUpperCase().replace(/[/:_]/g, '');
+    const bucketStartMemo = this.getBucketStart(interval, timestamp);
+    const memoKey = `${exMemo}|${symMemo}|${interval}|${bucketStartMemo}`;
+    const memoHit = this._accurateOpenMemo.get(memoKey);
+    if (memoHit && (memoNow - memoHit.at) <= memoTtlMs) {
+      return memoHit.value;
+    }
     const ex = (exchange || '').toLowerCase();
     const sym = String(symbol || '').toUpperCase().replace(/[/:_]/g, '');
     const bucketStart = this.getBucketStart(interval, timestamp);
@@ -236,7 +248,9 @@ export class RealtimeOCDetector {
     const cached = this.openPriceCache.get(key);
     if (cached && cached.bucketStart === bucketStart && Number.isFinite(cached.open) && cached.open > 0) {
       openSource = cached.source || 'cache';
-      return { open: cached.open, error: null, source: openSource };
+      const value = { open: cached.open, error: null, source: openSource };
+      this._accurateOpenMemo.set(memoKey, { at: memoNow, value });
+      return value;
     }
 
     try {
@@ -247,7 +261,9 @@ export class RealtimeOCDetector {
         const wsOpen = webSocketManager.getKlineOpen(sym, interval, bucketStart);
         if (Number.isFinite(wsOpen) && wsOpen > 0) {
           this.openPriceCache.set(key, { open: wsOpen, bucketStart, lastUpdate: timestamp, source: 'binance_ws_bucket_open' });
-          return { open: wsOpen, error: null, source: 'binance_ws_bucket_open' };
+          const value = { open: wsOpen, error: null, source: 'binance_ws_bucket_open' };
+          this._accurateOpenMemo.set(memoKey, { at: memoNow, value });
+          return value;
         }
 
         // 2) If we have latest candle for this interval and it matches the bucketStart, use its open
@@ -256,7 +272,9 @@ export class RealtimeOCDetector {
           const lo = Number(latest.open);
           if (Number.isFinite(lo) && lo > 0) {
             this.openPriceCache.set(key, { open: lo, bucketStart, lastUpdate: timestamp, source: 'binance_ws_latest_candle_open' });
-            return { open: lo, error: null, source: 'binance_ws_latest_candle_open' };
+            const value = { open: lo, error: null, source: 'binance_ws_latest_candle_open' };
+            this._accurateOpenMemo.set(memoKey, { at: memoNow, value });
+            return value;
           }
         }
 
@@ -310,7 +328,9 @@ export class RealtimeOCDetector {
             `bucketStart=${bucketStart} prevClose=${prevClose.toFixed(8)}`
           );
           this.openPriceCache.set(key, { open: prevClose, bucketStart, lastUpdate: timestamp, source: 'binance_ws_prev_close' });
-          return { open: prevClose, error: null, source: 'binance_ws_prev_close' };
+          const value = { open: prevClose, error: null, source: 'binance_ws_prev_close' };
+          this._accurateOpenMemo.set(memoKey, { at: memoNow, value });
+          return value;
         }
       } else if (ex === 'mexc') {
         const { mexcPriceWs } = await import('./MexcWebSocketManager.js');

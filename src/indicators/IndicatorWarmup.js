@@ -11,7 +11,7 @@ export class IndicatorWarmup {
     this.warmupCandleCount1m = Number(configService.getNumber('INDICATORS_WARMUP_CANDLES_1M', 50));
     this.warmupCandleCount5m = Number(configService.getNumber('INDICATORS_WARMUP_CANDLES_5M', 0));
     this.warmupCandleCount15m = Number(configService.getNumber('INDICATORS_WARMUP_CANDLES_15M', 50));
-    this.warmupTimeoutMs = 30 * 1000;
+    this.warmupTimeoutMs = Number(configService.getNumber('INDICATORS_WARMUP_TIMEOUT_MS', 30 * 1000));
 
     // Fast mode toggles
     this.fastModeEnabled = configService.getBoolean('INDICATORS_WARMUP_FAST_MODE', false);

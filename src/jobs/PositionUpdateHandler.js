@@ -5,6 +5,7 @@ import { Position } from '../models/Position.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { PositionWebSocketClient } from '../services/PositionWebSocketClient.js';
 import { orderStatusCache } from '../services/OrderStatusCache.js';
+import { calculatePnL } from '../utils/calculator.js';
 import { DEFAULT_CRON_PATTERNS } from '../config/constants.js';
 import { configService } from '../services/ConfigService.js';
 import logger from '../utils/logger.js';
@@ -17,6 +18,8 @@ import logger from '../utils/logger.js';
  */
 export class EntryOrderMonitor {
   constructor() {
+    this.positionServices = new Map(); // botId -> PositionService (lazy)
+
     this.exchangeServices = new Map(); // botId -> ExchangeService
     this.wsClients = new Map(); // botId -> PositionWebSocketClient (Binance only)
     this.bots = new Map(); // botId -> Bot (for exchange lookup)
@@ -75,6 +78,12 @@ export class EntryOrderMonitor {
         wsClient.on('ORDER_TRADE_UPDATE', (evt) => {
           this._handleBinanceOrderTradeUpdate(bot.id, evt).catch(err => {
             logger.error(`[EntryOrderMonitor] Error in ORDER_TRADE_UPDATE handler for bot ${bot.id}:`, err?.message || err);
+          });
+        });
+
+        wsClient.on('ACCOUNT_UPDATE', (evt) => {
+          this._handleBinanceAccountUpdate(bot.id, evt).catch(err => {
+            logger.error(`[EntryOrderMonitor] Error in ACCOUNT_UPDATE handler for bot ${bot.id}:`, err?.message || err);
           });
         });
 
@@ -356,7 +365,6 @@ export class EntryOrderMonitor {
     const reason = (String(exitOrderId) === String(position.exit_order_id)) ? 'tp_hit' : 'sl_hit';
     const closePrice = Number.isFinite(Number(avgPrice)) && Number(avgPrice) > 0 ? Number(avgPrice) : Number(position.take_profit_price || position.stoploss_price || position.entry_price);
 
-    const { calculatePnL } = await import('../utils/calculator.js');
     const pnl = calculatePnL(position.entry_price, closePrice, position.amount, position.side);
 
     // Close in DB
@@ -431,9 +439,7 @@ export class EntryOrderMonitor {
       // Exclude orders that are already filled or cancelled
       const pendingOrders = openOrders.filter(order => {
         const status = String(order?.status || '').toUpperCase();
-        const orderId = String(order?.orderId || order?.id || '');
-        const orderType = String(order?.type || order?.orderType || '').toUpperCase();
-        
+
         // Skip if order is already filled, cancelled, or expired
         if (status === 'FILLED' || status === 'CANCELED' || status === 'CANCELLED' || status === 'EXPIRED') {
           return false;
@@ -517,11 +523,22 @@ export class EntryOrderMonitor {
   }
 
   async _getPositionServiceForBot(botId) {
-    // Lazy import to avoid circular deps
-    const { PositionService } = await import('../services/PositionService.js');
+    if (this.positionServices && this.positionServices.has(botId)) {
+      return this.positionServices.get(botId);
+    }
+
     const exchangeService = this.exchangeServices.get(botId);
     if (!exchangeService) return null;
-    return new PositionService(exchangeService, this.telegramService);
+
+    // Lazy import to avoid circular deps
+    const { PositionService } = await import('../services/PositionService.js');
+    const svc = new PositionService(exchangeService, this.telegramService);
+
+    if (this.positionServices) {
+      this.positionServices.set(botId, svc);
+    }
+
+    return svc;
   }
 
   /**
@@ -670,6 +687,101 @@ export class EntryOrderMonitor {
     } catch (error) {
       logger.error(`[EntryOrderMonitor] Error checking exit order: ${error?.message || error}`);
       return false;
+    }
+  }
+
+  /**
+   * Find an open DB position by botId + symbol.
+   * Used for ACCOUNT_UPDATE-based close detection (manual close on exchange).
+   * @param {number} botId
+   * @param {string} symbol
+   * @returns {Promise<Object|null>}
+   */
+  async _findOpenPosition(botId, symbol) {
+    if (!botId || !symbol) return null;
+
+    const normalized = String(symbol).replace(/_/g, '').toUpperCase();
+
+    try {
+      // Fast path: query open positions and match normalized symbol.
+      const open = await Position.findOpen();
+      for (const p of open) {
+        if (Number(p?.bot_id) !== Number(botId)) continue;
+        const dbSym = String(p?.symbol || '').replace(/_/g, '').toUpperCase();
+        if (dbSym === normalized) return p;
+      }
+      return null;
+    } catch (error) {
+      logger.error(`[EntryOrderMonitor] Error finding open position for bot ${botId} symbol ${symbol}: ${error?.message || error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Handle Binance ACCOUNT_UPDATE user-data event.
+   * Primary purpose here: detect manual closes on exchange and close DB position accordingly.
+   * @param {number} botId
+   * @param {Object} evt
+   */
+  async _handleBinanceAccountUpdate(botId, evt) {
+    try {
+      const e = evt?.e || evt?.eventType;
+      if (e !== 'ACCOUNT_UPDATE') return;
+
+      const a = evt?.a || evt?.account || null;
+      const positions = a?.P || a?.positions || [];
+      if (!Array.isArray(positions) || positions.length === 0) return;
+
+      for (const p of positions) {
+        const sym = p?.s || p?.symbol;
+        const pa = p?.pa ?? p?.positionAmt;
+        if (!sym) continue;
+
+        const amt = Number(pa);
+        // Binance futures: when position is closed, positionAmt becomes 0
+        if (Number.isFinite(amt) && amt === 0) {
+          const normalizedSymbol = String(sym).replace(/_/g, '');
+          const dbPos = await this._findOpenPosition(botId, normalizedSymbol);
+          if (!dbPos) continue;
+
+          // We don't have reliable close price from ACCOUNT_UPDATE; best-effort using exit order avgPrice cache or last ticker
+          let closePrice = Number(dbPos.take_profit_price || dbPos.stoploss_price || dbPos.entry_price);
+          try {
+            const exchangeService = this.exchangeServices.get(botId);
+            if (exchangeService) {
+              const px = await exchangeService.getTickerPrice(dbPos.symbol);
+              if (Number.isFinite(px) && px > 0) closePrice = px;
+            }
+          } catch (_) {}
+
+          const pnl = calculatePnL(dbPos.entry_price, closePrice, dbPos.amount, dbPos.side);
+          const closed = await Position.close(dbPos.id, closePrice, pnl, 'exchange_manual_close');
+
+          logger.info(`[EntryOrderMonitor] ✅ Closed DB position ${dbPos.id} via ACCOUNT_UPDATE (manual close) | symbol=${dbPos.symbol} closePrice=${closePrice} pnl=${pnl}`);
+
+          // Telegram notify (best-effort)
+          try {
+            const positionService = await this._getPositionServiceForBot(botId);
+            if (positionService?.sendTelegramCloseNotification) {
+              await positionService.sendTelegramCloseNotification(closed);
+            } else if (this.telegramService?.sendCloseSummaryAlert) {
+              const stats = await Position.getBotStats(closed.bot_id);
+              await this.telegramService.sendCloseSummaryAlert(closed, stats);
+            }
+          } catch (notifyErr) {
+            logger.error(`[EntryOrderMonitor] Failed to send Telegram close alert for position ${dbPos.id} (ACCOUNT_UPDATE): ${notifyErr?.message || notifyErr}`);
+          }
+
+          // Cancel pending orders for safety
+          try {
+            await this._cancelPendingOrdersForSymbol(botId, dbPos.symbol, dbPos.id);
+          } catch (cancelErr) {
+            logger.warn(`[EntryOrderMonitor] Failed to cancel pending orders for ${dbPos.symbol} after ACCOUNT_UPDATE close: ${cancelErr?.message || cancelErr}`);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error(`[EntryOrderMonitor] Error in _handleBinanceAccountUpdate for bot ${botId}: ${error?.message || error}`, error?.stack);
     }
   }
 

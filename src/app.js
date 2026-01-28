@@ -82,7 +82,16 @@ app.get('/health/detailed', async (req, res) => {
           reconnectQueue: wsStatus.reconnectQueue,
           messageStats: wsStatus.messageStats
         },
-        candleDbFlusher: candleFlushStats
+        candleDbFlusher: candleFlushStats,
+        positionMonitor: positionMonitor ? {
+          tpslQueues: Array.from(positionMonitor._tpslQueues.entries()).map(([botId, queue]) => ({
+            botId,
+            name: queue.name,
+            pending: queue.size,
+            inFlight: queue.inFlight,
+            total: queue.size + queue.inFlight
+          }))
+        } : null
       }
     };
     
@@ -124,6 +133,7 @@ let strategiesWorker = null;
 let symbolsUpdaterJob = null;
 let positionSyncJob = null;
 let telegramBot = null;
+export let positionMonitor = null;
 
 
 // Initialize services and start server
@@ -411,7 +421,7 @@ async function start() {
       logger.info('='.repeat(60));
       try {
         const { PositionMonitor } = await import('./jobs/PositionMonitor.js');
-        const positionMonitor = new PositionMonitor();
+        positionMonitor = new PositionMonitor();
         await positionMonitor.initialize(telegramService);
         positionMonitor.start();
         logger.info('✅ Position Monitor started successfully');
