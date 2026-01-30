@@ -37,7 +37,7 @@ export class PriceAlertScanner {
     // ✅ OPTIMIZED: Cache PriceAlertConfigs (refresh định kỳ để bắt config mới mà không query mỗi scan)
     this.cachedConfigs = null;
     this.configCacheTime = 0;
-    this.configCacheTTL = 60 * 1000; // 60s refresh by default (can be tuned)
+    this.configCacheTTL = 30 * 60 * 1000; // 30 minutes refresh by default (can be tuned)
 
     // ✅ OPTIMIZED: Cache symbols với TTL
     this.cachedSymbols = new Map(); // exchange -> Set<symbol>
@@ -637,12 +637,15 @@ export class PriceAlertScanner {
       const oc = ((price - openPrice) / openPrice) * 100; // signed
       const ocAbs = Math.abs(oc);
 
-      // ✅ Log OC detection for visibility
-      logger.info(
-        `[PriceAlertScanner] 🔍 detectOC | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
-        `OC=${oc.toFixed(2)}% (open=${openPrice.toFixed(8)}, current=${price.toFixed(8)}, ` +
-        `source=${openSource || 'unknown'}, bucket=${bucket})`
-      );
+      // ✅ Log OC detection only when it reaches alert threshold (reduce log spam)
+      // NOTE: threshold is per-config; we only log when OC >= threshold to keep logs meaningful.
+      if (Number(ocAbs) >= Number(threshold)) {
+        logger.info(
+          `[PriceAlertScanner] 🔍 detectOC | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
+          `OC=${oc.toFixed(2)}% (open=${openPrice.toFixed(8)}, current=${price.toFixed(8)}, ` +
+          `source=${openSource || 'unknown'}, bucket=${bucket})`
+        );
+      }
 
       // 1) ALWAYS execute signal for any OC (no threshold gate)
       // Execute is independent from Telegram success/fail.

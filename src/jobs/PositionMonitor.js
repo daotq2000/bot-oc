@@ -1779,7 +1779,7 @@ export class PositionMonitor {
           }
           
           // CRITICAL SAFETY CHECK: If position has been open > 30s without TP/SL, force it to high priority
-          if (!needsTPSL && timeSinceOpened > SAFETY_CHECK_MS) {
+          if (needsTPSL && timeSinceOpened > SAFETY_CHECK_MS) {
             logger.error(
               `[PositionMonitor] 🚨 CRITICAL: Position ${pos.id} (${pos.symbol}) has been open for ${Math.floor(timeSinceOpened / 1000)}s ` +
               `without TP/SL! exit_order_id=${pos.exit_order_id || 'NULL'}, sl_order_id=${pos.sl_order_id || 'NULL'}. ` +

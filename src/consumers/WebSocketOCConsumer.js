@@ -908,6 +908,32 @@ export class WebSocketOCConsumer {
       
       logger.info(`[WebSocketOCConsumer] ✅ Strategy ${strategy.id} has no open position, proceeding...`);
 
+      // ==============================================
+      // Candle-Close Confirmation (follow-trend 1m/5m)
+      // ----------------------------------------------
+      // For trend-following strategies on 1m/5m, only enter after the
+      // candle has CLOSED, and OC of that closed candle still meets the
+      // threshold/direction. This avoids fills on intrabar wicks.
+      // ==============================================
+      if (!Boolean(strategy.is_reverse_strategy) && (strategy.interval === '1m' || strategy.interval === '5m')) {
+        const latestCandle = webSocketManager.getLatestCandle(strategy.symbol, strategy.interval);
+        if (!latestCandle || latestCandle.isClosed !== true) {
+          logger.debug(`[WebSocketOCConsumer] ⏭️ Candle not closed yet for strategy ${strategy.id} (${strategy.interval}), skipping until close.`);
+          return;
+        }
+        const closedOc = ((Number(latestCandle.close) - Number(latestCandle.open)) / Number(latestCandle.open)) * 100;
+        const closedOcAbs = Math.abs(closedOc);
+        const closedDir = closedOc >= 0 ? 'bullish' : 'bearish';
+        if (closedOcAbs < Number(strategy.oc || 0)) {
+          logger.debug(`[WebSocketOCConsumer] ⏭️ Closed-candle OC ${closedOcAbs.toFixed(3)}% < threshold ${strategy.oc}% for strategy ${strategy.id}`);
+          return;
+        }
+        if (closedDir !== direction) {
+          logger.debug(`[WebSocketOCConsumer] ⏭️ Direction mismatch after candle close for strategy ${strategy.id}: tick=${direction}, candle=${closedDir}`);
+          return;
+        }
+      }
+
       // Determine side based on direction, trade_type and is_reverse_strategy from bot
       const side = determineSide(direction, strategy.trade_type, strategy.is_reverse_strategy);
       logger.debug(
