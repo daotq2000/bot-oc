@@ -1207,10 +1207,10 @@ export class ExchangeService {
     throw new Error('createCloseStopMarket not supported on this exchange');
   }
 
-  async createCloseTakeProfitMarket(symbol, side, stopPrice, position = null) {
+  async createCloseTakeProfitMarket(symbol, side, stopPrice, position = null, preferredQuantity = null) {
     if (this.bot.exchange === 'binance' && this.binanceDirectClient) {
       const normalizedSymbol = this.binanceDirectClient.normalizeSymbol(symbol);
-      return await this.binanceDirectClient.createCloseTakeProfitMarket(normalizedSymbol, side, stopPrice, position, this.bot);
+      return await this.binanceDirectClient.createCloseTakeProfitMarket(normalizedSymbol, side, stopPrice, position, this.bot, preferredQuantity);
     }
     throw new Error('createCloseTakeProfitMarket not supported on this exchange');
   }

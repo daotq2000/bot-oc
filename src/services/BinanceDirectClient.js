@@ -2690,7 +2690,7 @@ export class BinanceDirectClient {
    * Create CLOSE-POSITION STOP_MARKET
    * LONG closes with SELL; SHORT closes with BUY.
    */
-  async createCloseStopMarket(symbol, side, stopPrice, position = null, bot = null) {
+  async createCloseStopMarket(symbol, side, stopPrice, position = null, bot = null, preferredQuantity = null) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
     const [tickSize, dualSide, currentPrice] = await Promise.all([
@@ -2753,6 +2753,16 @@ export class BinanceDirectClient {
       timeInForce: 'GTC',
       workingType: 'MARK_PRICE' // Use MARK_PRICE for better trigger accuracy
     };
+
+    // Optional: When provided, use explicit quantity (more reliable than closePosition for some symbols/modes).
+    // This helps prevent -2022 ReduceOnly Order is rejected due to DB/exchange size drift.
+    try {
+      if (preferredQuantity && Number(preferredQuantity) > 0) {
+        delete params.closePosition;
+        params.quantity = String(preferredQuantity);
+      }
+    } catch (_) {}
+
 
     // Add deterministic clientOrderId to reliably map WS fills back to DB position
     // Format: OC_B{botId}_P{positionId}_EXIT / _SL
@@ -2828,7 +2838,7 @@ export class BinanceDirectClient {
    * Create CLOSE-POSITION TAKE_PROFIT_MARKET
    * LONG closes with SELL; SHORT closes with BUY.
    */
-  async createCloseTakeProfitMarket(symbol, side, stopPrice, position = null, bot = null) {
+  async createCloseTakeProfitMarket(symbol, side, stopPrice, position = null, bot = null, preferredQuantity = null) {
     const normalizedSymbol = this.normalizeSymbol(symbol);
 
     const [tickSize, dualSide, currentPrice] = await Promise.all([
@@ -2949,7 +2959,7 @@ export class BinanceDirectClient {
         // - Prefer an explicit quantity and set reduceOnly=true (Binance rejects LIMIT + closePosition=true with -4136)
         // - As a fallback, try to fetch current position size from the exchange
         // - Only if everything fails, we will fall back to closePosition=true (may be rejected, but we log and surface)
-        let fallbackQuantity = params.quantity;
+        let fallbackQuantity = preferredQuantity || params.quantity;
         try {
           if (!fallbackQuantity && position) {
             const stepSize = await this.getStepSize(normalizedSymbol);

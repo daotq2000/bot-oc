@@ -480,11 +480,6 @@ export class PriceAlertScanner {
     const normalizedExchange = (exchange || 'mexc').toLowerCase();
     
     // ✅ Debug: Log config being checked (use info level for visibility)
-    logger.info(
-      `[PriceAlertScanner] 📋 Checking config ${id} | exchange=${normalizedExchange} ` +
-      `threshold=${threshold}% telegram_chat_id=${telegram_chat_id} intervals=${JSON.stringify(config.intervals || [])}`
-    );
-
     // Get exchange service
     const exchangeService = this.exchangeServices.get(normalizedExchange);
     if (!exchangeService) {
@@ -698,14 +693,7 @@ export class PriceAlertScanner {
           );
         }
       } else {
-        // Reset alerted flag when oc drops below threshold
-        // Only log when OC is close to threshold (within 0.5%) to reduce noise
-        if (state.alerted || (ocAbs >= threshold * 0.5)) {
-          logger.info(
-            `[PriceAlertScanner] ⏭️ OC below threshold | ${exchange.toUpperCase()} ${symbol} ${interval} ` +
-            `OC=${ocAbs.toFixed(2)}% < threshold=${threshold}% | ${state.alerted ? 'Resetting alerted flag' : 'Waiting for threshold'}`
-          );
-        }
+        
         state.alerted = false;
       }
     } catch (error) {

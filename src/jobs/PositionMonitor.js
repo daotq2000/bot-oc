@@ -855,20 +855,51 @@ export class PositionMonitor {
           `[Place TP/SL] ⚠️ No closable quantity found for position ${position.id} (${position.symbol}), ` +
           `position likely already closed on exchange. Skipping TP/SL placement (will be synced by PositionSync).`
         );
-        
+
         // CRITICAL: Mark position as needing sync (don't retry TP/SL placement)
         try {
-          await Position.update(position.id, { 
+          await Position.update(position.id, {
             tp_sl_pending: false // Clear pending flag to prevent retry loops
           });
         } catch (e) {
           // Ignore if column doesn't exist
         }
-        
+
         // Release lock before returning
         await this._releasePositionLock(position.id);
         return;
       }
+
+      // ✅ Reconcile DB amount with on-exchange position size to avoid ReduceOnly rejections
+      // `amount` in DB is USDT notional; exchange position size is in base-asset quantity.
+      // If DB notional drifts, downstream TP/SL fallback may derive wrong quantity.
+      try {
+        const markPriceForNotional = Number(position.entry_price || fillPrice || 0);
+        if (Number.isFinite(markPriceForNotional) && markPriceForNotional > 0) {
+          const exchangeNotional = Number(quantity) * markPriceForNotional;
+          const dbNotional = Number(position.amount || 0);
+          const diffPct = dbNotional > 0 ? Math.abs(exchangeNotional - dbNotional) / dbNotional * 100 : 0;
+
+          const reconcilePct = Number(configService.getNumber('POSITION_SIZE_RECONCILE_DIFF_PCT', 5)); // default 5%
+          if (!Number.isFinite(reconcilePct) || reconcilePct < 0) {
+            // no-op
+          } else if (!dbNotional || !Number.isFinite(dbNotional) || dbNotional <= 0 || diffPct >= reconcilePct) {
+            await Position.update(position.id, { amount: exchangeNotional });
+            position.amount = exchangeNotional;
+            logger.warn(
+              `[Place TP/SL] 🔄 Reconciled DB amount using exchange qty | pos=${position.id} symbol=${position.symbol} ` +
+              `qty=${Number(quantity).toFixed(8)} price=${markPriceForNotional.toFixed(8)} ` +
+              `dbAmount=${Number(dbNotional || 0).toFixed(4)} newAmount=${exchangeNotional.toFixed(4)} diff=${diffPct.toFixed(2)}%`
+            );
+          }
+        }
+      } catch (e) {
+        logger.debug(`[Place TP/SL] Size reconcile failed (non-blocking) | pos=${position.id} error=${e?.message || e}`);
+      }
+
+      // Attach preferred exit quantity to this position object so ExitOrderManager/BinanceDirectClient can use it
+      // (helps avoid ReduceOnly order rejected due to stale DB sizing)
+      position.preferred_exit_qty = quantity;
 
       // Only set SL if strategy.stoploss > 0. No fallback to reduce/up_reduce
       // NEW: stoploss is now in USDT (not percentage), need quantity to calculate SL price

@@ -897,10 +897,61 @@ class WebSocketManager {
 
     conn.ws.on('pong', () => {
       conn._lastPongAt = Date.now();
+      // Pong received, clear the timeout
+      if (conn._pongTimeoutTimer) {
+        clearTimeout(conn._pongTimeoutTimer);
+      }
     });
 
-    // NOTE: message handler omitted for brevity in this snippet rewrite
-    conn.ws.on('message', () => {});
+    conn.ws.on('message', data => {
+      try {
+        conn._lastWsMessageAt = Date.now();
+        this._messageStats.totalReceived++;
+
+        const message = JSON.parse(data);
+
+        if (message.stream && message.data) {
+          const streamType = message.stream.split('@')[1];
+          const symbol = message.data.s;
+
+          if (streamType === 'bookTicker') {
+            const price = (Number(message.data.b) + Number(message.data.a)) / 2;
+            const bid = Number(message.data.b);
+            const ask = Number(message.data.a);
+            const ts = message.data.E;
+
+            if (Number.isFinite(price) && price > 0) {
+              const cacheKey = symbol.toUpperCase();
+              let cached = this.priceCache.get(cacheKey);
+              if (!cached) {
+                cached = { price: 0, bid: 0, ask: 0, lastAccess: 0 };
+                this.priceCache.set(cacheKey, cached);
+              }
+              cached.price = price;
+              cached.bid = bid;
+              cached.ask = ask;
+              cached.lastAccess = Date.now();
+
+              this._emitPrice({ symbol, price, ts, bid, ask, _conn: conn });
+            }
+          } else if (streamType.startsWith('kline_')) {
+            const kline = message.data.k;
+            this.candleAggregator.addTradeToCandle(
+              symbol,
+              kline.t,
+              kline.c,
+              kline.v,
+              kline.i
+            );
+          }
+        }
+        this._messageStats.totalProcessed++;
+        this._messageStats.lastProcessedAt = Date.now();
+      } catch (err) {
+        this._messageStats.totalErrors++;
+        logger.debug(`[Binance-WS] Failed to parse message: ${err?.message || err}`);
+      }
+    });
 
     conn.ws.on('close', (code, reason) => {
       const reasonStr = reason?.toString() || 'none';
@@ -985,19 +1036,19 @@ class WebSocketManager {
 
     conn._pingTimer = setInterval(() => {
       try {
-        if (!conn.ws || conn.ws.readyState !== WebSocket.OPEN) return;
+        if (!conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
+          clearInterval(conn._pingTimer);
+          clearTimeout(conn._pongTimeoutTimer);
+          return;
+        }
+
+        // Set a timeout for the pong response
+        conn._pongTimeoutTimer = setTimeout(() => {
+          logger.warn(`[Binance-WS] ⚠️ Pong not received in ${pongTimeoutMs}ms. Terminating connection. | streams=${conn.streams.size}`);
+          conn.ws.terminate(); // Force close, 'close' event will trigger reconnect logic
+        }, pongTimeoutMs);
 
         conn.ws.ping();
-
-        if (conn._pongTimeoutTimer) clearTimeout(conn._pongTimeoutTimer);
-        const pingSentAt = Date.now();
-        conn._pongTimeoutTimer = setTimeout(() => {
-          const lastPong = Number(conn._lastPongAt || 0);
-          if (lastPong < pingSentAt) {
-            logger.warn(`[Binance-WS] ⚠️ Pong timeout (${pongTimeoutMs}ms) - scheduling reconnect | streams=${conn.streams.size}`);
-            this._scheduleReconnect(conn);
-          }
-        }, pongTimeoutMs);
       } catch (e) {
         logger.debug(`[Binance-WS] ping error (non-critical): ${e?.message || e}`);
       }

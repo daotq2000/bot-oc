@@ -114,7 +114,7 @@ fi
 
 # Export any runtime overrides here
 export TP_UPDATE_THRESHOLD_TICKS="${TP_UPDATE_THRESHOLD_TICKS:-1}"
-
+rm -rf ~/.pm2/logs/*
 if has_cmd pm2; then
   pm2 start "${APP_ENTRY}" --name "${BOT_NAME}" --update-env
   pm2 save || true

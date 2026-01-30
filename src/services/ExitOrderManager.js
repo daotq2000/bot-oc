@@ -347,7 +347,14 @@ export class ExitOrderManager {
       if (isStopOrder) {
         res = await this.exchangeService.createCloseStopMarket(position.symbol, side, stopPrice, position);
       } else {
-        res = await this.exchangeService.createCloseTakeProfitMarket(position.symbol, side, stopPrice, position);
+        // Pass preferredQuantity if caller attached it to position (reconciliation step)
+        res = await this.exchangeService.createCloseTakeProfitMarket(
+          position.symbol,
+          side,
+          stopPrice,
+          position,
+          position?.preferred_exit_qty ?? null
+        );
       }
 
       newOrderId = res?.orderId != null ? String(res.orderId) : null;
