@@ -97,7 +97,7 @@ export class TelegramService {
       logger.info(`Telegram clients initialized for ${this.clients.size} modules`);
       return true;
     } catch (error) {
-      logger.error('Failed to initialize Telegram bots:', error);
+      logger.error('Failed to initialize Telegram bots', { err: error?.message, stack: error?.stack });
       return false;
     }
   }
@@ -247,6 +247,13 @@ export class TelegramService {
       return;
     }
 
+    // Guard: message must be a string to avoid "Cannot read properties of undefined (reading 'length')" in queue processor
+    const safeMessage = message != null ? String(message) : '';
+    if (safeMessage === '' && message !== '') {
+      logger.warn(`[Telegram] Message is empty or invalid for chatId=${chatId}, skipping`);
+      return;
+    }
+
     // Determine which telegram client to use.
     // Supported: order, price_mexc, price_binance
     const alertType = (options?.alertType || '').toLowerCase() || 'order';
@@ -260,8 +267,8 @@ export class TelegramService {
     this._queueLastAccess.set(alertType, Date.now());
     this._chatLastAccess.set(chatId, Date.now());
 
-    // Enqueue to avoid blocking and to respect rate limits
-    this._queues.get(alertType).push({ chatId, message, options });
+    // Enqueue to avoid blocking and to respect rate limits (use safeMessage so processor never sees undefined)
+    this._queues.get(alertType).push({ chatId, message: safeMessage, options });
     logger.debug(`[Telegram] Queued message for alertType=${alertType}, queue.length=${this._queues.get(alertType).length}`);
     this._processQueue(alertType).catch((err) => {
       logger.error(`[Telegram] Error processing queue for alertType=${alertType}:`, err?.message || err);
@@ -295,7 +302,14 @@ export class TelegramService {
     
     try {
       while (queue.length > 0) {
-        const { chatId, message, options } = queue.shift();
+        const item = queue.shift();
+        const chatId = item?.chatId;
+        const message = item?.message != null ? String(item.message) : '';
+        const options = item?.options || {};
+        if (!message) {
+          logger.warn(`[Telegram] Skipping queued item with empty message for chatId=${chatId}`);
+          continue;
+        }
         // Throttle globally (per exchange) and per-chat
         const now = Date.now();
         const lastSendAt = this._lastSendAt.get(queueKey) || 0;
@@ -381,7 +395,7 @@ export class TelegramService {
         logger.debug(`[Telegram] Queue ${queueKey} processing completed, queue is empty`);
       }
     } catch (outerError) {
-      logger.error(`[Telegram] ❌ CRITICAL: Error in _processQueue for alertType=${alertType} (queueKey=${queueKey}):`, outerError?.message || outerError, outerError?.stack);
+      logger.error(`[Telegram] ❌ CRITICAL: Error in _processQueue for alertType=${alertType} (queueKey=${queueKey})`, { err: outerError?.message, stack: outerError?.stack });
     } finally {
       this._processing.set(queueKey, false);
       logger.debug(`[Telegram] Queue ${queueKey} processing flag cleared`);

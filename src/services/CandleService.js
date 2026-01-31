@@ -101,7 +101,7 @@ class CandleService {
   /**
    * Fetch candles from REST (Binance futures API) as a last resort
    */
-  async getFromRest(exchange, symbol, interval = '1m', limit = 100) {
+  async getFromRest(exchange, symbol, interval = '1m', limit = 100, options = {}) {
     const ex = this._normalizeExchange(exchange);
     if (ex !== 'binance') return [];
 
@@ -118,7 +118,7 @@ class CandleService {
 
         try {
           const params = { symbol: sym, interval: intv, limit };
-          const data = await client.makeMarketDataRequest('/fapi/v1/klines', 'GET', params);
+          const data = await client.makeMarketDataRequest('/fapi/v1/klines', 'GET', params, options);
 
           // success: reset backoff
           this._rateLimitRetryDelay = Number(configService.getNumber('CANDLES_429_RETRY_DELAY_MS', 10000));
@@ -158,10 +158,33 @@ class CandleService {
 
       // Legacy direct fetch as fallback
       const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=${intv}&limit=${limit}`;
+      const controller = new AbortController();
+      const timeoutMs = Number(configService.getNumber('BINANCE_MARKET_DATA_TIMEOUT_MS', 20000));
+      const timeoutId = setTimeout(() => controller.abort(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+
+      // Respect upstream abort if provided
+      const externalSignal = options?.signal;
+      let detachExternalAbort = null;
+      if (externalSignal) {
+        if (externalSignal.aborted) {
+          controller.abort(externalSignal.reason);
+        } else {
+          const onAbort = () => controller.abort(externalSignal.reason);
+          externalSignal.addEventListener('abort', onAbort, { once: true });
+          detachExternalAbort = () => {
+            try { externalSignal.removeEventListener('abort', onAbort); } catch (_) {}
+          };
+        }
+      }
+
       const response = await fetch(url, {
         method: 'GET',
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal
       });
+
+      clearTimeout(timeoutId);
+      if (detachExternalAbort) detachExternalAbort();
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -252,7 +275,7 @@ class CandleService {
    * PUBLIC: Get historical candles with Aggregator-first / DB-fallback / REST-last
    * Always returns candles sorted oldest -> newest.
    */
-  async getHistoricalCandles(exchange, symbol, interval, limit = 100) {
+  async getHistoricalCandles(exchange, symbol, interval, limit = 100, options = {}) {
     const ex = this._normalizeExchange(exchange);
     const sym = String(symbol || '').toUpperCase();
     const intv = String(interval || '1m').toLowerCase();
@@ -282,7 +305,7 @@ class CandleService {
 
     // 3) REST fallback: fetch missing candles
     const missing = safeLimit - merged.length;
-    const restCandles = await this.getFromRest(ex, sym, intv, Math.max(missing, safeLimit));
+    const restCandles = await this.getFromRest(ex, sym, intv, Math.max(missing, safeLimit), options);
 
     if (restCandles.length > 0) {
       await this._ingestAndPersist(ex, sym, intv, restCandles);

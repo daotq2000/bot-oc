@@ -198,7 +198,7 @@ class ExchangeInfoService {
       await this.loadFiltersFromDB();
 
     } catch (error) {
-      this.logger.error('Error updating symbol filters (Binance):', error);
+      this.logger.error('Error updating symbol filters (Binance)', { err: error?.message, stack: error?.stack });
     }
   }
 
@@ -358,7 +358,12 @@ class ExchangeInfoService {
       this.filtersCache.clear();
       await this.loadFiltersFromDB();
     } catch (e) {
-      this.logger.error('Error updating symbol filters (MEXC) via CCXT:', e);
+      const is404 = e?.code === 404 || /404|Not Found/i.test(String(e?.message || ''));
+      if (is404) {
+        this.logger.warn(`[MEXC] 404 fetching symbol filters via CCXT: ${e?.message || e}. Will try contract/spot fallback.`);
+      } else {
+        this.logger.error('Error updating symbol filters (MEXC) via CCXT', { err: e?.message, stack: e?.stack });
+      }
       const futuresOnly = this.config.getBoolean('MEXC_FUTURES_ONLY', true)
       if (futuresOnly) {
         this.logger.warn('Futures-only mode enabled. Trying contract API...');

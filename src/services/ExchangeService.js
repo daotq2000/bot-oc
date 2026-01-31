@@ -227,7 +227,7 @@ export class ExchangeService {
               logger.warn(`[${this.bot.exchange}] loadMarkets attempt ${attempt}/${maxRetries} failed, retrying in ${delayMs}ms: ${error?.message || error}`);
               await new Promise(resolve => setTimeout(resolve, delayMs));
             } else {
-              logger.error(`[${this.bot.exchange}] loadMarkets failed after ${maxRetries} attempts for bot ${this.bot.id}:`, error);
+              logger.error(`[${this.bot.exchange}] loadMarkets failed after ${maxRetries} attempts for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
               // For MEXC, continue anyway (markets will be loaded on-demand)
               if (this.bot.exchange === 'mexc') {
                 logger.warn(`[MEXC] Continuing without loadMarkets - will load markets on-demand`);
@@ -248,7 +248,7 @@ export class ExchangeService {
 
       return true;
     } catch (error) {
-      logger.error(`Failed to initialize exchange for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to initialize exchange for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -319,7 +319,7 @@ export class ExchangeService {
         };
       }
     } catch (error) {
-      logger.error(`Failed to get ${type} balance for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to get ${type} balance for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -830,7 +830,7 @@ export class ExchangeService {
           logger.warn(`Create order validation for bot ${this.bot.id}: ${msg}`);
         }
       } else {
-        logger.error(`Failed to create order for bot ${this.bot.id}:`, error);
+        logger.error(`Failed to create order for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       }
       throw error;
     }
@@ -1066,7 +1066,7 @@ export class ExchangeService {
         logger.warn(`[ExchangeService] ReduceOnly close skipped for bot ${this.bot.id} (${symbol}): ${msg}`);
         return { skipped: true, reason: 'reduceonly_error' };
       }
-      logger.error(`Failed to close position for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to close position for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -1148,7 +1148,7 @@ export class ExchangeService {
         return result;
       }
     } catch (error) {
-      logger.error(`Failed to transfer spot to future for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to transfer spot to future for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -1177,7 +1177,7 @@ export class ExchangeService {
         return result;
       }
     } catch (error) {
-      logger.error(`Failed to transfer future to spot for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to transfer future to spot for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -1292,7 +1292,7 @@ export class ExchangeService {
 
       return result;
     } catch (error) {
-      logger.error(`Failed to withdraw for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to withdraw for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -1330,7 +1330,7 @@ export class ExchangeService {
       
       return positions.filter(p => p.contracts > 0);
     } catch (error) {
-      logger.error(`Failed to get open positions for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to get open positions for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -1405,7 +1405,7 @@ export class ExchangeService {
         throw error;
       }
       
-      logger.error(`Failed to fetch OHLCV for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to fetch OHLCV for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -1623,7 +1623,7 @@ export class ExchangeService {
         logger.warn(`Order ${orderId} not found on exchange (may have been filled or already cancelled): ${error.message}`);
         return null; // Return null to indicate order doesn't exist
       }
-      logger.error(`Failed to cancel order for bot ${this.bot.id}:`, error);
+      logger.error(`Failed to cancel order for bot ${this.bot.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }

@@ -1020,7 +1020,7 @@ export class PositionService {
         }
       }
     } catch (error) {
-      logger.error(`Failed to update position ${position.id}:`, error);
+      logger.error(`Failed to update position ${position.id}`, { err: error?.message, stack: error?.stack });
       throw error;
     }
   }
@@ -1768,7 +1768,7 @@ export class PositionService {
 
       return closed;
     } catch (error) {
-      logger.error(`Failed to close position ${position.id}:`, error);
+      logger.error(`Failed to close position ${position.id}`, { err: error?.message, stack: error?.stack });
       
       // CRITICAL FIX: Even if closePosition fails, try to send alert if position was already closed in DB
       // This handles cases where CloseGuard blocks the close but position was already closed elsewhere

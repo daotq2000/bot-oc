@@ -295,13 +295,13 @@ async function start() {
     setTimeout(() => {
       // Update symbol filters from Binance API (async, don't wait)
       exchangeInfoService.updateFiltersFromExchange()
-        .catch(error => logger.error('Failed to update symbol filters from Binance:', error));
+        .catch(error => logger.error('Failed to update symbol filters from Binance', { err: error?.message, stack: error?.stack }));
     }, 10000); // Delay 10 seconds
 
     setTimeout(() => {
       // Update symbol filters from MEXC API (async, don't wait)
       exchangeInfoService.updateMexcFiltersFromExchange()
-        .catch(error => logger.error('Failed to update symbol filters from MEXC:', error));
+        .catch(error => logger.error('Failed to update symbol filters from MEXC', { err: error?.message, stack: error?.stack }));
     }, 15000); // Delay 15 seconds
 
 
@@ -317,7 +317,7 @@ async function start() {
       telegramBot = new TelegramBot();
       telegramBot.start()
         .then(() => logger.info('Telegram bot started'))
-        .catch(error => logger.error('Telegram bot failed to start, continuing without it:', error));
+        .catch(error => logger.error('Telegram bot failed to start, continuing without it', { err: error?.message, stack: error?.stack }));
     }, 2000); // Delay 2 seconds
 
     // Small delay before starting heavy operations
@@ -638,7 +638,7 @@ async function start() {
     });
 
   } catch (error) {
-    logger.error('Failed to start application:', error);
+    logger.error('Failed to start application', { err: error?.message, stack: error?.stack });
     process.exit(1);
   }
 }

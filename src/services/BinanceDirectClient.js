@@ -214,6 +214,7 @@ export class BinanceDirectClient {
         });
         
         clearTimeout(timeoutId);
+        if (detachExternalAbort) detachExternalAbort();
         
         if (response.ok || response.status === 200) {
           testSuccess = true;
@@ -685,7 +686,7 @@ export class BinanceDirectClient {
    * 
    * ⚠️ CRITICAL FIX: Added aggressive rate limiting to prevent IP ban
    */
-  async makeMarketDataRequest(endpoint, method = 'GET', params = {}) {
+  async makeMarketDataRequest(endpoint, method = 'GET', params = {}, options = {}) {
     // CRITICAL FIX: Check if rate limited before making request
     if (!this._checkRateLimitBlock()) {
       const blockedMs = Math.max(0, this._rateLimitBlockedUntil - Date.now());
@@ -707,7 +708,7 @@ export class BinanceDirectClient {
         isMainnet: true, // Market data always from mainnet
         requiresAuth: false, // Market data doesn't need auth
         fn: async () => {
-          return await this._makeMarketDataRequestInternal(endpoint, method, params);
+          return await this._makeMarketDataRequestInternal(endpoint, method, params, options);
         },
         label: `market_data:${endpoint}`
       });
@@ -724,14 +725,14 @@ export class BinanceDirectClient {
     }
     this.lastRequestTime = Date.now();
     
-    return await this._makeMarketDataRequestInternal(endpoint, method, params);
+    return await this._makeMarketDataRequestInternal(endpoint, method, params, options);
   }
 
   /**
    * Internal method to actually make the market data request
    * @private
    */
-  async _makeMarketDataRequestInternal(endpoint, method = 'GET', params = {}) {
+  async _makeMarketDataRequestInternal(endpoint, method = 'GET', params = {}, options = {}) {
 
     const url = new URL(endpoint, this.productionDataURL);
     
@@ -752,8 +753,25 @@ export class BinanceDirectClient {
       : baseTimeout;
 
     const doFetch = async () => {
+      const externalSignal = options?.signal;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+      // If caller provides a signal, propagate abort into our internal controller.
+      // This allows upper layers (IndicatorWarmup) to cancel scheduled/in-flight requests.
+      let detachExternalAbort = null;
+      if (externalSignal) {
+        if (externalSignal.aborted) {
+          controller.abort(externalSignal.reason);
+        } else {
+          const onAbort = () => controller.abort(externalSignal.reason);
+          externalSignal.addEventListener('abort', onAbort, { once: true });
+          detachExternalAbort = () => {
+            try { externalSignal.removeEventListener('abort', onAbort); } catch (_) {}
+          };
+        }
+      }
+
+      const timeoutId = setTimeout(() => controller.abort(new Error(`Request timeout after ${timeout}ms`)), timeout);
       try {
         const response = await fetch(url.toString(), {
           method,
@@ -782,6 +800,7 @@ export class BinanceDirectClient {
         const text = await response.text();
         try { return JSON.parse(text); } catch (_) { return text; }
       } catch (e) {
+        if (detachExternalAbort) detachExternalAbort();
         throw e;
       }
     };
@@ -2098,7 +2117,7 @@ export class BinanceDirectClient {
       logger.info(`✅ Entry trigger order placed: Order ID: ${data.orderId}`);
       return data;
     } catch (error) {
-      logger.error(`Failed to create entry trigger order:`, error);
+      logger.error('Failed to create entry trigger order', { err: error?.message, stack: error?.stack });
       throw error;
     }
   }

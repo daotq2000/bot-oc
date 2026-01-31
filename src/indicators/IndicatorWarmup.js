@@ -69,7 +69,7 @@ export class IndicatorWarmup {
     this._requestCount++;
   }
 
-  async fetchBinanceKlines(symbol, interval = '1m', limit = 100) {
+  async fetchBinanceKlines(symbol, interval = '1m', limit = 100, options = {}) {
     try {
       // Still keep local throttle counter to avoid overwhelming CandleService/REST
       await this._checkAndThrottleRequests();
@@ -78,7 +78,7 @@ export class IndicatorWarmup {
       const intv = String(interval || '1m').toLowerCase();
       if (!sym) return [];
 
-      const candles = await candleService.getHistoricalCandles('binance', sym, intv, limit);
+      const candles = await candleService.getHistoricalCandles('binance', sym, intv, limit, options);
       return candles;
     } catch (error) {
       logger.warn(`[IndicatorWarmup] Failed to fetch ${interval} klines for ${symbol} via CandleService: ${error?.message || error}`);
@@ -101,27 +101,33 @@ export class IndicatorWarmup {
       const targetInterval = is15mState ? '15m' : '1m';
       const targetCount = is15mState ? this.warmupCandleCount15m : this.warmupCandleCount1m;
 
-      const candles = await Promise.race([
-        this.fetchBinanceKlines(sym, targetInterval, targetCount),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`${targetInterval} warmup timeout`)), this.warmupTimeoutMs)
-        )
-      ]).catch(err => {
-        logger.warn(`[IndicatorWarmup] Failed to fetch ${targetInterval} candles for ${ex} ${sym}: ${err?.message || err}`);
-        return [];
-      });
+      const requestTimeoutMs = Math.max(5000, Number(this.warmupTimeoutMs) || 30000);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(new Error(`${targetInterval} warmup timeout after ${requestTimeoutMs}ms`)), requestTimeoutMs);
+
+      const candles = await this.fetchBinanceKlines(sym, targetInterval, targetCount, { signal: controller.signal })
+        .catch(err => {
+          logger.warn(
+            `[IndicatorWarmup] Failed to fetch ${targetInterval} candles for ${ex} ${sym}: ${err?.message || err}`
+          );
+          return [];
+        })
+        .finally(() => clearTimeout(timeoutId));
 
       let candles5m = [];
       if (this.warmupCandleCount5m > 0 && !is15mState) {
-        candles5m = await Promise.race([
-          this.fetchBinanceKlines(sym, '5m', this.warmupCandleCount5m),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('5m warmup timeout')), this.warmupTimeoutMs)
-          )
-        ]).catch(err => {
-          logger.debug(`[IndicatorWarmup] Failed to fetch 5m candles for ${ex} ${sym}: ${err?.message || err}`);
-          return [];
-        });
+        const controller5m = new AbortController();
+        const timeoutId5m = setTimeout(
+          () => controller5m.abort(new Error(`5m warmup timeout after ${requestTimeoutMs}ms`)),
+          requestTimeoutMs
+        );
+
+        candles5m = await this.fetchBinanceKlines(sym, '5m', this.warmupCandleCount5m, { signal: controller5m.signal })
+          .catch(err => {
+            logger.debug(`[IndicatorWarmup] Failed to fetch 5m candles for ${ex} ${sym}: ${err?.message || err}`);
+            return [];
+          })
+          .finally(() => clearTimeout(timeoutId5m));
       }
 
       if ((!candles || candles.length === 0) && (!candles5m || candles5m.length === 0)) {

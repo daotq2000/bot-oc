@@ -237,7 +237,7 @@ export class PositionMonitor {
       
       logger.info(`[PositionMonitor] ✅ Initialized ${this.exchangeServices.size} ExchangeService(s) for ${bots.length} bot(s)`);
     } catch (error) {
-      logger.error('Failed to initialize PositionMonitor:', error);
+      logger.error('Failed to initialize PositionMonitor', { err: error?.message, stack: error?.stack });
     }
   }
 
@@ -435,7 +435,7 @@ export class PositionMonitor {
         logger.info(`Position ${position.id} was closed with reason: ${updated.close_reason}. Notification handled by PositionService.`);
       }
     } catch (error) {
-      logger.error(`Error monitoring position ${position.id}:`, error);
+      logger.error(`Error monitoring position ${position.id}`, { err: error?.message, stack: error?.stack });
     }
   }
 
@@ -1680,7 +1680,7 @@ export class PositionMonitor {
       }
 
     } catch (error) {
-      logger.error(`Error checking unfilled orders for position ${position.id}:`, error);
+      logger.error(`Error checking unfilled orders for position ${position.id}`, { err: error?.message, stack: error?.stack });
     }
   }
 
@@ -2081,7 +2081,7 @@ export class PositionMonitor {
         this._lastLogTime = Date.now();
       }
     } catch (error) {
-      logger.error('Error in monitorAllPositions:', error);
+      logger.error('Error in monitorAllPositions', { err: error?.message, stack: error?.stack });
     } finally {
       this.isRunning = false;
     }
