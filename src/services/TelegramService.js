@@ -16,12 +16,8 @@ export class TelegramService {
     this._processing = new Map(); // alertType -> boolean
     this._lastSendAt = new Map(); // alertType -> timestamp
     this._perChatLastSend = new Map(); // chatId -> ts (shared across all bots)
-    this._minGapGlobalMs = 1000;   // 1 msgs/sec global per bot (more conservative)
-    this._perChatMinGapMs = 3000; // 1 msg/3sec per chat (Telegram recommends max 20 msg/min per chat)
-    
-    // Global backoff tracking for 429 errors
-    this._globalBackoffUntil = new Map(); // alertType -> timestamp when backoff ends
-    this._consecutiveErrors = new Map(); // alertType -> count of consecutive 429 errors
+    this._minGapGlobalMs = 200;   // 5 msgs/sec global per bot
+    this._perChatMinGapMs = 1000; // 1 msg/sec per chat
 
     // TTL and cleanup for memory leak prevention
     this._queueLastAccess = new Map(); // alertType -> timestamp
@@ -314,19 +310,8 @@ export class TelegramService {
           logger.warn(`[Telegram] Skipping queued item with empty message for chatId=${chatId}`);
           continue;
         }
-        
-        // Check global backoff first (from previous 429 errors)
-        const now = Date.now();
-        const backoffUntil = this._globalBackoffUntil.get(queueKey) || 0;
-        if (now < backoffUntil) {
-          const waitForBackoff = backoffUntil - now;
-          logger.info(`[Telegram] Global backoff active for ${queueKey}, waiting ${waitForBackoff}ms before processing. Queue size: ${queue.length + 1}`);
-          queue.unshift({ chatId, message, options }); // Put item back
-          await new Promise(r => setTimeout(r, waitForBackoff));
-          continue;
-        }
-        
         // Throttle globally (per exchange) and per-chat
+        const now = Date.now();
         const lastSendAt = this._lastSendAt.get(queueKey) || 0;
         const gapGlobal = now - lastSendAt;
         const lastPerChat = this._perChatLastSend.get(chatId) || 0;
@@ -354,15 +339,11 @@ export class TelegramService {
           
           await Promise.race([sendPromise, timeoutPromise]);
           
-          const nowAfterSend = Date.now();
-          this._lastSendAt.set(queueKey, nowAfterSend);
-          this._perChatLastSend.set(chatId, nowAfterSend);
-          this._queueLastAccess.set(queueKey, nowAfterSend);
-          this._chatLastAccess.set(chatId, nowAfterSend);
-          
-          // Reset consecutive errors on success
-          this._consecutiveErrors.set(queueKey, 0);
-          
+          const now = Date.now();
+          this._lastSendAt.set(queueKey, now);
+          this._perChatLastSend.set(chatId, now);
+          this._queueLastAccess.set(queueKey, now);
+          this._chatLastAccess.set(chatId, now);
           logger.info(`[Telegram] ✅ Successfully sent message to ${chatId} (alertType=${alertType || 'order'})`);
         } catch (error) {
           // ✅ IMPROVED: Extract comprehensive error information
@@ -381,11 +362,11 @@ export class TelegramService {
             error?.response?.description ? `telegram_desc: ${error.response.description}` : ''
           ].filter(Boolean).join(', ');
           
-          const is429 = /429/i.test(msg) || errorCode === 429 || error?.response?.error_code === 429;
-          const transient = is429 || /retry|timeout|network|ECONNRESET|ETIMEDOUT|socket hang|EAI_AGAIN|ENOTFOUND|ECONNREFUSED/i.test(msg) || 
+          const transient = /429|retry|timeout|network|ECONNRESET|ETIMEDOUT|socket hang|EAI_AGAIN|ENOTFOUND|ECONNREFUSED/i.test(msg) || 
                            errorCode === 'ECONNRESET' || errorCode === 'ETIMEDOUT' || errorCode === 'ECONNREFUSED';
           
           // Check for specific Telegram API errors
+          const isTelegramError = error?.response?.error_code || error?.code;
           const isChatNotFound = /chat.*not.*found|chat_id.*invalid/i.test(msg) || error?.response?.error_code === 400;
           const isForbidden = /forbidden|blocked/i.test(msg) || error?.response?.error_code === 403;
 
@@ -393,28 +374,10 @@ export class TelegramService {
             // Chat not found or bot blocked - don't retry, just log warning
             logger.warn(`[Telegram] Chat ${chatId} not found or bot blocked. Skipping message. ${errorDetails}`);
             // Don't requeue - this is a permanent error
-          } else if (is429) {
-            // Handle 429 specifically with global backoff
-            const consecutiveErrors = (this._consecutiveErrors.get(queueKey) || 0) + 1;
-            this._consecutiveErrors.set(queueKey, consecutiveErrors);
-            
-            // Use retry_after from Telegram, add extra buffer, and apply exponential backoff for consecutive errors
-            const baseBackoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000 + 5000) : 35000; // retry_after + 5s buffer, or 35s default
-            const multiplier = Math.min(consecutiveErrors, 5); // Max 5x multiplier
-            const backoffMs = baseBackoffMs * multiplier;
-            
-            // Set global backoff for this queue
-            const backoffUntilTime = Date.now() + backoffMs;
-            this._globalBackoffUntil.set(queueKey, backoffUntilTime);
-            
-            logger.warn(`[Telegram] 429 Rate Limited! Setting global backoff for ${queueKey}: ${backoffMs}ms (consecutive: ${consecutiveErrors}). chatId=${chatId}, retry_after=${retryAfter || 'N/A'}s`);
-            
-            queue.unshift({ chatId, message, options }); // requeue at front
-            await new Promise(r => setTimeout(r, backoffMs));
           } else if (transient) {
-            // Other transient errors (network issues, etc.)
-            const backoffMs = 5000; // 5 second backoff for non-429 transient errors
-            logger.warn(`[Telegram] Transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, alertType=${alertType || 'order'}, ${errorDetails}`);
+            // Respect Telegram retry_after when present
+            const backoffMs = Number.isFinite(retryAfter) ? (retryAfter * 1000) : 2000; // Increased default backoff to 2s
+            logger.warn(`[Telegram] Throttled or transient error, backing off ${backoffMs}ms before retry. chatId=${chatId}, alertType=${alertType || 'order'}, ${errorDetails}`);
             queue.unshift({ chatId, message, options }); // requeue
             await new Promise(r => setTimeout(r, backoffMs));
           } else {

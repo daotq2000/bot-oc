@@ -6,7 +6,68 @@ import logger from '../utils/logger.js';
  * 
  * 1. Pullback confirmation (5m EMA20) - avoid chasing spikes
  * 2. Volatility filter (ATR%) - avoid too quiet or too volatile markets
+ * 3. Volume VMA Gate - only enter when volume > VMA * ratio
+ * 4. Bollinger Bands Gate - filter entries by price position relative to bands
  */
+
+/**
+ * Filter: Volume VMA Gate
+ * Chỉ vào lệnh khi Volume hiện tại lớn hơn mức trung bình * hệ số
+ */
+export function checkVolumeVmaGate(indicatorState, minRatio = 1.2) {
+  if (!indicatorState.volume || !indicatorState.volume.ma || !indicatorState.volume.current) {
+    return { ok: false, reason: 'volume_data_not_ready' };
+  }
+  const { current, ma, ratio } = indicatorState.volume;
+  if (!Number.isFinite(current) || !Number.isFinite(ma) || ma <= 0) {
+    return { ok: false, reason: 'volume_invalid' };
+  }
+  if (ratio < minRatio) {
+    return { ok: false, reason: `volume_ratio_low_${ratio.toFixed(2)}<${minRatio}` };
+  }
+  return { ok: true, reason: 'volume_ok', ratio };
+}
+
+/**
+ * Filter: Bollinger Trend Confirmation
+ * Long: Giá phải nằm trên Mid Band, không quá Upper Band
+ * Short: Giá phải nằm dưới Mid Band, không quá Lower Band
+ */
+export function checkBollingerGate(direction, indicatorState, currentPrice) {
+  if (!indicatorState.bollinger) {
+    return { ok: false, reason: 'bollinger_data_not_ready' };
+  }
+  const { middle, upper, lower } = indicatorState.bollinger;
+  if (!Number.isFinite(middle) || !Number.isFinite(upper) || !Number.isFinite(lower)) {
+    return { ok: false, reason: 'bollinger_invalid' };
+  }
+  if (!Number.isFinite(currentPrice)) {
+    return { ok: false, reason: 'price_invalid' };
+  }
+  const dir = String(direction || '').toUpperCase();
+  if (dir === 'LONG') {
+    const isTrendUp = currentPrice > middle;
+    const isOverbought = currentPrice > upper;
+    if (!isTrendUp) {
+      return { ok: false, reason: 'long_below_mid' };
+    }
+    if (isOverbought) {
+      return { ok: false, reason: 'long_over_upper' };
+    }
+    return { ok: true, reason: 'long_ok' };
+  } else if (dir === 'SHORT') {
+    const isTrendDown = currentPrice < middle;
+    const isOversold = currentPrice < lower;
+    if (!isTrendDown) {
+      return { ok: false, reason: 'short_above_mid' };
+    }
+    if (isOversold) {
+      return { ok: false, reason: 'short_below_lower' };
+    }
+    return { ok: true, reason: 'short_ok' };
+  }
+  return { ok: false, reason: 'bollinger_invalid_direction' };
+}
 
 /**
  * Check if price has pulled back to EMA20(5m) and confirmed reversal

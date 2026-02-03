@@ -17,7 +17,7 @@ import { SupportResistanceService } from '../services/SupportResistanceService.j
 import { MultiTimeframeService } from '../services/MultiTimeframeService.js';
 import { LossStreakService } from '../services/LossStreakService.js';
 import { AutoOptimizeService } from '../services/AutoOptimizeService.js';
-import { LifoAsyncQueue } from '../utils/LifoAsyncQueue.js';
+import { GlobalTPSLQueueManager } from '../utils/PriorityAsyncQueue.js';
 
 /**
  * Position Monitor Job - Monitor and update open positions
@@ -49,13 +49,22 @@ export class PositionMonitor {
     this._priceCache = new ScanCycleCache();
     this._closableQtyCache = new ScanCycleCache();
 
-    // TP/SL placement queue (LIFO): newest positions get protected first.
-    // Per-bot queues to avoid cross-bot starvation and reduce rate-limit collisions.
-    this._tpslQueues = new Map(); // botId -> LifoAsyncQueue
+    // TP/SL placement queue - Priority-based with global concurrency control
+    // UPGRADED: From LIFO to age-based priority (older positions = higher priority)
+    // Global manager handles multi-bot coordination and rate limiting
+    this._tpslQueueManager = new GlobalTPSLQueueManager({
+      perBotConcurrency: Number(configService.getNumber('TPSL_QUEUE_CONCURRENCY_PER_BOT', 5)),
+      globalConcurrency: Number(configService.getNumber('TPSL_QUEUE_GLOBAL_CONCURRENCY', 15)),
+      maxQueueSizePerBot: Number(configService.getNumber('TPSL_QUEUE_MAX_SIZE_PER_BOT', 200)),
+      taskTimeoutMs: Number(configService.getNumber('TPSL_QUEUE_TASK_TIMEOUT_MS', 30000))
+    });
 
     // Emergency cooldown/backoff (prevents infinite retry + log storm when TP/SL placement fails)
     this._emergencyCooldownUntil = new Map(); // posId -> ts
     this._emergencyBackoffLevel = new Map(); // posId -> integer
+    
+    // Ghost position tracking (avoid repeated cleanup attempts)
+    this._ghostPositionsCleaned = new Set(); // Set of position IDs already cleaned
   }
 
   /**
@@ -444,25 +453,72 @@ export class PositionMonitor {
   }
 
   /**
-   * Place TP/SL orders for new positions that don't have them yet.
-   * Uses soft lock to prevent race conditions when multiple instances run concurrently.
-   * @param {Object} position - Position object
+   * Get TP/SL queue manager (singleton)
+   * UPGRADED: Now uses GlobalTPSLQueueManager with priority-based scheduling
    */
-  _getTpSlQueue(botId) {
-    const id = String(botId);
-    if (this._tpslQueues.has(id)) return this._tpslQueues.get(id);
+  _getTPSLQueueManager() {
+    return this._tpslQueueManager;
+  }
 
-    const concurrency = Number(configService.getNumber('TPSL_QUEUE_CONCURRENCY_PER_BOT', 2));
-    const maxSize = Number(configService.getNumber('TPSL_QUEUE_MAX_SIZE_PER_BOT', 500));
+  /**
+   * HELPER: Batch verify positions on exchange using cached data
+   * OPTIMIZATION: Reduces API calls by caching exchange positions per bot
+   * Returns Map<positionId, { exists, position, reason }>
+   */
+  async _batchVerifyPositionsOnExchange(exchangeService, botId, positions) {
+    const results = new Map();
+    
+    try {
+      // Get cached exchange positions (or fetch new)
+      const exchangePositions = await this._tpslQueueManager.getCachedExchangePositions(
+        botId, 
+        exchangeService
+      );
+      
+      if (!Array.isArray(exchangePositions) || exchangePositions.length === 0) {
+        // No positions on exchange - all are ghosts
+        for (const pos of positions) {
+          results.set(pos.id, { exists: false, position: null, reason: 'no_positions_on_exchange' });
+        }
+        return results;
+      }
 
-    const q = new LifoAsyncQueue({
-      concurrency,
-      maxSize,
-      name: `TPSLQueue(bot=${id})`
-    });
+      // Build lookup map: `${symbol}|${side}` -> exchange position
+      const exchangeMap = new Map();
+      for (const exPos of exchangePositions) {
+        const sym = exPos.symbol || exPos.info?.symbol;
+        const rawAmt = parseFloat(exPos.positionAmt ?? exPos.contracts ?? exPos.size ?? 0);
+        if (!sym || rawAmt === 0) continue;
+        
+        const side = rawAmt > 0 ? 'long' : 'short';
+        const key = `${sym}|${side}`;
+        exchangeMap.set(key, exPos);
+      }
 
-    this._tpslQueues.set(id, q);
-    return q;
+      // Verify each position
+      for (const pos of positions) {
+        const normalizedSymbol = exchangeService?.binanceDirectClient?.normalizeSymbol?.(pos.symbol) || pos.symbol;
+        const key = `${normalizedSymbol}|${pos.side}`;
+        const altKey = `${pos.symbol}|${pos.side}`;
+        
+        const matchingPos = exchangeMap.get(key) || exchangeMap.get(altKey);
+        
+        if (matchingPos) {
+          results.set(pos.id, { exists: true, position: matchingPos, reason: 'ok' });
+        } else {
+          results.set(pos.id, { exists: false, position: null, reason: 'position_not_found_on_exchange' });
+        }
+      }
+      
+      return results;
+    } catch (e) {
+      logger.debug(`[BatchVerify] Error verifying positions for bot ${botId}: ${e?.message || e}`);
+      // On error, assume all exist to avoid false positives
+      for (const pos of positions) {
+        results.set(pos.id, { exists: true, position: null, reason: 'verification_error' });
+      }
+      return results;
+    }
   }
 
   /**
@@ -471,15 +527,21 @@ export class PositionMonitor {
    */
   async _verifyPositionExistsOnExchange(exchangeService, position) {
     try {
-      const openPositions = await exchangeService.getOpenPositions(position.symbol);
-      if (!Array.isArray(openPositions) || openPositions.length === 0) {
+      // Use cached verification via queue manager
+      const cachedPositions = await this._tpslQueueManager.getCachedExchangePositions(
+        position.bot_id,
+        exchangeService,
+        position.symbol
+      );
+      
+      if (!Array.isArray(cachedPositions) || cachedPositions.length === 0) {
         return { exists: false, position: null, reason: 'no_positions_on_exchange' };
       }
 
       const normalizedSymbol = exchangeService?.binanceDirectClient?.normalizeSymbol?.(position.symbol) || position.symbol;
       const expectedSide = position.side === 'long' ? 'LONG' : 'SHORT';
 
-      const matchingPos = openPositions.find(p => {
+      const matchingPos = cachedPositions.find(p => {
         const symOk = (p.symbol === normalizedSymbol || p.symbol === position.symbol);
         if (!symOk) return false;
         
@@ -504,8 +566,15 @@ export class PositionMonitor {
 
   /**
    * HELPER: Close ghost position (exists in DB but not on exchange)
+   * IMPROVED: Tracks cleaned positions to avoid repeated attempts
    */
   async _closeGhostPosition(position, reason = 'ghost_position_cleanup') {
+    // Skip if already cleaned this session
+    if (this._ghostPositionsCleaned.has(position.id)) {
+      logger.debug(`[GhostCleanup] Position ${position.id} already cleaned this session, skipping`);
+      return true;
+    }
+
     try {
       const exchangeService = this.exchangeServices.get(position.bot_id);
       const positionService = this.positionServices.get(position.bot_id);
@@ -538,6 +607,12 @@ export class PositionMonitor {
         logger.warn(`[GhostCleanup] Closed ghost position ${position.id} (${position.symbol}) via direct DB update (no Telegram) | reason=${reason}`);
       }
       
+      // Mark as cleaned
+      this._ghostPositionsCleaned.add(position.id);
+      
+      // Clear verification cache for this bot (position state changed)
+      this._tpslQueueManager.clearVerificationCache(position.bot_id);
+      
       return true;
     } catch (e) {
       logger.error(`[GhostCleanup] Failed to close ghost position ${position.id}: ${e?.message || e}`);
@@ -545,21 +620,27 @@ export class PositionMonitor {
     }
   }
 
+  /**
+   * Place TP/SL orders for a position using priority queue
+   * UPGRADED: Uses age-based priority (older = higher priority) instead of LIFO
+   */
   async placeExitOrder(position) {
     const botId = position?.bot_id;
-    const q = this._getTpSlQueue(botId);
-
-    // Dedupe per position: only keep the latest TP/SL placement request.
-    // Priority: emergency positions go first.
+    
+    // Calculate priority based on position age (older = higher priority)
     const openedAt = position?.opened_at ? new Date(position.opened_at).getTime() : 0;
     const ageMs = openedAt ? Date.now() - openedAt : 0;
+    
+    // Priority formula: base priority + age in seconds
+    // Emergency positions (age > SLA) get additional boost
     const emergencyMs = Number(configService.getNumber('POSITION_EMERGENCY_SLA_MS', 10 * 1000));
-    const priority = ageMs > emergencyMs ? 10 : 0;
+    const isEmergency = ageMs > emergencyMs;
+    const priority = (isEmergency ? 100000 : 0) + Math.floor(ageMs / 1000); // Higher age = higher priority
 
-    return q.push({
+    return this._tpslQueueManager.pushTask(botId, {
       key: `tpsl:${position?.id}`,
       priority,
-      maxRetries: Number(configService.getNumber('TPSL_QUEUE_MAX_RETRIES', 3)),
+      maxRetries: Number(configService.getNumber('TPSL_QUEUE_MAX_RETRIES', 2)),
       baseDelayMs: Number(configService.getNumber('TPSL_QUEUE_BASE_DELAY_MS', 200)),
       fn: async () => this._placeExitOrderCore(position)
     });

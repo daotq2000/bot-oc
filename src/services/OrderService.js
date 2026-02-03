@@ -457,6 +457,19 @@ export class OrderService {
         // TP/SL creation is handled by PositionMonitor.
         logger.debug(`Entry order placed for position ${position.id}. TP/SL will be placed by PositionMonitor.`);
 
+        // ✅ NEW: Immediate TP/SL placement for filled positions
+        // This ensures protection is in place within milliseconds of entry
+        if (position.status === 'open') {
+          const immediateTPSLEnabled = configService.getBoolean('IMMEDIATE_TPSL_ENABLED', true);
+          if (immediateTPSLEnabled) {
+            // Place TP/SL immediately in background (non-blocking)
+            this.placeImmediateTpSl(position, strategy, effectiveEntryPrice, tempTpPrice, tempSlPrice)
+              .catch(err => {
+                logger.warn(`[OrderService] Immediate TP/SL failed for position ${position.id}, PositionMonitor will retry: ${err?.message || err}`);
+              });
+          }
+        }
+
         if (position.status === 'open') {
           // Central log: success (filled)
           await this.sendCentralLog(`Order Success | bot=${strategy?.bot_id} strat=${strategy?.id} ${strategy?.symbol} ${String(side).toUpperCase()} orderId=${order?.id} posId=${position?.id} type=${orderType} entry=${position.entry_price} tp=${tempTpPrice} sl=${tempSlPrice}`);
@@ -629,6 +642,157 @@ export class OrderService {
     } catch (error) {
       logger.error(`Failed to close position ${position.id}:`, error);
       throw error;
+    }
+  }
+
+  /**
+   * ✅ NEW: Place TP/SL orders immediately after entry fill
+   * This ensures position protection is in place within milliseconds
+   * UPGRADED: Places TP and SL in PARALLEL for faster protection
+   * 
+   * @param {Object} position - Position object
+   * @param {Object} strategy - Strategy object
+   * @param {number} entryPrice - Actual entry fill price
+   * @param {number} tpPrice - Calculated take profit price
+   * @param {number} slPrice - Calculated stop loss price
+   * @returns {Promise<{tpOrderId: string|null, slOrderId: string|null}>}
+   */
+  async placeImmediateTpSl(position, strategy, entryPrice, tpPrice, slPrice) {
+    const startTime = Date.now();
+    let tpOrderId = null;
+    let slOrderId = null;
+
+    try {
+      logger.info(
+        `[OrderService] 🚀 Placing immediate TP/SL for position ${position.id} | ` +
+        `symbol=${position.symbol} side=${position.side} entry=${entryPrice} tp=${tpPrice} sl=${slPrice}`
+      );
+
+      // Get closable quantity from exchange
+      const quantity = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
+      if (!quantity || quantity <= 0) {
+        logger.warn(`[OrderService] No closable quantity for position ${position.id}, skipping immediate TP/SL`);
+        return { tpOrderId: null, slOrderId: null };
+      }
+
+      // Determine position side for reduce-only orders
+      const positionSide = position.side === 'long' ? 'LONG' : 'SHORT';
+      const closeSide = position.side === 'long' ? 'sell' : 'buy';
+
+      // ========== PARALLEL TP+SL PLACEMENT ==========
+      // Place TP and SL orders in parallel for faster protection
+      const orderPromises = [];
+      
+      // TP order promise
+      if (tpPrice && Number.isFinite(tpPrice) && tpPrice > 0) {
+        orderPromises.push(
+          this.exchangeService.createOrder({
+            symbol: position.symbol,
+            side: closeSide,
+            positionSide: positionSide,
+            type: 'TAKE_PROFIT_MARKET',
+            quantity: quantity,
+            stopPrice: tpPrice,
+            reduceOnly: true,
+            closePosition: false
+          }).then(order => ({ type: 'tp', order, price: tpPrice }))
+            .catch(err => ({ type: 'tp', error: err, price: tpPrice }))
+        );
+      }
+      
+      // SL order promise
+      if (slPrice && Number.isFinite(slPrice) && slPrice > 0) {
+        orderPromises.push(
+          this.exchangeService.createOrder({
+            symbol: position.symbol,
+            side: closeSide,
+            positionSide: positionSide,
+            type: 'STOP_MARKET',
+            quantity: quantity,
+            stopPrice: slPrice,
+            reduceOnly: true,
+            closePosition: false
+          }).then(order => ({ type: 'sl', order, price: slPrice }))
+            .catch(err => ({ type: 'sl', error: err, price: slPrice }))
+        );
+      }
+
+      // Wait for all orders to complete
+      const results = await Promise.all(orderPromises);
+      
+      // Process results
+      for (const result of results) {
+        if (result.type === 'tp') {
+          if (result.order?.id) {
+            tpOrderId = result.order.id;
+            logger.info(
+              `[OrderService] ✅ Immediate TP placed for position ${position.id} | ` +
+              `orderId=${tpOrderId} price=${result.price} qty=${quantity}`
+            );
+          } else if (result.error) {
+            const errMsg = result.error?.message || '';
+            if (errMsg.includes('-2021') || errMsg.includes('would immediately trigger')) {
+              logger.warn(`[OrderService] TP would trigger immediately for position ${position.id}, skipping TP order`);
+            } else if (errMsg.includes('-2022') || errMsg.includes('ReduceOnly')) {
+              logger.warn(`[OrderService] ReduceOnly rejected for TP on position ${position.id}: ${errMsg}`);
+            } else {
+              logger.error(`[OrderService] Failed to place immediate TP for position ${position.id}: ${errMsg}`);
+            }
+          }
+        } else if (result.type === 'sl') {
+          if (result.order?.id) {
+            slOrderId = result.order.id;
+            logger.info(
+              `[OrderService] ✅ Immediate SL placed for position ${position.id} | ` +
+              `orderId=${slOrderId} price=${result.price} qty=${quantity}`
+            );
+          } else if (result.error) {
+            const errMsg = result.error?.message || '';
+            if (errMsg.includes('-2021') || errMsg.includes('would immediately trigger')) {
+              logger.warn(`[OrderService] SL would trigger immediately for position ${position.id}, skipping SL order`);
+            } else if (errMsg.includes('-2022') || errMsg.includes('ReduceOnly')) {
+              logger.warn(`[OrderService] ReduceOnly rejected for SL on position ${position.id}: ${errMsg}`);
+            } else {
+              logger.error(`[OrderService] Failed to place immediate SL for position ${position.id}: ${errMsg}`);
+            }
+          }
+        }
+      }
+
+      // ========== UPDATE POSITION IN DB ==========
+      const updateData = {};
+      if (tpOrderId) {
+        updateData.exit_order_id = tpOrderId;
+        updateData.take_profit_price = tpPrice;
+      }
+      if (slOrderId) {
+        updateData.sl_order_id = slOrderId;
+        updateData.stop_loss_price = slPrice;
+      }
+      
+      // Clear tp_sl_pending if at least TP was placed successfully
+      if (tpOrderId) {
+        updateData.tp_sl_pending = false;
+      }
+
+      if (Object.keys(updateData).length > 0) {
+        await Position.update(position.id, updateData);
+      }
+
+      const duration = Date.now() - startTime;
+      logger.info(
+        `[OrderService] ⚡ Immediate TP/SL completed for position ${position.id} in ${duration}ms | ` +
+        `tpOrderId=${tpOrderId || 'N/A'} slOrderId=${slOrderId || 'N/A'}`
+      );
+
+      return { tpOrderId, slOrderId };
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      logger.error(
+        `[OrderService] ❌ Immediate TP/SL failed for position ${position.id} after ${duration}ms: ${error?.message || error}`
+      );
+      // Don't throw - let PositionMonitor handle as fallback
+      return { tpOrderId, slOrderId };
     }
   }
 }

@@ -4,6 +4,8 @@ import { ADX } from './adx.js';
 import { ATR } from './atr.js';
 import { donchian } from './donchian.js';
 import { rvolFromCandles } from './rvol.js';
+import { SMA } from './sma.js';
+import { BB } from './bb.js';
 
 /**
  * Lightweight per-(exchange|symbol) indicator state.
@@ -22,6 +24,7 @@ export class TrendIndicatorsState {
     atrPeriod = 14,
     donchianPeriod = 20,
     rvolPeriod = 20
+  , bbPeriod = 20, bbStdDev = 2, vmaPeriod = 20
   } = {}) {
     this.ema20 = new EMA(emaFastPeriod);
     this.ema50 = new EMA(emaSlowPeriod);
@@ -38,8 +41,16 @@ export class TrendIndicatorsState {
     this.rvolCurrentVolume = null;
     this.rvolAvgVolume = null;
 
+  // Bollinger Bands & Volume MA
+    this.bbPeriod = Math.max(1, Number(bbPeriod) || 20);
+    this.bbStdDev = Number(bbStdDev) || 2;
+    this.bollinger = null;
+    this.vmaPeriod = Math.max(1, Number(vmaPeriod) || 20);
+    this.vma = null;
+    this.currentVolume = null;
+
     this._closedCandles = [];
-    this._closedCandlesMax = Math.max(this.donchianPeriod, this.rvolPeriod, 20) + 5;
+    this._closedCandlesMax = Math.max(this.donchianPeriod, this.rvolPeriod, this.bbPeriod, this.vmaPeriod, 20) + 5;
 
     this.adxInterval = String(adxInterval).toLowerCase();
 
@@ -101,6 +112,33 @@ export class TrendIndicatorsState {
     this.rvol = rv.rvol;
     this.rvolCurrentVolume = rv.currentVolume;
     this.rvolAvgVolume = rv.avgVolume;
+
+    // Compute Bollinger Bands
+    if (this._closedCandles.length >= this.bbPeriod) {
+      const closes = this._closedCandles.map(c => c.close);
+      const bbArr = BB.calculate({
+        period: this.bbPeriod,
+        values: closes,
+        stdDev: this.bbStdDev
+      });
+      this.bollinger = bbArr.length > 0 ? bbArr[bbArr.length - 1] : null;
+    } else {
+      this.bollinger = null;
+    }
+
+    // Compute Volume MA
+    if (this._closedCandles.length >= this.vmaPeriod) {
+      const volumes = this._closedCandles.map(c => c.volume);
+      const vmaArr = SMA.calculate({
+        period: this.vmaPeriod,
+        values: volumes
+      });
+      this.vma = vmaArr.length > 0 ? vmaArr[vmaArr.length - 1] : null;
+      this.currentVolume = volumes[volumes.length - 1];
+    } else {
+      this.vma = null;
+      this.currentVolume = null;
+    }
   }
 
   snapshot() {
@@ -117,6 +155,17 @@ export class TrendIndicatorsState {
       rvol: this.rvol,
       rvolCurrentVolume: this.rvolCurrentVolume,
       rvolAvgVolume: this.rvolAvgVolume,
+
+      bollinger: this.bollinger ? {
+        upper: this.bollinger.upper,
+        middle: this.bollinger.middle,
+        lower: this.bollinger.lower
+      } : null,
+      volume: {
+        current: this.currentVolume,
+        ma: this.vma,
+        ratio: (this.vma && this.currentVolume) ? (this.currentVolume / this.vma) : 0
+      },
 
       lastPrice: this.lastPrice,
       lastUpdateTs: this.lastUpdateTs

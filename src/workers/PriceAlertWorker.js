@@ -271,8 +271,30 @@ export class PriceAlertWorker {
       await priceAlertSymbolTracker.refresh();
       // Update WebSocket subscriptions after refresh
       await this.subscribeWebSockets();
+      
+      // ✅ NEW: Keep WebSocket symbols alive to prevent cleanup
+      await this.keepWebSocketSymbolsAlive();
     } catch (error) {
       logger.error('[PriceAlertWorker] Error refreshing symbols:', error?.message || error);
+    }
+  }
+
+  /**
+   * ✅ NEW: Keep WebSocket symbols alive to prevent cleanup
+   * Call this periodically to prevent symbols from being unsubscribed
+   */
+  async keepWebSocketSymbolsAlive() {
+    try {
+      const trackingSymbols = await priceAlertSymbolTracker.refresh();
+      
+      // Keep Binance symbols alive
+      const binanceSymbols = Array.from(trackingSymbols.get('binance') || []);
+      if (binanceSymbols.length > 0) {
+        webSocketManager.keepAlive(binanceSymbols);
+        logger.debug(`[PriceAlertWorker] Kept ${binanceSymbols.length} Binance symbols alive`);
+      }
+    } catch (error) {
+      logger.error('[PriceAlertWorker] Error keeping WebSocket symbols alive:', error?.message || error);
     }
   }
 
@@ -373,6 +395,8 @@ export class PriceAlertWorker {
           binanceStatus = webSocketManager.getStatus();
           if (binanceStatus.connectedCount > 0) {
             webSocketManager.subscribe(binanceSymbols);
+            // ✅ Keep symbols alive to prevent cleanup
+            webSocketManager.keepAlive(binanceSymbols);
             logger.info(`[PriceAlertWorker] ✅ Binance WebSocket subscribed to ${binanceSymbols.length} symbols`);
           } else {
             logger.warn(`[PriceAlertWorker] ⚠️ Cannot subscribe Binance symbols: WebSocket not connected (connectedCount: ${binanceStatus.connectedCount})`);
@@ -422,9 +446,20 @@ export class PriceAlertWorker {
       }
     }
 
-    // Auto-recovery for WebSocket subscriptions (if disconnected)
-    if (status.mexcWs.status !== 'CONNECTED' || status.binanceWs.status !== 'CONNECTED') {
-      logger.warn(`[PriceAlertWorker-Health] ⚠️ WebSocket disconnected (mexc=${status.mexcWs.status}, binance=${status.binanceWs.status}). Triggering resubscription...`);
+    // Auto-recovery for WebSocket subscriptions (if disconnected OR no subscriptions)
+    // ✅ FIX: Also check subs count to detect when symbols are unsubscribed while still connected
+    const mexcNeedsResub = status.mexcWs.status !== 'CONNECTED' || 
+      (status.mexcWs.subs === 0 && status.trackingSymbols.mexc > 0);
+    const binanceNeedsResub = status.binanceWs.status !== 'CONNECTED' || 
+      (status.binanceWs.subs === 0 && status.trackingSymbols.binance > 0);
+    
+    if (mexcNeedsResub || binanceNeedsResub) {
+      logger.warn(
+        `[PriceAlertWorker-Health] ⚠️ WebSocket needs resubscription ` +
+        `(mexc=${status.mexcWs.status}/${status.mexcWs.subs}subs vs ${status.trackingSymbols.mexc}tracked, ` +
+        `binance=${status.binanceWs.status}/${status.binanceWs.subs}subs vs ${status.trackingSymbols.binance}tracked). ` +
+        `Triggering resubscription...`
+      );
       try {
         await this.subscribeWebSockets();
       } catch (e) {
@@ -449,7 +484,8 @@ export class PriceAlertWorker {
       } : null,
       mexcWs: {
         status: mexcStatus?.connected ? 'CONNECTED' : 'DISCONNECTED',
-        subs: mexcStatus?.subscribed?.size || 0
+        // ✅ FIX: Use correct field name from MexcWebSocketManager.getStatus()
+        subs: mexcStatus?.subscribedSymbols || 0
       },
       binanceWs: {
         status: (binanceStatus?.connectedCount || 0) > 0 ? 'CONNECTED' : 'DISCONNECTED',

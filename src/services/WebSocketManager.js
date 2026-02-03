@@ -85,7 +85,10 @@ class WebSocketManager {
     // ✅ LIFO SYMBOL MANAGEMENT
     this.symbolUsage = new Map();
     this.maxTotalStreams = 2000;
-    this.symbolUnusedTimeout = 10 * 60 * 1000;
+    // ✅ FIX: Increased timeout from 10 min to 60 min to prevent premature cleanup
+    // PriceAlertScanner may not access all symbols frequently enough, causing them to be 
+    // unsubscribed while alerts are still active. 60 minutes provides better safety margin.
+    this.symbolUnusedTimeout = Number(configService.getNumber('BINANCE_WS_SYMBOL_UNUSED_TIMEOUT_MS', 60 * 60 * 1000));
     this.symbolCleanupInterval = 2 * 60 * 1000;
     this._symbolCleanupTimer = null;
 
@@ -394,6 +397,11 @@ class WebSocketManager {
             `[Binance-WS] ⚠️ Connection starvation: no WS message for ${Math.round(sinceLastMsg / 1000)}s ` +
               `(threshold ${Math.round(noMessageThresholdMs / 1000)}s) | streams=${conn.streams.size}. Reconnecting...`
           );
+          // Skip starvation reconnect for empty shards
+          if (!conn.streams || conn.streams.size === 0) {
+            continue;
+          }
+
           this._scheduleReconnect(conn);
           break;
         }
@@ -469,6 +477,23 @@ class WebSocketManager {
       return cached.price;
     }
     return null;
+  }
+
+  /**
+   * ✅ NEW: Keep symbols alive without requiring price fetch
+   * Call this periodically from PriceAlertWorker to prevent symbol cleanup
+   * @param {Array<string>} symbols - Array of symbol names to keep alive
+   */
+  keepAlive(symbols) {
+    if (!Array.isArray(symbols)) return;
+    const now = Date.now();
+    for (const sym of symbols) {
+      const key = String(sym).toUpperCase();
+      if (this.symbolUsage.has(key)) {
+        const usage = this.symbolUsage.get(key);
+        usage.lastAccess = now;
+      }
+    }
   }
 
   _trackSymbolUsage(symbol) {
@@ -1032,7 +1057,8 @@ class WebSocketManager {
   }
 
   _startConnKeepalive(conn) {
-    if (!conn || !conn.ws) return;
+    // Do not run keepalive for empty shards. It causes reconnect storms when streams=0.
+    if (!conn || !conn.ws || !conn.streams || conn.streams.size === 0) return;
 
     if (conn._pingTimer) {
       clearInterval(conn._pingTimer);
@@ -1080,6 +1106,17 @@ class WebSocketManager {
   }
 
   _scheduleReconnect(conn) {
+    // CRITICAL: never enqueue reconnect for empty shards (streams=0). They should be recreated only when new streams are subscribed.
+    if (!conn || !conn.streams || conn.streams.size === 0) {
+      try {
+        // Best-effort cleanup to avoid reconnect storm + queue saturation
+        const idx = this.connections.indexOf(conn);
+        if (idx > -1) this.connections.splice(idx, 1);
+        this._disconnect(conn);
+      } catch (_) {}
+      return;
+    }
+
     if (this.reconnectQueue.includes(conn) || this.reconnectInProgress.has(conn)) {
       logger.debug(`[Binance-WS] Connection already queued/in-progress for reconnect, skipping duplicate`);
       return;

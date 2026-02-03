@@ -8,7 +8,7 @@ import logger from '../utils/logger.js';
 import { TrendIndicatorsState } from '../indicators/TrendIndicatorsState.js';
 import { isTrendConfirmed } from '../indicators/trendFilter.js';
 import { IndicatorWarmup } from '../indicators/IndicatorWarmup.js';
-import { checkPullbackConfirmation, checkVolatilityFilter, checkRvolGate, checkDonchianBreakoutGate } from '../indicators/entryFilters.js';
+import { checkPullbackConfirmation, checkVolatilityFilter, checkRvolGate, checkDonchianBreakoutGate, checkVolumeVmaGate, checkBollingerGate } from '../indicators/entryFilters.js';
 import {
   calculateTakeProfit,
   calculateInitialStopLoss,
@@ -1137,6 +1137,54 @@ export class WebSocketOCConsumer {
               return;
             }
           }
+
+          // ✅ NEW: Volume VMA Gate (5m) - chỉ vào lệnh khi volume > VMA * ratio
+          if (isFollowingTrend) {
+            const vmaMinRatio = Number(configService.getNumber('VMA_MIN_RATIO', 1.2));
+            const vmaVerdict = checkVolumeVmaGate(snap5m, vmaMinRatio);
+            filterTrace.volumeVma = {
+              ok: vmaVerdict.ok,
+              reason: vmaVerdict.reason,
+              timeframe: '5m',
+              ratio: vmaVerdict.ratio,
+              min: vmaMinRatio,
+              current: snap5m.volume?.current,
+              ma: snap5m.volume?.ma
+            };
+            if (!vmaVerdict.ok) {
+              if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
+                logger.info(
+                  `[WebSocketOCConsumer] ⏭️ Volume VMA filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+                  `reason=${vmaVerdict.reason} VMA_RATIO=${Number(snap5m.volume?.ratio)?.toFixed?.(2) || 'N/A'}`
+                );
+              }
+              return;
+            }
+          }
+
+          // ✅ NEW: Bollinger Bands Gate (5m) - lọc nhiễu, chỉ vào khi giá nằm đúng vùng
+          if (isFollowingTrend) {
+            const bbDirection = direction === 'bullish' ? 'LONG' : 'SHORT';
+            const bbVerdict = checkBollingerGate(bbDirection, snap5m, currentPrice);
+            filterTrace.bollinger = {
+              ok: bbVerdict.ok,
+              reason: bbVerdict.reason,
+              timeframe: '5m',
+              upper: snap5m.bollinger?.upper,
+              middle: snap5m.bollinger?.middle,
+              lower: snap5m.bollinger?.lower,
+              price: currentPrice
+            };
+            if (!bbVerdict.ok) {
+              if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
+                logger.info(
+                  `[WebSocketOCConsumer] ⏭️ Bollinger filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+                  `reason=${bbVerdict.reason} BB_MID=${Number(snap5m.bollinger?.middle)?.toFixed?.(4) || 'N/A'} price=${currentPrice.toFixed(4)}`
+                );
+              }
+              return;
+            }
+          }
         }
         
         // ✅ Log when all filters pass
@@ -1150,12 +1198,14 @@ export class WebSocketOCConsumer {
           : `RSI_15m(${snap15m.rsi14?.toFixed(2)}) <= 45`;
         const rvolStr = filterTrace.rvol ? ` RVOL5m=${Number(filterTrace.rvol.rvol)?.toFixed?.(2) || 'N/A'} ✓` : '';
         const donchianStr = filterTrace.donchian ? ' Donchian5m ✓' : '';
+        const vmaStr = filterTrace.volumeVma ? ` VMA_RATIO=${Number(filterTrace.volumeVma.ratio)?.toFixed?.(2) || 'N/A'} ✓` : '';
+        const bbStr = filterTrace.bollinger ? ' BB5m ✓' : '';
         if (filterInfoEnabled && shouldLogSampled('FILTER_PASS', filterPassSampleN)) {
           logger.info(
             `[WebSocketOCConsumer] ✅ All filters PASSED (15m gate) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
             `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} | ` +
             `CONDITIONS: ${emaCondition} ✓ ${adxCondition} ✓ ${rsiCondition} ✓ ` +
-            `ATR%=${volCheck.atrPercent?.toFixed(2)}% ✓ Pullback ✓${rvolStr}${donchianStr}`
+            `ATR%=${volCheck.atrPercent?.toFixed(2)}% ✓ Pullback ✓${rvolStr}${donchianStr}${vmaStr}${bbStr}`
           );
         }
       } else if (exchangeLower === 'mexc') {
