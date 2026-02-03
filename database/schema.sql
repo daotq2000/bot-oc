@@ -98,6 +98,22 @@ CREATE TABLE IF NOT EXISTS candles (
   INDEX idx_close_time (close_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- warmup_runs: Audit indicator warmup runs (for IndicatorWarmup child process)
+CREATE TABLE IF NOT EXISTS warmup_runs (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  worker VARCHAR(50) NOT NULL,
+  exchange VARCHAR(20) NOT NULL,
+  symbol VARCHAR(20) NOT NULL,
+  `interval` VARCHAR(5) NOT NULL,
+  status ENUM('started', 'succeeded', 'failed') NOT NULL,
+  details_json JSON NULL,
+  started_at TIMESTAMP NULL,
+  finished_at TIMESTAMP NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_warmup_runs_worker_created (worker, created_at),
+  INDEX idx_warmup_runs_exchange_symbol_interval (exchange, symbol, `interval`, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- Bảng transactions: Lưu lịch sử transfer và withdraw
 CREATE TABLE IF NOT EXISTS transactions (
   id INT PRIMARY KEY AUTO_INCREMENT,
@@ -112,4 +128,3 @@ CREATE TABLE IF NOT EXISTS transactions (
   INDEX idx_created_at (created_at),
   INDEX idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-

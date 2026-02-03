@@ -1,5 +1,4 @@
 import logger from '../utils/logger.js';
-import { TrendIndicatorsState } from './TrendIndicatorsState.js';
 import { configService } from '../services/ConfigService.js';
 import { candleService } from '../services/CandleService.js';
 
@@ -28,9 +27,6 @@ export class IndicatorWarmup {
     this._requestWindowStart = Date.now();
     this._requestWindowMs = 60 * 1000;
 
-    // Exponential backoff
-    this._rateLimitRetryDelay = Number(configService.getNumber('INDICATORS_WARMUP_429_RETRY_DELAY_MS', 10000));
-    this._rateLimitBackoffMultiplier = Number(configService.getNumber('INDICATORS_WARMUP_429_BACKOFF_MULTIPLIER', 1.5));
 
     // Priority warmup
     this.prioritySymbols = this._parsePrioritySymbols(configService.getString('INDICATORS_WARMUP_PRIORITY_SYMBOLS', ''));
@@ -97,9 +93,11 @@ export class IndicatorWarmup {
 
     try {
       const adxInterval = state?.adxInterval || '1m';
-      const is15mState = adxInterval === '15m';
-      const targetInterval = is15mState ? '15m' : '1m';
-      const targetCount = is15mState ? this.warmupCandleCount15m : this.warmupCandleCount1m;
+      const intervalKey = String(adxInterval || '1m').toLowerCase();
+      const is15mState = intervalKey === '15m';
+      const is5mState = intervalKey === '5m';
+      const targetInterval = is15mState ? '15m' : (is5mState ? '5m' : '1m');
+      const targetCount = is15mState ? this.warmupCandleCount15m : (is5mState ? this.warmupCandleCount5m : this.warmupCandleCount1m);
 
       const requestTimeoutMs = Math.max(5000, Number(this.warmupTimeoutMs) || 30000);
       const controller = new AbortController();

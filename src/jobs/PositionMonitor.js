@@ -52,6 +52,10 @@ export class PositionMonitor {
     // TP/SL placement queue (LIFO): newest positions get protected first.
     // Per-bot queues to avoid cross-bot starvation and reduce rate-limit collisions.
     this._tpslQueues = new Map(); // botId -> LifoAsyncQueue
+
+    // Emergency cooldown/backoff (prevents infinite retry + log storm when TP/SL placement fails)
+    this._emergencyCooldownUntil = new Map(); // posId -> ts
+    this._emergencyBackoffLevel = new Map(); // posId -> integer
   }
 
   /**
@@ -461,6 +465,86 @@ export class PositionMonitor {
     return q;
   }
 
+  /**
+   * HELPER: Verify if position exists on exchange before TP/SL placement
+   * Returns { exists: boolean, position: object|null, reason: string }
+   */
+  async _verifyPositionExistsOnExchange(exchangeService, position) {
+    try {
+      const openPositions = await exchangeService.getOpenPositions(position.symbol);
+      if (!Array.isArray(openPositions) || openPositions.length === 0) {
+        return { exists: false, position: null, reason: 'no_positions_on_exchange' };
+      }
+
+      const normalizedSymbol = exchangeService?.binanceDirectClient?.normalizeSymbol?.(position.symbol) || position.symbol;
+      const expectedSide = position.side === 'long' ? 'LONG' : 'SHORT';
+
+      const matchingPos = openPositions.find(p => {
+        const symOk = (p.symbol === normalizedSymbol || p.symbol === position.symbol);
+        if (!symOk) return false;
+        
+        // Check positionSide for dual position mode
+        if (p.positionSide && String(p.positionSide).toUpperCase() !== expectedSide) return false;
+        
+        const amt = Math.abs(parseFloat(p.positionAmt ?? p.contracts ?? 0));
+        return amt > 0;
+      });
+
+      if (!matchingPos) {
+        return { exists: false, position: null, reason: 'position_not_found_on_exchange' };
+      }
+
+      return { exists: true, position: matchingPos, reason: 'ok' };
+    } catch (e) {
+      // On error, assume exists to avoid false positives (continue with TP/SL placement)
+      logger.debug(`[VerifyPosition] Error verifying position ${position.id} on exchange: ${e?.message || e}`);
+      return { exists: true, position: null, reason: 'verification_error' };
+    }
+  }
+
+  /**
+   * HELPER: Close ghost position (exists in DB but not on exchange)
+   */
+  async _closeGhostPosition(position, reason = 'ghost_position_cleanup') {
+    try {
+      const exchangeService = this.exchangeServices.get(position.bot_id);
+      const positionService = this.positionServices.get(position.bot_id);
+
+      // Get close price (best effort)
+      let closePrice = Number(position.entry_price || 0);
+      try {
+        if (exchangeService) {
+          closePrice = await exchangeService.getTickerPrice(position.symbol) || closePrice;
+        }
+      } catch (e) {
+        logger.debug(`[GhostCleanup] Could not get price for ${position.symbol}: ${e?.message || e}`);
+      }
+
+      // Calculate PnL (will be 0 since position was not on exchange)
+      const { calculatePnL } = await import('../utils/calculator.js');
+      const pnl = calculatePnL(position.entry_price, closePrice, position.amount, position.side);
+
+      // Close via PositionService (sends Telegram alert)
+      if (positionService) {
+        await positionService.closePosition(position, closePrice, pnl, reason);
+        logger.info(`[GhostCleanup] ✅ Closed ghost position ${position.id} (${position.symbol}) via PositionService | reason=${reason}`);
+      } else {
+        // Fallback to direct DB update
+        await Position.update(position.id, {
+          status: 'closed',
+          close_reason: reason,
+          closed_at: new Date()
+        });
+        logger.warn(`[GhostCleanup] Closed ghost position ${position.id} (${position.symbol}) via direct DB update (no Telegram) | reason=${reason}`);
+      }
+      
+      return true;
+    } catch (e) {
+      logger.error(`[GhostCleanup] Failed to close ghost position ${position.id}: ${e?.message || e}`);
+      return false;
+    }
+  }
+
   async placeExitOrder(position) {
     const botId = position?.bot_id;
     const q = this._getTpSlQueue(botId);
@@ -485,6 +569,67 @@ export class PositionMonitor {
     // Skip if position is not open
     if (position.status !== 'open') {
       return;
+    }
+
+    // Emergency cooldown/backoff: if this position recently failed TP/SL placement in EMERGENCY,
+    // skip it for a short period to avoid infinite retry + log storm.
+    const openedAt = position?.opened_at ? new Date(position.opened_at).getTime() : 0;
+    const ageMs = openedAt ? Date.now() - openedAt : 0;
+    const emergencyMs = Number(configService.getNumber('POSITION_EMERGENCY_SLA_MS', 10 * 1000));
+    const isEmergency = ageMs > emergencyMs;
+
+    if (isEmergency) {
+      const cooldownUntil = this._emergencyCooldownUntil.get(position.id);
+      if (cooldownUntil && Date.now() < cooldownUntil) {
+        return;
+      }
+    }
+
+    // =========================================================================
+    // FIX #1 & #2: VERIFY POSITION EXISTS ON EXCHANGE BEFORE TP/SL PLACEMENT
+    // This prevents ReduceOnly Order rejected (-2022) errors for ghost positions
+    // =========================================================================
+    const exchangeService = this.exchangeServices.get(position.bot_id);
+    if (exchangeService) {
+      const verification = await this._verifyPositionExistsOnExchange(exchangeService, position);
+      
+      if (!verification.exists && verification.reason !== 'verification_error') {
+        logger.warn(
+          `[Place TP/SL] ⚠️ Position ${position.id} (${position.symbol} ${position.side}) does not exist on exchange. ` +
+          `Reason: ${verification.reason}. Marking as ghost position and closing in DB.`
+        );
+        
+        // Close ghost position in DB (FIX #2: Position "Ma" cleanup)
+        await this._closeGhostPosition(position, `ghost_${verification.reason}`);
+        return;
+      }
+
+      // FIX #4: Update DB amount if exchange quantity differs significantly
+      if (verification.exists && verification.position) {
+        const exQty = Math.abs(parseFloat(verification.position.positionAmt || 0));
+        const exEntryPrice = parseFloat(verification.position.entryPrice || position.entry_price || 0);
+        
+        if (exQty > 0 && exEntryPrice > 0) {
+          const exNotional = exQty * exEntryPrice;
+          const dbNotional = Number(position.amount || 0);
+          const diffPct = dbNotional > 0 ? Math.abs(exNotional - dbNotional) / dbNotional * 100 : 100;
+          
+          // FIX #4: Reconcile if mismatch > 5%
+          if (diffPct > 5) {
+            await Position.update(position.id, { 
+              amount: exNotional,
+              entry_price: exEntryPrice  // Also sync entry price
+            });
+            position.amount = exNotional;
+            position.entry_price = exEntryPrice;
+            logger.info(
+              `[Place TP/SL] 🔄 Reconciled position ${position.id} amount/price from exchange | ` +
+              `oldAmount=${dbNotional.toFixed(4)} newAmount=${exNotional.toFixed(4)} diff=${diffPct.toFixed(1)}% ` +
+              `entryPrice=${exEntryPrice}`
+            );
+          }
+        }
+      }
     }
 
     // CRITICAL SAFETY CHECK: If position has been open > 10s without TP/SL, force create immediately
@@ -1163,32 +1308,36 @@ export class PositionMonitor {
             `timestamp=${new Date().toISOString()}`
           );
 
-          // SELF-HEALING: If error is -2022, check if position is already closed
+          // =========================================================================
+          // FIX #1: SELF-HEALING for -2022 ReduceOnly errors
+          // If position doesn't exist on exchange, close it in DB to prevent retry loops
+          // =========================================================================
           const errorMsg = e?.message || String(e);
           if (errorMsg.includes('-2022') || errorMsg.includes('ReduceOnly')) {
             try {
               const exchangeService = this.exchangeServices.get(position.bot_id);
               if (exchangeService) {
-                const positions = await exchangeService.getOpenPositions();
-                const pos = Array.isArray(positions) 
-                  ? positions.find(p => (p.symbol || p.info?.symbol) === position.symbol && 
-                                       Math.abs(parseFloat(p.positionAmt || p.contracts || 0)) > 0)
-                  : null;
+                // Use our new verification method for consistency
+                const verification = await this._verifyPositionExistsOnExchange(exchangeService, position);
                 
-                if (!pos || Math.abs(parseFloat(pos.positionAmt || pos.contracts || 0)) === 0) {
+                if (!verification.exists) {
                   logger.info(
-                    `[Place TP/SL] Position ${position.id} (${position.symbol}) already closed on exchange. ` +
-                    `TP creation failed with -2022, but position is safe. Updating local status to 'closed'.`
+                    `[Place TP/SL] 🔄 SELF-HEALING: Position ${position.id} (${position.symbol}) not found on exchange after -2022 error. ` +
+                    `Closing ghost position in DB. Reason: ${verification.reason}`
                   );
-                  await Position.update(position.id, { 
-                    status: 'closed', 
-                    close_reason: 'sync_closed_on_exchange',
-                    closed_at: new Date(),
-                    tp_sl_pending: false
-                  });
+                  
+                  // Use helper to close ghost position properly (sends Telegram alert)
+                  await this._closeGhostPosition(position, `ghost_reduceonly_rejected_${verification.reason}`);
+                  
                   // Release lock and exit early
                   await this._releasePositionLock(position.id);
                   return;
+                } else {
+                  // Position exists but -2022 still occurred - could be timing issue or partial fill
+                  logger.warn(
+                    `[Place TP/SL] ⚠️ Position ${position.id} exists on exchange but -2022 error occurred. ` +
+                    `This could be a timing issue. Will retry on next cycle.`
+                  );
                 }
               }
             } catch (verifyError) {
@@ -1356,6 +1505,23 @@ export class PositionMonitor {
         logger.debug(`[Place TP/SL] Skipping SL order placement for position ${position.id} (stoploss <= 0 or not set in strategy)`);
       }
     } catch (error) {
+      // Emergency cooldown/backoff on failures to prevent infinite retries/log storms.
+      if (isEmergency) {
+        const prevLevel = this._emergencyBackoffLevel.get(position.id) || 0;
+        const nextLevel = Math.min(prevLevel + 1, Number(configService.getNumber('POSITION_EMERGENCY_BACKOFF_MAX_LEVEL', 8)));
+        this._emergencyBackoffLevel.set(position.id, nextLevel);
+
+        const baseMs = Number(configService.getNumber('POSITION_EMERGENCY_BACKOFF_BASE_MS', 5000));
+        const maxMs = Number(configService.getNumber('POSITION_EMERGENCY_BACKOFF_MAX_MS', 5 * 60 * 1000));
+        const cooldownMs = Math.min(baseMs * Math.pow(2, nextLevel - 1), maxMs);
+        this._emergencyCooldownUntil.set(position.id, Date.now() + cooldownMs);
+
+        logger.warn(
+          `[PositionMonitor] 🚨 Emergency TP/SL failed for pos=${position.id} ${position.symbol} ` +
+          `-> cooldown=${Math.floor(cooldownMs / 1000)}s level=${nextLevel} reason=${error?.message || error}`
+        );
+      }
+
       logger.error(`[Place TP/SL] Error processing TP/SL for position ${position.id}:`, error?.message || error, error?.stack);
     } finally {
       // Always release lock in finally block
@@ -1841,14 +2007,27 @@ export class PositionMonitor {
         
         // Sort by age (oldest first = highest priority)
         emergencyPositions.sort((a, b) => b.ageMs - a.ageMs);
+
+        const now = Date.now();
+        const activeEmergency = emergencyPositions.filter(p => {
+          const cooldownUntil = this._emergencyCooldownUntil.get(p.id);
+          if (cooldownUntil && now < cooldownUntil) {
+            return false; // In cooldown
+          }
+          return true;
+        });
+
+        if (activeEmergency.length < emergencyPositions.length) {
+          logger.warn(`[PositionMonitor] 🚨 Cooldown active: ${emergencyPositions.length - activeEmergency.length} emergency positions are in backoff and will be skipped this cycle.`);
+        }
         
         // CRITICAL FIX: Limit concurrent emergency processing to prevent blocking
         // Process in small batches with yielding
         const EMERGENCY_BATCH_SIZE = Number(configService.getNumber('POSITION_MONITOR_EMERGENCY_BATCH_SIZE', 5)); // Max 5 concurrent
         const EMERGENCY_BATCH_DELAY_MS = Number(configService.getNumber('POSITION_MONITOR_EMERGENCY_BATCH_DELAY_MS', 100)); // 100ms delay
         
-        for (let i = 0; i < emergencyPositions.length; i += EMERGENCY_BATCH_SIZE) {
-          const batch = emergencyPositions.slice(i, i + EMERGENCY_BATCH_SIZE);
+        for (let i = 0; i < activeEmergency.length; i += EMERGENCY_BATCH_SIZE) {
+          const batch = activeEmergency.slice(i, i + EMERGENCY_BATCH_SIZE);
           
           // Process batch in parallel
           await Promise.allSettled(

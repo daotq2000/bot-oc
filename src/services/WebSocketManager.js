@@ -900,12 +900,14 @@ class WebSocketManager {
       // Pong received, clear the timeout
       if (conn._pongTimeoutTimer) {
         clearTimeout(conn._pongTimeoutTimer);
+        conn._pongTimeoutTimer = null;
       }
     });
 
     conn.ws.on('message', data => {
       try {
         conn._lastWsMessageAt = Date.now();
+        this._messageStats.lastMessageAt = conn._lastWsMessageAt;
         this._messageStats.totalReceived++;
 
         const message = JSON.parse(data);
@@ -957,6 +959,16 @@ class WebSocketManager {
       const reasonStr = reason?.toString() || 'none';
       const codeStr = code || 'unknown';
       logger.warn(`[Binance-WS] Connection closed (code: ${codeStr}, reason: ${reasonStr}, streams: ${conn.streams.size})`);
+
+      // Ensure keepalive timers are cleared immediately
+      if (conn._pingTimer) {
+        clearInterval(conn._pingTimer);
+        conn._pingTimer = null;
+      }
+      if (conn._pongTimeoutTimer) {
+        clearTimeout(conn._pongTimeoutTimer);
+        conn._pongTimeoutTimer = null;
+      }
 
       if (!this.reconnectQueue.includes(conn) && !this.reconnectInProgress.has(conn)) {
         this._scheduleReconnect(conn);
@@ -1037,9 +1049,21 @@ class WebSocketManager {
     conn._pingTimer = setInterval(() => {
       try {
         if (!conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
-          clearInterval(conn._pingTimer);
-          clearTimeout(conn._pongTimeoutTimer);
+          if (conn._pingTimer) {
+            clearInterval(conn._pingTimer);
+            conn._pingTimer = null;
+          }
+          if (conn._pongTimeoutTimer) {
+            clearTimeout(conn._pongTimeoutTimer);
+            conn._pongTimeoutTimer = null;
+          }
           return;
+        }
+
+        // Clear any previous pong timeout before setting a new one
+        if (conn._pongTimeoutTimer) {
+          clearTimeout(conn._pongTimeoutTimer);
+          conn._pongTimeoutTimer = null;
         }
 
         // Set a timeout for the pong response
@@ -1071,12 +1095,24 @@ class WebSocketManager {
     }
 
     if (conn.reconnectAttempts >= this.maxReconnectAttempts) {
-      logger.error('[Binance-WS] Max reconnect attempts reached for a shard.');
+      logger.error(`[Binance-WS] Max reconnect attempts (${this.maxReconnectAttempts}) reached for shard with ${conn.streams.size} streams.`);
+      
+      // If we hit max attempts, force a fresh connection with new streams
+      if (conn.streams.size > 0) {
+        logger.info(`[Binance-WS] Forcing new connection for ${conn.streams.size} streams after max reconnects`);
+        const streams = Array.from(conn.streams);
+        this._disconnect(conn);
+        const index = this.connections.indexOf(conn);
+        if (index > -1) this.connections.splice(index, 1);
+        
+        // Re-subscribe streams to trigger new connection
+        this.subscribe(streams.map(s => s.split('@')[0]));
+      }
       return;
     }
 
-    if (conn.ws && conn.ws.readyState !== WebSocket.OPEN && conn.ws.readyState !== WebSocket.CONNECTING) {
-      logger.debug(`[Binance-WS] Connection already closed (state: ${conn.ws.readyState}), skipping reconnect scheduling`);
+    if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {
+      logger.debug(`[Binance-WS] Connection already open/connecting (state: ${conn.ws.readyState}), skipping reconnect scheduling`);
       conn._latencyReconnectScheduled = false;
       return;
     }

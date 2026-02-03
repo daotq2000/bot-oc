@@ -28,6 +28,10 @@ export class PriceAlertWorker {
     this.refreshInterval = null;
     this.subscriptionInterval = null;
     this.lastSubscriptionTime = 0;
+
+    // Health/auto-recovery
+    this.healthInterval = null;
+    this.healthCheckEveryMs = Number(configService.getNumber('PRICE_ALERT_HEALTH_CHECK_INTERVAL_MS', 60000)); // 60s
   }
 
   /**
@@ -163,6 +167,19 @@ export class PriceAlertWorker {
       const websocketEnabled = alertMode.useWebSocket();
       logger.info(`[PriceAlertWorker] Starting... mode: scanner=${scannerEnabled} websocket=${websocketEnabled}`);
 
+      // Start health check loop (heartbeat + auto-recovery)
+      if (!this.healthInterval) {
+        this.healthInterval = setInterval(() => {
+          this.runHealthCheck().catch((e) => {
+            logger.error('[PriceAlertWorker] Health check failed:', e?.message || e);
+          });
+        }, this.healthCheckEveryMs);
+        logger.info(`[PriceAlertWorker] ✅ Health check enabled: every ${this.healthCheckEveryMs}ms`);
+
+        // Run one immediately
+        this.runHealthCheck().catch(() => {});
+      }
+
       // Start PriceAlertScanner (polling) if enabled
       if (scannerEnabled) {
         if (!this.priceAlertScanner) {
@@ -226,6 +243,10 @@ export class PriceAlertWorker {
       if (this.subscriptionInterval) {
         clearInterval(this.subscriptionInterval);
         this.subscriptionInterval = null;
+      }
+      if (this.healthInterval) {
+        clearInterval(this.healthInterval);
+        this.healthInterval = null;
       }
 
       // Stop PriceAlertScanner (polling) if running
@@ -372,7 +393,53 @@ export class PriceAlertWorker {
   /**
    * Get status of Price Alert Worker
    */
+  /**
+   * ✅ HEARTBEAT + AUTO-RECOVERY
+   * Runs periodically to log status and recover from silent failures.
+   */
+  async runHealthCheck() {
+    if (!this.isRunning) {
+      logger.debug('[PriceAlertWorker-Health] Worker is stopped, skipping health check.');
+      return;
+    }
+
+    const status = this.getStatus();
+    logger.info(`[PriceAlertWorker-Health] ❤️ Heartbeat | isRunning=${status.isRunning} | scanner=${status.priceAlertScanner?.isRunning || 'N/A'} | mexc_ws=${status.mexcWs.status} (${status.mexcWs.subs} subs) | binance_ws=${status.binanceWs.status} (${status.binanceWs.subs} subs)`);
+
+    // Auto-recovery for PriceAlertScanner
+    const scannerEnabled = alertMode.useScanner();
+    if (scannerEnabled && this.priceAlertScanner && !this.priceAlertScanner.isRunning) {
+      logger.warn('[PriceAlertWorker-Health] ⚠️ PriceAlertScanner is not running but should be. Attempting to restart...');
+      try {
+        this.priceAlertScanner.start();
+        if (this.priceAlertScanner.isRunning) {
+          logger.info('[PriceAlertWorker-Health] ✅ PriceAlertScanner restarted successfully.');
+        } else {
+          logger.error('[PriceAlertWorker-Health] ❌ PriceAlertScanner failed to restart.');
+        }
+      } catch (e) {
+        logger.error(`[PriceAlertWorker-Health] ❌ Error restarting PriceAlertScanner: ${e?.message || e}`);
+      }
+    }
+
+    // Auto-recovery for WebSocket subscriptions (if disconnected)
+    if (status.mexcWs.status !== 'CONNECTED' || status.binanceWs.status !== 'CONNECTED') {
+      logger.warn(`[PriceAlertWorker-Health] ⚠️ WebSocket disconnected (mexc=${status.mexcWs.status}, binance=${status.binanceWs.status}). Triggering resubscription...`);
+      try {
+        await this.subscribeWebSockets();
+      } catch (e) {
+        logger.error(`[PriceAlertWorker-Health] ❌ Error during auto-resubscription: ${e?.message || e}`);
+      }
+    }
+  }
+
+  /**
+   * Get status of Price Alert Worker
+   */
   getStatus() {
+    const mexcStatus = mexcPriceWs?.getStatus?.();
+    const binanceStatus = webSocketManager?.getStatus?.();
+
     return {
       isRunning: this.isRunning,
       priceAlertScanner: this.priceAlertScanner ? {
@@ -380,9 +447,14 @@ export class PriceAlertWorker {
         isScanning: this.priceAlertScanner.isScanning,
         orderServicesCount: this.orderServices.size
       } : null,
-      ocAlertEnabled: alertMode.useWebSocket() ? realtimeOCDetector.alertEnabled : false,
-      ocAlertScanRunning: false,
-      orderServicesCount: this.orderServices.size,
+      mexcWs: {
+        status: mexcStatus?.connected ? 'CONNECTED' : 'DISCONNECTED',
+        subs: mexcStatus?.subscribed?.size || 0
+      },
+      binanceWs: {
+        status: (binanceStatus?.connectedCount || 0) > 0 ? 'CONNECTED' : 'DISCONNECTED',
+        subs: binanceStatus?.totalStreams || 0
+      },
       trackingSymbols: {
         mexc: priceAlertSymbolTracker.getSymbolsForExchange('mexc').size,
         binance: priceAlertSymbolTracker.getSymbolsForExchange('binance').size

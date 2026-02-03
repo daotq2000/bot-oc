@@ -187,14 +187,15 @@ export class PositionWebSocketClient extends EventEmitter {
       logger.debug('[WS] Received pong');
     });
 
-    this.ws.on('close', () => {
+    this.ws.on('close', (code, reason) => {
+      const reasonStr = reason?.toString() || 'none';
       this.state = 'idle';
-      logger.warn('[WS] User stream closed');
+      logger.warn(`[WS] User stream closed (code: ${code ?? 'unknown'}, reason: ${reasonStr})`);
       this.emit('disconnected');
       this.clearTimers();
       // Only reconnect if not stopped and not already reconnecting
       if (!this._isStopped && !this._isReconnecting) {
-      this.reconnect();
+        this.reconnect();
       }
     });
 

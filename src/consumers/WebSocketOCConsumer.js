@@ -8,7 +8,7 @@ import logger from '../utils/logger.js';
 import { TrendIndicatorsState } from '../indicators/TrendIndicatorsState.js';
 import { isTrendConfirmed } from '../indicators/trendFilter.js';
 import { IndicatorWarmup } from '../indicators/IndicatorWarmup.js';
-import { checkPullbackConfirmation, checkVolatilityFilter } from '../indicators/entryFilters.js';
+import { checkPullbackConfirmation, checkVolatilityFilter, checkRvolGate, checkDonchianBreakoutGate } from '../indicators/entryFilters.js';
 import {
   calculateTakeProfit,
   calculateInitialStopLoss,
@@ -291,8 +291,15 @@ export class WebSocketOCConsumer {
     const now = Date.now();
     let cached = this._trendIndicators5m.get(key);
     if (!cached) {
+      const donchianPeriod = Math.max(2, Number(configService.getNumber('DONCHIAN_PERIOD', 20)) || 20);
+      const rvolPeriod = Math.max(2, Number(configService.getNumber('RVOL_PERIOD', 20)) || 20);
+
       cached = {
-        state: new TrendIndicatorsState({ adxInterval: '5m' }),
+        state: new TrendIndicatorsState({
+          adxInterval: '5m',
+          donchianPeriod,
+          rvolPeriod
+        }),
         lastTs: now,
         lastClosed5mStart: null,
         warmedUp: false
@@ -960,6 +967,9 @@ export class WebSocketOCConsumer {
       // - Trend-following (is_reverse_strategy = false): Use current price with MARKET order
       const isReverseStrategy = Boolean(strategy.is_reverse_strategy);
 
+      // Only apply indicator entry gates to FOLLOWING_TREND
+      const isFollowingTrend = isReverseStrategy === false;
+
       // ✅ CRITICAL: ALL orders MUST pass through trend filter gate
       // WHY: OC spikes during sideways markets are often fakeouts; we only trade when
       // EMA alignment + ADX strength + RSI regime confirm the existing `direction`.
@@ -1082,6 +1092,51 @@ export class WebSocketOCConsumer {
             }
             return;
           }
+
+          // ✅ NEW: RVOL gate (5m)
+          if (isFollowingTrend) {
+            const rvolMin = Number(configService.getNumber('RVOL_MIN', 1.2));
+            const rvolVerdict = checkRvolGate(snap5m.rvol, rvolMin);
+            filterTrace.rvol = {
+              ok: rvolVerdict.ok,
+              reason: rvolVerdict.reason,
+              timeframe: '5m',
+              rvol: snap5m.rvol,
+              min: rvolMin,
+              currentVolume: snap5m.rvolCurrentVolume,
+              avgVolume: snap5m.rvolAvgVolume
+            };
+            if (!rvolVerdict.ok) {
+              if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
+                logger.info(
+                  `[WebSocketOCConsumer] ⏭️ RVOL filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+                  `reason=${rvolVerdict.reason} RVOL=${Number(snap5m.rvol)?.toFixed?.(2) || 'N/A'}`
+                );
+              }
+              return;
+            }
+          }
+
+          // ✅ NEW: Donchian breakout gate (5m)
+          if (isFollowingTrend) {
+            const dcVerdict = checkDonchianBreakoutGate(direction, currentPrice, snap5m.donchianHigh, snap5m.donchianLow);
+            filterTrace.donchian = {
+              ok: dcVerdict.ok,
+              reason: dcVerdict.reason,
+              timeframe: '5m',
+              high: snap5m.donchianHigh,
+              low: snap5m.donchianLow
+            };
+            if (!dcVerdict.ok) {
+              if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
+                logger.info(
+                  `[WebSocketOCConsumer] ⏭️ Donchian filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+                  `reason=${dcVerdict.reason} DC_H=${Number(snap5m.donchianHigh)?.toFixed?.(4) || 'N/A'} DC_L=${Number(snap5m.donchianLow)?.toFixed?.(4) || 'N/A'}`
+                );
+              }
+              return;
+            }
+          }
         }
         
         // ✅ Log when all filters pass
@@ -1093,12 +1148,14 @@ export class WebSocketOCConsumer {
         const rsiCondition = direction === 'bullish'
           ? `RSI_15m(${snap15m.rsi14?.toFixed(2)}) >= 55`
           : `RSI_15m(${snap15m.rsi14?.toFixed(2)}) <= 45`;
+        const rvolStr = filterTrace.rvol ? ` RVOL5m=${Number(filterTrace.rvol.rvol)?.toFixed?.(2) || 'N/A'} ✓` : '';
+        const donchianStr = filterTrace.donchian ? ' Donchian5m ✓' : '';
         if (filterInfoEnabled && shouldLogSampled('FILTER_PASS', filterPassSampleN)) {
           logger.info(
             `[WebSocketOCConsumer] ✅ All filters PASSED (15m gate) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
             `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} | ` +
             `CONDITIONS: ${emaCondition} ✓ ${adxCondition} ✓ ${rsiCondition} ✓ ` +
-            `ATR%=${volCheck.atrPercent?.toFixed(2)}% ✓ Pullback ✓`
+            `ATR%=${volCheck.atrPercent?.toFixed(2)}% ✓ Pullback ✓${rvolStr}${donchianStr}`
           );
         }
       } else if (exchangeLower === 'mexc') {

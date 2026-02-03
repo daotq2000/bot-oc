@@ -15,9 +15,16 @@ import logger from './utils/logger.js';
 import { webSocketManager } from './services/WebSocketManager.js';
 import { watchdogService } from './services/WatchdogService.js';
 import { candleDbFlusher } from './services/CandleDbFlusher.js';
+import { logMonitorService } from './services/LogMonitorService.js';
+import { ChildProcessManager } from './services/ChildProcessManager.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 // Load environment variables
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -51,6 +58,7 @@ app.get('/health/detailed', async (req, res) => {
       status: 'ok',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
+      childProcesses: childProcessManager.getStatus(),
       memory: {
         used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
         total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
@@ -135,6 +143,8 @@ let positionSyncJob = null;
 let telegramBot = null;
 export let positionMonitor = null;
 
+const childProcessManager = new ChildProcessManager();
+
 
 // Initialize services and start server
 async function start() {
@@ -169,6 +179,11 @@ async function start() {
       await AppConfig.set('WS_OC_SUBSCRIBE_INTERVAL_MS', '60000', 'Interval to update WebSocket subscriptions for OC detection (ms)');
       await AppConfig.set('REALTIME_OC_ENABLED', 'true', 'Enable realtime OC detection from WebSocket (no database candles)');
       await AppConfig.set('WS_OC_GATE_LOG_ENABLED', 'true', 'Enable detailed gate decision logs for OC entries (pass/fail reasons). WARNING: can be noisy');
+      await AppConfig.set('RVOL_FILTER_ENABLED', 'true', 'Enable/Disable RVOL (relative volume) gate for FOLLOWING_TREND entries');
+      await AppConfig.set('RVOL_MIN', '1.2', 'Minimum RVOL (5m) required for FOLLOWING_TREND entries');
+      await AppConfig.set('RVOL_PERIOD', '20', 'Lookback length for RVOL SMA(volume) on 5m candles');
+      await AppConfig.set('DONCHIAN_FILTER_ENABLED', 'true', 'Enable/Disable Donchian breakout gate (5m) for FOLLOWING_TREND entries');
+      await AppConfig.set('DONCHIAN_PERIOD', '20', 'Lookback length for Donchian channel on 5m candles');
 
       // WebSocket OC high-performance configs
       await AppConfig.set('WS_MATCH_CONCURRENCY', '50', 'Max concurrency for processing matched strategies per tick (higher = faster entries, more CPU/API usage)');
@@ -269,7 +284,11 @@ async function start() {
       await AppConfig.set('ADV_TPSL_AUTO_OPTIMIZE_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
       await AppConfig.set('ADV_TPSL_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
       await AppConfig.set('ADV_TPSL_SR_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
-      await AppConfig.set('ADV_TPSL_MTF_ENABLED', 'true', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('BINANCE_WS_TICK_WORKER_COUNT', '10', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('BINANCE_WS_TICK_DRAIN_BATCH_SIZE', '2000', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('BINANCE_WS_TICK_DRAIN_TIME_BUDGET_MS', '25', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('BINANCE_WS_PONG_TIMEOUT_MS', '30000', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('BINANCE_WS_MAX_CONCURRENT_RECONNECTS', '1', 'Cron for symbols refresh job (default every 15 minutes)');
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);
     }
@@ -328,7 +347,82 @@ async function start() {
 
     // Initialize Binance WebSocket connection for price data
     logger.info('Initializing Binance WebSocket manager...');
-    webSocketManager.connect();
+    // webSocketManager.connect(); // Connect is now called implicitly by consumer subscriptions
+
+    // ✅ FIX: Initialize and start WebSocket OC Consumer independently and unconditionally
+    logger.info('Initializing WebSocket OC Consumer...');
+    const { webSocketOCConsumer } = await import('./consumers/WebSocketOCConsumer.js');
+    await webSocketOCConsumer.initialize(); // Initialize with empty OrderServices first
+    webSocketOCConsumer.start();
+    logger.info('✅ WebSocket OC Consumer started.');
+
+    // ✅ Log monitor: detect WS errors in combined.log/error.log and auto-recover
+    try {
+      const projectRoot = process.cwd();
+      const combinedPath = process.env.LOG_MONITOR_COMBINED_PATH || path.join(projectRoot, 'logs', 'combined.log');
+      const errorPath = process.env.LOG_MONITOR_ERROR_PATH || path.join(projectRoot, 'logs', 'error.log');
+
+      logMonitorService.configure({
+        logFiles: [combinedPath, errorPath],
+        pollIntervalMs: Number(process.env.LOG_MONITOR_POLL_MS || 1000),
+        defaultCooldownMs: Number(process.env.LOG_MONITOR_COOLDOWN_MS || 15000),
+        onEvent: (evt) => {
+          try {
+            const type = evt?.type;
+
+            if (type === 'recover_binance_ws' || type === 'recover_network') {
+              logger.warn(`[LogMonitor] Auto-fix: ${type} | ${evt?.message || ''}`);
+              // Best-effort: reconnect all shards
+              try {
+                for (const conn of webSocketManager.connections || []) {
+                  if (!conn) continue;
+                  // Use existing safe reconnect logic
+                  webSocketManager._scheduleReconnect?.(conn);
+                }
+              } catch (_) {}
+            }
+
+            if (type === 'recover_mexc_ws') {
+              logger.warn(`[LogMonitor] Auto-fix: ${type} | ${evt?.message || ''}`);
+              import('./services/MexcWebSocketManager.js').then(({ mexcPriceWs }) => {
+                mexcPriceWs?.ensureConnected?.();
+              }).catch(() => {});
+            }
+
+            if (type === 'recover_tick_starvation') {
+              logger.warn(`[LogMonitor] Auto-fix: ${type} | ${evt?.message || ''}`);
+              // Force refresh subscriptions (idempotent)
+              webSocketOCConsumer.subscribeWebSockets?.().catch(() => {});
+              import('./services/MexcWebSocketManager.js').then(({ mexcPriceWs }) => {
+                mexcPriceWs?.ensureConnected?.();
+              }).catch(() => {});
+            }
+          } catch (e) {
+            logger.warn(`[LogMonitor] handler error: ${e?.message || e}`);
+          }
+        },
+        tickStarvation: {
+          enabled: true,
+          thresholdMs: Number(process.env.LOG_MONITOR_TICK_STARVATION_MS || 60000),
+          checkEveryMs: Number(process.env.LOG_MONITOR_TICK_STARVATION_CHECK_MS || 10000),
+          getState: () => {
+            try {
+              const st = webSocketOCConsumer.getStats?.();
+              const timeSinceLastTick = st?.stats?.timeSinceLastTick ?? null;
+              return {
+                isRunning: Boolean(st?.isRunning),
+                timeSinceLastTick
+              };
+            } catch (_) {
+              return null;
+            }
+          }
+        }
+      });
+      logMonitorService.start();
+    } catch (e) {
+      logger.warn(`[LogMonitor] Failed to start (non-critical): ${e?.message || e}`);
+    }
 
     // Start auto DB persistence for closed candles (Aggregator -> DB) after WS init
     setTimeout(() => {
@@ -368,6 +462,11 @@ async function start() {
       // Delay Price Alert Worker initialization to reduce startup CPU load
       setTimeout(async () => {
         try {
+          const { alertMode } = await import('./services/AlertMode.js');
+          const useScanner = alertMode.useScanner();
+          const useWebSocket = alertMode.useWebSocket();
+          logger.info(`[App] Price Alert Mode: scanner=${useScanner} (polling), websocket=${useWebSocket} (realtime)`);
+
           // Pre-load PriceAlertConfig cache on startup (TTL: 30 minutes)
           logger.info('[App] Pre-loading PriceAlertConfig cache...');
           const { PriceAlertConfig } = await import('./models/PriceAlertConfig.js');
@@ -377,11 +476,20 @@ async function start() {
           // Small delay before initializing worker
           await new Promise(resolve => setTimeout(resolve, 500));
           
+          logger.info('[App] Starting Price Alert Worker...');
           const { PriceAlertWorker } = await import('./workers/PriceAlertWorker.js');
           priceAlertWorker = new PriceAlertWorker();
           await priceAlertWorker.initialize(telegramService);
-          priceAlertWorker.start();
-          logger.info('✅ Price Alert Worker started successfully');
+          await priceAlertWorker.start();
+
+          // ✅ Verify worker status after start()
+          const workerStatus = priceAlertWorker.getStatus();
+          if (workerStatus.isRunning) {
+            logger.info('✅ Price Alert Worker started successfully');
+            logger.info(`[App] Worker Status: ${JSON.stringify(workerStatus)}`);
+          } else {
+            logger.error('❌ CRITICAL: Price Alert Worker start() was called but isRunning is false. The system may be disabled by other settings.');
+          }
         } catch (error) {
           logger.error('❌ CRITICAL: Failed to start Price Alert Worker:', { message: error?.message || error, stack: error?.stack });
           logger.error('Price Alert system is critical - application will continue but alerts may not work');
@@ -413,20 +521,25 @@ async function start() {
     }, 5000); // Delay 5 seconds
 
     // ============================================
-    // POSITION MONITOR (Always-on)
+    // POSITION MONITOR (Always-on, in a separate Worker Thread)
     // ============================================
-    setTimeout(async () => {
+    setTimeout(() => {
       logger.info('='.repeat(60));
-      logger.info('Initializing Position Monitor...');
+      logger.info('Initializing Position Monitor as a child process (fork)...');
       logger.info('='.repeat(60));
+
       try {
-        const { PositionMonitor } = await import('./jobs/PositionMonitor.js');
-        positionMonitor = new PositionMonitor();
-        await positionMonitor.initialize(telegramService);
-        positionMonitor.start();
-        logger.info('✅ Position Monitor started successfully');
+        childProcessManager.start(
+          'positionMonitor',
+          'processes/PositionMonitor.child.js',
+          {
+            WORKER_LOCK_NAME: 'worker:position_monitor',
+            WORKER_LOCK_TIMEOUT_SEC: '0'
+          },
+          { autoRestart: true }
+        );
       } catch (error) {
-        logger.error('❌ Failed to start Position Monitor:', error?.message || error);
+        logger.error('❌ CRITICAL: Failed to start Position Monitor child process:', { message: error?.message || error, stack: error?.stack });
       }
     }, 6000); // Delay 6 seconds
 
@@ -559,6 +672,10 @@ async function start() {
         logger.warn('Failed to stop Memory Monitor:', e?.message || e);
       }
       
+      try {
+        childProcessManager.stopAll();
+      } catch (_) {}
+
       if (telegramBot) {
         if (telegramBot) {
         await telegramBot.stop();
@@ -633,6 +750,10 @@ async function start() {
         logger.warn('Failed to stop Memory Monitor:', e?.message || e);
       }
       
+      try {
+        childProcessManager.stopAll();
+      } catch (_) {}
+
       await telegramBot.stop();
       process.exit(0);
     });

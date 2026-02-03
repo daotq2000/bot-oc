@@ -3053,6 +3053,19 @@ export class BinanceDirectClient {
             }
           }
 
+          // =========================================================================
+          // FIX #1: Handle -2022 ReduceOnly error gracefully
+          // Instead of throwing (which causes retry loops), return null to signal
+          // that the position likely doesn't exist on exchange anymore
+          // =========================================================================
+          if (feCode === -2022 || feCode === '-2022' || feMsg.includes('-2022') || feMsg.includes('ReduceOnly')) {
+            logger.warn(
+              `[TP Fallback] ⚠️ ReduceOnly Order rejected (-2022) for pos=${position?.id || 'N/A'}. ` +
+              `Position likely already closed on exchange. Returning null (caller should sync position state).`
+            );
+            return null; // Return null instead of throwing to prevent retry loops
+          }
+
           logger.error(
             `[TP Fallback] ❌ Failed to create LIMIT order (fallback) | pos=${position?.id || 'N/A'} ` +
             `error=${feMsg}`

@@ -72,14 +72,10 @@ export class StrategiesWorker {
       // Small delay to reduce CPU load
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      // Initialize WebSocket OC Consumer (realtime detection)
-      // Note: OrderServices will be populated in initializeOrderServices()
-      // We'll update it after initialization
-      await webSocketOCConsumer.initialize(this.orderServices);
-      
-      // Update OrderServices reference after initialization
+      // WebSocket OC Consumer is now initialized and started globally in app startup.
+      // Here we only ensure it has the latest OrderServices.
       webSocketOCConsumer.orderServices = this.orderServices;
-      
+
       // Small delay before checking strategies
       await new Promise(resolve => setTimeout(resolve, 500));
 

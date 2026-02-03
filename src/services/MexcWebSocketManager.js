@@ -93,6 +93,17 @@ class MexcWebSocketManager {
     if (this._connecting) return;
     if (this.ws?.readyState === WebSocket.OPEN) return;
 
+    // Defensive: ensure previous socket is fully torn down before creating a new one
+    if (this.ws) {
+      try {
+        this.ws.removeAllListeners();
+      } catch (_) {}
+      try {
+        this.ws.terminate();
+      } catch (_) {}
+      this.ws = null;
+    }
+
     this._connecting = true;
     logger.info(`[MEXC-WS] Connecting to ${this.baseUrl}...`);
 
@@ -131,6 +142,9 @@ class MexcWebSocketManager {
     this.ws.on('error', (err) => {
       logger.error('[MEXC-WS] WebSocket error:', err?.message || err, err?.code || '');
       this._connecting = false;
+
+      // Some network errors may not emit 'close' quickly; schedule reconnect defensively.
+      this._scheduleReconnect();
     });
   }
 

@@ -107,3 +107,56 @@ export function checkVolatilityFilter(atr, price) {
   return { ok: true, reason: 'volatility_ok', atrPercent };
 }
 
+export function checkRvolGate(rvol, minRvol = 1.2) {
+  const enabled = configService.getBoolean('RVOL_FILTER_ENABLED', true);
+
+  if (!enabled) {
+    return { ok: true, reason: 'rvol_disabled', rvol: null };
+  }
+
+  const v = Number(rvol);
+  if (!Number.isFinite(v) || v <= 0) {
+    return { ok: false, reason: 'rvol_data_not_ready', rvol: null };
+  }
+
+  const min = Number(configService.getNumber('RVOL_MIN', minRvol));
+  if (v < min) {
+    return { ok: false, reason: `rvol_too_low_${v.toFixed(2)}<${min.toFixed(2)}`, rvol: v };
+  }
+
+  return { ok: true, reason: 'rvol_ok', rvol: v };
+}
+
+export function checkDonchianBreakoutGate(direction, price, donchianHigh, donchianLow) {
+  const enabled = configService.getBoolean('DONCHIAN_FILTER_ENABLED', true);
+
+  if (!enabled) {
+    return { ok: true, reason: 'donchian_disabled' };
+  }
+
+  const dir = String(direction || '').toLowerCase();
+  const p = Number(price);
+  const hi = Number(donchianHigh);
+  const lo = Number(donchianLow);
+
+  if ((dir !== 'bullish' && dir !== 'bearish') || !Number.isFinite(p) || p <= 0) {
+    return { ok: false, reason: 'donchian_invalid_input' };
+  }
+
+  if (!Number.isFinite(hi) || !Number.isFinite(lo) || hi <= 0 || lo <= 0) {
+    return { ok: false, reason: 'donchian_data_not_ready' };
+  }
+
+  if (dir === 'bullish') {
+    if (p <= hi) {
+      return { ok: false, reason: `donchian_not_break_high_${p.toFixed(4)}<=${hi.toFixed(4)}` };
+    }
+    return { ok: true, reason: 'donchian_breakout_long' };
+  }
+
+  if (p >= lo) {
+    return { ok: false, reason: `donchian_not_break_low_${p.toFixed(4)}>=${lo.toFixed(4)}` };
+  }
+  return { ok: true, reason: 'donchian_breakout_short' };
+}
+
