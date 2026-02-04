@@ -185,22 +185,91 @@ export const riskManagementService = {
   },
 
   /**
-   * Simple trailing SL computation: lock % of profit distance.
+   * Advanced trailing SL with profit lock levels.
+   * Implements tiered profit protection:
+   * - Level 1: When profit >= 1%, move SL to breakeven + small buffer
+   * - Level 2: When profit >= 2%, lock 30% of profit
+   * - Level 3: When profit >= 3%, lock 50% of profit
+   * - Level 4: When profit >= 5%, lock 70% of profit
    * @returns {{shouldTrail:boolean,newStopLoss:number,reason:string}|{shouldTrail:false}}
    */
   calculateTrailingSL(position, currentPrice) {
     const trailingEnabled = configService.getBoolean('ADV_TPSL_TRAILING_ENABLED', true);
     if (!trailingEnabled) return { shouldTrail: false };
+    
     const entry = Number(position?.entry_price);
     const cur = Number(currentPrice);
     const side = position?.side;
-    if (!Number.isFinite(entry) || !Number.isFinite(cur) || (side !== 'long' && side !== 'short')) return { shouldTrail: false };
+    const prevSL = Number(position?.stop_loss_price || 0);
+    
+    if (!Number.isFinite(entry) || !Number.isFinite(cur) || (side !== 'long' && side !== 'short')) {
+      return { shouldTrail: false };
+    }
+    
     const dir = side === 'long' ? 1 : -1;
-    const progress = (cur - entry) * dir;
+    const progress = (cur - entry) * dir; // Profit in price terms
+    const pnlPct = (progress / entry) * 100; // Profit percentage
+    
     if (progress <= 0) return { shouldTrail: false };
-    const lockRatio = Number(configService.getNumber('ADV_TPSL_TRAILING_LOCK_RATIO', 0.5));
-    const locked = progress * Math.max(0, Math.min(1, lockRatio));
-    const newStopLoss = entry + dir * locked;
-    return { shouldTrail: true, newStopLoss, reason: `trail lockRatio=${lockRatio}` };
+    
+    // Define profit lock levels (configurable)
+    // Format: [profitPct, lockRatio] - when profit >= profitPct%, lock lockRatio% of profit
+    const defaultLevels = [
+      [1.0, 0.0],   // Level 1: >= 1% profit → breakeven (lock 0%, just protect capital)
+      [2.0, 0.30],  // Level 2: >= 2% profit → lock 30% of profit
+      [3.0, 0.50],  // Level 3: >= 3% profit → lock 50% of profit
+      [5.0, 0.70],  // Level 4: >= 5% profit → lock 70% of profit
+      [8.0, 0.80],  // Level 5: >= 8% profit → lock 80% of profit
+    ];
+    
+    // Allow custom levels via config (JSON array)
+    let levels = defaultLevels;
+    try {
+      const customLevels = configService.getString('ADV_TPSL_PROFIT_LOCK_LEVELS', '');
+      if (customLevels) {
+        const parsed = JSON.parse(customLevels);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          levels = parsed;
+        }
+      }
+    } catch (_) {
+      // Use default levels if parsing fails
+    }
+    
+    // Sort levels by profit threshold (ascending)
+    levels.sort((a, b) => a[0] - b[0]);
+    
+    // Find the highest applicable level
+    let applicableLevel = null;
+    for (const level of levels) {
+      if (pnlPct >= level[0]) {
+        applicableLevel = level;
+      }
+    }
+    
+    if (!applicableLevel) {
+      return { shouldTrail: false };
+    }
+    
+    const [triggerPct, lockRatio] = applicableLevel;
+    const bufferPct = Number(configService.getNumber('ADV_TPSL_TRAILING_BUFFER_PCT', 0.1)); // Small buffer to avoid slippage
+    
+    // Calculate new SL: entry + (profit * lockRatio) + buffer
+    const locked = progress * lockRatio;
+    const buffer = entry * (bufferPct / 100) * dir;
+    let newStopLoss = entry + dir * locked + buffer;
+    
+    // Ensure SL only moves in favorable direction (never worse than current SL)
+    if (prevSL > 0) {
+      if (side === 'long' && newStopLoss <= prevSL) {
+        return { shouldTrail: false }; // Don't move SL backwards for LONG
+      }
+      if (side === 'short' && newStopLoss >= prevSL) {
+        return { shouldTrail: false }; // Don't move SL backwards for SHORT
+      }
+    }
+    
+    const reason = `profitLock level=${triggerPct}% lockRatio=${(lockRatio*100).toFixed(0)}% pnl=${pnlPct.toFixed(2)}%`;
+    return { shouldTrail: true, newStopLoss, reason };
   }
 };

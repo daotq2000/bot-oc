@@ -833,6 +833,7 @@ export class PositionMonitor {
     }
 
     // If sl_order_id exists, verify it's still active on exchange (skip for new positions)
+    // ALSO check if SL price has changed (breakeven/trailing) and needs to be updated
     if (position.sl_order_id && !isNewPosition) {
       try {
         const exchangeService = this.exchangeServices.get(position.bot_id);
@@ -851,6 +852,29 @@ export class PositionMonitor {
             // Clear sl_order_id in DB so we can recreate
             await Position.update(position.id, { sl_order_id: null });
             position.sl_order_id = null;
+          } else if (status === 'new' || status === 'open' || status === 'pending') {
+            // Order is active - check if SL price has been updated (breakeven/trailing SL)
+            const currentOrderPrice = Number(orderStatus?.stopPrice || orderStatus?.price || 0);
+            const desiredSLPrice = Number(position.stop_loss_price || 0);
+            
+            if (desiredSLPrice > 0 && currentOrderPrice > 0) {
+              const priceDiff = Math.abs(desiredSLPrice - currentOrderPrice);
+              const priceDiffPercent = (priceDiff / currentOrderPrice) * 100;
+              
+              // If SL price changed by more than 0.05%, update the order
+              // This handles breakeven and trailing SL updates
+              if (priceDiffPercent > 0.05) {
+                logger.info(
+                  `[Place TP/SL] 🔄 SL price changed (breakeven/trailing) for position ${position.id}: ` +
+                  `currentOrder=${currentOrderPrice.toFixed(8)} → desired=${desiredSLPrice.toFixed(8)} ` +
+                  `(diff=${priceDiffPercent.toFixed(3)}%). Marking for update.`
+                );
+                needsSl = true;
+                // Clear sl_order_id to force recreation with new price
+                await Position.update(position.id, { sl_order_id: null });
+                position.sl_order_id = null;
+              }
+            }
           }
         }
       } catch (e) {
