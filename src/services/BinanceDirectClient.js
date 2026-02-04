@@ -2866,13 +2866,15 @@ export class BinanceDirectClient {
     } catch (_) {}
 
 
-    // Add deterministic clientOrderId to reliably map WS fills back to DB position
-    // Format: OC_B{botId}_P{positionId}_EXIT / _SL
+    // Add clientOrderId with timestamp to reliably map WS fills back to DB position
+    // Format: OC_B{botId}_P{positionId}_EXIT_{timestamp}
+    // Timestamp ensures uniqueness when replacing orders for same position
     try {
       const botId = bot?.id;
       const posId = position?.id;
+      const ts = Date.now() % 100000; // Last 5 digits of timestamp for uniqueness
       if (botId && posId) {
-        params.newClientOrderId = `OC_B${botId}_P${posId}_EXIT`;
+        params.newClientOrderId = `OC_B${botId}_P${posId}_EXIT_${ts}`;
       }
     } catch (_) {}
 
@@ -2926,12 +2928,13 @@ export class BinanceDirectClient {
           return null;
         }
 
-        // Helper to build clientOrderId
+        // Helper to build clientOrderId with timestamp to avoid duplicates on retry
         const buildClientId = (suffix) => {
           try {
             const botId = bot?.id;
             const posId = position?.id;
-            if (botId && posId) return `OC_B${botId}_P${posId}_${suffix}`;
+            const ts = Date.now() % 100000; // Last 5 digits of timestamp for uniqueness
+            if (botId && posId) return `OC_B${botId}_P${posId}_${suffix}_${ts}`;
           } catch (_) {}
           return undefined;
         };
@@ -3052,13 +3055,15 @@ export class BinanceDirectClient {
       workingType: 'MARK_PRICE' // Use MARK_PRICE for better trigger accuracy
     };
 
-    // Add deterministic clientOrderId to reliably map WS fills back to DB position
-    // Format: OC_B{botId}_P{positionId}_TP
+    // Add clientOrderId with timestamp to reliably map WS fills back to DB position
+    // Format: OC_B{botId}_P{positionId}_TP_{timestamp}
+    // Timestamp ensures uniqueness when replacing orders for same position
     try {
       const botId = bot?.id;
       const posId = position?.id;
+      const ts = Date.now() % 100000; // Last 5 digits of timestamp for uniqueness
       if (botId && posId) {
-        params.newClientOrderId = `OC_B${botId}_P${posId}_TP`;
+        params.newClientOrderId = `OC_B${botId}_P${posId}_TP_${ts}`;
       }
     } catch (_) {}
 
@@ -3112,12 +3117,13 @@ export class BinanceDirectClient {
           return null;
         }
 
-        // Helper to build clientOrderId
+        // Helper to build clientOrderId with timestamp to avoid duplicates on retry
         const buildClientId = (suffix) => {
           try {
             const botId = bot?.id;
             const posId = position?.id;
-            if (botId && posId) return `OC_B${botId}_P${posId}_${suffix}`;
+            const ts = Date.now() % 100000; // Last 5 digits of timestamp for uniqueness
+            if (botId && posId) return `OC_B${botId}_P${posId}_${suffix}_${ts}`;
           } catch (_) {}
           return undefined;
         };
