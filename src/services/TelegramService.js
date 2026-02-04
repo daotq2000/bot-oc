@@ -28,6 +28,12 @@ export class TelegramService {
     this._queueMaxIdleMs = 30 * 60 * 1000;
     this._chatMaxIdleMs = 6 * 60 * 60 * 1000;
     this._lastCleanupAt = 0;
+    
+    // Deduplication for close notifications to prevent duplicate alerts
+    // Key: "close_{positionId}" or "ws_exit_{botId}_{orderId}_{symbol}"
+    // Value: timestamp when notification was sent
+    this._closeNotificationSent = new Map();
+    this._closeNotificationTtlMs = 60 * 1000; // 60 seconds dedup window
   }
 
   /**
@@ -197,6 +203,16 @@ export class TelegramService {
           // Clear timer if batch is empty
           clearTimeout(batch.timer);
           this._batches.delete(exchange);
+          cleaned++;
+        }
+      }
+    }
+
+    // Cleanup expired close notification dedup entries
+    if (this._closeNotificationSent && this._closeNotificationSent.entries) {
+      for (const [key, sentAt] of this._closeNotificationSent.entries()) {
+        if ((now - sentAt) > this._closeNotificationTtlMs) {
+          this._closeNotificationSent.delete(key);
           cleaned++;
         }
       }
@@ -520,6 +536,28 @@ Amount: ${amountStr} (100%)`.trim();
         return;
       }
 
+      // DEDUPLICATION: Check if we already sent a close notification for this position recently
+      const dedupKey = `close_${position.id}`;
+      const now = Date.now();
+      const lastSent = this._closeNotificationSent.get(dedupKey);
+      if (lastSent && (now - lastSent) < this._closeNotificationTtlMs) {
+        logger.warn(`[CloseSummaryAlert] Duplicate notification detected for position ${position.id}, skipping (sent ${now - lastSent}ms ago)`);
+        return;
+      }
+      
+      // Also check by botId + symbol to prevent duplicate with sendWsExitFilledAlert
+      const normalizedSymbol = String(position.symbol || '').replace(/_/g, '').toUpperCase();
+      const symbolDedupKey = `close_symbol_${position.bot_id}_${normalizedSymbol}`;
+      const symbolLastSent = this._closeNotificationSent.get(symbolDedupKey);
+      if (symbolLastSent && (now - symbolLastSent) < this._closeNotificationTtlMs) {
+        logger.warn(`[CloseSummaryAlert] Duplicate notification detected for bot ${position.bot_id} symbol ${normalizedSymbol}, skipping (sent ${now - symbolLastSent}ms ago)`);
+        return;
+      }
+      
+      // Mark as sent BEFORE sending to prevent race condition
+      this._closeNotificationSent.set(dedupKey, now);
+      this._closeNotificationSent.set(symbolDedupKey, now);
+
       // Try to get channel ID from position, or use default alert channel
       let channelId = position?.telegram_alert_channel_id;
       
@@ -602,6 +640,29 @@ Amount: ${amountStr}
         logger.warn(`[WS Exit Alert] Telegram bot not initialized, skipping alert for order ${orderId}`);
         return;
       }
+
+      // DEDUPLICATION: Check if we already sent an exit filled alert for this order recently
+      const normalizedSymbol = String(symbol).replace(/_/g, '').toUpperCase();
+      const dedupKey = `ws_exit_${botId}_${orderId}_${normalizedSymbol}`;
+      const now = Date.now();
+      const lastSent = this._closeNotificationSent.get(dedupKey);
+      if (lastSent && (now - lastSent) < this._closeNotificationTtlMs) {
+        logger.warn(`[WS Exit Alert] Duplicate notification detected for order ${orderId} (${symbol}), skipping (sent ${now - lastSent}ms ago)`);
+        return;
+      }
+      
+      // Also check by botId + symbol to prevent duplicate with sendCloseSummaryAlert
+      // If a close summary was already sent for this symbol, don't send WS exit alert
+      const symbolDedupKey = `close_symbol_${botId}_${normalizedSymbol}`;
+      const symbolLastSent = this._closeNotificationSent.get(symbolDedupKey);
+      if (symbolLastSent && (now - symbolLastSent) < this._closeNotificationTtlMs) {
+        logger.warn(`[WS Exit Alert] Close notification already sent for bot ${botId} symbol ${normalizedSymbol}, skipping WS exit alert (sent ${now - symbolLastSent}ms ago)`);
+        return;
+      }
+      
+      // Mark as sent BEFORE sending to prevent race condition
+      this._closeNotificationSent.set(dedupKey, now);
+      this._closeNotificationSent.set(symbolDedupKey, now);
 
       // WS exit filled alert is part of order service -> always use order client/channel
       const formattedSymbol = this.formatSymbolUnderscore(symbol);
