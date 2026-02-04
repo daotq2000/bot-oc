@@ -13,11 +13,13 @@ class WatchdogService {
     this.delayMonitor = null;
     this.degradeActive = false;
     this.degradeUntil = 0;
+    // ✅ FIX: Reduced degrade duration from 10 min to 3 min for faster recovery
+    // Also reduced threshold from 400ms to 200ms for earlier warning
     this.config = {
       sampleIntervalMs: 10000,
-      thresholdMs: 400, // event loop delay warn threshold
+      thresholdMs: 200, // event loop delay warn threshold (reduced from 400ms)
       consecutiveTriggers: 3,
-      degradeDurationMs: 10 * 60 * 1000 // 10 minutes
+      degradeDurationMs: 3 * 60 * 1000 // 3 minutes (reduced from 10 min)
     };
     this._consecutiveHigh = 0;
   }

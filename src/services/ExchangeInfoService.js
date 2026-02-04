@@ -739,8 +739,13 @@ class ExchangeInfoService {
    * @returns {Object|null} The filters or null if not found.
    */
   getFilters(symbol, exchange = null) {
+    // ✅ FIX: Throttle warning log to prevent log spam (max 1 per 60s)
     if (!this.isInitialized) {
-      this.logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
+      const now = Date.now();
+      if (!this._lastNotInitWarningAt || now - this._lastNotInitWarningAt > 60000) {
+        this._lastNotInitWarningAt = now;
+        this.logger.warn('ExchangeInfoService not initialized. Filters may be stale.');
+      }
     }
     
     // CRITICAL FIX: Use exchange:symbol as cache key

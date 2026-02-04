@@ -540,21 +540,38 @@ export class RealtimeOCDetector {
       // Get strategies for this exchange and symbol
       const strategies = strategyCache.getStrategies(ex, sym);
       if (!strategies || strategies.length === 0) {
+        // ✅ DEBUG: Log when no strategies found for symbol
+        const debugOCEnabled = configService.getBoolean('DEBUG_OC_DETECTION', false);
+        const debugSymbol = configService.getString('DEBUG_OC_SYMBOL', '');
+        if (debugOCEnabled && (!debugSymbol || sym.includes(debugSymbol.toUpperCase()))) {
+          logger.debug(`[OC-Debug] No strategies found for ${ex}|${sym}`);
+        }
         return [];
       }
 
       const matches = [];
+      const debugOCEnabled = configService.getBoolean('DEBUG_OC_DETECTION', false);
+      const debugSymbol = configService.getString('DEBUG_OC_SYMBOL', '');
+      const shouldDebug = debugOCEnabled && (!debugSymbol || sym.includes(debugSymbol.toUpperCase()));
 
       // Process each strategy
       for (const strategy of strategies) {
+        const strategyDebugKey = `${strategy.id}|${strategy.symbol}`;
+        
         // Skip inactive strategies
         if (!strategy.is_active || strategy.bot?.is_active === false) {
+          if (shouldDebug) {
+            logger.debug(`[OC-Debug] Strategy ${strategyDebugKey} skipped: inactive (is_active=${strategy.is_active}, bot.is_active=${strategy.bot?.is_active})`);
+          }
           continue;
         }
 
         // Get strategy interval
         const strategyInterval = String(strategy.interval || '1m').toLowerCase();
         if (!strategyInterval) {
+          if (shouldDebug) {
+            logger.debug(`[OC-Debug] Strategy ${strategyDebugKey} skipped: no interval`);
+          }
           continue;
         }
 
@@ -562,6 +579,9 @@ export class RealtimeOCDetector {
         const { open, source: openSource } = await this.getAccurateOpen(ex, sym, strategyInterval, p, ts);
         if (!Number.isFinite(open) || open <= 0) {
           // Skip if we can't get open price
+          if (shouldDebug) {
+            logger.debug(`[OC-Debug] Strategy ${strategyDebugKey} skipped: invalid open price (open=${open}, source=${openSource})`);
+          }
           continue;
         }
 
@@ -572,9 +592,26 @@ export class RealtimeOCDetector {
 
         // Check if OC meets strategy threshold
         const strategyOcThreshold = Number(strategy.oc || 0);
+        
+        // ✅ DEBUG: Always log OC calculation for debugging
+        if (shouldDebug) {
+          logger.info(
+            `[OC-Debug] Strategy ${strategyDebugKey} | interval=${strategyInterval} | ` +
+            `price=${p.toFixed(6)} open=${open.toFixed(6)} (${openSource}) | OC=${oc.toFixed(4)}% (abs=${ocAbs.toFixed(4)}%) | ` +
+            `threshold=${strategyOcThreshold}% | ${ocAbs >= strategyOcThreshold ? '✅ PASS' : '❌ BELOW THRESHOLD'}`
+          );
+        }
+        
         if (ocAbs < strategyOcThreshold) {
           continue;
         }
+
+        // ✅ DEBUG: Log when OC matches threshold
+        logger.info(
+          `[OC-Debug] 🎯 OC MATCH! Strategy ${strategy.id} (${strategy.symbol}) | ` +
+          `OC=${oc.toFixed(4)}% >= threshold=${strategyOcThreshold}% | ` +
+          `direction=${direction} | price=${p} open=${open} | interval=${strategyInterval}`
+        );
 
         // Create match object
         matches.push({

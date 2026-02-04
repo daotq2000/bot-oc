@@ -2238,20 +2238,19 @@ export class BinanceDirectClient {
     } catch (error) {
       const errorMsg = error?.message || String(error);
       
-      // If TAKE_PROFIT is not supported, fallback to LIMIT order with reduceOnly
+      // If TAKE_PROFIT is not supported, fallback to TAKE_PROFIT_LIMIT or STOP_LIMIT
       if (errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
-        logger.warn(`[TP Fallback] TAKE_PROFIT order type not supported, using LIMIT order with reduceOnly instead`);
+        logger.warn(`[TP Fallback] TAKE_PROFIT order type not supported, trying TAKE_PROFIT_LIMIT fallback...`);
         
-        // Fallback: Use LIMIT order with reduceOnly=true
-        // CRITICAL FIX: Must include closePosition=true OR quantity for LIMIT orders
+        // Fallback 1: Try TAKE_PROFIT_LIMIT (Binance Futures conditional limit order for TP)
         const fallbackParams = {
           symbol: normalizedSymbol,
           side: orderSide,
-          type: 'LIMIT',
-          price: limitPriceStr,
+          type: 'TAKE_PROFIT_LIMIT',
+          stopPrice: stopPriceStr,  // Trigger price
+          price: limitPriceStr,     // Limit price to execute at
           timeInForce: 'GTC',
-          // reduceOnly is intentionally omitted: Binance may reject reduceOnly for TP fallback with -2022.
-          // Use explicit quantity/closePosition to ensure this order is a closing order.
+          workingType: 'MARK_PRICE'
         };
         
         // Only include positionSide in dual-side (hedge) mode
@@ -2277,21 +2276,65 @@ export class BinanceDirectClient {
         
         try {
           const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
-          if (!fallbackData || !fallbackData.orderId) {
-            logger.error(`Failed to place TP limit order (fallback): Invalid response from Binance`, { data: fallbackData, symbol: normalizedSymbol, side, tpPrice });
-            throw new Error(`Invalid order response: ${JSON.stringify(fallbackData)}`);
+          if (fallbackData && fallbackData.orderId) {
+            logger.info(`✅ TP order placed (fallback TAKE_PROFIT_LIMIT): Order ID: ${fallbackData.orderId}`);
+            return fallbackData;
           }
-          logger.info(`✅ TP limit order placed (fallback LIMIT): Order ID: ${fallbackData.orderId}`);
-          return fallbackData;
-        } catch (fallbackError) {
-          logger.error(`Failed to create TP limit order (fallback also failed):`, {
-            error: fallbackError?.message || String(fallbackError),
-            symbol: normalizedSymbol,
-            side,
-            params: this.sanitizeParams(fallbackParams)
-          });
-          throw fallbackError;
+        } catch (fallback1Error) {
+          logger.warn(`[TP Fallback] TAKE_PROFIT_LIMIT also failed: ${fallback1Error?.message || fallback1Error}, trying STOP_LIMIT...`);
+          
+          // Fallback 2: Try STOP_LIMIT as last resort
+          const stopLimitParams = {
+            ...fallbackParams,
+            type: 'STOP'  // STOP type in Binance Futures = STOP_LIMIT with price
+          };
+          
+          try {
+            const stopLimitData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', stopLimitParams, true);
+            if (stopLimitData && stopLimitData.orderId) {
+              logger.info(`✅ TP order placed (fallback STOP): Order ID: ${stopLimitData.orderId}`);
+              return stopLimitData;
+            }
+          } catch (fallback2Error) {
+            logger.warn(`[TP Fallback] STOP also failed: ${fallback2Error?.message || fallback2Error}, trying plain LIMIT as last resort...`);
+            
+            // Fallback 3: Plain LIMIT order as last resort (will execute immediately if price is favorable)
+            const limitParams = {
+              symbol: normalizedSymbol,
+              side: orderSide,
+              type: 'LIMIT',
+              price: limitPriceStr,
+              timeInForce: 'GTC'
+            };
+            
+            if (dualSide) {
+              limitParams.positionSide = positionSide;
+            }
+            
+            if (fallbackParams.quantity) {
+              limitParams.quantity = fallbackParams.quantity;
+            } else {
+              limitParams.closePosition = 'true';
+            }
+            
+            try {
+              const limitData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', limitParams, true);
+              if (limitData && limitData.orderId) {
+                logger.info(`✅ TP order placed (fallback LIMIT): Order ID: ${limitData.orderId}`);
+                return limitData;
+              }
+            } catch (fallback3Error) {
+              logger.error(`[TP Fallback] All TP strategies failed for ${normalizedSymbol}:`, {
+                error1: fallback1Error?.message,
+                error2: fallback2Error?.message,
+                error3: fallback3Error?.message
+              });
+              throw fallback3Error;
+            }
+          }
         }
+        
+        throw new Error(`All TP placement strategies failed for ${normalizedSymbol}`);
       }
       
       // For other errors, log and throw
@@ -2546,48 +2589,88 @@ export class BinanceDirectClient {
       );
       
       // Handle -4120 (Order type not supported) & -1106 (reduceOnly not required)
-      // Fallback strategy: Retry with different STOP variations instead of LIMIT to avoid immediate fills.
+      // Fallback strategy: STOP_MARKET → STOP → MARKET (immediate close)
       if (errorCode === -4120 || errorCode === '-4120' || errorCode === -1106 || errorCode === '-1106' || 
           errorMsg.includes('-4120') || errorMsg.includes('-1106') || 
           errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API') ||
           errorMsg.includes("Parameter 'reduceonly' sent when not required")) {
         logger.warn(
           `[SL Fallback] STOP_MARKET failed for ${normalizedSymbol} (errorCode=${errorCode}). ` +
-          `Attempting fallback with different STOP variations...`
+          `Attempting fallback with STOP type and different variations...`
         );
 
-        // Fallback attempts
-        const fallbackStrategies = [
-          // 1. Try STOP_LOSS type (often an alias for STOP_MARKET)
-          { ...params, type: 'STOP_LOSS' },
-          // 2. Try STOP_MARKET with reduceOnly explicitly set (sometimes works despite -1106)
-          { ...params, reduceOnly: 'true' },
-          // 3. If original had quantity, try with closePosition instead
-          (params.quantity ? { ...params, quantity: undefined, closePosition: 'true' } : null),
-        ].filter(Boolean); // Remove null entries
-
-        for (let i = 0; i < fallbackStrategies.length; i++) {
-          const fallbackParams = fallbackStrategies[i];
+        // Derive quantity for fallback orders
+        let fallbackQuantity = params.quantity;
+        if (!fallbackQuantity) {
           try {
-            logger.info(`[SL Fallback] Attempt ${i + 1}/${fallbackStrategies.length} with type=${fallbackParams.type}, closePos=${fallbackParams.closePosition}, reduceOnly=${fallbackParams.reduceOnly}`);
-            const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
-            if (fallbackData && fallbackData.orderId) {
-              logger.info(`✅ SL order placed with fallback strategy: Order ID: ${fallbackData.orderId}`);
-              return fallbackData;
+            const dualSide = await this.getDualSidePosition();
+            const positionSide = params.positionSide || (params.side === 'SELL' ? 'LONG' : 'SHORT');
+            const openPositions = await this.getOpenPositions(normalizedSymbol);
+            const posSideFilter = dualSide ? positionSide : null;
+            const posMatch = Array.isArray(openPositions)
+              ? openPositions.find(
+                  p =>
+                    p.symbol === normalizedSymbol &&
+                    (posSideFilter ? p.positionSide === posSideFilter : true) &&
+                    Math.abs(parseFloat(p.positionAmt || 0)) > 0
+                )
+              : null;
+            if (posMatch) {
+              const stepSize = await this.getStepSize(normalizedSymbol);
+              const posAmt = Math.abs(parseFloat(posMatch.positionAmt || 0));
+              fallbackQuantity = this.formatQuantity(posAmt, stepSize);
             }
-          } catch (fallbackError) {
-            logger.warn(
-              `[SL Fallback] Attempt ${i + 1} failed for ${normalizedSymbol}: ${fallbackError?.message || fallbackError}`
-            );
+          } catch (qtyErr) {
+            logger.warn(`[SL Fallback] Unable to derive quantity: ${qtyErr?.message || qtyErr}`);
           }
         }
 
-        // If all fallbacks fail, throw a clear error.
-        const finalError = new Error(
-          `All SL placement strategies failed for ${normalizedSymbol} after STOP_MARKET error (code=${errorCode}). No SL was placed.`
+        if (!fallbackQuantity) {
+          logger.warn(`[SL Fallback] ⚠️ Skipping SL fallback - no closable quantity found. Position likely already closed.`);
+          return null;
+        }
+
+        // ========== FALLBACK 1: STOP (stop-limit) ==========
+        try {
+          const stopParams = {
+            symbol: normalizedSymbol,
+            side: params.side,
+            type: 'STOP',
+            stopPrice: params.stopPrice,
+            price: params.stopPrice, // For STOP (stop-limit), price is required
+            quantity: fallbackQuantity,
+            timeInForce: 'GTC',
+            workingType: 'MARK_PRICE'
+          };
+          if (params.positionSide) stopParams.positionSide = params.positionSide;
+          if (params.newClientOrderId) stopParams.newClientOrderId = `${params.newClientOrderId}_FB1`;
+
+          logger.info(`[SL Fallback] Attempt 1: STOP type | symbol=${normalizedSymbol}`);
+          const data1 = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', stopParams, true);
+          if (data1?.orderId) {
+            logger.info(`✅ SL STOP order placed (fallback 1) | orderId=${data1.orderId}`);
+            return data1;
+          }
+        } catch (err1) {
+          logger.warn(`[SL Fallback] STOP failed: ${err1?.message || err1}`);
+        }
+
+        // ========== FALLBACK 2: DO NOT USE LIMIT ORDER FOR SL ==========
+        // CRITICAL: LIMIT orders CANNOT work as Stop-Loss orders!
+        // - LIMIT BUY fills when market price <= limit price (would fill immediately if stop > current)
+        // - LIMIT SELL fills when market price >= limit price (would fill immediately if stop < current)
+        // This is the OPPOSITE behavior of what we need for SL!
+        // 
+        // Instead of placing a dangerous LIMIT order, we return null and let 
+        // PositionMonitor handle SL via market close when price hits stop level.
+        
+        logger.error(
+          `[SL Fallback] ❌ All conditional order types failed for ${normalizedSymbol}. ` +
+          `LIMIT orders cannot be used as Stop-Loss (they would fill immediately or not protect position). ` +
+          `Position will have NO exchange-level stop-loss. PositionMonitor must handle SL via market close.`,
+          { stopPrice: params.stopPrice, side: params.side }
         );
-        finalError.code = errorCode;
-        throw finalError;
+        return null; // Return null instead of placing dangerous LIMIT order
       }
       
       // For other errors, log and throw
@@ -2804,48 +2887,95 @@ export class BinanceDirectClient {
       const errorMsg = error?.message || String(error);
       const errorCode = error?.code || error?.status;
       
-      // Handle -4120: Order type not supported → fallback to MARKET order with reduceOnly
+      // Handle -4120: Order type not supported → fallback chain: STOP → MARKET
       if (errorCode === -4120 || errorCode === '-4120' || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
         logger.warn(
           `[SL Fallback] STOP_MARKET order type not supported for ${normalizedSymbol}, ` +
-          `using MARKET order with reduceOnly instead | pos=${position?.id || 'N/A'}`
+          `trying STOP (stop-limit) fallback... | pos=${position?.id || 'N/A'} stopPrice=${finalStop}`
         );
         
-        // Fallback: Use MARKET order with reduceOnly=true to close position
-        const fallbackParams = {
+        // Derive quantity for fallback orders
+        let fallbackQuantity = preferredQuantity || params.quantity;
+        try {
+          if (!fallbackQuantity && position) {
+            const stepSize = await this.getStepSize(normalizedSymbol);
+            const openPositions = await this.getOpenPositions(normalizedSymbol);
+            const posSideFilter = dualSide ? positionSide : null;
+            const posMatch = Array.isArray(openPositions)
+              ? openPositions.find(
+                  p =>
+                    p.symbol === normalizedSymbol &&
+                    (posSideFilter ? p.positionSide === posSideFilter : true) &&
+                    Math.abs(parseFloat(p.positionAmt || 0)) > 0
+                )
+              : null;
+            if (posMatch) {
+              const posAmt = Math.abs(parseFloat(posMatch.positionAmt || 0));
+              fallbackQuantity = this.formatQuantity(posAmt, stepSize);
+            }
+          }
+        } catch (qtyErr) {
+          logger.warn(`[SL Fallback] Unable to derive quantity for fallback | pos=${position?.id || 'N/A'} error=${qtyErr?.message || qtyErr}`);
+        }
+
+        if (!fallbackQuantity) {
+          // No closable quantity found - position likely already closed
+          logger.warn(
+            `[SL Fallback] ⚠️ Skipping SL fallback for pos=${position?.id || 'N/A'} because no closable quantity was found on the exchange. The position is likely already closed.`
+          );
+          return null;
+        }
+
+        // Helper to build clientOrderId
+        const buildClientId = (suffix) => {
+          try {
+            const botId = bot?.id;
+            const posId = position?.id;
+            if (botId && posId) return `OC_B${botId}_P${posId}_${suffix}`;
+          } catch (_) {}
+          return undefined;
+        };
+
+        // ========== FALLBACK 1: STOP (stop-limit) ==========
+        const stopParams = {
           symbol: normalizedSymbol,
           side: orderSide,
-          type: 'MARKET',
-          closePosition: 'true'
+          type: 'STOP',
+          stopPrice: String(finalStop),
+          price: String(finalStop),
+          quantity: fallbackQuantity,
+          timeInForce: 'GTC',
+          workingType: 'MARK_PRICE'
         };
-        
-        if (dualSide) {
-          fallbackParams.positionSide = positionSide;
-        }
-        
-        // Add clientOrderId if available
+        if (dualSide) stopParams.positionSide = positionSide;
+        const clientId1 = buildClientId('SL_FB1');
+        if (clientId1) stopParams.newClientOrderId = clientId1;
+
         try {
-          const botId = bot?.id;
-          const posId = position?.id;
-          if (botId && posId) {
-            fallbackParams.newClientOrderId = `OC_B${botId}_P${posId}_SL_FB`;
+          const data1 = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', stopParams, true);
+          if (data1?.orderId) {
+            logger.info(`[SL Fallback] ✅ STOP order placed | pos=${position?.id || 'N/A'} orderId=${data1.orderId}`);
+            return data1;
           }
-        } catch (_) {}
-        
-        try {
-          const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
-          logger.info(
-            `[SL Fallback] ✅ MARKET order placed (fallback) | pos=${position?.id || 'N/A'} ` +
-            `orderId=${fallbackData?.orderId || 'N/A'}`
-          );
-          return fallbackData;
-        } catch (fallbackError) {
-          logger.error(
-            `[SL Fallback] ❌ Failed to create MARKET order (fallback) | pos=${position?.id || 'N/A'} ` +
-            `error=${fallbackError?.message || fallbackError}`
-          );
-          throw fallbackError;
+        } catch (err1) {
+          logger.warn(`[SL Fallback] STOP (stop-limit) also failed: ${err1?.message || err1}`);
         }
+
+        // ========== NO MORE FALLBACKS - LIMIT ORDERS CANNOT BE USED AS SL ==========
+        // CRITICAL: LIMIT orders CANNOT work as Stop-Loss orders!
+        // - LIMIT BUY fills when market price <= limit price (would fill immediately if stop > current)
+        // - LIMIT SELL fills when market price >= limit price (would fill immediately if stop < current)
+        // This is the OPPOSITE behavior of what we need for SL!
+        
+        logger.error(
+          `[SL Fallback] ❌ All conditional order types (STOP_MARKET, STOP) failed for ${normalizedSymbol}. ` +
+          `LIMIT orders cannot be used as SL fallback (they would fill immediately or not protect position). ` +
+          `pos=${position?.id || 'N/A'} stopPrice=${finalStop}. ` +
+          `Position has NO exchange-level stop-loss - PositionMonitor must handle SL via market close.`
+        );
+        
+        // Return null - let PositionMonitor handle SL via market close when price hits stop level
+        return null;
       }
       
       // Re-throw other errors
@@ -2943,41 +3073,14 @@ export class BinanceDirectClient {
       const errorMsg = error?.message || String(error);
       const errorCode = error?.code || error?.status;
       
-      // Handle -4120: Order type not supported → fallback to LIMIT order
+      // Handle -4120: Order type not supported → fallback chain: TAKE_PROFIT_LIMIT → STOP → LIMIT
       if (errorCode === -4120 || errorCode === '-4120' || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
         logger.warn(
           `[TP Fallback] TAKE_PROFIT_MARKET order type not supported for ${normalizedSymbol}, ` +
-          `using LIMIT order with reduceOnly instead | pos=${position?.id || 'N/A'} stopPrice=${finalStop}`
+          `trying TAKE_PROFIT_LIMIT fallback... | pos=${position?.id || 'N/A'} stopPrice=${finalStop}`
         );
         
-        // Fallback: Prefer LIMIT order with explicit quantity derived from current position.
-        // NOTE: Some accounts reject LIMIT + closePosition=true for TP purposes; and reduceOnly may be rejected when
-        // there is no matching position. So we derive quantity from the exchange and only proceed if position exists.
-        const fallbackParams = {
-          symbol: normalizedSymbol,
-          side: orderSide,
-          type: 'LIMIT',
-          price: String(finalStop),
-          timeInForce: 'GTC'
-        };
-        
-        if (dualSide) {
-          fallbackParams.positionSide = positionSide;
-        }
-        
-        // Add clientOrderId if available
-        try {
-          const botId = bot?.id;
-          const posId = position?.id;
-          if (botId && posId) {
-            fallbackParams.newClientOrderId = `OC_B${botId}_P${posId}_TP_FB`;
-          }
-        } catch (_) {}
-
-        // Quantity handling:
-        // - Prefer an explicit quantity and set reduceOnly=true (Binance rejects LIMIT + closePosition=true with -4136)
-        // - As a fallback, try to fetch current position size from the exchange
-        // - Only if everything fails, we will fall back to closePosition=true (may be rejected, but we log and surface)
+        // Derive quantity for fallback orders
         let fallbackQuantity = preferredQuantity || params.quantity;
         try {
           if (!fallbackQuantity && position) {
@@ -2998,80 +3101,118 @@ export class BinanceDirectClient {
             }
           }
         } catch (qtyErr) {
-          logger.warn(`[TP Fallback] Unable to derive quantity for LIMIT fallback | pos=${position?.id || 'N/A'} error=${qtyErr?.message || qtyErr}`);
+          logger.warn(`[TP Fallback] Unable to derive quantity for fallback | pos=${position?.id || 'N/A'} error=${qtyErr?.message || qtyErr}`);
         }
 
-        if (fallbackQuantity) {
-          fallbackParams.quantity = fallbackQuantity;
-          // IMPORTANT: reduceOnly is optional for LIMIT; some accounts/endpoints reject it.
-          // For safety, rely on explicit quantity without reduceOnly to avoid -1106.
-        } else {
-          // CRITICAL FIX: If no quantity can be derived, it means the position is likely closed.
-          // Do NOT attempt to place an order with closePosition=true as it will likely fail with -2022.
-          // Instead, log and return null to signal that no order was placed.
+        if (!fallbackQuantity) {
+          // No closable quantity found - position likely already closed
           logger.warn(
-            `[TP Fallback] ⚠️ Skipping LIMIT fallback for pos=${position?.id || 'N/A'} because no closable quantity was found on the exchange. The position is likely already closed.`
+            `[TP Fallback] ⚠️ Skipping TP fallback for pos=${position?.id || 'N/A'} because no closable quantity was found on the exchange. The position is likely already closed.`
           );
           return null;
         }
-        
+
+        // Helper to build clientOrderId
+        const buildClientId = (suffix) => {
+          try {
+            const botId = bot?.id;
+            const posId = position?.id;
+            if (botId && posId) return `OC_B${botId}_P${posId}_${suffix}`;
+          } catch (_) {}
+          return undefined;
+        };
+
+        // ========== FALLBACK 1: TAKE_PROFIT_LIMIT ==========
+        const tpLimitParams = {
+          symbol: normalizedSymbol,
+          side: orderSide,
+          type: 'TAKE_PROFIT_LIMIT',
+          stopPrice: String(finalStop),
+          price: String(finalStop),
+          quantity: fallbackQuantity,
+          timeInForce: 'GTC',
+          workingType: 'MARK_PRICE'
+        };
+        if (dualSide) tpLimitParams.positionSide = positionSide;
+        const clientId1 = buildClientId('TP_FB1');
+        if (clientId1) tpLimitParams.newClientOrderId = clientId1;
+
         try {
-          const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
-          logger.info(
-            `[TP Fallback] ✅ LIMIT order placed (fallback) | pos=${position?.id || 'N/A'} ` +
-            `orderId=${fallbackData?.orderId || 'N/A'} price=${finalStop}`
-          );
-          return fallbackData;
-        } catch (fallbackError) {
-          const feMsg = fallbackError?.message || String(fallbackError);
-          const feCode = fallbackError?.code;
-
-          // CRITICAL: -4116 ClientOrderId duplicated.
-          // This often means the previous request actually succeeded but we didn't receive/handle the response.
-          // Recover by querying the order by origClientOrderId.
-          if (feCode === -4116 || feCode === '-4116' || feMsg.includes('-4116')) {
-            const clientId = fallbackParams?.newClientOrderId;
-            if (clientId) {
-              try {
-                const existing = await this.makeRequest('/fapi/v1/order', 'GET', {
-                  symbol: normalizedSymbol,
-                  origClientOrderId: clientId
-                }, true);
-                if (existing?.orderId) {
-                  logger.warn(
-                    `[TP Fallback] ⚠️ Recovered duplicated clientOrderId by fetching existing order | ` +
-                    `pos=${position?.id || 'N/A'} origClientOrderId=${clientId} orderId=${existing.orderId}`
-                  );
-                  return existing;
-                }
-              } catch (fetchErr) {
-                logger.error(
-                  `[TP Fallback] ❌ Failed to recover duplicated clientOrderId (GET by origClientOrderId failed) | ` +
-                  `pos=${position?.id || 'N/A'} origClientOrderId=${clientId} error=${fetchErr?.message || fetchErr}`
-                );
-              }
-            }
+          const data1 = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', tpLimitParams, true);
+          if (data1?.orderId) {
+            logger.info(`[TP Fallback] ✅ TAKE_PROFIT_LIMIT order placed | pos=${position?.id || 'N/A'} orderId=${data1.orderId}`);
+            return data1;
           }
+        } catch (err1) {
+          logger.warn(`[TP Fallback] TAKE_PROFIT_LIMIT failed: ${err1?.message || err1}, trying STOP...`);
+        }
 
-          // =========================================================================
-          // FIX #1: Handle -2022 ReduceOnly error gracefully
-          // Instead of throwing (which causes retry loops), return null to signal
-          // that the position likely doesn't exist on exchange anymore
-          // =========================================================================
+        // ========== FALLBACK 2: STOP (STOP_LIMIT in Futures) ==========
+        const stopParams = {
+          symbol: normalizedSymbol,
+          side: orderSide,
+          type: 'STOP',
+          stopPrice: String(finalStop),
+          price: String(finalStop),
+          quantity: fallbackQuantity,
+          timeInForce: 'GTC',
+          workingType: 'MARK_PRICE'
+        };
+        if (dualSide) stopParams.positionSide = positionSide;
+        const clientId2 = buildClientId('TP_FB2');
+        if (clientId2) stopParams.newClientOrderId = clientId2;
+
+        try {
+          const data2 = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', stopParams, true);
+          if (data2?.orderId) {
+            logger.info(`[TP Fallback] ✅ STOP order placed | pos=${position?.id || 'N/A'} orderId=${data2.orderId}`);
+            return data2;
+          }
+        } catch (err2) {
+          logger.warn(`[TP Fallback] STOP failed: ${err2?.message || err2}, trying plain LIMIT as last resort...`);
+        }
+
+        // ========== FALLBACK 3: Plain LIMIT (last resort) ==========
+        const limitParams = {
+          symbol: normalizedSymbol,
+          side: orderSide,
+          type: 'LIMIT',
+          price: String(finalStop),
+          quantity: fallbackQuantity,
+          timeInForce: 'GTC'
+        };
+        if (dualSide) limitParams.positionSide = positionSide;
+        const clientId3 = buildClientId('TP_FB3');
+        if (clientId3) limitParams.newClientOrderId = clientId3;
+
+        try {
+          const data3 = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', limitParams, true);
+          if (data3?.orderId) {
+            logger.info(`[TP Fallback] ✅ LIMIT order placed (last resort) | pos=${position?.id || 'N/A'} orderId=${data3.orderId}`);
+            return data3;
+          }
+        } catch (err3) {
+          const feMsg = err3?.message || String(err3);
+          const feCode = err3?.code;
+
+          // Handle -2022 ReduceOnly error gracefully
           if (feCode === -2022 || feCode === '-2022' || feMsg.includes('-2022') || feMsg.includes('ReduceOnly')) {
             logger.warn(
               `[TP Fallback] ⚠️ ReduceOnly Order rejected (-2022) for pos=${position?.id || 'N/A'}. ` +
-              `Position likely already closed on exchange. Returning null (caller should sync position state).`
+              `Position likely already closed on exchange. Returning null.`
             );
-            return null; // Return null instead of throwing to prevent retry loops
+            return null;
           }
 
-          logger.error(
-            `[TP Fallback] ❌ Failed to create LIMIT order (fallback) | pos=${position?.id || 'N/A'} ` +
-            `error=${feMsg}`
-          );
-          throw fallbackError;
+          logger.error(`[TP Fallback] ❌ All TP strategies failed for ${normalizedSymbol}:`, {
+            pos: position?.id,
+            originalError: errorMsg,
+            lastError: feMsg
+          });
+          throw err3;
         }
+
+        throw new Error(`All TP placement strategies failed for ${normalizedSymbol}`);
       }
       
       // Re-throw other errors

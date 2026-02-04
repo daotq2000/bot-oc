@@ -210,6 +210,10 @@ async function start() {
       // Position monitoring and order management configs
       await AppConfig.set('RECREATE_CANCELED_ENTRY_MINUTES', '2', 'Minutes to wait before recreating manually canceled entry orders');
       await AppConfig.set('SHORT_EXTEND_OVERRIDE', '0', 'Override extend value for SHORT entries (0 = use strategy extend)');
+      
+      // Debug configs
+      await AppConfig.set('DEBUG_OC_DETECTION', 'true', 'Enable detailed OC detection debug logs (very noisy)');
+      await AppConfig.set('DEBUG_OC_SYMBOL', '', 'Only debug OC for this specific symbol (empty = all symbols)');
 
       // Position service and SL/TP update configs
       await AppConfig.set('SL_UPDATE_THRESHOLD_TICKS', '1', 'Minimum price ticks change to trigger SL update');

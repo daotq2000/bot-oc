@@ -13,8 +13,11 @@ const pool = mysql.createPool({
   connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '30'), // Increased from 15 to 30 for high-frequency WebSocket processing
   queueLimit: 0,
   enableKeepAlive: true,
-  keepAliveInitialDelay: 0,
-  connectTimeout: 10000 // 10 seconds connection timeout
+  keepAliveInitialDelay: 10000, // Send keepalive after 10 seconds of inactivity
+  connectTimeout: 10000, // 10 seconds connection timeout
+  // Auto-reconnect settings for better resilience
+  maxIdle: 10, // Max idle connections to keep in pool
+  idleTimeout: 60000 // Close idle connections after 60 seconds
 });
 
 /**

@@ -7,6 +7,19 @@ import { riskManagementService } from './RiskManagementService.js';
 import logger from '../utils/logger.js';
 
 /**
+ * Safe toFixed helper - prevents crash when value is undefined/null/NaN
+ * @param {*} value - Value to format
+ * @param {number} digits - Number of decimal places (default 8)
+ * @returns {string} Formatted string or 'N/A' if invalid
+ */
+const safeFixed = (value, digits = 8) => {
+  if (value === null || value === undefined) return 'N/A';
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 'N/A';
+  return num.toFixed(digits);
+};
+
+/**
  * Position Service - Position tracking and updates
  */
 export class PositionService {
@@ -479,20 +492,20 @@ export class PositionService {
         // ✅ NEW: Risk Management - Move SL to breakeven or trail SL
         // Priority 1: Check if should move to breakeven (when profit >= 1%)
         const breakevenCheck = riskManagementService.shouldMoveSLToBreakeven(position, currentPrice);
-        if (breakevenCheck.shouldMove) {
+        if (breakevenCheck.shouldMove && Number.isFinite(breakevenCheck.newSL)) {
           updatedSL = breakevenCheck.newSL;
           logger.info(
             `[RiskManagement] ✅ Moving SL to breakeven | pos=${position.id} ` +
-            `currentSL=${prevSL.toFixed(8)} → breakeven=${updatedSL.toFixed(8)} reason=${breakevenCheck.reason}`
+            `currentSL=${prevSL?.toFixed?.(8) || prevSL} → breakeven=${updatedSL?.toFixed?.(8) || updatedSL} reason=${breakevenCheck.reason}`
           );
         } else {
           // Priority 2: Check if should trail SL (when profit >= 2%)
           const trailingCheck = riskManagementService.calculateTrailingSL(position, currentPrice);
-          if (trailingCheck.shouldTrail) {
+          if (trailingCheck.shouldTrail && Number.isFinite(trailingCheck.newSL)) {
             updatedSL = trailingCheck.newSL;
             logger.info(
               `[RiskManagement] ✅ Trailing SL | pos=${position.id} ` +
-              `currentSL=${prevSL.toFixed(8)} → newSL=${updatedSL.toFixed(8)} reason=${trailingCheck.reason}`
+              `currentSL=${prevSL?.toFixed?.(8) || prevSL} → newSL=${updatedSL?.toFixed?.(8) || updatedSL} reason=${trailingCheck.reason}`
             );
           }
         }
@@ -502,7 +515,7 @@ export class PositionService {
           try {
             // Update SL in database
             await Position.update(position.id, { stop_loss_price: updatedSL });
-            logger.debug(`[RiskManagement] Updated SL in DB | pos=${position.id} newSL=${updatedSL.toFixed(8)}`);
+            logger.debug(`[RiskManagement] Updated SL in DB | pos=${position.id} newSL=${updatedSL?.toFixed?.(8) || updatedSL}`);
             
             // Note: SL order update on exchange will be handled by PositionMonitor
             // when it detects SL price change in next monitoring cycle
@@ -551,7 +564,7 @@ export class PositionService {
 
           logger.info(
             `[TP Trail] 🎯 Starting TP trail check | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
-            `prevTP=${prevTP.toFixed(8)} entryPrice=${entryPrice.toFixed(8)} marketPrice=${marketPrice.toFixed(8)} ` +
+            `prevTP=${prevTP?.toFixed?.(8) || prevTP} entryPrice=${entryPrice?.toFixed?.(8) || entryPrice} marketPrice=${marketPrice?.toFixed?.(8) || marketPrice} ` +
             `reduce=${reduce} upReduce=${upReduce} minutesToProcess=${minutesForTrailing} prevMinutes=${prevMinutes} actualMinutesElapsed=${actualMinutesElapsed} ` +
             `initial_tp_price=${position.initial_tp_price || 'N/A'} timestamp=${new Date().toISOString()}`
           );
@@ -660,15 +673,15 @@ export class PositionService {
                 initialTP = calculateTakeProfit(entryPriceForTP, takeProfit, position.side);
                 // Save it to DB for future use
                 await Position.update(position.id, { initial_tp_price: initialTP });
-                logger.debug(`[TP Trail] Calculated and saved initial TP: ${initialTP.toFixed(2)} (entry=${entryPriceForTP}, take_profit=${takeProfit})`);
+                logger.debug(`[TP Trail] Calculated and saved initial TP: ${safeFixed(initialTP, 2)} (entry=${entryPriceForTP}, take_profit=${takeProfit})`);
               } else {
                 // If we can't calculate, use current TP as initial (fallback)
                 initialTP = prevTP;
                 await Position.update(position.id, { initial_tp_price: initialTP });
-                logger.debug(`[TP Trail] Using current TP as initial: ${initialTP.toFixed(2)}`);
+                logger.debug(`[TP Trail] Using current TP as initial: ${safeFixed(initialTP, 2)}`);
               }
             } else {
-              logger.debug(`[TP Trail] Using stored initial TP: ${initialTP.toFixed(2)}`);
+              logger.debug(`[TP Trail] Using stored initial TP: ${safeFixed(initialTP, 2)}`);
             }
             
             const trailingPercent = position.side === 'long' ? upReduce : reduce;
@@ -678,7 +691,7 @@ export class PositionService {
               logger.warn(
                 `[TP Trail] ⚠️ Trailing disabled: trailingPercent=${trailingPercent}% | pos=${position.id} ` +
                 `side=${position.side} reduce=${reduce} upReduce=${upReduce} ` +
-                `→ TP will remain static at ${prevTP.toFixed(8)}`
+                `→ TP will remain static at ${safeFixed(prevTP)}`
               );
             }
             
@@ -701,18 +714,18 @@ export class PositionService {
               
               logger.info(
                 `[TP Trail] 📊 Calculated new TP | pos=${position.id} ${position.symbol} side=${position.side} ` +
-                `prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} entry=${entryPrice.toFixed(8)} ` +
-                `initialTP=${initialTP.toFixed(8)} trailing=${trailingPercent}% minutesToProcess=${minutesForTrailing} ` +
-                `totalRange=${totalRange.toFixed(8)} stepPerMinute=${stepPerMinute.toFixed(8)} step=${step.toFixed(8)} ` +
-                `change=${((newTP - prevTP) / prevTP * 100).toFixed(3)}% absoluteChange=${Math.abs(newTP - prevTP).toFixed(8)} ` +
+                `prevTP=${safeFixed(prevTP)} newTP=${safeFixed(newTP)} entry=${safeFixed(entryPrice)} ` +
+                `initialTP=${safeFixed(initialTP)} trailing=${trailingPercent}% minutesToProcess=${minutesForTrailing} ` +
+                `totalRange=${safeFixed(totalRange)} stepPerMinute=${safeFixed(stepPerMinute)} step=${safeFixed(step)} ` +
+                `change=${safeFixed(((newTP - prevTP) / prevTP * 100), 3)}% absoluteChange=${safeFixed(Math.abs(newTP - prevTP))} ` +
                 `timestamp=${new Date().toISOString()}`
               );
               
               // Warn if newTP equals prevTP (no movement)
               if (Math.abs(newTP - prevTP) < 0.00000001) {
                 logger.warn(
-                  `[TP Trail] ⚠️ WARNING: newTP (${newTP.toFixed(8)}) equals prevTP (${prevTP.toFixed(8)})! ` +
-                  `No movement detected. Check calculation: totalRange=${totalRange.toFixed(8)} stepPerMinute=${stepPerMinute.toFixed(8)} step=${step.toFixed(8)} ` +
+                  `[TP Trail] ⚠️ WARNING: newTP (${safeFixed(newTP)}) equals prevTP (${safeFixed(prevTP)})! ` +
+                  `No movement detected. Check calculation: totalRange=${safeFixed(totalRange)} stepPerMinute=${safeFixed(stepPerMinute)} step=${safeFixed(step)} ` +
                   `trailingPercent=${trailingPercent}% minutesForTrailing=${minutesForTrailing} | pos=${position.id}`
                 );
               }
@@ -736,7 +749,7 @@ export class PositionService {
                 logger.warn(
                   `[TP Trail] ⚠️ TP crossed entry and currentPrice better than newTP, but FORCE CLOSE is DISABLED. ` +
                   `Will attempt WS-driven single-exit replace instead | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
-                  `entry=${entryPrice.toFixed(8)} newTP=${newTP.toFixed(8)} currentPrice=${marketPrice.toFixed(8)}`
+                  `entry=${safeFixed(entryPrice)} newTP=${safeFixed(newTP)} currentPrice=${safeFixed(marketPrice)}`
                 );
 
                 // Fall through to cross-entry exit replace logic (Case 2A)
@@ -757,7 +770,7 @@ export class PositionService {
 
                   logger.warn(
                     `[TP Trail] ⚠️ TP crossed entry -> attempt fast exit (WS-driven close) | pos=${position.id} symbol=${position.symbol} side=${position.side} ` +
-                    `entry=${entryPrice.toFixed(8)} prevTP=${prevTP.toFixed(8)} newTP=${newTP.toFixed(8)} market=${marketPrice.toFixed(8)} ` +
+                    `entry=${safeFixed(entryPrice)} prevTP=${safeFixed(prevTP)} newTP=${safeFixed(newTP)} market=${safeFixed(marketPrice)} ` +
                     `(currentPrice NOT better than newTP, using conditional order)`
                   );
 

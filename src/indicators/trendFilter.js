@@ -1,22 +1,30 @@
 import { configService } from '../services/ConfigService.js';
 
 // =============================================================================
-// TREND FILTER CONFIGURATION - "Hard Direction + Soft Scoring" Architecture
+// TREND FILTER CONFIGURATION - "Hard Direction + Quality Scoring" Architecture
 // =============================================================================
-// These thresholds are designed to reduce missed entries from ADX lag and RSI
-// conflicts while maintaining trend direction safety. Easily tunable for optimization.
+// Enhanced thresholds to improve entry quality and reduce false signals.
+// Key changes:
+// 1. Added RSI overbought/oversold protection
+// 2. Added EMA separation requirement (avoid flat/sideways markets)
+// 3. Made ADX requirement stricter when available
 
 const TREND_THRESHOLDS = {
-  // Phase 1: Hard Gate (EMA Direction)
-  // EMA alignment is mandatory - Price > EMA20 > EMA50 for Long (no slope requirement)
+  // Phase 1: Hard Gate (EMA Direction + Separation)
+  // EMA alignment is mandatory - Price > EMA20 > EMA50 for Long
+  EMA_SEPARATION_MIN: 0.001,  // Minimum (EMA20-EMA50)/EMA50 = 0.1% separation to confirm trend
 
   // Phase 2: Soft Scoring - ADX Thresholds
-  ADX_MIN_FLOOR: 18,          // Lowered from 25 to catch early breakouts (ADX lag compensation)
+  ADX_MIN_FLOOR: 18,          // ADX below this = no score
   ADX_SCORE_THRESHOLD: 20,    // ADX >= this value adds +1 to trend score
 
-  // Phase 2: Soft Scoring - RSI Regime Thresholds (Loose)
-  RSI_BULL_LOOSE: 52,         // Loose bullish regime (allows pullback entries)
-  RSI_BEAR_LOOSE: 48,         // Loose bearish regime
+  // Phase 2: Soft Scoring - RSI Regime Thresholds
+  RSI_BULL_MIN: 52,           // Bullish minimum (allows pullback entries)
+  RSI_BEAR_MAX: 48,           // Bearish maximum
+  
+  // Phase 3: RSI Extreme Protection (HARD GATE - NEW!)
+  RSI_OVERBOUGHT: 75,         // LONG rejected if RSI > 75 (overbought)
+  RSI_OVERSOLD: 25,           // SHORT rejected if RSI < 25 (oversold)
 
   // Scoring Configuration
   TREND_MIN_SCORE: 1,         // Minimum score to confirm trend (ADX OR RSI, not both required)
@@ -68,8 +76,11 @@ export function isTrendConfirmed(direction, price, indicatorsState, indicatorsSt
 
   // Load configurable thresholds (with sensible defaults from TREND_THRESHOLDS)
   const adxScoreThreshold = Number(configService.getNumber('TREND_ADX_SCORE_THRESHOLD', TREND_THRESHOLDS.ADX_SCORE_THRESHOLD));
-  const rsiBullLoose = Number(configService.getNumber('TREND_RSI_BULL_LOOSE', TREND_THRESHOLDS.RSI_BULL_LOOSE));
-  const rsiBearLoose = Number(configService.getNumber('TREND_RSI_BEAR_LOOSE', TREND_THRESHOLDS.RSI_BEAR_LOOSE));
+  const rsiBullMin = Number(configService.getNumber('TREND_RSI_BULL_MIN', TREND_THRESHOLDS.RSI_BULL_MIN));
+  const rsiBearMax = Number(configService.getNumber('TREND_RSI_BEAR_MAX', TREND_THRESHOLDS.RSI_BEAR_MAX));
+  const rsiOverbought = Number(configService.getNumber('TREND_RSI_OVERBOUGHT', TREND_THRESHOLDS.RSI_OVERBOUGHT));
+  const rsiOversold = Number(configService.getNumber('TREND_RSI_OVERSOLD', TREND_THRESHOLDS.RSI_OVERSOLD));
+  const emaSeparationMin = Number(configService.getNumber('TREND_EMA_SEPARATION_MIN', TREND_THRESHOLDS.EMA_SEPARATION_MIN));
   const minScore = Number(configService.getNumber('TREND_MIN_SCORE', TREND_THRESHOLDS.TREND_MIN_SCORE));
 
   // Extract indicator values
@@ -96,7 +107,6 @@ export function isTrendConfirmed(direction, price, indicatorsState, indicatorsSt
   // ---------------------------------------------------------------------------
   // For Long:  Price > EMA20 > EMA50 (bullish structure)
   // For Short: Price < EMA20 < EMA50 (bearish structure)
-  // NOTE: Removed EMA slope requirement to reduce noise sensitivity
   const emaDirectionOk = dir === 'bullish'
     ? (p > ema20 && ema20 > ema50)
     : (p < ema20 && ema20 < ema50);
@@ -106,6 +116,46 @@ export function isTrendConfirmed(direction, price, indicatorsState, indicatorsSt
       ok: false, 
       reason: use15m ? 'ema15m_direction' : 'ema_direction',
       details: { price: p, ema20, ema50, direction: dir }
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // PHASE 1.5: HARD GATE - EMA Separation (NEW!)
+  // ---------------------------------------------------------------------------
+  // Require minimum separation between EMA20 and EMA50 to ensure actual trend
+  // Avoid flat markets where EMA20 ≈ EMA50
+  const emaSeparation = Math.abs(ema20 - ema50) / ema50;
+  if (emaSeparation < emaSeparationMin) {
+    return {
+      ok: false,
+      reason: use15m ? 'ema15m_flat' : 'ema_flat',
+      details: { 
+        ema20, ema50, 
+        separation: (emaSeparation * 100).toFixed(3) + '%',
+        required: (emaSeparationMin * 100).toFixed(3) + '%',
+        hint: 'EMA20 and EMA50 too close - market may be sideways/ranging'
+      }
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // PHASE 1.6: HARD GATE - RSI Extreme Protection (NEW!)
+  // ---------------------------------------------------------------------------
+  // Reject entries in overbought/oversold conditions to avoid mean reversion losses
+  // Long: reject if RSI > 75 (overbought - likely to pullback)
+  // Short: reject if RSI < 25 (oversold - likely to bounce)
+  if (dir === 'bullish' && rsi14 > rsiOverbought) {
+    return {
+      ok: false,
+      reason: use15m ? 'rsi15m_overbought' : 'rsi_overbought',
+      details: { rsi14, threshold: rsiOverbought, hint: `RSI ${rsi14.toFixed(1)} > ${rsiOverbought} - overbought, avoid LONG` }
+    };
+  }
+  if (dir === 'bearish' && rsi14 < rsiOversold) {
+    return {
+      ok: false,
+      reason: use15m ? 'rsi15m_oversold' : 'rsi_oversold',
+      details: { rsi14, threshold: rsiOversold, hint: `RSI ${rsi14.toFixed(1)} < ${rsiOversold} - oversold, avoid SHORT` }
     };
   }
 
@@ -128,13 +178,12 @@ export function isTrendConfirmed(direction, price, indicatorsState, indicatorsSt
     scoreBreakdown.adxContribution = true;
   }
 
-  // Condition B: RSI Regime Support (Loose Thresholds)
-  // Long:  RSI >= 52 (loose bullish - allows pullback entries)
-  // Short: RSI <= 48 (loose bearish - allows pullback entries)
-  // Loosened from 55/45 to 52/48 to reduce rejection of valid pullbacks
+  // Condition B: RSI Regime Support
+  // Long:  RSI >= 52 (allows pullback entries)
+  // Short: RSI <= 48 (allows pullback entries)
   const rsiRegimeOk = dir === 'bullish' 
-    ? (rsi14 >= rsiBullLoose) 
-    : (rsi14 <= rsiBearLoose);
+    ? (rsi14 >= rsiBullMin) 
+    : (rsi14 <= rsiBearMax);
   
   if (rsiRegimeOk) {
     score++;
@@ -153,8 +202,9 @@ export function isTrendConfirmed(direction, price, indicatorsState, indicatorsSt
       score,
       details: {
         ema20, ema50, adx14, rsi14,
+        emaSeparation: (emaSeparation * 100).toFixed(3) + '%',
         scoreBreakdown,
-        thresholds: { adxScoreThreshold, rsiBullLoose, rsiBearLoose, minScore }
+        thresholds: { adxScoreThreshold, rsiBullMin, rsiBearMax, rsiOverbought, rsiOversold, emaSeparationMin, minScore }
       }
     };
   }
@@ -166,10 +216,10 @@ export function isTrendConfirmed(direction, price, indicatorsState, indicatorsSt
     score,
     details: {
       ema20, ema50, adx14, rsi14,
+      emaSeparation: (emaSeparation * 100).toFixed(3) + '%',
       scoreBreakdown,
-      thresholds: { adxScoreThreshold, rsiBullLoose, rsiBearLoose, minScore },
-      hint: `Score ${score} < required ${minScore}. ADX=${adx14.toFixed(1)} (need>=${adxScoreThreshold}), RSI=${rsi14.toFixed(1)} (need ${dir === 'bullish' ? '>=' + rsiBullLoose : '<=' + rsiBearLoose})`
+      thresholds: { adxScoreThreshold, rsiBullMin, rsiBearMax, rsiOverbought, rsiOversold, emaSeparationMin, minScore },
+      hint: `Score ${score} < required ${minScore}. ADX=${adx14.toFixed(1)} (need>=${adxScoreThreshold}), RSI=${rsi14.toFixed(1)} (need ${dir === 'bullish' ? '>=' + rsiBullMin : '<=' + rsiBearMax})`
     }
   };
 }
-

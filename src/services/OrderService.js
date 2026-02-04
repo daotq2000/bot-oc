@@ -668,51 +668,41 @@ export class OrderService {
         `symbol=${position.symbol} side=${position.side} entry=${entryPrice} tp=${tpPrice} sl=${slPrice}`
       );
 
-      // Get closable quantity from exchange
+      // Get closable quantity from exchange for validation and preferred quantity
       const quantity = await this.exchangeService.getClosableQuantity(position.symbol, position.side);
       if (!quantity || quantity <= 0) {
         logger.warn(`[OrderService] No closable quantity for position ${position.id}, skipping immediate TP/SL`);
         return { tpOrderId: null, slOrderId: null };
       }
 
-      // Determine position side for reduce-only orders
-      const positionSide = position.side === 'long' ? 'LONG' : 'SHORT';
-      const closeSide = position.side === 'long' ? 'sell' : 'buy';
-
       // ========== PARALLEL TP+SL PLACEMENT ==========
-      // Place TP and SL orders in parallel for faster protection
+      // Use dedicated TP/SL creation methods which handle closePosition properly
       const orderPromises = [];
       
-      // TP order promise
+      // TP order promise - use createCloseTakeProfitMarket which handles closePosition correctly
       if (tpPrice && Number.isFinite(tpPrice) && tpPrice > 0) {
         orderPromises.push(
-          this.exchangeService.createOrder({
-            symbol: position.symbol,
-            side: closeSide,
-            positionSide: positionSide,
-            type: 'TAKE_PROFIT_MARKET',
-            quantity: quantity,
-            stopPrice: tpPrice,
-            reduceOnly: true,
-            closePosition: false
-          }).then(order => ({ type: 'tp', order, price: tpPrice }))
+          this.exchangeService.createCloseTakeProfitMarket(
+            position.symbol,
+            position.side,    // 'long' or 'short'
+            tpPrice,
+            position,         // pass position for clientOrderId mapping
+            quantity          // preferred quantity
+          ).then(order => ({ type: 'tp', order, price: tpPrice }))
             .catch(err => ({ type: 'tp', error: err, price: tpPrice }))
         );
       }
       
-      // SL order promise
+      // SL order promise - use createCloseStopMarket which handles closePosition correctly
       if (slPrice && Number.isFinite(slPrice) && slPrice > 0) {
         orderPromises.push(
-          this.exchangeService.createOrder({
-            symbol: position.symbol,
-            side: closeSide,
-            positionSide: positionSide,
-            type: 'STOP_MARKET',
-            quantity: quantity,
-            stopPrice: slPrice,
-            reduceOnly: true,
-            closePosition: false
-          }).then(order => ({ type: 'sl', order, price: slPrice }))
+          this.exchangeService.createCloseStopMarket(
+            position.symbol,
+            position.side,    // 'long' or 'short'
+            slPrice,
+            position,         // pass position for clientOrderId mapping
+            quantity          // preferred quantity (will be passed to createCloseStopMarket)
+          ).then(order => ({ type: 'sl', order, price: slPrice }))
             .catch(err => ({ type: 'sl', error: err, price: slPrice }))
         );
       }
@@ -723,12 +713,17 @@ export class OrderService {
       // Process results
       for (const result of results) {
         if (result.type === 'tp') {
-          if (result.order?.id) {
-            tpOrderId = result.order.id;
+          // Binance returns orderId, not id - handle both cases
+          const orderId = result.order?.orderId || result.order?.id;
+          if (orderId) {
+            tpOrderId = orderId;
             logger.info(
               `[OrderService] ✅ Immediate TP placed for position ${position.id} | ` +
               `orderId=${tpOrderId} price=${result.price} qty=${quantity}`
             );
+          } else if (result.order === null) {
+            // createCloseTakeProfitMarket returns null when no position exists on exchange
+            logger.warn(`[OrderService] TP skipped for position ${position.id}: no position found on exchange`);
           } else if (result.error) {
             const errMsg = result.error?.message || '';
             if (errMsg.includes('-2021') || errMsg.includes('would immediately trigger')) {
@@ -740,12 +735,17 @@ export class OrderService {
             }
           }
         } else if (result.type === 'sl') {
-          if (result.order?.id) {
-            slOrderId = result.order.id;
+          // Binance returns orderId, not id - handle both cases
+          const orderId = result.order?.orderId || result.order?.id;
+          if (orderId) {
+            slOrderId = orderId;
             logger.info(
               `[OrderService] ✅ Immediate SL placed for position ${position.id} | ` +
               `orderId=${slOrderId} price=${result.price} qty=${quantity}`
             );
+          } else if (result.order === null) {
+            // createCloseStopMarket returns null when no position exists on exchange
+            logger.warn(`[OrderService] SL skipped for position ${position.id}: no position found on exchange`);
           } else if (result.error) {
             const errMsg = result.error?.message || '';
             if (errMsg.includes('-2021') || errMsg.includes('would immediately trigger')) {

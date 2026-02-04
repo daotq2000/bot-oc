@@ -52,9 +52,12 @@ export class PositionMonitor {
     // TP/SL placement queue - Priority-based with global concurrency control
     // UPGRADED: From LIFO to age-based priority (older positions = higher priority)
     // Global manager handles multi-bot coordination and rate limiting
+    // ✅ FIX: Reduced concurrency to prevent event loop blocking
+    // perBotConcurrency: 5 → 3 (prevent single bot from saturating)
+    // globalConcurrency: 15 → 8 (prevent API flooding causing WS lag)
     this._tpslQueueManager = new GlobalTPSLQueueManager({
-      perBotConcurrency: Number(configService.getNumber('TPSL_QUEUE_CONCURRENCY_PER_BOT', 5)),
-      globalConcurrency: Number(configService.getNumber('TPSL_QUEUE_GLOBAL_CONCURRENCY', 15)),
+      perBotConcurrency: Number(configService.getNumber('TPSL_QUEUE_CONCURRENCY_PER_BOT', 3)),
+      globalConcurrency: Number(configService.getNumber('TPSL_QUEUE_GLOBAL_CONCURRENCY', 8)),
       maxQueueSizePerBot: Number(configService.getNumber('TPSL_QUEUE_MAX_SIZE_PER_BOT', 200)),
       taskTimeoutMs: Number(configService.getNumber('TPSL_QUEUE_TASK_TIMEOUT_MS', 30000))
     });

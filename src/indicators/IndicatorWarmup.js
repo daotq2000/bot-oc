@@ -15,17 +15,21 @@ export class IndicatorWarmup {
     // Fast mode toggles
     this.fastModeEnabled = configService.getBoolean('INDICATORS_WARMUP_FAST_MODE', false);
 
-    // Batch pacing
-    const defaultDelay = this.fastModeEnabled ? 200 : 5000;
+    // Batch pacing - adaptive throttling enabled by default
+    this.adaptiveThrottling = configService.getBoolean('INDICATORS_WARMUP_ADAPTIVE_THROTTLE', true);
+    const defaultDelay = this.fastModeEnabled ? 200 : 1000; // Reduced from 5000 to 1000
     this.batchDelayMs = Number(configService.getNumber('INDICATORS_WARMUP_BATCH_DELAY_MS', defaultDelay));
+    this.minBatchDelayMs = 200; // Minimum delay when RPM is very low
+    this.maxBatchDelayMs = 5000; // Maximum delay when approaching rate limit
     this._lastBatchTime = 0;
 
-    // Request throttling
-    const defaultRpm = this.fastModeEnabled ? 900 : 400;
+    // Request throttling - safer limits
+    const defaultRpm = this.fastModeEnabled ? 900 : 600; // Increased from 400 to 600
     this._maxRequestsPerMinute = Number(configService.getNumber('INDICATORS_WARMUP_MAX_REQUESTS_PER_MINUTE', defaultRpm));
     this._requestCount = 0;
     this._requestWindowStart = Date.now();
     this._requestWindowMs = 60 * 1000;
+    this._safetyBuffer = 0.7; // Use only 70% of RPM to leave room for other operations
 
 
     // Priority warmup
@@ -49,11 +53,13 @@ export class IndicatorWarmup {
       this._requestWindowStart = now;
     }
 
-    if (this._requestCount >= this._maxRequestsPerMinute) {
+    const effectiveLimit = Math.floor(this._maxRequestsPerMinute * this._safetyBuffer);
+    
+    if (this._requestCount >= effectiveLimit) {
       const waitTime = this._requestWindowMs - (now - this._requestWindowStart);
       if (waitTime > 0) {
         logger.warn(
-          `[IndicatorWarmup] ⚠️ Rate limit approaching (${this._requestCount}/${this._maxRequestsPerMinute} requests). ` +
+          `[IndicatorWarmup] ⚠️ Rate limit approaching (${this._requestCount}/${effectiveLimit} requests, buffer=${this._safetyBuffer}). ` +
           `Waiting ${Math.ceil(waitTime / 1000)}s before next request...`
         );
         await new Promise(resolve => setTimeout(resolve, waitTime + 100));
@@ -63,6 +69,35 @@ export class IndicatorWarmup {
     }
 
     this._requestCount++;
+  }
+
+  /**
+   * Calculate adaptive delay based on current RPM usage
+   * When RPM is low → faster (min delay)
+   * When RPM is high → slower (max delay)
+   */
+  _getAdaptiveDelay() {
+    if (!this.adaptiveThrottling) {
+      return this.batchDelayMs;
+    }
+
+    const effectiveLimit = Math.floor(this._maxRequestsPerMinute * this._safetyBuffer);
+    const usageRatio = this._requestCount / effectiveLimit;
+
+    // Exponential backoff based on usage
+    // 0% usage → minDelay (200ms)
+    // 50% usage → ~1000ms  
+    // 70%+ usage → maxDelay (5000ms)
+    if (usageRatio < 0.3) {
+      return this.minBatchDelayMs; // Very fast when RPM is low
+    } else if (usageRatio < 0.5) {
+      return Math.round(this.minBatchDelayMs + (this.batchDelayMs - this.minBatchDelayMs) * (usageRatio / 0.5));
+    } else if (usageRatio < 0.7) {
+      return this.batchDelayMs;
+    } else {
+      // Approaching limit - slow down significantly
+      return Math.round(this.batchDelayMs + (this.maxBatchDelayMs - this.batchDelayMs) * ((usageRatio - 0.7) / 0.3));
+    }
   }
 
   async fetchBinanceKlines(symbol, interval = '1m', limit = 100, options = {}) {
@@ -311,8 +346,9 @@ export class IndicatorWarmup {
    * - Optional: warm only top N priority symbols (INDICATORS_WARMUP_PRIORITY_ONLY_COUNT)
    * - Fast mode: defaults to higher RPM and lower batch delay
    * - ✅ NEW: Automatically caches open prices from warmup candles
+   * - ✅ NEW: Adaptive throttling - auto-adjusts delay based on RPM usage
    */
-  async warmupBatch(indicators, concurrency = 2) {
+  async warmupBatch(indicators, concurrency = 5) {
     const entriesAll = Array.from(indicators.entries());
 
     // Priority ordering
@@ -338,10 +374,12 @@ export class IndicatorWarmup {
     const results = { succeeded: 0, failed: 0 };
     const totalBatches = Math.ceil(entries.length / concurrency);
     const startTime = Date.now();
+    const effectiveRpmLimit = Math.floor(this._maxRequestsPerMinute * this._safetyBuffer);
 
     logger.info(
       `[IndicatorWarmup] 🚀 Starting warmup for ${entries.length} states in ${totalBatches} batches ` +
-      `(concurrency=${concurrency}, delay=${this.batchDelayMs}ms between batches, rpmCap=${this._maxRequestsPerMinute}, fastMode=${this.fastModeEnabled})`
+      `(concurrency=${concurrency}, baseDelay=${this.batchDelayMs}ms, adaptiveThrottle=${this.adaptiveThrottling}, ` +
+      `rpmCap=${this._maxRequestsPerMinute}, effectiveLimit=${effectiveRpmLimit}, fastMode=${this.fastModeEnabled})`
     );
 
     for (let i = 0; i < entries.length; i += concurrency) {
@@ -350,18 +388,23 @@ export class IndicatorWarmup {
       const elapsed = Math.round((Date.now() - startTime) / 1000);
 
       if (i > 0) {
+        // Use adaptive delay based on current RPM usage
+        const adaptiveDelay = this._getAdaptiveDelay();
         const now = Date.now();
         const timeSinceLastBatch = now - this._lastBatchTime;
-        if (timeSinceLastBatch < this.batchDelayMs) {
-          const delay = this.batchDelayMs - timeSinceLastBatch;
+        if (timeSinceLastBatch < adaptiveDelay) {
+          const delay = adaptiveDelay - timeSinceLastBatch;
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
 
+      const adaptiveDelay = this._getAdaptiveDelay();
+      const usagePercent = Math.round((this._requestCount / effectiveRpmLimit) * 100);
+      
       if (batchIndex === 1 || batchIndex % 10 === 0) {
         logger.info(
           `[IndicatorWarmup] Processing batch ${batchIndex}/${totalBatches} (${batch.length} states) | ` +
-          `Elapsed: ${elapsed}s | Requests in window: ${this._requestCount}/${this._maxRequestsPerMinute}`
+          `Elapsed: ${elapsed}s | RPM: ${this._requestCount}/${effectiveRpmLimit} (${usagePercent}%) | Delay: ${adaptiveDelay}ms`
         );
       }
 

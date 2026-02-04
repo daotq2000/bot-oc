@@ -99,10 +99,10 @@ export class WebSocketOCConsumer {
     this._warmedUpSymbols5m = new Set();
 
     // Pre-warm service (Option C: REST snapshot to achieve "ready" status quickly)
-    // ✅ OPTIMIZED: Giảm concurrency để tránh rate limit (chấp nhận warmup trong 5-10 phút)
+    // ✅ OPTIMIZED: Tăng concurrency lên 5 với adaptive throttling để warmup nhanh hơn
     this._warmupService = new IndicatorWarmup();
     this._warmupEnabled = configService.getBoolean('INDICATORS_WARMUP_ENABLED', true);
-    this._warmupConcurrency = Number(configService.getNumber('INDICATORS_WARMUP_CONCURRENCY', 2)); // Giảm từ 5 xuống 2
+    this._warmupConcurrency = Number(configService.getNumber('INDICATORS_WARMUP_CONCURRENCY', 5)); // Tăng từ 2 lên 5 với adaptive throttling
     
     // Track which symbols have been warmed up (to avoid re-warming)
     this._warmedUpSymbols = new Set(); // exchange|symbol keys
