@@ -2237,101 +2237,85 @@ export class BinanceDirectClient {
       return data;
     } catch (error) {
       const errorMsg = error?.message || String(error);
+      const errorCode = error?.code;
       
-      // If TAKE_PROFIT is not supported, fallback to TAKE_PROFIT_LIMIT or STOP_LIMIT
-      if (errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
-        logger.warn(`[TP Fallback] TAKE_PROFIT order type not supported, trying TAKE_PROFIT_LIMIT fallback...`);
+      // If TAKE_PROFIT is not supported (error -4120), skip all conditional types and go directly to LIMIT
+      // This is common on Binance Testnet which has deprecated conditional orders on /fapi/v1/order
+      if (errorCode === -4120 || errorMsg.includes('-4120') || errorMsg.includes('Order type not supported') || errorMsg.includes('Algo Order API')) {
+        logger.warn(`[TP Fallback] TAKE_PROFIT order type not supported (error -4120), using LIMIT order directly...`);
         
-        // Fallback 1: Try TAKE_PROFIT_LIMIT (Binance Futures conditional limit order for TP)
-        const fallbackParams = {
+        // DIRECT FALLBACK: Use plain LIMIT order
+        // This works on Binance Testnet and is reliable for TP functionality
+        // LIMIT order will be placed at the TP price and wait for price to reach it
+        const limitParams = {
           symbol: normalizedSymbol,
           side: orderSide,
-          type: 'TAKE_PROFIT_LIMIT',
-          stopPrice: stopPriceStr,  // Trigger price
-          price: limitPriceStr,     // Limit price to execute at
-          timeInForce: 'GTC',
-          workingType: 'MARK_PRICE'
+          type: 'LIMIT',
+          price: stopPriceStr, // Use the TP price directly (not limit price which is offset)
+          timeInForce: 'GTC'
         };
+        
+        // --- Ownership ---
+        if (options.clientOrderId) {
+          limitParams.newClientOrderId = options.clientOrderId;
+        }
         
         // Only include positionSide in dual-side (hedge) mode
         if (dualSide) {
-          fallbackParams.positionSide = positionSide;
+          limitParams.positionSide = positionSide;
         }
         
-        // If quantity provided, use it; otherwise use closePosition=true
+        // Add quantity if provided
         if (params.quantity) {
-          fallbackParams.quantity = params.quantity;
+          limitParams.quantity = params.quantity;
         } else if (quantity) {
           const formattedQuantity = this.formatQuantity(quantity, stepSize);
           if (parseFloat(formattedQuantity) > 0) {
-            fallbackParams.quantity = formattedQuantity;
-          } else {
-            // No valid quantity, use closePosition instead
-            fallbackParams.closePosition = 'true';
+            limitParams.quantity = formattedQuantity;
           }
-        } else {
-          // No quantity at all, use closePosition
-          fallbackParams.closePosition = 'true';
+        }
+        
+        // If still no quantity, we can't place a LIMIT order (it doesn't support closePosition)
+        if (!limitParams.quantity) {
+          logger.error(`[TP Fallback] Cannot place LIMIT order without quantity. Need to derive quantity from position.`);
+          
+          // Try to get position quantity
+          try {
+            const openPositions = await this.getOpenPositions(normalizedSymbol);
+            const posMatch = Array.isArray(openPositions)
+              ? openPositions.find(
+                  p =>
+                    p.symbol === normalizedSymbol &&
+                    (dualSide ? p.positionSide === positionSide : true) &&
+                    Math.abs(parseFloat(p.positionAmt || 0)) > 0
+                )
+              : null;
+            if (posMatch) {
+              const posAmt = Math.abs(parseFloat(posMatch.positionAmt || 0));
+              limitParams.quantity = this.formatQuantity(posAmt, stepSize);
+              logger.info(`[TP Fallback] Derived quantity ${limitParams.quantity} from open position`);
+            }
+          } catch (qtyErr) {
+            logger.error(`[TP Fallback] Failed to derive quantity: ${qtyErr?.message || qtyErr}`);
+            return null;
+          }
+          
+          if (!limitParams.quantity) {
+            logger.error(`[TP Fallback] No open position found to derive quantity`);
+            return null;
+          }
         }
         
         try {
-          const fallbackData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', fallbackParams, true);
-          if (fallbackData && fallbackData.orderId) {
-            logger.info(`✅ TP order placed (fallback TAKE_PROFIT_LIMIT): Order ID: ${fallbackData.orderId}`);
-            return fallbackData;
+          logger.info(`[TP Fallback] Placing LIMIT order: ${orderSide} ${normalizedSymbol} @ ${limitParams.price}`);
+          const limitData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', limitParams, true);
+          if (limitData && limitData.orderId) {
+            logger.info(`✅ TP order placed (LIMIT fallback): Order ID: ${limitData.orderId}`);
+            return limitData;
           }
-        } catch (fallback1Error) {
-          logger.warn(`[TP Fallback] TAKE_PROFIT_LIMIT also failed: ${fallback1Error?.message || fallback1Error}, trying STOP_LIMIT...`);
-          
-          // Fallback 2: Try STOP_LIMIT as last resort
-          const stopLimitParams = {
-            ...fallbackParams,
-            type: 'STOP'  // STOP type in Binance Futures = STOP_LIMIT with price
-          };
-          
-          try {
-            const stopLimitData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', stopLimitParams, true);
-            if (stopLimitData && stopLimitData.orderId) {
-              logger.info(`✅ TP order placed (fallback STOP): Order ID: ${stopLimitData.orderId}`);
-              return stopLimitData;
-            }
-          } catch (fallback2Error) {
-            logger.warn(`[TP Fallback] STOP also failed: ${fallback2Error?.message || fallback2Error}, trying plain LIMIT as last resort...`);
-            
-            // Fallback 3: Plain LIMIT order as last resort (will execute immediately if price is favorable)
-            const limitParams = {
-              symbol: normalizedSymbol,
-              side: orderSide,
-              type: 'LIMIT',
-              price: limitPriceStr,
-              timeInForce: 'GTC'
-            };
-            
-            if (dualSide) {
-              limitParams.positionSide = positionSide;
-            }
-            
-            if (fallbackParams.quantity) {
-              limitParams.quantity = fallbackParams.quantity;
-            } else {
-              limitParams.closePosition = 'true';
-            }
-            
-            try {
-              const limitData = await this.makeRequestWithRetry('/fapi/v1/order', 'POST', limitParams, true);
-              if (limitData && limitData.orderId) {
-                logger.info(`✅ TP order placed (fallback LIMIT): Order ID: ${limitData.orderId}`);
-                return limitData;
-              }
-            } catch (fallback3Error) {
-              logger.error(`[TP Fallback] All TP strategies failed for ${normalizedSymbol}:`, {
-                error1: fallback1Error?.message,
-                error2: fallback2Error?.message,
-                error3: fallback3Error?.message
-              });
-              throw fallback3Error;
-            }
-          }
+        } catch (limitError) {
+          logger.error(`[TP Fallback] LIMIT order also failed for ${normalizedSymbol}: ${limitError?.message || limitError}`);
+          throw limitError;
         }
         
         throw new Error(`All TP placement strategies failed for ${normalizedSymbol}`);

@@ -18,6 +18,7 @@ import { MultiTimeframeService } from '../services/MultiTimeframeService.js';
 import { LossStreakService } from '../services/LossStreakService.js';
 import { AutoOptimizeService } from '../services/AutoOptimizeService.js';
 import { GlobalTPSLQueueManager } from '../utils/PriorityAsyncQueue.js';
+import { getSoftwareStopLossService } from '../services/SoftwareStopLossService.js';
 
 /**
  * Position Monitor Job - Monitor and update open positions
@@ -32,6 +33,7 @@ export class PositionMonitor {
     this.riskMgmtServices = new Map(); // botId -> RiskManagementService
     this.srServices = new Map(); // botId -> SupportResistanceService
     this.mtfServices = new Map(); // botId -> MultiTimeframeService
+    this.softwareSLServices = new Map(); // botId -> SoftwareStopLossService
     this._autoOptimize = new AutoOptimizeService();
     this.telegramService = null;
     this.isRunning = false;
@@ -310,6 +312,9 @@ export class PositionMonitor {
       this.riskMgmtServices.set(bot.id, new RiskManagementService(exchangeService));
       this.srServices.set(bot.id, new SupportResistanceService(exchangeService));
       this.mtfServices.set(bot.id, new MultiTimeframeService(exchangeService));
+      
+      // Software SL service (for exchanges that don't support conditional orders)
+      this.softwareSLServices.set(bot.id, getSoftwareStopLossService(exchangeService));
 
       logger.info(`[PositionMonitor] ✅ Initialized for bot ${bot.id} (${bot.exchange || 'unknown'}, testnet=${bot.binance_testnet || 'false'})`);
     } catch (error) {
@@ -331,6 +336,7 @@ export class PositionMonitor {
     this.riskMgmtServices.delete(botId);
     this.srServices.delete(botId);
     this.mtfServices.delete(botId);
+    this.softwareSLServices.delete(botId);
     logger.info(`Removed bot ${botId} from PositionMonitor`);
   }
 
@@ -784,9 +790,11 @@ export class PositionMonitor {
     // Check if TP/SL orders still exist on exchange
     // If exit_order_id exists in DB but order is not on exchange (filled/canceled), we should recreate it
     // CRITICAL FIX: Also check tp_sl_pending flag - if true, we need to place TP/SL even if exit_order_id exists
+    // CRITICAL FIX 2: When use_software_sl=true, don't require sl_order_id (software SL handles it)
     const isTPSLPending = position.tp_sl_pending === true || position.tp_sl_pending === 1;
+    const hasSoftwareSL = position.use_software_sl === true || position.use_software_sl === 1;
     let needsTp = !position.exit_order_id || isTPSLPending;
-    let needsSl = !position.sl_order_id || isTPSLPending;
+    let needsSl = (!position.sl_order_id && !hasSoftwareSL) || isTPSLPending;
 
     // OPTIMIZATION: Skip order verification for newly opened positions (< 5s)
     // New positions won't have orders yet, so verification is unnecessary
@@ -1535,7 +1543,8 @@ export class PositionMonitor {
             const hasTP = currentPosition?.exit_order_id && currentPosition.exit_order_id.trim() !== '';
             const updateData = { 
               sl_order_id: slOrderId, 
-              stop_loss_price: slPrice 
+              stop_loss_price: slPrice,
+              use_software_sl: false // Explicitly disable software SL since exchange SL is placed
             };
             // Clear pending flag if both TP and SL are placed (only if column exists)
             if (hasTP && Position?.rawAttributes?.tp_sl_pending) {
@@ -1558,6 +1567,30 @@ export class PositionMonitor {
               // Non-critical: dedupe failure doesn't affect order placement
               logger.debug(`[Place TP/SL] Dedupe after SL creation skipped/failed for position ${position.id}: ${dedupeError?.message || dedupeError}`);
             }
+          } else {
+            // SL order creation returned null - exchange doesn't support conditional orders
+            // Enable software-based SL monitoring
+            logger.warn(
+              `[Place TP/SL] ⚠️ Exchange SL order returned null for position ${position.id} (${position.symbol}). ` +
+              `This typically means the exchange doesn't support conditional orders (e.g., Testnet). ` +
+              `Enabling SOFTWARE-BASED STOP LOSS monitoring.`
+            );
+            
+            // Update position to use software SL
+            const updateData = { 
+              use_software_sl: true,
+              stop_loss_price: slPrice // Ensure SL price is saved for software monitoring
+            };
+            // Clear tp_sl_pending since we're handling SL via software (but only if column exists)
+            if (Position?.rawAttributes?.tp_sl_pending) {
+              updateData.tp_sl_pending = false;
+            }
+            await Position.update(position.id, updateData);
+            
+            logger.info(
+              `[Place TP/SL] 🔄 Position ${position.id} now using SOFTWARE STOP LOSS @ ${slPrice}. ` +
+              `SL will trigger via MARKET close when price hits stop level.`
+            );
           }
         } catch (e) {
           const errorMsg = e?.message || String(e);
@@ -1959,6 +1992,118 @@ export class PositionMonitor {
   }
 
   /**
+   * Check software-based stop loss for positions that cannot use exchange SL orders
+   * (e.g., Binance Testnet where conditional orders return -4120)
+   * 
+   * This monitors price via WebSocket and triggers MARKET close when SL is breached.
+   * 
+   * @param {Array} positions - Array of open positions
+   */
+  async _checkSoftwareStopLossPositions(positions) {
+    if (!positions || positions.length === 0) return;
+
+    // Filter positions that use software SL
+    const softwareSLPositions = positions.filter(p => 
+      p.use_software_sl === true || p.use_software_sl === 1
+    );
+
+    if (softwareSLPositions.length === 0) {
+      return; // No positions need software SL
+    }
+
+    logger.info(
+      `[SoftwareSL] 🔍 Checking ${softwareSLPositions.length} positions with software-based Stop Loss`
+    );
+
+    const triggeredResults = [];
+
+    for (const position of softwareSLPositions) {
+      try {
+        const botId = position.bot_id || position.strategy?.bot_id;
+        const softwareSLService = this.softwareSLServices.get(botId);
+        
+        if (!softwareSLService) {
+          logger.warn(
+            `[SoftwareSL] ⚠️ SoftwareStopLossService not found for bot ${botId}, ` +
+            `cannot check SL for position ${position.id}`
+          );
+          continue;
+        }
+
+        // Check if SL is breached and trigger close
+        const result = await softwareSLService.checkAndTriggerSL(position);
+        
+        if (result) {
+          triggeredResults.push({
+            positionId: position.id,
+            symbol: position.symbol,
+            side: position.side,
+            slPrice: position.stop_loss_price,
+            orderId: result.orderId,
+            status: result.status
+          });
+
+          // Mark position as closed in DB
+          const positionService = this.positionServices.get(botId);
+          if (positionService) {
+            try {
+              // Get current price for PnL calculation
+              const exchangeService = this.exchangeServices.get(botId);
+              let closePrice = 0;
+              if (exchangeService) {
+                closePrice = await exchangeService.getTickerPrice(position.symbol);
+              }
+              
+              // Calculate PnL
+              const pnl = calculatePnL(
+                position.side,
+                Number(position.entry_price),
+                closePrice,
+                Number(position.amount)
+              );
+
+              // Update position status
+              await Position.update(position.id, {
+                status: 'closed',
+                close_reason: 'software_sl',
+                close_price: closePrice,
+                pnl: pnl,
+                closed_at: new Date(),
+                use_software_sl: false // Clear flag
+              });
+
+              // Clear triggered status in service
+              softwareSLService.clearTriggeredStatus(position.id);
+
+              logger.info(
+                `[SoftwareSL] ✅ Position ${position.id} (${position.symbol} ${position.side.toUpperCase()}) ` +
+                `closed via software SL | PnL: ${pnl.toFixed(2)} USDT`
+              );
+            } catch (updateErr) {
+              logger.error(
+                `[SoftwareSL] ❌ Failed to update position ${position.id} after SL close: ` +
+                `${updateErr?.message || updateErr}`
+              );
+            }
+          }
+        }
+      } catch (error) {
+        logger.error(
+          `[SoftwareSL] ❌ Error checking SL for position ${position.id}: ` +
+          `${error?.message || error}`
+        );
+      }
+    }
+
+    if (triggeredResults.length > 0) {
+      logger.warn(
+        `[SoftwareSL] 🚨 TRIGGERED ${triggeredResults.length} Software Stop Loss closes: ` +
+        `${triggeredResults.map(r => `${r.positionId}(${r.symbol})`).join(', ')}`
+      );
+    }
+  }
+
+  /**
    * Monitor all open positions
    */
   async monitorAllPositions() {
@@ -2066,7 +2211,10 @@ export class PositionMonitor {
       const EMERGENCY_SLA_MS = Number(configService.getNumber('POSITION_EMERGENCY_SLA_MS', 10 * 1000)); // 10 seconds - Emergency threshold
       
       for (const pos of openPositions) {
-        const needsTPSL = !pos.exit_order_id || !pos.sl_order_id || pos.tp_sl_pending === true || pos.tp_sl_pending === 1;
+        // CRITICAL FIX: When use_software_sl=true, position doesn't need sl_order_id (software SL handles it)
+        // Only require sl_order_id when use_software_sl is NOT enabled
+        const hasSLProtection = pos.sl_order_id || pos.use_software_sl === true || pos.use_software_sl === 1;
+        const needsTPSL = !pos.exit_order_id || !hasSLProtection || pos.tp_sl_pending === true || pos.tp_sl_pending === 1;
         
         if (pos.opened_at) {
           const openedAt = new Date(pos.opened_at).getTime();
@@ -2175,12 +2323,15 @@ export class PositionMonitor {
           totalBotsProcessed++;
           totalPositionsProcessed += botPositions.length;
           // Split bot positions by priority
-          const botHighPriority = botPositions.filter(p => 
-            !p.exit_order_id || !p.sl_order_id || p.tp_sl_pending === true || p.tp_sl_pending === 1
-          );
-          const botLowPriority = botPositions.filter(p => 
-            p.exit_order_id && p.sl_order_id && p.tp_sl_pending !== true && p.tp_sl_pending !== 1
-          );
+          // CRITICAL FIX: When use_software_sl=true, position doesn't need sl_order_id
+          const botHighPriority = botPositions.filter(p => {
+            const hasSLProtection = p.sl_order_id || p.use_software_sl === true || p.use_software_sl === 1;
+            return !p.exit_order_id || !hasSLProtection || p.tp_sl_pending === true || p.tp_sl_pending === 1;
+          });
+          const botLowPriority = botPositions.filter(p => {
+            const hasSLProtection = p.sl_order_id || p.use_software_sl === true || p.use_software_sl === 1;
+            return p.exit_order_id && hasSLProtection && p.tp_sl_pending !== true && p.tp_sl_pending !== 1;
+          });
           
           logger.info(
             `[PositionMonitor] 🚀 Starting processing ${botPositions.length} positions for bot ${botId} ` +
@@ -2356,6 +2507,13 @@ export class PositionMonitor {
 
       // Wait for all bots to complete (parallel processing)
       await Promise.allSettled(botProcessingPromises);
+
+      // =====================================================================
+      // PHASE: SOFTWARE-BASED STOP LOSS MONITORING
+      // For positions where exchange SL orders are not supported (e.g., Binance Testnet)
+      // Check price vs SL level and trigger MARKET close if SL is breached
+      // =====================================================================
+      await this._checkSoftwareStopLossPositions(openPositions);
 
       // Log monitoring summary (per-cycle)
       const cycleTime = Date.now() - cycleStart;
