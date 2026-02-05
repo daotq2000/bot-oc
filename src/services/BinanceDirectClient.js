@@ -69,14 +69,14 @@ export class BinanceDirectClient {
     this._positionModeTTL = Number(configService.getNumber('BINANCE_POSITION_MODE_TTL_MS', 60000)); // 1 minute default
 
     // CRITICAL FIX: Request queue for rate limiting (prevents IP ban)
-    // Binance Futures: 1200 requests per minute (20 req/sec), but we use conservative 8 req/sec
+    // Binance Futures: 1200 requests per minute (20 req/sec), but we use conservative 5 req/sec
     // PRIORITY QUEUE: Mainnet (isTestnet=false) has priority=1 (highest), Testnet has priority=0
     this._requestQueue = [];
     this._isProcessingQueue = false;
     this.isMainnet = !isTestnet; // Track if this client is for mainnet
-    this._requestInterval = Number(configService.getNumber('BINANCE_REQUEST_INTERVAL_MS', 125)); // 8 req/sec default
+    this._requestInterval = Number(configService.getNumber('BINANCE_REQUEST_INTERVAL_MS', 200)); // 5 req/sec default (increased from 125ms)
     this._lastSignedRequestTime = 0; // Track signed requests separately (more strict)
-    this._signedRequestInterval = Number(configService.getNumber('BINANCE_SIGNED_REQUEST_INTERVAL_MS', 150)); // ~6.6 req/sec for signed
+    this._signedRequestInterval = Number(configService.getNumber('BINANCE_SIGNED_REQUEST_INTERVAL_MS', 250)); // ~4 req/sec for signed (increased from 150ms)
 
     // CRITICAL FIX: Circuit breaker to prevent spam when Binance is down
     this._circuitBreakerState = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
@@ -339,12 +339,16 @@ export class BinanceDirectClient {
     
     // Network/timeout errors - always retryable
     if (/timeout|ECONNRESET|ENOTFOUND|ECONNREFUSED|network|fetch|aborted/i.test(msg)) {
+      // CRITICAL FIX: Notify scheduler of timeout error for adaptive throttling
+      binanceRequestScheduler.recordTimeoutError();
       return { retryable: true, reason: 'network_error', code };
     }
     
     // Binance API timeout error (-1007) - retryable
     // Error -1007: "Timeout waiting for response from backend server. Send status unknown; execution status unknown."
     if (code === -1007 || /timeout waiting for response|backend server/i.test(msg)) {
+      // CRITICAL FIX: Notify scheduler of timeout error for adaptive throttling
+      binanceRequestScheduler.recordTimeoutError();
       return { retryable: true, reason: 'timeout_error', code };
     }
     
@@ -355,6 +359,8 @@ export class BinanceDirectClient {
     
     // 408 Request Timeout - retryable
     if (error?.status === 408 || /request timeout/i.test(msg)) {
+      // CRITICAL FIX: Notify scheduler of timeout error for adaptive throttling
+      binanceRequestScheduler.recordTimeoutError();
       return { retryable: true, reason: 'timeout_error', code, status: error?.status };
     }
     
@@ -373,6 +379,12 @@ export class BinanceDirectClient {
     // Non-retryable logic errors
     if (code && this._nonRetryableErrors.has(code)) {
       return { retryable: false, reason: 'logic_error', code };
+    }
+    
+    // CRITICAL FIX: -4120 (Order type not supported) should NOT be retried
+    // This error means the symbol doesn't support certain order types
+    if (code === -4120 || /Order type not supported|Algo Order API/i.test(msg)) {
+      return { retryable: false, reason: 'unsupported_order_type', code };
     }
     
     // Other 4xx errors - generally not retryable

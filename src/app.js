@@ -184,6 +184,21 @@ async function start() {
       await AppConfig.set('RVOL_PERIOD', '20', 'Lookback length for RVOL SMA(volume) on 5m candles');
       await AppConfig.set('DONCHIAN_FILTER_ENABLED', 'true', 'Enable/Disable Donchian breakout gate (5m) for FOLLOWING_TREND entries');
       await AppConfig.set('DONCHIAN_PERIOD', '20', 'Lookback length for Donchian channel on 5m candles');
+      
+      // ✅ NEW: Enhanced RSI + ADX Combo configs
+      await AppConfig.set('TREND_ADX_STRONG_TREND', '35', 'ADX threshold for strong trend detection (relaxes RSI extreme thresholds)');
+      await AppConfig.set('TREND_RSI_OVERBOUGHT', '75', 'RSI overbought threshold for LONG rejection (normal trend)');
+      await AppConfig.set('TREND_RSI_OVERSOLD', '25', 'RSI oversold threshold for SHORT rejection (normal trend)');
+      await AppConfig.set('TREND_RSI_OVERBOUGHT_STRONG', '80', 'RSI overbought threshold for LONG rejection (strong trend ADX>=35)');
+      await AppConfig.set('TREND_RSI_OVERSOLD_STRONG', '20', 'RSI oversold threshold for SHORT rejection (strong trend ADX>=35)');
+      
+      // ✅ NEW: Dynamic ATR Multiplier configs
+      await AppConfig.set('VOL_ATR_MAX_PCT', '2.0', 'Maximum ATR% for volatility filter (normal trend)');
+      await AppConfig.set('VOL_ATR_MAX_STRONG_PCT', '2.5', 'Maximum ATR% for volatility filter (strong trend - allows higher volatility)');
+      
+      // ✅ NEW: Candle Body Confirmation configs
+      await AppConfig.set('CANDLE_BODY_FILTER_ENABLED', 'true', 'Enable/Disable candle body confirmation filter (avoid Doji/Pinbar entries)');
+      await AppConfig.set('CANDLE_BODY_MIN_RATIO', '0.5', 'Minimum candle body/range ratio (0.5 = body must be 50% of total candle range)');
 
       // WebSocket OC high-performance configs
       await AppConfig.set('WS_MATCH_CONCURRENCY', '50', 'Max concurrency for processing matched strategies per tick (higher = faster entries, more CPU/API usage)');
@@ -292,6 +307,7 @@ async function start() {
       await AppConfig.set('BINANCE_WS_TICK_DRAIN_BATCH_SIZE', '2000', 'Cron for symbols refresh job (default every 15 minutes)');
       await AppConfig.set('BINANCE_WS_TICK_DRAIN_TIME_BUDGET_MS', '25', 'Cron for symbols refresh job (default every 15 minutes)');
       await AppConfig.set('BINANCE_WS_PONG_TIMEOUT_MS', '30000', 'Cron for symbols refresh job (default every 15 minutes)');
+      await AppConfig.set('BINANCE_WS_MAX_STREAMS_PER_CONN', '100', 'Cron for symbols refresh job (default every 15 minutes)');
       await AppConfig.set('BINANCE_WS_MAX_CONCURRENT_RECONNECTS', '1', 'Cron for symbols refresh job (default every 15 minutes)');
     } catch (e) {
       logger.warn(`Failed seeding default configs: ${e?.message || e}`);

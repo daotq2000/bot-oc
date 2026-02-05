@@ -68,7 +68,8 @@ class WebSocketManager {
     this.candleAggregator = new CandleAggregator(['1m', '5m', '15m', '30m']);
 
     this.baseUrl = 'wss://fstream.binance.com/stream?streams=';
-    this.maxStreamsPerConn = 20;
+    // ✅ CONFIGURABLE: maxStreamsPerConn via env (Binance limit: 200 streams/connection, but 50-100 is optimal)
+    this.maxStreamsPerConn = Number(configService.getNumber('BINANCE_WS_MAX_STREAMS_PER_CONN', 50));
     this.maxUrlLength = 8000;
     this.maxReconnectAttempts = 10;
     this.maxPriceCacheSize = 1000;
@@ -84,7 +85,8 @@ class WebSocketManager {
 
     // ✅ LIFO SYMBOL MANAGEMENT
     this.symbolUsage = new Map();
-    this.maxTotalStreams = 2000;
+    // ✅ CONFIGURABLE: Max total streams across all connections (each symbol needs 2 streams: bookTicker + kline_1m)
+    this.maxTotalStreams = Number(configService.getNumber('BINANCE_WS_MAX_TOTAL_STREAMS', 2000));
     // ✅ FIX: Increased timeout from 10 min to 60 min to prevent premature cleanup
     // PriceAlertScanner may not access all symbols frequently enough, causing them to be 
     // unsubscribed while alerts are still active. 60 minutes provides better safety margin.
@@ -897,7 +899,9 @@ class WebSocketManager {
     }
 
     conn.ws.on('open', () => {
-      logger.info(`[Binance-WS] ✅ Connected successfully (${conn.streams.size} streams)`);
+      const totalConns = this.connections.filter(c => c.ws && c.ws.readyState === WebSocket.OPEN).length + 1;
+      const totalStreams = this._getTotalStreams();
+      logger.info(`[Binance-WS] ✅ Connected (conn #${totalConns}/${this.connections.length} | this=${conn.streams.size} streams | total=${totalStreams}/${this.maxTotalStreams} streams)`);
       conn.reconnectAttempts = 0;
       conn._needsReconnect = false;
       conn.latencyHistory = [];

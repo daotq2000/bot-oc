@@ -801,6 +801,11 @@ export class PositionMonitor {
     const timeSinceOpened = position.opened_at ? Date.now() - new Date(position.opened_at).getTime() : 0;
     const isNewPosition = timeSinceOpened < 5000; // Less than 5 seconds
 
+    // AUTO-REFRESH: Cancel and recreate stale TP/SL orders (unfilled after X minutes)
+    // This allows TP/SL prices to be recalculated based on current market conditions
+    const tpslStaleMinutes = Number(configService.getNumber('TPSL_STALE_MINUTES', 0)); // 0 = disabled
+    const tpslStaleMs = tpslStaleMinutes > 0 ? tpslStaleMinutes * 60 * 1000 : 0;
+
     // If exit_order_id exists, verify it's still active on exchange (skip for new positions)
     if (position.exit_order_id && !isNewPosition) {
       try {
@@ -820,6 +825,38 @@ export class PositionMonitor {
             // Clear exit_order_id in DB so we can recreate
             await Position.update(position.id, { exit_order_id: null });
             position.exit_order_id = null;
+          } else if ((status === 'new' || status === 'open' || status === 'pending') && tpslStaleMs > 0) {
+            // AUTO-REFRESH: Check if TP order has been pending too long
+            // This helps refresh TP price to match current market conditions
+            const orderCreatedAt = orderStatus?.timestamp || orderStatus?.datetime;
+            const orderAgeMs = orderCreatedAt ? Date.now() - new Date(orderCreatedAt).getTime() : timeSinceOpened;
+            
+            if (orderAgeMs >= tpslStaleMs) {
+              logger.info(
+                `[Place TP/SL] 🔄 AUTO-REFRESH: TP order ${position.exit_order_id} for position ${position.id} ` +
+                `has been pending for ${Math.round(orderAgeMs / 60000)}m (threshold: ${tpslStaleMinutes}m). ` +
+                `Canceling to recreate with updated price.`
+              );
+              try {
+                await exchangeService.cancelOrder(position.symbol, position.exit_order_id);
+                logger.info(`[Place TP/SL] ✅ Canceled stale TP order ${position.exit_order_id}`);
+              } catch (cancelErr) {
+                const msg = cancelErr?.message || '';
+                // Ignore if already canceled/filled
+                if (!msg.includes('Unknown order') && !msg.includes('already') && !msg.includes('UNKNOWN_ORDER')) {
+                  logger.warn(`[Place TP/SL] ⚠️ Failed to cancel stale TP order: ${msg}`);
+                }
+              }
+              needsTp = true;
+              // Clear order IDs and prices to force recalculation
+              await Position.update(position.id, { 
+                exit_order_id: null, 
+                take_profit_price: null,
+                tp_sl_pending: 1 
+              });
+              position.exit_order_id = null;
+              position.take_profit_price = null;
+            }
           }
         }
       } catch (e) {
@@ -865,6 +902,9 @@ export class PositionMonitor {
             const currentOrderPrice = Number(orderStatus?.stopPrice || orderStatus?.price || 0);
             const desiredSLPrice = Number(position.stop_loss_price || 0);
             
+            let shouldRefreshSL = false;
+            
+            // Check 1: SL price changed (breakeven/trailing)
             if (desiredSLPrice > 0 && currentOrderPrice > 0) {
               const priceDiff = Math.abs(desiredSLPrice - currentOrderPrice);
               const priceDiffPercent = (priceDiff / currentOrderPrice) * 100;
@@ -877,11 +917,47 @@ export class PositionMonitor {
                   `currentOrder=${currentOrderPrice.toFixed(8)} → desired=${desiredSLPrice.toFixed(8)} ` +
                   `(diff=${priceDiffPercent.toFixed(3)}%). Marking for update.`
                 );
-                needsSl = true;
-                // Clear sl_order_id to force recreation with new price
-                await Position.update(position.id, { sl_order_id: null });
-                position.sl_order_id = null;
+                shouldRefreshSL = true;
               }
+            }
+            
+            // Check 2: AUTO-REFRESH stale SL order (same as TP)
+            if (!shouldRefreshSL && tpslStaleMs > 0) {
+              const orderCreatedAt = orderStatus?.timestamp || orderStatus?.datetime;
+              const orderAgeMs = orderCreatedAt ? Date.now() - new Date(orderCreatedAt).getTime() : timeSinceOpened;
+              
+              if (orderAgeMs >= tpslStaleMs) {
+                logger.info(
+                  `[Place TP/SL] 🔄 AUTO-REFRESH: SL order ${position.sl_order_id} for position ${position.id} ` +
+                  `has been pending for ${Math.round(orderAgeMs / 60000)}m (threshold: ${tpslStaleMinutes}m). ` +
+                  `Canceling to recreate with updated price.`
+                );
+                try {
+                  await exchangeService.cancelOrder(position.symbol, position.sl_order_id);
+                  logger.info(`[Place TP/SL] ✅ Canceled stale SL order ${position.sl_order_id}`);
+                } catch (cancelErr) {
+                  const msg = cancelErr?.message || '';
+                  if (!msg.includes('Unknown order') && !msg.includes('already') && !msg.includes('UNKNOWN_ORDER')) {
+                    logger.warn(`[Place TP/SL] ⚠️ Failed to cancel stale SL order: ${msg}`);
+                  }
+                }
+                shouldRefreshSL = true;
+                // Clear SL price to force recalculation
+                await Position.update(position.id, { 
+                  sl_order_id: null, 
+                  stop_loss_price: null,
+                  tp_sl_pending: 1 
+                });
+                position.sl_order_id = null;
+                position.stop_loss_price = null;
+              }
+            }
+            
+            if (shouldRefreshSL && position.sl_order_id) {
+              needsSl = true;
+              // Clear sl_order_id to force recreation with new price
+              await Position.update(position.id, { sl_order_id: null });
+              position.sl_order_id = null;
             }
           }
         }

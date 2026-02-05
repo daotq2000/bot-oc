@@ -8,7 +8,7 @@ import logger from '../utils/logger.js';
 import { TrendIndicatorsState } from '../indicators/TrendIndicatorsState.js';
 import { isTrendConfirmed } from '../indicators/trendFilter.js';
 import { IndicatorWarmup } from '../indicators/IndicatorWarmup.js';
-import { checkPullbackConfirmation, checkVolatilityFilter, checkRvolGate, checkDonchianBreakoutGate, checkVolumeVmaGate, checkBollingerGate } from '../indicators/entryFilters.js';
+import { checkPullbackConfirmation, checkVolatilityFilter, checkRvolGate, checkDonchianBreakoutGate, checkVolumeVmaGate, checkBollingerGate, checkMarketRegimeGate, checkFundingRateGate } from '../indicators/entryFilters.js';
 import {
   calculateTakeProfit,
   calculateInitialStopLoss,
@@ -1185,6 +1185,64 @@ export class WebSocketOCConsumer {
               return;
             }
           }
+
+          // ✅ NEW: Market Regime Filter (15m) - avoid trend-following in ranging markets
+          if (isFollowingTrend) {
+            const regimeEnabled = configService.getBoolean('MARKET_REGIME_FILTER_ENABLED', true);
+            if (regimeEnabled) {
+              const regimeVerdict = checkMarketRegimeGate(snap15m, currentPrice, 'FOLLOWING_TREND');
+              filterTrace.marketRegime = {
+                ok: regimeVerdict.ok,
+                reason: regimeVerdict.reason,
+                regime: regimeVerdict.regime,
+                confidence: regimeVerdict.confidence,
+                timeframe: '15m'
+              };
+              if (!regimeVerdict.ok) {
+                if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
+                  logger.info(
+                    `[WebSocketOCConsumer] ⏭️ Market Regime filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+                    `reason=${regimeVerdict.reason} regime=${regimeVerdict.regime} confidence=${(regimeVerdict.confidence * 100).toFixed(1)}%`
+                  );
+                }
+                return;
+              }
+            }
+          }
+
+          // ✅ NEW: Funding Rate Filter - avoid extreme sentiment positions in futures
+          if (isFollowingTrend) {
+            const fundingEnabled = configService.getBoolean('FUNDING_RATE_FILTER_ENABLED', true);
+            if (fundingEnabled) {
+              try {
+                const orderService = this.orderServices.get(bot.id);
+                if (orderService?.exchangeService) {
+                  const fundingDirection = direction === 'bullish' ? 'LONG' : 'SHORT';
+                  const fundingVerdict = await checkFundingRateGate(fundingDirection, orderService.exchangeService, strategy.symbol);
+                  filterTrace.fundingRate = {
+                    ok: fundingVerdict.ok,
+                    reason: fundingVerdict.reason,
+                    fundingRatePct: fundingVerdict.fundingRatePct,
+                    sentiment: fundingVerdict.sentiment,
+                    level: fundingVerdict.level
+                  };
+                  if (!fundingVerdict.ok) {
+                    if (filterInfoEnabled && shouldLogSampled('FILTER_REJECT', filterRejectSampleN)) {
+                      logger.info(
+                        `[WebSocketOCConsumer] ⏭️ Funding Rate filter rejected entry | strategy=${strategy.id} symbol=${strategy.symbol} ` +
+                        `direction=${fundingDirection} reason=${fundingVerdict.reason} ` +
+                        `funding=${fundingVerdict.fundingRatePct?.toFixed(4) || 'N/A'}% sentiment=${fundingVerdict.sentiment}`
+                      );
+                    }
+                    return;
+                  }
+                }
+              } catch (fundingError) {
+                logger.debug(`[WebSocketOCConsumer] Funding rate check failed (fail-open): ${fundingError?.message || fundingError}`);
+                // Fail open - allow trade if funding rate check fails
+              }
+            }
+          }
         }
         
         // ✅ Log when all filters pass
@@ -1200,12 +1258,14 @@ export class WebSocketOCConsumer {
         const donchianStr = filterTrace.donchian ? ' Donchian5m ✓' : '';
         const vmaStr = filterTrace.volumeVma ? ` VMA_RATIO=${Number(filterTrace.volumeVma.ratio)?.toFixed?.(2) || 'N/A'} ✓` : '';
         const bbStr = filterTrace.bollinger ? ' BB5m ✓' : '';
+        const regimeStr = filterTrace.marketRegime ? ` Regime=${filterTrace.marketRegime.regime} ✓` : '';
+        const fundingStr = filterTrace.fundingRate ? ` Funding=${Number(filterTrace.fundingRate.fundingRatePct)?.toFixed?.(4) || 'N/A'}% ✓` : '';
         if (filterInfoEnabled && shouldLogSampled('FILTER_PASS', filterPassSampleN)) {
           logger.info(
             `[WebSocketOCConsumer] ✅ All filters PASSED (15m gate) | strategy=${strategy.id} symbol=${strategy.symbol} ` +
             `type=${isReverseStrategy ? 'COUNTER_TREND' : 'FOLLOWING_TREND'} direction=${direction} | ` +
             `CONDITIONS: ${emaCondition} ✓ ${adxCondition} ✓ ${rsiCondition} ✓ ` +
-            `ATR%=${volCheck.atrPercent?.toFixed(2)}% ✓ Pullback ✓${rvolStr}${donchianStr}${vmaStr}${bbStr}`
+            `ATR%=${volCheck.atrPercent?.toFixed(2)}% ✓ Pullback ✓${rvolStr}${donchianStr}${vmaStr}${bbStr}${regimeStr}${fundingStr}`
           );
         }
       } else if (exchangeLower === 'mexc') {

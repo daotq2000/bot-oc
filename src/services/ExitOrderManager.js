@@ -1,5 +1,6 @@
 import logger from '../utils/logger.js';
 import { configService } from './ConfigService.js';
+import { binanceRequestScheduler } from './BinanceRequestScheduler.js';
 // NOTE: avoid importing DB model here to keep manager easily unit-testable.
 // Callers are responsible for persisting exit_order_id to DB if needed.
 
@@ -17,20 +18,43 @@ import { configService } from './ConfigService.js';
  * SHORT:
  *  - desiredExitPrice < entry => BUY TAKE_PROFIT_MARKET
  *  - desiredExitPrice >= entry => BUY STOP_MARKET
+ *
+ * CRITICAL FIX: Integrated with BinanceRequestScheduler for adaptive throttling
+ * - Checks timeout circuit breaker before placing orders
+ * - Propagates timeout errors to scheduler for adaptive throttling
  */
 export class ExitOrderManager {
   constructor(exchangeService) {
     this.exchangeService = exchangeService;
   }
 
+  /**
+   * CRITICAL FIX: Check if operations should be blocked due to timeout circuit breaker
+   * @returns {boolean} True if operations should be blocked
+   */
+  _isCircuitBreakerOpen() {
+    return binanceRequestScheduler.isTimeoutCircuitOpen();
+  }
+
   async _cancelExistingExitOrder(position) {
     if (!position?.exit_order_id) return;
+
+    // CRITICAL FIX: Check circuit breaker before making API call
+    if (this._isCircuitBreakerOpen()) {
+      logger.debug(`[ExitOrderManager] Skipping cancel - timeout circuit breaker is OPEN`);
+      return;
+    }
 
     try {
       await this.exchangeService.cancelOrder(String(position.exit_order_id), position.symbol);
     } catch (e) {
+      // CRITICAL FIX: Record timeout error for adaptive throttling
+      const errorMsg = e?.message || String(e);
+      if (errorMsg.includes('-1007') || errorMsg.includes('Timeout')) {
+        binanceRequestScheduler.recordTimeoutError();
+      }
       logger.error(
-        `[ExitOrderManager] Failed to cancel existing exit order ${position.exit_order_id} for pos=${position.id}: ${e?.message || e}`
+        `[ExitOrderManager] Failed to cancel existing exit order ${position.exit_order_id} for pos=${position.id}: ${errorMsg}`
       );
     }
 
@@ -76,6 +100,15 @@ export class ExitOrderManager {
   async placeOrReplaceExitOrder(position, desiredExitPrice) {
     const startTime = Date.now();
     const timestamp = new Date().toISOString();
+    
+    // CRITICAL FIX: Check timeout circuit breaker before making API calls
+    if (this._isCircuitBreakerOpen()) {
+      logger.warn(
+        `[ExitOrderManager] ⚠️ SKIP: Timeout circuit breaker is OPEN | pos=${position?.id} ` +
+        `Will retry when Binance backend recovers. timestamp=${timestamp}`
+      );
+      return null;
+    }
     
     if (!position || position.status !== 'open') {
       logger.warn(

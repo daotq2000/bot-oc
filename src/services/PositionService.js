@@ -4,6 +4,7 @@ import { exchangeInfoService } from './ExchangeInfoService.js';
 import { configService } from './ConfigService.js';
 import { orderStatusCache } from './OrderStatusCache.js';
 import { riskManagementService } from './RiskManagementService.js';
+import { binanceRequestScheduler } from './BinanceRequestScheduler.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -31,6 +32,76 @@ export class PositionService {
     // A) Memory map for cross-entry exit deduplication
     this.crossEntryExitPending = new Map(); // position.id -> timestamp
     this.crossEntryExitTTL = 60 * 1000; // 60 seconds cooldown
+
+    // CRITICAL FIX: TP/SL update throttling to prevent rate limit
+    // This ensures we don't overwhelm Binance with too many TP/SL updates in parallel
+    this._tpSlUpdateQueue = [];
+    this._tpSlUpdateProcessing = false;
+    this._tpSlUpdateDelayMs = Number(configService.getNumber('TP_SL_UPDATE_DELAY_MS', 500)); // 500ms between updates
+    this._tpSlUpdateBatchSize = Number(configService.getNumber('TP_SL_UPDATE_BATCH_SIZE', 3)); // Process 3 at a time
+    this._tpSlUpdateLastAt = 0;
+
+    // CRITICAL FIX: Track failed TP/SL updates to avoid infinite retries
+    this._tpSlFailedPositions = new Map(); // position.id -> { count, lastAttempt, error }
+    this._tpSlMaxRetries = Number(configService.getNumber('TP_SL_MAX_RETRIES', 3));
+    this._tpSlRetryBackoffMs = Number(configService.getNumber('TP_SL_RETRY_BACKOFF_MS', 30000)); // 30s backoff after max retries
+  }
+
+  /**
+   * CRITICAL FIX: Check if position TP/SL update should be skipped due to recent failures
+   * @param {number} positionId - Position ID
+   * @returns {boolean} True if should skip
+   */
+  _shouldSkipTpSlUpdate(positionId) {
+    const failInfo = this._tpSlFailedPositions.get(positionId);
+    if (!failInfo) return false;
+
+    const now = Date.now();
+    
+    // Clear old failures (after backoff period)
+    if (now - failInfo.lastAttempt > this._tpSlRetryBackoffMs) {
+      this._tpSlFailedPositions.delete(positionId);
+      return false;
+    }
+
+    // Skip if max retries exceeded and still in backoff period
+    if (failInfo.count >= this._tpSlMaxRetries) {
+      logger.debug(
+        `[TP/SL Throttle] Skipping TP/SL update for position ${positionId} ` +
+        `(${failInfo.count} failures, backoff until ${new Date(failInfo.lastAttempt + this._tpSlRetryBackoffMs).toISOString()})`
+      );
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * CRITICAL FIX: Record TP/SL update failure
+   * @param {number} positionId - Position ID
+   * @param {Error} error - Error object
+   */
+  _recordTpSlFailure(positionId, error) {
+    const failInfo = this._tpSlFailedPositions.get(positionId) || { count: 0, lastAttempt: 0, error: null };
+    failInfo.count++;
+    failInfo.lastAttempt = Date.now();
+    failInfo.error = error?.message || String(error);
+    this._tpSlFailedPositions.set(positionId, failInfo);
+
+    // Check if timeout circuit breaker is open
+    if (binanceRequestScheduler.isTimeoutCircuitOpen()) {
+      logger.warn(
+        `[TP/SL Throttle] Timeout circuit breaker is OPEN - skipping TP/SL updates to let Binance recover`
+      );
+    }
+  }
+
+  /**
+   * CRITICAL FIX: Clear TP/SL failure record on success
+   * @param {number} positionId - Position ID
+   */
+  _clearTpSlFailure(positionId) {
+    this._tpSlFailedPositions.delete(positionId);
   }
 
   /**
@@ -39,6 +110,19 @@ export class PositionService {
    * @returns {Promise<Object>} Updated position with close info if triggered
    */
   async updatePosition(position) {
+    // CRITICAL FIX: Check if timeout circuit breaker is open - skip updates to let Binance recover
+    if (binanceRequestScheduler.isTimeoutCircuitOpen()) {
+      logger.debug(
+        `[PositionService] ⏳ Skipping position ${position.id} update - timeout circuit breaker is OPEN`
+      );
+      return position;
+    }
+
+    // CRITICAL FIX: Check if this position had too many recent failures
+    if (this._shouldSkipTpSlUpdate(position.id)) {
+      return position;
+    }
+
     // Cache closable quantity for this update cycle to avoid multiple API calls
     let cachedClosableQty = null;
     const getCachedClosableQty = async () => {

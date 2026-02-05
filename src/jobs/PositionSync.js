@@ -17,6 +17,33 @@ export class PositionSync {
     this.telegramService = null; // TelegramService for sending alerts
     this.isRunning = false;
     this.task = null;
+    
+    // ✅ IMPROVEMENT: Track sync metrics for monitoring and alerting
+    this.syncMetrics = {
+      totalSyncs: 0,
+      successfulSyncs: 0,
+      failedSyncs: 0,
+      totalSyncIssues: 0,
+      tpSlVerifiedCloses: 0,  // Positions closed because TP/SL was verified as filled
+      unknownCloses: 0,        // Positions closed without verified TP/SL
+      lastSyncAt: null,
+      lastSyncDuration: 0,
+      avgSyncDuration: 0
+    };
+  }
+
+  /**
+   * Get current sync metrics for monitoring
+   */
+  getSyncMetrics() {
+    const successRate = this.syncMetrics.totalSyncs > 0 
+      ? ((this.syncMetrics.successfulSyncs / this.syncMetrics.totalSyncs) * 100).toFixed(1)
+      : 0;
+    
+    return {
+      ...this.syncMetrics,
+      successRate: `${successRate}%`
+    };
   }
 
   /**
@@ -79,6 +106,8 @@ export class PositionSync {
 
     this.isRunning = true;
     const startTime = Date.now();
+    this.syncMetrics.totalSyncs++;
+    
     try {
       logger.info('[PositionSync] Starting position sync from exchange...');
 
@@ -87,6 +116,8 @@ export class PositionSync {
       let totalClosed = 0;
       let totalErrors = 0;
       let syncIssuesDetected = 0; // ✅ Track sync issues
+      let tpSlVerifiedCloses = 0; // ✅ Track TP/SL verified closes
+      let unknownCloses = 0;      // ✅ Track unknown closes
 
       for (const [botId, exchangeService] of this.exchangeServices.entries()) {
         try {
@@ -96,6 +127,8 @@ export class PositionSync {
             totalCreated += result.created || 0;
             totalClosed += result.closed || 0;
             syncIssuesDetected += result.syncIssuesDetected || 0;
+            tpSlVerifiedCloses += result.tpSlVerifiedCloses || 0;
+            unknownCloses += result.unknownCloses || 0;
           }
         } catch (error) {
           totalErrors++;
@@ -104,18 +137,34 @@ export class PositionSync {
       }
 
       const duration = Date.now() - startTime;
+      
+      // ✅ IMPROVEMENT: Update sync metrics
+      this.syncMetrics.successfulSyncs++;
+      this.syncMetrics.totalSyncIssues += syncIssuesDetected;
+      this.syncMetrics.tpSlVerifiedCloses += tpSlVerifiedCloses;
+      this.syncMetrics.unknownCloses += unknownCloses;
+      this.syncMetrics.lastSyncAt = new Date().toISOString();
+      this.syncMetrics.lastSyncDuration = duration;
+      this.syncMetrics.avgSyncDuration = Math.round(
+        (this.syncMetrics.avgSyncDuration * (this.syncMetrics.totalSyncs - 1) + duration) / this.syncMetrics.totalSyncs
+      );
+      
       logger.info(
         `[PositionSync] Position sync completed in ${duration}ms: ` +
         `processed=${totalProcessed}, created=${totalCreated}, closed=${totalClosed}, ` +
-        `sync_issues=${syncIssuesDetected}, errors=${totalErrors}`
+        `tpsl_verified=${tpSlVerifiedCloses}, unknown=${unknownCloses}, sync_issues=${syncIssuesDetected}, errors=${totalErrors}`
       );
       
-      // ✅ IMPROVEMENT: Alert if sync issues detected
-      if (syncIssuesDetected > 5 && this.telegramService) {
+      // ✅ IMPROVEMENT: Alert if sync issues detected (with more context)
+      if (syncIssuesDetected > 3 && this.telegramService) {
         try {
+          const metrics = this.getSyncMetrics();
           await this.telegramService.sendMessage(
-            `⚠️ PositionSync detected ${syncIssuesDetected} sync issue(s) in this cycle. ` +
-            `Please check logs for details.`
+            `⚠️ [PositionSync] Detected ${syncIssuesDetected} sync issue(s)\n` +
+            `📊 Success Rate: ${metrics.successRate}\n` +
+            `✅ TP/SL Verified: ${tpSlVerifiedCloses}\n` +
+            `❓ Unknown: ${unknownCloses}\n` +
+            `⏱️ Duration: ${duration}ms`
           );
         } catch (alertError) {
           logger.debug(`[PositionSync] Could not send Telegram alert: ${alertError?.message || alertError}`);
@@ -129,20 +178,49 @@ export class PositionSync {
   }
 
   /**
+   * Retry helper with exponential backoff
+   * @param {Function} fn - Async function to retry
+   * @param {number} maxRetries - Maximum number of retries (default: 3)
+   * @param {number} baseDelayMs - Base delay in ms (default: 2000)
+   * @returns {Promise<any>} Result from fn or throws after max retries
+   */
+  async _retryWithBackoff(fn, maxRetries = 3, baseDelayMs = 2000) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxRetries) {
+          const delayMs = baseDelayMs * Math.pow(2, attempt - 1); // Exponential backoff: 2s, 4s, 8s
+          logger.warn(`[PositionSync] Retry ${attempt}/${maxRetries} failed, waiting ${delayMs}ms before next attempt: ${error?.message || error}`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  /**
    * Sync positions for a specific bot
    * @param {number} botId - Bot ID
    * @param {ExchangeService} exchangeService - Exchange service instance
    */
   async syncBotPositions(botId, exchangeService) {
     try {
-      // Fetch positions from exchange
+      // Fetch positions from exchange with retry logic
       // Use exchangeService.getOpenPositions() which handles Binance DirectClient properly
       let exchangePositions;
       try {
-        exchangePositions = await exchangeService.getOpenPositions();
+        // ✅ IMPROVEMENT: Add retry with exponential backoff for network/API failures
+        exchangePositions = await this._retryWithBackoff(
+          () => exchangeService.getOpenPositions(),
+          3, // maxRetries
+          2000 // baseDelayMs
+        );
         logger.debug(`[PositionSync] Fetched ${Array.isArray(exchangePositions) ? exchangePositions.length : 0} positions from exchange for bot ${botId}`);
       } catch (error) {
-        logger.error(`[PositionSync] Failed to fetch positions from exchange for bot ${botId}:`, error?.message || error);
+        logger.error(`[PositionSync] Failed to fetch positions from exchange for bot ${botId} after retries:`, error?.message || error);
         return;
       }
       
@@ -357,6 +435,9 @@ export class PositionSync {
       // CRITICAL: Close positions that exist in DB but not on exchange
       // ✅ IMPROVEMENT: Verify TP/SL orders before closing to avoid false positives
       let closedCount = 0;
+      let tpSlVerifiedCloses = 0;  // ✅ Track closes that were verified as TP/SL hit
+      let unknownCloses = 0;        // ✅ Track closes without verified TP/SL
+      
       for (const dbPos of dbPositions) {
         if (!matchedDbPositionIds.has(dbPos.id) && dbPos.status === 'open') {
           // This position exists in DB but not on exchange - verify TP/SL orders first
@@ -440,6 +521,14 @@ export class PositionSync {
                   
                   await positionService.closePosition(dbPos, closePrice, pnl, closeReason);
                   closedCount++;
+                  
+                  // ✅ IMPROVEMENT: Track TP/SL verified vs unknown closes
+                  if (tpOrderFilled || slOrderFilled) {
+                    tpSlVerifiedCloses++;
+                  } else {
+                    unknownCloses++;
+                  }
+                  
                   logger.info(`[PositionSync] ✅ Closed position ${dbPos.id} via PositionService (reason: ${closeReason}, Telegram alert should be sent)`);
                 } catch (closeError) {
                   // Fallback to direct update if PositionService fails
@@ -453,6 +542,13 @@ export class PositionSync {
                     closed_at: new Date()
                   });
                   closedCount++;
+                  
+                  // ✅ Track even for fallback
+                  if (tpOrderFilled || slOrderFilled) {
+                    tpSlVerifiedCloses++;
+                  } else {
+                    unknownCloses++;
+                  }
                 }
               } finally {
                 // Always release lock in finally block
@@ -584,7 +680,9 @@ export class PositionSync {
         processed: processedCount,
         created: createdCount,
         closed: closedCount,
-        syncIssuesDetected: closedCount // ✅ Track positions closed due to sync issues
+        syncIssuesDetected: unknownCloses, // ✅ Track positions closed due to sync issues (not TP/SL)
+        tpSlVerifiedCloses: tpSlVerifiedCloses, // ✅ Track positions closed because TP/SL was verified
+        unknownCloses: unknownCloses  // ✅ Track positions closed without verified TP/SL
       };
     } catch (error) {
       logger.error(`[PositionSync] Error syncing bot ${botId}:`, error?.message || error);

@@ -29,8 +29,8 @@ This document describes the configuration values for the **CRITICAL FIX** that p
 | `BINANCE_MARKET_DATA_MIN_INTERVAL_MS` | `500` | Min interval between market data requests (increased from 200ms) |
 | `BINANCE_MARKET_DATA_TIMEOUT_MS` | `20000` | Timeout for market data requests (20s) |
 | `BINANCE_MIN_REQUEST_INTERVAL_MS` | `100` | Min interval for general requests |
-| `BINANCE_REQUEST_INTERVAL_MS` | `125` | Request interval for scheduler (~8 req/sec) |
-| `BINANCE_SIGNED_REQUEST_INTERVAL_MS` | `150` | Request interval for signed requests (~6.6 req/sec) |
+| `BINANCE_REQUEST_INTERVAL_MS` | `200` | Request interval for scheduler (~5 req/sec) - **UPDATED: increased from 125ms** |
+| `BINANCE_SIGNED_REQUEST_INTERVAL_MS` | `250` | Request interval for signed requests (~4 req/sec) - **UPDATED: increased from 150ms** |
 
 ### Rate Limit Blocking (429 Handling)
 
@@ -46,6 +46,25 @@ This document describes the configuration values for the **CRITICAL FIX** that p
 | `BINANCE_CIRCUIT_BREAKER_THRESHOLD` | `5` | Failures before opening circuit breaker |
 | `BINANCE_CIRCUIT_BREAKER_TIMEOUT_MS` | `60000` | Cooldown period when circuit breaker opens (1 minute) |
 | `BINANCE_CIRCUIT_BREAKER_SUCCESS_THRESHOLD` | `2` | Successes needed to close circuit breaker |
+
+### Timeout Adaptive Throttling (NEW)
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `BINANCE_TIMEOUT_WINDOW_MS` | `60000` | Window for counting timeout errors (1 minute) |
+| `BINANCE_TIMEOUT_THRESHOLD` | `3` | Number of timeouts in window to trigger throttle |
+| `BINANCE_MAX_THROTTLE_MULTIPLIER` | `4` | Max throttle multiplier (4x = 800ms intervals) |
+| `BINANCE_THROTTLE_DECAY_MS` | `30000` | Decay throttle after 30s of no errors |
+| `BINANCE_TIMEOUT_CIRCUIT_COOLDOWN_MS` | `15000` | Block all requests for 15s when timeout circuit opens |
+
+### TP/SL Update Throttling (NEW)
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `TP_SL_UPDATE_DELAY_MS` | `500` | Delay between TP/SL updates |
+| `TP_SL_UPDATE_BATCH_SIZE` | `3` | Process N TP/SL updates at a time |
+| `TP_SL_MAX_RETRIES` | `3` | Max retries for failed TP/SL updates |
+| `TP_SL_RETRY_BACKOFF_MS` | `30000` | Backoff after max retries (30s) |
 
 ### Request Scheduler
 
