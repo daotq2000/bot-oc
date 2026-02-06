@@ -1,5 +1,4 @@
 import { Position } from '../models/Position.js';
-import { Strategy } from '../models/Strategy.js';
 import { EntryOrder } from '../models/EntryOrder.js';
 import { ExchangeService } from '../services/ExchangeService.js';
 import { SCAN_INTERVALS } from '../config/constants.js';
@@ -355,27 +354,34 @@ export class PositionSync {
       // Helper to normalize symbol exactly like we do for exchange positions
       const normalizeSymbol = (symbol) => this.normalizeSymbol(symbol);
 
-      // Create a map of DB positions by *normalized* symbol+side
-      // This prevents duplicates like "H/USDT" vs "HUSDT" for the same underlying coin.
-      // Use array to store multiple positions with same symbol+side
+      // Build exchange_position_key for hedge-mode reconciliation.
+      // Key format: <exchange>_<botId>_<symbol>_<LONG|SHORT>
+      const buildExchangePositionKey = (exchange, botId, symbol, side) => {
+        const ex = String(exchange || '').toLowerCase();
+        const normSym = normalizeSymbol(symbol);
+        const ps = side === 'long' ? 'LONG' : 'SHORT';
+        return `${ex}_${botId}_${normSym}_${ps}`;
+      };
+
+      // Create a map of DB positions by exchange_position_key (preferred) and by normalized symbol+side (fallback)
+      // Use array to store multiple positions with same key (defensive for historical duplicates)
       const dbPositionsMap = new Map();
       for (const pos of dbPositions) {
         const rawSym = pos.symbol;
         const normSym = normalizeSymbol(rawSym);
         const keyRaw = `${rawSym}_${pos.side}`;
         const keyNorm = `${normSym}_${pos.side}`;
-        
-        // Store as array to handle multiple positions with same symbol+side
-        if (!dbPositionsMap.has(keyRaw)) {
-          dbPositionsMap.set(keyRaw, []);
+
+        if (pos.exchange_position_key) {
+          const k = String(pos.exchange_position_key);
+          if (!dbPositionsMap.has(k)) dbPositionsMap.set(k, []);
+          dbPositionsMap.get(k).push(pos);
         }
-        if (!dbPositionsMap.has(keyNorm)) {
-          dbPositionsMap.set(keyNorm, []);
-        }
+
+        if (!dbPositionsMap.has(keyRaw)) dbPositionsMap.set(keyRaw, []);
+        if (!dbPositionsMap.has(keyNorm)) dbPositionsMap.set(keyNorm, []);
         dbPositionsMap.get(keyRaw).push(pos);
-        if (keyRaw !== keyNorm) {
-          dbPositionsMap.get(keyNorm).push(pos);
-        }
+        if (keyRaw !== keyNorm) dbPositionsMap.get(keyNorm).push(pos);
       }
 
       // Process exchange positions
@@ -404,10 +410,15 @@ export class PositionSync {
           logger.debug(`[PositionSync] Processing position: ${symbol} -> ${normalizedSymbol}, ${side}, contracts=${contracts}`);
 
           // Check if position exists in database
-          // Try multiple key formats for matching
+          // Preferred matching key: exchange_position_key (stable for hedge mode)
+          const exchange = exchangeService?.bot?.exchange || 'binance';
+          const exKey = buildExchangePositionKey(exchange, botId, normalizedSymbol, side);
+
+          // Fallback matching keys (legacy): symbol_side
           const key1 = `${normalizedSymbol}_${side}`;
           const key2 = `${symbol}_${side}`;
-          const dbPosArray = dbPositionsMap.get(key1) || dbPositionsMap.get(key2) || [];
+
+          const dbPosArray = dbPositionsMap.get(exKey) || dbPositionsMap.get(key1) || dbPositionsMap.get(key2) || [];
 
           if (dbPosArray.length === 0) {
             // Position exists on exchange but not in database - try to find matching entry_order or strategy
@@ -423,7 +434,30 @@ export class PositionSync {
             // Match all positions with same symbol+side (there can be multiple positions)
             for (const dbPos of dbPosArray) {
               matchedDbPositionIds.add(dbPos.id); // Mark as matched
-            await this.verifyPositionConsistency(dbPos, exPos, exchangeService);
+
+              // Backfill exchange_position_key if missing (stabilizes future reconciliation)
+              if (!dbPos.exchange_position_key) {
+                try {
+                  const exchange = exchangeService?.bot?.exchange || 'binance';
+                  const k = buildExchangePositionKey(exchange, botId, normalizedSymbol, dbPos.side);
+                  await Position.update(dbPos.id, { exchange_position_key: k });
+                  dbPos.exchange_position_key = k;
+                } catch (e) {
+                  logger.debug(`[PositionSync] Could not backfill exchange_position_key for pos=${dbPos.id}: ${e?.message || e}`);
+                }
+              }
+
+              // Reset debounce counter when the position is confirmed on exchange
+              if (Number(dbPos.not_on_exchange_count || 0) !== 0) {
+                try {
+                  await Position.update(dbPos.id, { not_on_exchange_count: 0 });
+                  dbPos.not_on_exchange_count = 0;
+                } catch (e) {
+                  logger.debug(`[PositionSync] Could not reset not_on_exchange_count for pos=${dbPos.id}: ${e?.message || e}`);
+                }
+              }
+
+              await this.verifyPositionConsistency(dbPos, exPos);
             }
           }
           processedCount++;
@@ -434,13 +468,34 @@ export class PositionSync {
       
       // CRITICAL: Close positions that exist in DB but not on exchange
       // ✅ IMPROVEMENT: Verify TP/SL orders before closing to avoid false positives
+      // ✅ FIX: Debounce close. Only close after N consecutive sync cycles not found on exchange.
+      const closeDebounceMax = Math.max(1, Number(configService.getNumber('POSITION_SYNC_CLOSE_DEBOUNCE_COUNT', 5)) || 5);
       let closedCount = 0;
       let tpSlVerifiedCloses = 0;  // ✅ Track closes that were verified as TP/SL hit
       let unknownCloses = 0;        // ✅ Track closes without verified TP/SL
       
       for (const dbPos of dbPositions) {
         if (!matchedDbPositionIds.has(dbPos.id) && dbPos.status === 'open') {
-          // This position exists in DB but not on exchange - verify TP/SL orders first
+          // This position exists in DB but not on exchange
+          // Debounce: increment not_on_exchange_count and close only when threshold reached
+          const prevCount = Number(dbPos.not_on_exchange_count || 0) || 0;
+          const nextCount = prevCount + 1;
+
+          try {
+            await Position.update(dbPos.id, { not_on_exchange_count: nextCount });
+          } catch (e) {
+            logger.debug(`[PositionSync] Could not update not_on_exchange_count for pos=${dbPos.id}: ${e?.message || e}`);
+          }
+
+          if (nextCount < closeDebounceMax) {
+            logger.warn(
+              `[PositionSync] Debounce close: pos ${dbPos.id} not found on exchange ` +
+              `(${nextCount}/${closeDebounceMax}) | symbol=${dbPos.symbol} side=${dbPos.side}`
+            );
+            continue;
+          }
+
+          // Threshold reached: verify TP/SL orders first, then close
           try {
             const pool = (await import('../config/database.js')).default;
             // Try to acquire lock before updating
@@ -800,7 +855,8 @@ export class PositionSync {
               amount: entry.amount,
               take_profit_price: tpPrice,
               stop_loss_price: slPrice,
-              current_reduce: strategy.reduce
+              current_reduce: strategy.reduce,
+              tp_sl_pending: true
             });
             
             await EntryOrder.markFilled(entry.id);
@@ -809,7 +865,7 @@ export class PositionSync {
           
           // OPTIMIZATION: Trigger immediate TP/SL placement for newly created position
           // This reduces unprotected time window from 30-60s to < 5s
-          await this._triggerImmediateTPSLPlacement(position, exchangeService);
+          await this._triggerImmediateTPSLPlacement(position);
           
             return true;
         } catch (error) {
@@ -836,7 +892,10 @@ export class PositionSync {
       );
 
       if (strategies.length === 0) {
-        logger.debug(`[PositionSync] No matching strategy found for missing position ${symbol} ${side} on bot ${botId}`);
+        logger.warn(
+          `[PositionSync] ⚠️ ORPHAN POSITION: No matching strategy found for position ${symbol} ${side} on bot ${botId}. ` +
+          `This position exists on exchange but cannot be managed by bot because no active strategy matches the symbol.`
+        );
         return false; // Can't create Position without strategy
       }
 
@@ -879,6 +938,9 @@ export class PositionSync {
       // Fake order_id like "sync_..." causes Binance API errors when querying order status
       // Synced positions are positions that already exist on exchange, not newly created orders
       try {
+        const exchange = exchangeService?.bot?.exchange || 'binance';
+        const exchangePositionKey = `${String(exchange).toLowerCase()}_${botId}_${normalizedSymbol}_${side === 'long' ? 'LONG' : 'SHORT'}`;
+
         const position = await Position.create({
           strategy_id: strategy.id,
           bot_id: botId,
@@ -889,7 +951,9 @@ export class PositionSync {
           amount: amount,
           take_profit_price: tpPrice,
           stop_loss_price: slPrice,
-          current_reduce: strategy.reduce
+          current_reduce: strategy.reduce,
+          tp_sl_pending: true,
+          exchange_position_key: exchangePositionKey
         });
 
         logger.info(
@@ -923,7 +987,7 @@ export class PositionSync {
    * @param {Object} exPos - Exchange position
    * @param {ExchangeService} exchangeService - Exchange service instance
    */
-  async verifyPositionConsistency(dbPos, exPos, exchangeService) {
+  async verifyPositionConsistency(dbPos, exPos) {
     try {
       // Parse raw amount first to determine side correctly
       const rawAmt = parseFloat(exPos.positionAmt ?? exPos.contracts ?? 0);
@@ -1016,6 +1080,19 @@ export class PositionSync {
           );
         }
       }
+
+      // 5. AUTO-REPAIR: Force TP/SL reconciliation if orders are missing on exchange
+      // Only for positions with an active strategy match (which dbPos already has)
+      const hasTP = dbPos.exit_order_id != null;
+      const hasSL = dbPos.sl_order_id != null || dbPos.use_software_sl;
+
+      if (!hasTP || !hasSL) {
+        logger.info(
+          `[PositionSync] 🔧 AUTO-REPAIR: Position ${dbPos.id} (${dbPos.symbol}) missing TP or SL orders in DB. ` +
+          `Setting tp_sl_pending=true to trigger re-placement.`
+        );
+        await Position.update(dbPos.id, { tp_sl_pending: true });
+      }
     } catch (error) {
       logger.warn(`[PositionSync] Error verifying position ${dbPos.id}:`, error?.message || error);
     }
@@ -1028,7 +1105,7 @@ export class PositionSync {
    * @param {Object} position - Position object
    * @param {ExchangeService} exchangeService - Exchange service instance
    */
-  async _triggerImmediateTPSLPlacement(position, exchangeService) {
+  async _triggerImmediateTPSLPlacement(position) {
     try {
       // Set tp_sl_pending flag to ensure PositionMonitor processes this position with high priority
       // PositionMonitor already has logic to prioritize positions with tp_sl_pending = true

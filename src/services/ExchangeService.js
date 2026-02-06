@@ -1603,6 +1603,12 @@ export class ExchangeService {
   }
 
   async cancelOrder(orderId, symbol) {
+    // Guard: never call exchange cancel with empty/null orderId (prevents Binance -1102)
+    if (orderId === undefined || orderId === null || String(orderId).trim() === '') {
+      logger.warn(`[ExchangeService] cancelOrder skipped: invalid orderId | bot=${this.bot?.id} symbol=${symbol} orderId=${orderId}`);
+      return null;
+    }
+
     try {
       // Binance: use direct client
       if (this.bot.exchange === 'binance' && this.binanceDirectClient) {

@@ -391,7 +391,8 @@ export class OrderService {
           stop_loss_price: tempSlPrice,
           current_reduce: strategy.reduce,
           status: 'entry_pending', // NEW: Start with a pending status
-          tp_sl_pending: true // TP/SL orders will be placed after fill confirmation
+          tp_sl_pending: true, // TP/SL orders will be placed after fill confirmation
+          not_on_exchange_count: 0
         });
         logger.info(`[OrderService] Position ${position.id} created with status 'entry_pending' for order ${order.id}.`);
 

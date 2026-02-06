@@ -116,9 +116,12 @@ class WebSocketManager {
     // ✅ RECONNECT STORM PREVENTION
     this.reconnectQueue = [];
     this.reconnectInProgress = new Set();
-    this.maxConcurrentReconnects = Number(configService.getNumber('BINANCE_WS_MAX_CONCURRENT_RECONNECTS', 2));
+    this.maxConcurrentReconnects = Number(configService.getNumber('BINANCE_WS_MAX_CONCURRENT_RECONNECTS', 1)); // 🔒 Force 1 for stability
     this.maxReconnectQueueSize = Number(configService.getNumber('BINANCE_WS_MAX_RECONNECT_QUEUE_SIZE', 50));
     this.reconnectQueueProcessorRunning = false;
+    // ✅ GLOBAL RECONNECT BACKOFF to avoid synchronized reconnects
+    this.lastGlobalReconnectAt = 0;
+    this.globalReconnectMinIntervalMs = Number(configService.getNumber('BINANCE_WS_GLOBAL_RECONNECT_MIN_INTERVAL_MS', 500));
 
     // ✅ EVENT LOOP DELAY MONITORING (lightweight)
     this._eventLoopDelay = {
@@ -224,7 +227,19 @@ class WebSocketManager {
     const conn = this.reconnectQueue.shift();
     if (!conn) return;
 
+    // ✅ GLOBAL RECONNECT THROTTLING: avoid synchronized reconnects
+    const now = Date.now();
+    const timeSinceLastGlobal = now - this.lastGlobalReconnectAt;
+    if (timeSinceLastGlobal < this.globalReconnectMinIntervalMs) {
+      // Re-queue with a small delay to stagger reconnects
+      setTimeout(() => {
+        this.reconnectQueue.unshift(conn);
+      }, this.globalReconnectMinIntervalMs - timeSinceLastGlobal);
+      return;
+    }
+
     this.reconnectInProgress.add(conn);
+    this.lastGlobalReconnectAt = now;
     logger.info(
       `[Binance-WS] 🔄 Processing reconnect from queue (remaining: ${this.reconnectQueue.length}, in-progress: ${this.reconnectInProgress.size}, streams: ${conn.streams.size})`
     );
@@ -241,8 +256,9 @@ class WebSocketManager {
 
         conn.reconnectAttempts += 1;
         const baseDelay = Math.min(this.minReconnectDelayMs * Math.pow(2, conn.reconnectAttempts), this.maxReconnectDelayMs);
-        const jitter = Math.floor(Math.random() * Math.min(1000, baseDelay * 0.2));
-        const delay = Math.max(100, baseDelay + jitter);
+        // ✅ INCREASED JITTER to avoid thundering herd
+        const jitter = Math.floor(Math.random() * Math.min(2000, baseDelay * 0.4));
+        const delay = Math.max(200, baseDelay + jitter);
 
         logger.info(`[Binance-WS] ⏱️ Scheduling reconnect in ${delay}ms (attempt ${conn.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
@@ -899,7 +915,7 @@ class WebSocketManager {
     }
 
     conn.ws.on('open', () => {
-      const totalConns = this.connections.filter(c => c.ws && c.ws.readyState === WebSocket.OPEN).length + 1;
+      const totalConns = this.connections.filter(c => c.ws && c.ws.readyState === WebSocket.OPEN).length;
       const totalStreams = this._getTotalStreams();
       logger.info(`[Binance-WS] ✅ Connected (conn #${totalConns}/${this.connections.length} | this=${conn.streams.size} streams | total=${totalStreams}/${this.maxTotalStreams} streams)`);
       conn.reconnectAttempts = 0;

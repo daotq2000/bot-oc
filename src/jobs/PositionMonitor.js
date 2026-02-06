@@ -838,12 +838,17 @@ export class PositionMonitor {
                 `Canceling to recreate with updated price.`
               );
               try {
-                await exchangeService.cancelOrder(position.symbol, position.exit_order_id);
-                logger.info(`[Place TP/SL] ✅ Canceled stale TP order ${position.exit_order_id}`);
+                // Validate orderId before canceling to prevent -1102 errors
+                if (!position.exit_order_id || String(position.exit_order_id).trim() === '') {
+                  logger.warn(`[Place TP/SL] ⚠️ Skipping cancel: invalid exit_order_id for position ${position.id}: ${position.exit_order_id}`);
+                } else {
+                  await exchangeService.cancelOrder(position.exit_order_id, position.symbol);
+                  logger.info(`[Place TP/SL] ✅ Canceled stale TP order ${position.exit_order_id}`);
+                }
               } catch (cancelErr) {
                 const msg = cancelErr?.message || '';
-                // Ignore if already canceled/filled
-                if (!msg.includes('Unknown order') && !msg.includes('already') && !msg.includes('UNKNOWN_ORDER')) {
+                // Ignore if already canceled/filled or invalid orderId
+                if (!msg.includes('Unknown order') && !msg.includes('already') && !msg.includes('UNKNOWN_ORDER') && !msg.includes('-1102')) {
                   logger.warn(`[Place TP/SL] ⚠️ Failed to cancel stale TP order: ${msg}`);
                 }
               }
@@ -933,11 +938,17 @@ export class PositionMonitor {
                   `Canceling to recreate with updated price.`
                 );
                 try {
-                  await exchangeService.cancelOrder(position.symbol, position.sl_order_id);
-                  logger.info(`[Place TP/SL] ✅ Canceled stale SL order ${position.sl_order_id}`);
+                  // Validate orderId before canceling to prevent -1102 errors
+                  if (!position.sl_order_id || String(position.sl_order_id).trim() === '') {
+                    logger.warn(`[Place TP/SL] ⚠️ Skipping cancel: invalid sl_order_id for position ${position.id}: ${position.sl_order_id}`);
+                  } else {
+                    await exchangeService.cancelOrder(position.sl_order_id, position.symbol);
+                    logger.info(`[Place TP/SL] ✅ Canceled stale SL order ${position.sl_order_id}`);
+                  }
                 } catch (cancelErr) {
                   const msg = cancelErr?.message || '';
-                  if (!msg.includes('Unknown order') && !msg.includes('already') && !msg.includes('UNKNOWN_ORDER')) {
+                  // Ignore if already canceled/filled or invalid orderId
+                  if (!msg.includes('Unknown order') && !msg.includes('already') && !msg.includes('UNKNOWN_ORDER') && !msg.includes('-1102')) {
                     logger.warn(`[Place TP/SL] ⚠️ Failed to cancel stale SL order: ${msg}`);
                   }
                 }
